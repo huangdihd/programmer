@@ -1,15 +1,18 @@
+use std::io;
 use std::path::Path;
 use ::config::Config;
 use ::config::File;
 use ::config::Environment;
+use crossterm::ExecutableCommand;
+use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use app::App;
 use crate::config::programmer_config::ProgrammerConfig;
 
 mod ui;
 pub mod config;
 pub mod app;
-
-const CONFIG_PATH: &str = "";
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -20,7 +23,10 @@ async fn main() -> color_eyre::Result<()> {
     }
     let config_path = programmer_dir.join("config.toml");
     color_eyre::install()?;
-    let terminal = ratatui::init();
+    enable_raw_mode()?;
+    io::stdout().execute(EnterAlternateScreen)?;
+
+    let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let programmer_config = Config::builder()
         .add_source(File::with_name(config_path.as_path().to_str().unwrap()).required(false))
         .add_source(Environment::with_prefix("Programmer"))

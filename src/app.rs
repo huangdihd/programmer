@@ -1,39 +1,39 @@
-use std::sync::Arc;
-use async_openai::{Client, config::OpenAIConfig };
+use crate::config::programmer_config::ProgrammerConfig;
+use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
-use async_openai::traits::EventType;
-use async_openai::types::responses::{CreateResponse, InputParam, ResponseStreamEvent};
 use async_openai::types::responses::ResponseStreamEvent::ResponseOutputTextDelta;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use async_openai::types::responses::{CreateResponse, InputParam, ResponseStreamEvent};
+use async_openai::{config::OpenAIConfig, Client};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use tokio::sync::Mutex;
-use crate::ui::event::{AppEvent, Event, EventHandler};
-use crate::config::programmer_config::ProgrammerConfig;
+use ratatui_textarea::TextArea;
 
 /// Application.
 #[derive(Debug)]
-pub struct App {
+pub struct App<'a> {
     /// Is the application running?
     pub running: bool,
     /// OpenAI client.
-    pub client: Arc<Mutex<Client<OpenAIConfig>>>,
+    pub client: Client<OpenAIConfig>,
     /// Event handler.
     pub events: EventHandler,
-    pub response: Arc<Mutex<String>>,
-    pub config: ProgrammerConfig
+    pub response: String,
+    pub config: ProgrammerConfig,
+    pub textarea: TextArea<'a>
 }
 
-impl App {
+impl App<'_> {
     /// Constructs a new instance of [`App`].
     pub async fn new(config: ProgrammerConfig) -> Self {
         let openai_config = OpenAIConfig::default().with_api_base(&config.base_url).with_api_key(&config.api_key);
         Self {
             running: true,
-            client: Arc::from(Mutex::from(Client::with_config(openai_config))),
+            client: Client::with_config(openai_config),
             events: EventHandler::new(),
-            response: Arc::from(Mutex::from(String::new())),
+            response: String::new(),
             config,
+            textarea: Default::default(),
         }
     }
 
@@ -59,13 +59,14 @@ impl App {
                         let client = self.client.clone();
                         let sender = self.events.sender.clone();
                         let model = self.config.model.clone();
+                        let text = self.textarea.lines().join("\n");
+                        self.textarea.clear();
                         tokio::spawn(async move {
-                            let guard_client = client.lock().await;
                             let mut request = CreateResponse::default();
                             request.stream = Option::from(true);
-                            request.input = InputParam::Text("Hello".to_string());
+                            request.input = InputParam::Text(text);
                             request.model = Option::from(model);
-                            let stream = guard_client.responses().create_stream(request).await;
+                            let stream = client.responses().create_stream(request).await;
                             match stream {
                                 Ok(mut response_stream) => {
                                     while let Some(response_stream_event) = response_stream.next().await {
@@ -94,32 +95,29 @@ impl App {
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent){
         match response_stream_event {
             ResponseOutputTextDelta(text_delta_event) => {
-                let mut guard_response = self.response.lock().await;
-                guard_response.push_str(text_delta_event.delta.as_str());
+                self.response.push_str(text_delta_event.delta.as_str());
             },
-            event => {
-                let mut guard_response = self.response.lock().await;
-                guard_response.push_str(format!("[{}]\n", event.event_type()).as_str());
-            }
+            _ => {}
         }
     }
 
     pub async fn handle_error_events(&mut self, error: OpenAIError) {
-        let mut guard_response = self.response.lock().await;
-        guard_response.push_str(format!("[Error]{}\n", error).as_str());
+        self.response.push_str(format!("[Error]{}\n", error).as_str());
     }
 
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+            KeyCode::Char('q' | 'Q') if key_event.modifiers == KeyModifiers::CONTROL => self.events.send(AppEvent::Quit),
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
             }
-            KeyCode::Char('s' | 'S') => {
+            KeyCode::Enter if key_event.modifiers != KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Start)
             }
-            // Other handlers you could add here.
+            _ if key_event.kind != KeyEventKind::Release => {
+                self.textarea.input(key_event);
+            }
             _ => {}
         }
         Ok(())

@@ -15,6 +15,7 @@ color-eyre = "0.6.5"
 async-openai = { version = "0.41.1", features = ["responses"] }
 serde = { version = "1.0.228", features = ["derive"] }
 config = "0.15.25"
+ratatui-textarea = "0.9.2"
 dirs = "6.0.0"
 toml = "1.1.2+spec-1.1.0"
 

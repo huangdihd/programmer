@@ -1,40 +1,37 @@
+use crate::app::App;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::widgets::Wrap;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
     style::{Color, Stylize},
-    widgets::{Block, BorderType, Paragraph, Widget},
+    widgets::{Block, Paragraph, Widget},
 };
-use ratatui::widgets::Wrap;
-use crate::app::App;
 
-impl Widget for &App {
+impl Widget for &App<'_> {
     /// Renders the user interface widgets.
     ///
-    // This is where you add new widgets.
-    // See the following resources:
-    // - https://docs.rs/ratatui/latest/ratatui/widgets/index.html
-    // - https://github.com/ratatui/ratatui/tree/master/examples
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::bordered()
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(2),
+                Constraint::Length(5),
+            ])
+            .split(area);
+
+        let block = Block::default()
             .title("programmer")
-            .title_alignment(Alignment::Center)
-            .border_type(BorderType::Rounded);
+            .title_alignment(Alignment::Center);
 
-        let mut text = match self.response.try_lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => String::from("Press s to call the LLM..."),
-        };
-
-        if text == "" {
-            text = "Press s to call the LLM...".to_string();
-        }
-
-        let paragraph = Paragraph::new(text)
+        let paragraph = Paragraph::new(self.response.clone())
             .block(block)
             .fg(Color::Cyan)
             .bg(Color::Black)
             .wrap(Wrap { trim: true });
 
-        paragraph.render(area, buf);
+        paragraph.render(chunks[0], buf);
+        self.textarea.render(chunks[1], buf);
     }
 }
