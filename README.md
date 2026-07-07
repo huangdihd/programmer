@@ -1,2 +1,2 @@
 # programmer
-a coding agent written in rust
+A coding agent written in rust
