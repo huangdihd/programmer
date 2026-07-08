@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use ratatui_textarea::TextArea;
+use tui_scrollview::ScrollViewState;
 
 /// Application.
 #[derive(Debug)]
@@ -20,7 +21,8 @@ pub struct App<'a> {
     pub events: EventHandler,
     pub response: String,
     pub config: ProgrammerConfig,
-    pub textarea: TextArea<'a>
+    pub textarea: TextArea<'a>,
+    pub scroll_view_state: ScrollViewState
 }
 
 impl App<'_> {
@@ -34,13 +36,18 @@ impl App<'_> {
             response: String::new(),
             config,
             textarea: Default::default(),
+            scroll_view_state: ScrollViewState::new(),
         }
     }
 
     /// Run the application's main loop.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         while self.running {
-            terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
+            let mut scroll_state = self.scroll_view_state;
+            terminal.draw(|frame| {
+                frame.render_stateful_widget(&self, frame.area(), &mut scroll_state)
+            })?;
+            self.scroll_view_state = scroll_state;
             match self.events.next().await? {
                 Event::Tick => self.tick(),
                 Event::Crossterm(event) => match event {
