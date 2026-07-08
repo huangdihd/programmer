@@ -1,7 +1,7 @@
 use crate::config::programmer_config::ProgrammerConfig;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::ResponseStreamEvent::ResponseOutputTextDelta;
+use async_openai::types::responses::ResponseStreamEvent::{ResponseOutputTextDelta, ResponseOutputTextDone};
 use async_openai::types::responses::{CreateResponse, InputParam, ResponseStreamEvent};
 use async_openai::{config::OpenAIConfig, Client};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -45,7 +45,7 @@ impl App<'_> {
                 Event::Tick => self.tick(),
                 Event::Crossterm(event) => match event {
                     crossterm::event::Event::Key(key_event)
-                        if key_event.kind == crossterm::event::KeyEventKind::Press =>
+                        if key_event.kind == KeyEventKind::Press =>
                     {
                         self.handle_key_events(key_event)?
                     }
@@ -55,41 +55,43 @@ impl App<'_> {
                     AppEvent::ChunkReceived(chunk) => self.handle_chunk_events(chunk).await,
                     AppEvent::OpenAIErrorReceived(error) => self.handle_error_events(error).await,
                     AppEvent::Quit =>self.quit(),
-                    AppEvent::Start => {
-                        let client = self.client.clone();
-                        let sender = self.events.sender.clone();
-                        let model = self.config.model.clone();
-                        let text = self.textarea.lines().join("\n");
-                        self.textarea.clear();
-                        tokio::spawn(async move {
-                            let mut request = CreateResponse::default();
-                            request.stream = Option::from(true);
-                            request.input = InputParam::Text(text);
-                            request.model = Option::from(model);
-                            let stream = client.responses().create_stream(request).await;
-                            match stream {
-                                Ok(mut response_stream) => {
-                                    while let Some(response_stream_event) = response_stream.next().await {
-                                        match response_stream_event {
-                                            Ok(response_event) => {
-                                                let _ = sender.send(Event::App(AppEvent::ChunkReceived(response_event)));
-                                            },
-                                            Err(openai_error) => {
-                                                let _ = sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(openai_error) => {
-                                    let _ = sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
-                                }
-                            }
-                        });
-                    }
+                    AppEvent::Start => self.start_request()
                 },
             }
         }
         Ok(())
+    }
+
+    fn start_request(&mut self) {
+        let client = self.client.clone();
+        let sender = self.events.sender.clone();
+        let model = self.config.model.clone();
+        let text = self.textarea.lines().join("\n");
+        self.textarea.clear();
+        tokio::spawn(async move {
+            let mut request = CreateResponse::default();
+            request.stream = Option::from(true);
+            request.input = InputParam::Text(text);
+            request.model = Option::from(model);
+            let stream = client.responses().create_stream(request).await;
+            match stream {
+                Ok(mut response_stream) => {
+                    while let Some(response_stream_event) = response_stream.next().await {
+                        match response_stream_event {
+                            Ok(response_event) => {
+                                let _ = sender.send(Event::App(AppEvent::ChunkReceived(response_event)));
+                            },
+                            Err(openai_error) => {
+                                let _ = sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
+                            }
+                        }
+                    }
+                }
+                Err(openai_error) => {
+                    let _ = sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
+                }
+            }
+        });
     }
 
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent){
@@ -97,6 +99,9 @@ impl App<'_> {
             ResponseOutputTextDelta(text_delta_event) => {
                 self.response.push_str(text_delta_event.delta.as_str());
             },
+            ResponseOutputTextDone(_) => {
+                self.response.push_str("\n");
+            }
             _ => {}
         }
     }
