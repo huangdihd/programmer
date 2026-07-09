@@ -24,7 +24,7 @@ impl<'a> AssistantMessage<'a> {
         let block = Block::default();
         Paragraph::new(text)
             .block(block)
-            .fg(Color::Cyan)
+            .fg(Color::White)
             .bg(Color::Black)
             .wrap(Wrap { trim: true })
     }

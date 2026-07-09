@@ -1,7 +1,5 @@
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui_textarea::{Input, TextArea};
-use ratatui_widgets::block::Block;
-use ratatui_widgets::borders::{BorderType, Borders};
 
 #[derive(Debug, Clone)]
 pub struct InputPanel<'a> {
@@ -12,21 +10,18 @@ impl InputPanel<'_> {
     pub fn new() -> Self {
         let mut text_area = TextArea::default();
 
-        text_area.set_block(
-            Block::default()
-                .title("Input")
-                .title_style(Color::LightBlue)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::LightBlue))
+        text_area.set_style(Style::default().fg(Color::White));
+        text_area.set_cursor_line_style(Style::default());
+        text_area.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        text_area.set_placeholder_text("Talk with the programmer…");
+        text_area.set_placeholder_style(
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         );
 
-        InputPanel {
-            text_area
-        }
+        InputPanel { text_area }
     }
 
-    pub fn get_content(&self) -> String{
+    pub fn get_content(&self) -> String {
         self.text_area.lines().join("\n")
     }
 
