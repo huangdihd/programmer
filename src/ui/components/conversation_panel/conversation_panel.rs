@@ -4,14 +4,16 @@ use tui_scrollview::ScrollViewState;
 #[derive(Debug)]
 pub struct ConversationPanel {
     pub messages: Vec<MessageItem>,
-    pub(crate)scroll_view_state: ScrollViewState
+    pub(crate)scroll_view_state: ScrollViewState,
+    pub pending_message: Option<String>
 }
 
 impl ConversationPanel {
     pub fn new() -> Self {
         ConversationPanel {
             messages: vec![],
-            scroll_view_state: ScrollViewState::new()
+            scroll_view_state: ScrollViewState::new(),
+            pending_message: None
         }
     }
 

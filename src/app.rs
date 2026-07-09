@@ -2,7 +2,7 @@ use crate::config::programmer_config::ProgrammerConfig;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem::Output;
-use async_openai::types::responses::ResponseStreamEvent::{ResponseCreated, ResponseOutputItemAdded, ResponseOutputItemDone, ResponseOutputTextDelta};
+use async_openai::types::responses::ResponseStreamEvent::{ResponseCompleted, ResponseCreated, ResponseOutputItemAdded, ResponseOutputItemDone, ResponseOutputTextDelta};
 use async_openai::types::responses::{AssistantRole, CreateResponse, InputContent, InputMessage, InputRole, InputTextContent, MessageItem, MessagePhase, OutputItem, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent, ResponseStreamEvent};
 use async_openai::{config::OpenAIConfig, Client};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -64,22 +64,37 @@ impl App<'_> {
                     AppEvent::ChunkReceived(chunk) => self.handle_chunk_events(chunk).await,
                     AppEvent::OpenAIErrorReceived(error) => self.handle_error_events(error).await,
                     AppEvent::Quit =>self.quit(),
-                    AppEvent::Start => self.start_request()
+                    AppEvent::Start => self.send_message().await
                 },
             }
         }
         Ok(())
     }
 
-    fn start_request(&mut self) {
+    async fn send_message(&mut self) {
+        let text = self.input_panel.get_content();
+        if text.is_empty() {
+            return;
+        }
+        self.input_panel.clear();
+        self.start_request(text).await;
+    }
+
+    async fn start_request(&mut self, text: String) {
         if let Some(Output(last_output_message)) = self.conversation_panel.get_last_message()
             && last_output_message.status == OutputStatus::InProgress {
-            
+            match self.conversation_panel.pending_message.as_mut() {
+                Some(pending_message) => {
+                    pending_message.push('\n');
+                    pending_message.push_str(&text);
+                }
+                None => self.conversation_panel.pending_message = Some(text),
+            }
+            return;
         }
         let client = self.client.clone();
         let sender = self.events.sender.clone();
         let model = self.config.model.clone();
-        let text = self.input_panel.get_content();
         let input_message = InputMessage {
             content: vec![InputContent::InputText(InputTextContent {
                 text: text.clone()
@@ -89,7 +104,6 @@ impl App<'_> {
         };
 
         self.conversation_panel.add_message(MessageItem::Input(input_message));
-        self.input_panel.clear();
         let input_param = self.conversation_panel.get_input_param();
         tokio::spawn(async move {
             let mut request = CreateResponse::default();
@@ -151,6 +165,11 @@ impl App<'_> {
                 if let Some(Output(existing)) = self.conversation_panel.get_last_message_mut()
                     && let OutputItem::Message(final_msg) = item_done_event.item {
                     *existing = final_msg;
+                }
+            }
+            ResponseCompleted(_) => {
+                if let Some(text) = self.conversation_panel.pending_message.take() {
+                    self.start_request(text).await;
                 }
             }
             _ => {}

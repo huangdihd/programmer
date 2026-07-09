@@ -7,6 +7,7 @@ use ratatui::layout::{Rect, Size};
 use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui_widgets::paragraph::Paragraph;
 use tui_scrollview::ScrollView;
+use crate::ui::components::messages::pending_message::PendingMessage;
 
 impl Widget for &mut ConversationPanel {
 
@@ -27,18 +28,19 @@ impl Widget for &mut ConversationPanel {
             content_height = content_height.saturating_add(height);
         }
 
+        if let Some(text) = &self.pending_message {
+            let paragraph = PendingMessage::new(text).into_paragraph();
+            let height = paragraph.line_count(content_width) as u16;
+            paragraphs.push((paragraph, content_height, height));
+            content_height = content_height.saturating_add(height);
+        }
+
         content_height = content_height.max(area.height);
 
         let mut scroll_view = ScrollView::new(Size::new(content_width, content_height));
-
         for (paragraph, y, height) in paragraphs {
-            scroll_view.render_widget(
-                paragraph,
-                Rect::new(0, y, content_width, height),
-            );
+            scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, height));
         }
-        let mut scroll_view_state = self.scroll_view_state;
-        scroll_view.render(area, buf, &mut scroll_view_state);
-        self.scroll_view_state = scroll_view_state;
+        scroll_view.render(area, buf, &mut self.scroll_view_state);
     }
 }

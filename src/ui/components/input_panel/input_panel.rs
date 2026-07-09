@@ -14,6 +14,8 @@ impl InputPanel<'_> {
 
         text_area.set_block(
             Block::default()
+                .title("Input")
+                .title_style(Color::LightBlue)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::LightBlue))
