@@ -1,9 +1,9 @@
 [package]
 name = "programmer"
 version = "0.1.0"
-description = "a programmer"
+description = "A coding agent written in rust"
 authors = ["huangdihd <hd20100104@163.com>"]
-license = "MIT"
+license = "GPL-3.0-or-later"
 edition = "2024"
 
 [dependencies]
