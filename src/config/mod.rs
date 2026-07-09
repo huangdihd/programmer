@@ -1,1 +1,1 @@
-pub(crate) mod programmer_config;
+pub mod programmer_config;
