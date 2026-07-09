@@ -1,5 +1,3 @@
-use crossterm::event::KeyEvent;
-use ratatui::macros::text;
 use ratatui::widgets::Widget;
 use ratatui_textarea::{Input, TextArea};
 
