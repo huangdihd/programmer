@@ -20,16 +20,16 @@ impl InputPanel<'_> {
             text_area: TextArea::default()
         }
     }
-    
+
     pub fn get_content(&self) -> String{
         self.text_area.lines().join("\n")
     }
-    
-    pub(crate) fn input(&mut self, input: impl Into<Input>) -> bool {
+
+    pub fn input(&mut self, input: impl Into<Input>) -> bool {
         self.text_area.input(input)
     }
-    
-    pub(crate) fn clear(&mut self) -> bool {
+
+    pub fn clear(&mut self) -> bool {
         self.text_area.clear()
     }
 }
