@@ -1,6 +1,4 @@
 use crate::config::programmer_config::ProgrammerConfig;
-use crate::ui::components::conversation_panel::ConversationPanel;
-use crate::ui::components::input_panel::InputPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem::Output;
@@ -10,6 +8,8 @@ use async_openai::{config::OpenAIConfig, Client};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
+use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
+use crate::ui::components::input_panel::input_panel::InputPanel;
 
 /// Application.
 #[derive(Debug)]
