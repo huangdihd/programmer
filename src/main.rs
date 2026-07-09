@@ -14,6 +14,7 @@ use crate::config::programmer_config::ProgrammerConfig;
 mod ui;
 pub mod config;
 pub mod app;
+pub mod response;
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
