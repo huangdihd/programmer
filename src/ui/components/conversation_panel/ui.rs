@@ -1,12 +1,12 @@
-use async_openai::types::responses::{InputContent, MessageItem, OutputMessageContent};
+use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
+use crate::ui::components::messages::assistant_message::AssistantMessage;
+use crate::ui::components::messages::user_message::UserMessage;
+use async_openai::types::responses::MessageItem;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
-use ratatui::style::{Color, Stylize};
 use ratatui::widgets::{StatefulWidget, Widget};
-use ratatui_widgets::block::Block;
-use ratatui_widgets::paragraph::{Paragraph, Wrap};
+use ratatui_widgets::paragraph::Paragraph;
 use tui_scrollview::ScrollView;
-use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
 
 impl Widget for &mut ConversationPanel {
 
@@ -18,30 +18,10 @@ impl Widget for &mut ConversationPanel {
         let mut paragraphs = vec![];
 
         for message in &self.messages {
-            let block = Block::default();
-            let text = match &message {
-                MessageItem::Input(input_message) => input_message.content
-                    .iter().map(|input_content| match input_content {
-                    InputContent::InputText(c) => c.text.clone(),
-                    _ => "Unsupported message".to_string(),
-                }).collect::<Vec<_>>().join("\n"),
-                MessageItem::Output(output_item) => output_item.content
-                    .iter().map(|c| match c {
-                    OutputMessageContent::OutputText(t) => t.text.clone(),
-                    OutputMessageContent::Refusal(r) => r.refusal.clone(),
-                }).collect::<Vec<_>>().join("\n"),
+            let paragraph: Paragraph = match message {
+                MessageItem::Input(input_message) => UserMessage::new(input_message).into_paragraph(),
+                MessageItem::Output(output_message) => AssistantMessage::new(output_message).into_paragraph(),
             };
-            let paragraph = Paragraph::new(text)
-                .block(block)
-                .fg(match &message {
-                    MessageItem::Input(_) => Color::White,
-                    MessageItem::Output(_) => Color::Cyan
-                })
-                .bg(match &message {
-                    MessageItem::Input(_) => Color::DarkGray,
-                    MessageItem::Output(_) => Color::Black
-                })
-                .wrap(Wrap { trim: true });
             let height = paragraph.line_count(content_width) as u16;
             paragraphs.push((paragraph, content_height, height));
             content_height = content_height.saturating_add(height);

@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     widgets::Widget,
 };
-use crate::ui::components::logo::logo::Logo;
+use crate::ui::components::logo::Logo;
 
 impl Widget for &mut App<'_> {
 

@@ -1,8 +1,18 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::widgets::Widget;
+use ratatui::prelude::Widget;
 use ratatui_widgets::block::Block;
-use crate::ui::components::logo::logo::Logo;
+
+pub struct Logo{
+
+}
+
+impl Logo{
+    pub fn new() -> Self{
+        Logo {
+        }
+    }
+}
 
 impl Widget for Logo {
     fn render(self, area: Rect, buf: &mut Buffer) {
