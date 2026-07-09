@@ -3,8 +3,9 @@ use std::path::Path;
 use ::config::Config;
 use ::config::File;
 use ::config::Environment;
-use crossterm::ExecutableCommand;
-use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+use crossterm::{execute, ExecutableCommand};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use app::App;
@@ -24,9 +25,11 @@ async fn main() -> color_eyre::Result<()> {
     let config_path = programmer_dir.join("config.toml");
     color_eyre::install()?;
     enable_raw_mode()?;
-    io::stdout().execute(EnterAlternateScreen)?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
-    let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+
+    let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let programmer_config = Config::builder()
         .add_source(File::with_name(config_path.as_path().to_str().unwrap()).required(false))
         .add_source(Environment::with_prefix("Programmer"))
@@ -41,5 +44,7 @@ async fn main() -> color_eyre::Result<()> {
 
     let result = App::new(programmer_config).await.run(terminal).await;
     ratatui::restore();
+    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    disable_raw_mode()?;
     result
 }

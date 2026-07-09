@@ -1,18 +1,14 @@
 use crate::app::App;
-use ratatui::layout::{Constraint, Direction, Layout, Size};
-use ratatui::widgets::{StatefulWidget, Wrap};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::{
     buffer::Buffer,
-    layout::{Alignment, Rect},
-    style::{Color, Stylize},
-    widgets::{Block, Paragraph, Widget},
+    layout::Rect,
+    widgets::Widget,
 };
-use tui_scrollview::{ScrollView, ScrollViewState};
 
-impl StatefulWidget for &App<'_> {
-    type State = ScrollViewState;
+impl Widget for &mut App<'_> {
 
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut ScrollViewState) {
+    fn render(self, area: Rect, buf: &mut Buffer) {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -22,8 +18,7 @@ impl StatefulWidget for &App<'_> {
             ])
             .split(area);
 
-        
-
         self.input_panel.render(chunks[1], buf);
+        self.conversation_panel.render(chunks[0], buf);
     }
 }

@@ -1,14 +1,15 @@
 use crate::config::programmer_config::ProgrammerConfig;
+use crate::ui::components::conversation_panel::ConversationPanel;
+use crate::ui::components::input_panel::InputPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::ResponseStreamEvent::{ResponseOutputTextDelta, ResponseOutputTextDone};
-use async_openai::types::responses::{CreateResponse, InputParam, OutputItem, OutputMessage, ResponseStreamEvent};
+use async_openai::types::responses::MessageItem::Output;
+use async_openai::types::responses::ResponseStreamEvent::{ResponseCreated, ResponseOutputItemAdded, ResponseOutputItemDone, ResponseOutputTextDelta};
+use async_openai::types::responses::{AssistantRole, CreateResponse, InputContent, InputMessage, InputRole, InputTextContent, MessageItem, MessagePhase, OutputItem, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent, ResponseStreamEvent};
 use async_openai::{config::OpenAIConfig, Client};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use tui_scrollview::ScrollViewState;
-use crate::ui::components::input_panel::InputPanel;
 
 /// Application.
 #[derive(Debug)]
@@ -19,10 +20,9 @@ pub struct App<'a> {
     pub client: Client<OpenAIConfig>,
     /// Event handler.
     pub events: EventHandler,
-    pub response: String,
     pub config: ProgrammerConfig,
     pub input_panel: InputPanel<'a>,
-    pub scroll_view_state: ScrollViewState
+    pub conversation_panel: ConversationPanel
 }
 
 impl App<'_> {
@@ -33,21 +33,18 @@ impl App<'_> {
             running: true,
             client: Client::with_config(openai_config),
             events: EventHandler::new(),
-            response: String::new(),
             config,
             input_panel: InputPanel::new(),
-            scroll_view_state: ScrollViewState::new(),
+            conversation_panel: ConversationPanel::new(),
         }
     }
 
     /// Run the application's main loop.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         while self.running {
-            let mut scroll_state = self.scroll_view_state;
             terminal.draw(|frame| {
-                frame.render_stateful_widget(&self, frame.area(), &mut scroll_state)
+                frame.render_widget(&mut self, frame.area())
             })?;
-            self.scroll_view_state = scroll_state;
             match self.events.next().await? {
                 Event::Tick => self.tick(),
                 Event::Crossterm(event) => match event {
@@ -55,6 +52,11 @@ impl App<'_> {
                         if key_event.kind == KeyEventKind::Press =>
                     {
                         self.handle_key_events(key_event)?
+                    }
+                    crossterm::event::Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollDown => self.conversation_panel.scroll_down(),
+                        MouseEventKind::ScrollUp => self.conversation_panel.scroll_up(),
+                        _ => {}
                     }
                     _ => {}
                 },
@@ -74,11 +76,21 @@ impl App<'_> {
         let sender = self.events.sender.clone();
         let model = self.config.model.clone();
         let text = self.input_panel.get_content();
+        let input_message = InputMessage {
+            content: vec![InputContent::InputText(InputTextContent {
+                text: text.clone()
+            })],
+            role: InputRole::User,
+            status: Option::from(OutputStatus::Completed),
+        };
+
+        self.conversation_panel.add_message(MessageItem::Input(input_message));
         self.input_panel.clear();
+        let input_param = self.conversation_panel.get_input_param();
         tokio::spawn(async move {
             let mut request = CreateResponse::default();
             request.stream = Option::from(true);
-            request.input = InputParam::Text(text);
+            request.input = input_param;
             request.model = Option::from(model);
             let stream = client.responses().create_stream(request).await;
             match stream {
@@ -103,18 +115,46 @@ impl App<'_> {
 
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent){
         match response_stream_event {
+            ResponseCreated(created_event) => {
+                self.conversation_panel.add_message(Output(
+                    OutputMessage {
+                        content: vec![],
+                        id: created_event.response.id,
+                        role: AssistantRole::Assistant,
+                        phase: Option::from(MessagePhase::Commentary),
+                        status: OutputStatus::InProgress,
+                    }))
+            }
+            ResponseOutputItemAdded(item_added_event) => {
+                if let Some(Output(existing)) = self.conversation_panel.get_last_message_mut()
+                    && let OutputItem::Message(new_msg) = item_added_event.item {
+                    *existing = new_msg;
+                    existing.content.push(OutputMessageContent::OutputText(OutputTextContent {
+                        annotations: vec![],
+                        logprobs: None,
+                        text: "".to_string(),
+                    }))
+                }
+            }
             ResponseOutputTextDelta(text_delta_event) => {
-                self.response.push_str(text_delta_event.delta.as_str());
-            },
-            ResponseOutputTextDone(_) => {
-                self.response.push_str("\n");
+                if let Some(Output(existing)) = self.conversation_panel.get_last_message_mut() {
+                    if let Some(OutputMessageContent::OutputText(output_text_content)) = existing.content.last_mut() {
+                        output_text_content.text.push_str(text_delta_event.delta.as_str())
+                    }
+                }
+            }
+            ResponseOutputItemDone(item_done_event) => {
+                if let Some(Output(existing)) = self.conversation_panel.get_last_message_mut()
+                    && let OutputItem::Message(final_msg) = item_done_event.item {
+                    *existing = final_msg;
+                }
             }
             _ => {}
         }
     }
 
     pub async fn handle_error_events(&mut self, error: OpenAIError) {
-        self.response.push_str(format!("[Error]{}\n", error).as_str());
+        // self.response.push_str(format!("[Error]{}\n", error).as_str());
     }
 
     /// Handles the key events and updates the state of [`App`].
@@ -127,10 +167,9 @@ impl App<'_> {
             KeyCode::Enter if key_event.modifiers != KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Start)
             }
-            _ if key_event.kind != KeyEventKind::Release => {
+            _ => {
                 self.input_panel.input(key_event);
             }
-            _ => {}
         }
         Ok(())
     }
