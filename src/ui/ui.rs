@@ -22,26 +22,8 @@ impl StatefulWidget for &App<'_> {
             ])
             .split(area);
 
-        let block = Block::default()
-            .title("programmer")
-            .title_alignment(Alignment::Center);
+        
 
-        let paragraph = Paragraph::new(self.response.clone())
-            .block(block)
-            .fg(Color::Cyan)
-            .wrap(Wrap { trim: true });
-
-        let content_width = chunks[0].width.saturating_sub(1);
-        let content_height = (paragraph.line_count(content_width) as u16).max(chunks[0].height);
-
-        let mut scroll_view = ScrollView::new(Size::new(content_width, content_height));
-
-        scroll_view.render_widget(
-            paragraph,
-            Rect::new(0, 0, content_width, content_height),
-        );
-
-        scroll_view.render(chunks[0], buf, state);
         self.input_panel.render(chunks[1], buf);
     }
 }

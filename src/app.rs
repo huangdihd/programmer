@@ -2,7 +2,7 @@ use crate::config::programmer_config::ProgrammerConfig;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::ResponseStreamEvent::{ResponseOutputTextDelta, ResponseOutputTextDone};
-use async_openai::types::responses::{CreateResponse, InputParam, ResponseStreamEvent};
+use async_openai::types::responses::{CreateResponse, InputParam, OutputItem, OutputMessage, ResponseStreamEvent};
 use async_openai::{config::OpenAIConfig, Client};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
