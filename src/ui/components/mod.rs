@@ -1,2 +1,2 @@
-mod input_panel;
-mod response_panel;
+pub mod input_panel;
+pub mod response_panel;

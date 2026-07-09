@@ -42,6 +42,6 @@ impl StatefulWidget for &App<'_> {
         );
 
         scroll_view.render(chunks[0], buf, state);
-        self.textarea.render(chunks[1], buf);
+        self.input_panel.render(chunks[1], buf);
     }
 }

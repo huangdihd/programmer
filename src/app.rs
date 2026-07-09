@@ -7,8 +7,8 @@ use async_openai::{config::OpenAIConfig, Client};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use ratatui_textarea::TextArea;
 use tui_scrollview::ScrollViewState;
+use crate::ui::components::input_panel::InputPanel;
 
 /// Application.
 #[derive(Debug)]
@@ -21,7 +21,7 @@ pub struct App<'a> {
     pub events: EventHandler,
     pub response: String,
     pub config: ProgrammerConfig,
-    pub textarea: TextArea<'a>,
+    pub input_panel: InputPanel<'a>,
     pub scroll_view_state: ScrollViewState
 }
 
@@ -35,7 +35,7 @@ impl App<'_> {
             events: EventHandler::new(),
             response: String::new(),
             config,
-            textarea: Default::default(),
+            input_panel: InputPanel::new(),
             scroll_view_state: ScrollViewState::new(),
         }
     }
@@ -73,8 +73,8 @@ impl App<'_> {
         let client = self.client.clone();
         let sender = self.events.sender.clone();
         let model = self.config.model.clone();
-        let text = self.textarea.lines().join("\n");
-        self.textarea.clear();
+        let text = self.input_panel.get_content();
+        self.input_panel.clear();
         tokio::spawn(async move {
             let mut request = CreateResponse::default();
             request.stream = Option::from(true);
@@ -128,7 +128,7 @@ impl App<'_> {
                 self.events.send(AppEvent::Start)
             }
             _ if key_event.kind != KeyEventKind::Release => {
-                self.textarea.input(key_event);
+                self.input_panel.input(key_event);
             }
             _ => {}
         }
