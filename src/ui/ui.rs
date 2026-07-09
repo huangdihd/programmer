@@ -5,6 +5,7 @@ use ratatui::{
     layout::Rect,
     widgets::Widget,
 };
+use crate::ui::components::logo::logo::Logo;
 
 impl Widget for &mut App<'_> {
 
@@ -13,12 +14,14 @@ impl Widget for &mut App<'_> {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1),
                 Constraint::Min(2),
                 Constraint::Length(5),
             ])
             .split(area);
-
-        self.input_panel.render(chunks[1], buf);
-        self.conversation_panel.render(chunks[0], buf);
+        let logo = Logo::new();
+        logo.render(chunks[0], buf);
+        self.conversation_panel.render(chunks[1], buf);
+        self.input_panel.render(chunks[2], buf);
     }
 }

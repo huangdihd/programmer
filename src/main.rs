@@ -3,7 +3,7 @@ use std::path::Path;
 use ::config::Config;
 use ::config::File;
 use ::config::Environment;
-use crossterm::{execute, ExecutableCommand};
+use crossterm::{execute};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;

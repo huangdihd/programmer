@@ -72,6 +72,10 @@ impl App<'_> {
     }
 
     fn start_request(&mut self) {
+        if let Some(Output(last_output_message)) = self.conversation_panel.get_last_message()
+            && last_output_message.status == OutputStatus::InProgress {
+            
+        }
         let client = self.client.clone();
         let sender = self.events.sender.clone();
         let model = self.config.model.clone();
