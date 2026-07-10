@@ -1,11 +1,11 @@
+use crate::response::partial_response::PartialResponse;
+use async_openai::error::OpenAIError;
+use async_openai::types::responses::ResponseStreamEvent;
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
 use std::time::Duration;
-use async_openai::error::OpenAIError;
-use async_openai::types::responses::{OutputItem, ResponseStreamEvent};
 use tokio::sync::mpsc;
-use crate::response::response_finish_reason::ResponseFinishReason;
 
 /// The frequency at which tick events are emitted.
 const TICK_FPS: f64 = 30.0;
@@ -38,7 +38,7 @@ pub enum AppEvent {
     ChunkReceived(ResponseStreamEvent),
     /// Receive an openai error.
     OpenAIErrorReceived(OpenAIError),
-    ResponseFinished(ResponseFinishReason, Vec<OutputItem>),
+    ResponseFinished(PartialResponse),
     /// Quit the application.
     Quit,
     Start
@@ -121,7 +121,7 @@ impl EventTask {
               Some(Ok(evt)) = crossterm_event => {
                 self.send(Event::Crossterm(evt));
               }
-            };
+            }
         }
         Ok(())
     }

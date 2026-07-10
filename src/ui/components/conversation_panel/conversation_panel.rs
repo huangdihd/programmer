@@ -1,10 +1,9 @@
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
-use crate::response::response_finish_reason::ResponseFinishReason;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
-    InputContent, InputItem, InputMessage, InputParam, InputRole, Item, OutputItem, OutputStatus,
+    InputContent, InputItem, InputMessage, InputParam, InputRole, Item, OutputStatus,
     ResponseStreamEvent,
 };
 use tui_scrollview::ScrollViewState;
@@ -119,34 +118,26 @@ impl ConversationPanel {
     pub fn handle_response_stream_event(
         &mut self,
         response_stream_event: ResponseStreamEvent,
-    ) -> Option<(ResponseFinishReason, Vec<OutputItem>)> {
+    ) -> Option<PartialResponse> {
         let is_at_bottom = self.is_at_bottom();
 
         let receiving_response = self
             .receiving_response
             .get_or_insert_with(PartialResponse::new);
         receiving_response.handle_response_stream_event(response_stream_event);
-
-        let result = if receiving_response.finished() {
-            let (finish_reason, output_items) = self
-                .receiving_response
-                .take()
-                .expect("receiving_response was just accessed above")
-                .into_parts();
-
-            self.items
-                .extend(output_items.iter().cloned().map(MessageItem::Output));
-
-            finish_reason.map(|finish_reason| (finish_reason, output_items))
-        } else {
-            None
-        };
+        let finished = receiving_response.finished();
 
         if is_at_bottom {
             self.scroll_to_bottom();
         }
 
-        result
+        if finished {
+            self.receiving_response.take()
+        }
+        else {
+            None
+        }
+
     }
 
     pub fn get_input_param(&self) -> InputParam {

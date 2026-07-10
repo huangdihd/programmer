@@ -9,6 +9,7 @@ use async_openai::{config::OpenAIConfig, Client};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
+use crate::response::message_item;
 
 /// Application.
 #[derive(Debug)]
@@ -62,7 +63,7 @@ impl App<'_> {
                 Event::App(app_event) => match app_event {
                     AppEvent::ChunkReceived(chunk) => self.handle_chunk_events(chunk).await,
                     AppEvent::OpenAIErrorReceived(error) => self.handle_error_events(error).await,
-                    AppEvent::ResponseFinished(_, _) => {
+                    AppEvent::ResponseFinished(_) => {
                         if let Some(pending_request) = self.conversation_panel.pending_message.take() {
                             self.start_request(pending_request).await
                         }
@@ -141,10 +142,11 @@ impl App<'_> {
     }
 
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent){
-        let Some((finish_reason, items)) = self.conversation_panel.handle_response_stream_event(response_stream_event) else {
+        let Some(partial_response) = self.conversation_panel.handle_response_stream_event(response_stream_event) else {
             return;
         };
-        self.events.send(AppEvent::ResponseFinished(finish_reason, items));
+        self.conversation_panel.items.extend(partial_response.items.iter().flatten().map(|item|message_item::MessageItem::Output(item.clone().into())));
+        self.events.send(AppEvent::ResponseFinished(partial_response));
     }
 
     pub async fn handle_error_events(&mut self, error: OpenAIError) {
