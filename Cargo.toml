@@ -20,6 +20,8 @@ ratatui-textarea = "0.9.2"
 dirs = "6.0.0"
 toml = "1.1.2+spec-1.1.0"
 tui-scrollview = "0.6.7"
+thiserror = "2.0.18"
+serde_json = "1.0.150"
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]

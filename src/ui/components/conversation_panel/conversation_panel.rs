@@ -1,99 +1,15 @@
-use async_openai::error::OpenAIError;
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
-use async_openai::types::responses::Item::Message;
-use async_openai::types::responses::MessageItem::Input;
-use async_openai::types::responses::OutputStatus::Completed;
-use async_openai::types::responses::{InputContent, InputItem, InputMessage, InputParam, InputRole, Item, OutputItem, ResponseStreamEvent};
-use tui_scrollview::ScrollViewState;
 use crate::response::response_finish_reason::ResponseFinishReason;
+use async_openai::error::OpenAIError;
+use async_openai::types::responses::MessageItem as ApiMessageItem;
+use async_openai::types::responses::{
+    InputContent, InputItem, InputMessage, InputParam, InputRole, Item, OutputItem, OutputStatus,
+    ResponseStreamEvent,
+};
+use tui_scrollview::ScrollViewState;
 
-#[derive(Debug)]
-pub struct ConversationPanel {
-    pub(crate) items: Vec<MessageItem>,
-    pub(crate) scroll_view_state: ScrollViewState,
-    pub pending_message: Option<String>,
-    pub receiving_response: Option<PartialResponse>
-}
-
-impl ConversationPanel {
-    pub fn new() -> Self {
-        ConversationPanel {
-            items: vec![],
-            scroll_view_state: ScrollViewState::new(),
-            pending_message: None,
-            receiving_response: None
-        }
-    }
-
-    pub fn add_input_message(&mut self, message: async_openai::types::responses::MessageItem) {
-        self.items.push(MessageItem::Input(InputItem::Item(Item::from(message))));
-        self.scroll_view_state.scroll_to_bottom();
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_view_state.scroll_to_bottom();
-    }
-
-    pub fn is_at_bottom(&self) -> bool {
-        self.scroll_view_state.is_at_bottom()
-    }
-
-    pub fn scroll_up(&mut self) {
-        self.scroll_view_state.scroll_up();
-    }
-
-    pub fn scroll_down(&mut self) {
-        self.scroll_view_state.scroll_down();
-    }
-
-    pub fn handle_response_stream_event(
-        &mut self,
-        response_stream_event: ResponseStreamEvent,
-    ) -> Option<(ResponseFinishReason, Vec<OutputItem>)> {
-        let is_at_bottom = self.is_at_bottom();
-
-        let receiving_response = self
-            .receiving_response
-            .get_or_insert_with(PartialResponse::new);
-        receiving_response.handle_response_stream_event(response_stream_event);
-        let finished = receiving_response.finished();
-
-        let result = if finished {
-            let (finish_reason, items) = self.receiving_response.take().unwrap().into_parts();
-            self.items.extend(
-                items
-                    .iter()
-                    .cloned()
-                    .map(MessageItem::Output),
-            );
-            Some((finish_reason.unwrap(), items))
-        } else {
-            None
-        };
-
-        if is_at_bottom {
-            self.scroll_to_bottom();
-        }
-
-        result
-    }
-
-    pub fn add_error(&mut self, openai_error: OpenAIError) {
-        self.items.push(MessageItem::OpenAIError(openai_error))
-    }
-
-    pub fn get_input_param(&self) -> InputParam{
-        let mut messages: Vec<InputItem> = self.items
-            .iter()
-            .filter_map(|message_item| match message_item {
-                MessageItem::Input(input_item) => Some(input_item.clone().into()),
-                MessageItem::Output(output_item) => Some(output_item.clone().into()),
-                _ => None,
-            })
-            .collect();
-        messages.insert(0, InputItem::from(Message(Input(InputMessage {
-            content: vec![InputContent::InputText("You are \"programmer\", a coding agent written in Rust, operating in the user's
+const SYSTEM_PROMPT: &str = r#"You are "programmer", a coding agent written in Rust, operating in the user's
 terminal. You help with software engineering tasks: writing code, fixing bugs,
 refactoring, explaining code, and running commands.
 
@@ -108,7 +24,7 @@ responses rendered in a terminal UI, so keep output compact.
 - Understand before you act. Read the relevant files before proposing or making
   changes. Never edit code you haven't seen.
 - Prefer minimal changes. Make the smallest edit that correctly solves the task.
-  Do not refactor, reformat, or \"improve\" code the user didn't ask about.
+  Do not refactor, reformat, or "improve" code the user didn't ask about.
 - Follow existing conventions. Match the project's style, naming, error handling
   patterns, and dependency choices. Check how similar code in the repo does it
   before writing new code.
@@ -153,10 +69,106 @@ responses rendered in a terminal UI, so keep output compact.
 - When you finish a multi-step task, summarize what changed in a few lines:
   files touched, what was verified, anything left undone.
 - Report failures honestly, including partial completion. Never claim tests
-  pass if you didn't run them.".into())],
-            role: InputRole::Developer,
-            status: Some(Completed),
-        }))));
-        InputParam::Items(messages)
+  pass if you didn't run them."#;
+
+#[derive(Debug)]
+pub struct ConversationPanel {
+    pub(crate) items: Vec<MessageItem>,
+    pub(crate) scroll_view_state: ScrollViewState,
+    pub pending_message: Option<String>,
+    pub receiving_response: Option<PartialResponse>,
+}
+
+impl ConversationPanel {
+    pub fn new() -> Self {
+        ConversationPanel {
+            items: vec![],
+            scroll_view_state: ScrollViewState::new(),
+            pending_message: None,
+            receiving_response: None,
+        }
+    }
+
+    pub fn add_input_message(&mut self, input_message_item: ApiMessageItem) {
+        self.items.push(MessageItem::Input(InputItem::Item(Item::from(
+            input_message_item,
+        ))));
+        self.scroll_view_state.scroll_to_bottom();
+    }
+
+    pub fn add_error(&mut self, openai_error: OpenAIError) {
+        self.items.push(MessageItem::OpenAIError(openai_error));
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_view_state.scroll_to_bottom();
+    }
+
+    pub fn is_at_bottom(&self) -> bool {
+        self.scroll_view_state.is_at_bottom()
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll_view_state.scroll_up();
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.scroll_view_state.scroll_down();
+    }
+
+    pub fn handle_response_stream_event(
+        &mut self,
+        response_stream_event: ResponseStreamEvent,
+    ) -> Option<(ResponseFinishReason, Vec<OutputItem>)> {
+        let is_at_bottom = self.is_at_bottom();
+
+        let receiving_response = self
+            .receiving_response
+            .get_or_insert_with(PartialResponse::new);
+        receiving_response.handle_response_stream_event(response_stream_event);
+
+        let result = if receiving_response.finished() {
+            let (finish_reason, output_items) = self
+                .receiving_response
+                .take()
+                .expect("receiving_response was just accessed above")
+                .into_parts();
+
+            self.items
+                .extend(output_items.iter().cloned().map(MessageItem::Output));
+
+            finish_reason.map(|finish_reason| (finish_reason, output_items))
+        } else {
+            None
+        };
+
+        if is_at_bottom {
+            self.scroll_to_bottom();
+        }
+
+        result
+    }
+
+    pub fn get_input_param(&self) -> InputParam {
+        let developer_message = InputItem::from(Item::Message(ApiMessageItem::Input(
+            InputMessage {
+                content: vec![InputContent::InputText(SYSTEM_PROMPT.into())],
+                role: InputRole::Developer,
+                status: Some(OutputStatus::Completed),
+            },
+        )));
+
+        let mut input_items = vec![developer_message];
+        input_items.extend(
+            self.items
+                .iter()
+                .filter_map(|message_item| match message_item {
+                    MessageItem::Input(input_item) => Some(input_item.clone()),
+                    MessageItem::Output(output_item) => Some(output_item.clone().into()),
+                    _ => None,
+                }),
+        );
+
+        InputParam::Items(input_items)
     }
 }
