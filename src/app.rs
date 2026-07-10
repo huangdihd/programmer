@@ -1,15 +1,14 @@
 use crate::config::programmer_config::ProgrammerConfig;
+use crate::response::partial_response::PartialResponse;
+use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
+use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::MessageItem::Output;
-use async_openai::types::responses::ResponseStreamEvent::{ResponseCompleted, ResponseCreated, ResponseOutputItemAdded, ResponseOutputItemDone, ResponseOutputTextDelta};
-use async_openai::types::responses::{AssistantRole, CreateResponse, InputContent, InputMessage, InputRole, InputTextContent, MessageItem, MessagePhase, OutputItem, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent, ResponseStreamEvent};
+use async_openai::types::responses::{CreateResponse, InputContent, InputMessage, InputRole, InputTextContent, MessageItem, OutputStatus, ResponseStreamEvent};
 use async_openai::{config::OpenAIConfig, Client};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
-use crate::ui::components::input_panel::input_panel::InputPanel;
 
 /// Application.
 #[derive(Debug)]
@@ -81,8 +80,7 @@ impl App<'_> {
     }
 
     async fn start_request(&mut self, text: String) {
-        if let Some(Output(last_output_message)) = self.conversation_panel.get_last_message()
-            && last_output_message.status == OutputStatus::InProgress {
+        if self.conversation_panel.receiving_response.is_some() {
             match self.conversation_panel.pending_message.as_mut() {
                 Some(pending_message) => {
                     pending_message.push('\n');
@@ -92,6 +90,7 @@ impl App<'_> {
             }
             return;
         }
+        self.conversation_panel.receiving_response = Some(PartialResponse::new());
         let client = self.client.clone();
         let sender = self.events.sender.clone();
         let model = self.config.model.clone();
@@ -103,7 +102,7 @@ impl App<'_> {
             status: Option::from(OutputStatus::Completed),
         };
 
-        self.conversation_panel.add_message(MessageItem::Input(input_message));
+        self.conversation_panel.add_input_message(MessageItem::Input(input_message));
         let input_param = self.conversation_panel.get_input_param();
         tokio::spawn(async move {
             let mut request = CreateResponse::default();
@@ -132,48 +131,7 @@ impl App<'_> {
     }
 
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent){
-        match response_stream_event {
-            ResponseCreated(created_event) => {
-                self.conversation_panel.add_message(Output(
-                    OutputMessage {
-                        content: vec![],
-                        id: created_event.response.id,
-                        role: AssistantRole::Assistant,
-                        phase: Option::from(MessagePhase::Commentary),
-                        status: OutputStatus::InProgress,
-                    }))
-            }
-            ResponseOutputItemAdded(item_added_event) => {
-                if let Some(Output(existing)) = self.conversation_panel.get_last_message_mut()
-                    && let OutputItem::Message(new_msg) = item_added_event.item {
-                    *existing = new_msg;
-                    existing.content.push(OutputMessageContent::OutputText(OutputTextContent {
-                        annotations: vec![],
-                        logprobs: None,
-                        text: "".to_string(),
-                    }))
-                }
-            }
-            ResponseOutputTextDelta(text_delta_event) => {
-                if let Some(Output(existing)) = self.conversation_panel.get_last_message_mut() {
-                    if let Some(OutputMessageContent::OutputText(output_text_content)) = existing.content.last_mut() {
-                        output_text_content.text.push_str(text_delta_event.delta.as_str())
-                    }
-                }
-            }
-            ResponseOutputItemDone(item_done_event) => {
-                if let Some(Output(existing)) = self.conversation_panel.get_last_message_mut()
-                    && let OutputItem::Message(final_msg) = item_done_event.item {
-                    *existing = final_msg;
-                }
-            }
-            ResponseCompleted(_) => {
-                if let Some(text) = self.conversation_panel.pending_message.take() {
-                    self.start_request(text).await;
-                }
-            }
-            _ => {}
-        }
+        self.conversation_panel.handle_response_stream_event(response_stream_event)
     }
 
     pub async fn handle_error_events(&mut self, error: OpenAIError) {

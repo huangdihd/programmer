@@ -1,41 +1,32 @@
+use crate::response::message_item::MessageItem;
+use crate::response::partial_response::PartialResponse;
 use async_openai::types::responses::Item::Message;
 use async_openai::types::responses::MessageItem::Input;
 use async_openai::types::responses::OutputStatus::Completed;
-use async_openai::types::responses::{InputContent, InputItem, InputMessage, InputParam, InputRole, MessageItem};
+use async_openai::types::responses::{InputContent, InputItem, InputMessage, InputParam, InputRole, Item, ResponseStreamEvent};
 use tui_scrollview::ScrollViewState;
 
 #[derive(Debug)]
 pub struct ConversationPanel {
-    pub messages: Vec<MessageItem>,
-    pub(crate)scroll_view_state: ScrollViewState,
-    pub pending_message: Option<String>
+    pub(crate) items: Vec<MessageItem>,
+    pub(crate) scroll_view_state: ScrollViewState,
+    pub pending_message: Option<String>,
+    pub receiving_response: Option<PartialResponse>
 }
 
 impl ConversationPanel {
     pub fn new() -> Self {
         ConversationPanel {
-            messages: vec![],
+            items: vec![],
             scroll_view_state: ScrollViewState::new(),
-            pending_message: None
+            pending_message: None,
+            receiving_response: None
         }
     }
 
-    pub fn add_message(&mut self, message: MessageItem) {
-        self.messages.push(message);
+    pub fn add_input_message(&mut self, message: async_openai::types::responses::MessageItem) {
+        self.items.push(MessageItem::Input(InputItem::Item(Item::from(message))));
         self.scroll_view_state.scroll_to_bottom();
-    }
-
-    pub fn get_last_message(&self) -> Option<&MessageItem> {
-        self.messages.last()
-    }
-
-    pub fn get_last_message_mut(&mut self) -> Option<&mut MessageItem> {
-        let at_bottom = self.is_at_bottom();
-        let res = self.messages.last_mut();
-        if at_bottom {
-            self.scroll_view_state.scroll_to_bottom();
-        }
-        res
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -54,9 +45,30 @@ impl ConversationPanel {
         self.scroll_view_state.scroll_down();
     }
 
+    pub fn handle_response_stream_event(&mut self, response_stream_event: ResponseStreamEvent) {
+        let is_at_bottom = self.is_at_bottom();
+        let receiving_response = self.receiving_response
+            .get_or_insert_with(PartialResponse::new);
+        receiving_response.handle_response_stream_event(response_stream_event);
+        let finished = receiving_response.finished();
+        if is_at_bottom {
+            self.scroll_to_bottom()
+        }
+        if finished {
+            self.receiving_response = None;
+        }
+    }
+
     pub fn get_input_param(&self) -> InputParam{
-        let mut messages: Vec<_> = self.messages.iter().map(|message_item: &MessageItem| InputItem::Item(Message(message_item.clone()))).collect();
-        messages.insert(0, InputItem::Item(Message(Input(InputMessage {
+        let mut messages: Vec<InputItem> = self.items
+            .iter()
+            .filter_map(|message_item| match message_item {
+                MessageItem::Input(input_item) => Some(input_item.clone().into()),
+                MessageItem::Output(output_item) => Some(output_item.clone().into()),
+                _ => None,
+            })
+            .collect();
+        messages.insert(0, InputItem::from(Message(Input(InputMessage {
             content: vec![InputContent::InputText("You are \"programmer\", a coding agent written in Rust, operating in the user's
 terminal. You help with software engineering tasks: writing code, fixing bugs,
 refactoring, explaining code, and running commands.
