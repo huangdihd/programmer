@@ -1,6 +1,6 @@
-use async_openai::types::responses::ResponseStreamEvent::{ResponseCompleted, ResponseCreated, ResponseError, ResponseFailed, ResponseIncomplete, ResponseOutputItemAdded, ResponseOutputItemDone, ResponseOutputTextDelta};
-use async_openai::types::responses::{OutputItem, OutputMessageContent, ResponseStreamEvent};
 use crate::response::response_finish_reason::ResponseFinishReason;
+use async_openai::types::responses::ResponseStreamEvent::{ResponseCompleted, ResponseContentPartAdded, ResponseError, ResponseFailed, ResponseIncomplete, ResponseOutputItemAdded, ResponseOutputItemDone, ResponseOutputTextDelta};
+use async_openai::types::responses::{OutputContent, OutputItem, OutputMessageContent, ResponseStreamEvent};
 
 #[derive(Debug)]
 pub struct PartialResponse {
@@ -29,11 +29,25 @@ impl PartialResponse {
 
     pub fn handle_response_stream_event(&mut self, response_stream_event: ResponseStreamEvent) {
         match response_stream_event {
-            ResponseCreated(_) => {
-
-            }
             ResponseOutputItemAdded(item_added_event) => {
                 self.set_item(item_added_event.item, item_added_event.output_index);
+            }
+            ResponseContentPartAdded(part_added_event) => {
+                if let Some(Some(OutputItem::Message(output_message))) =
+                    self.items.get_mut(part_added_event.output_index as usize)
+                {
+                    let index = part_added_event.content_index as usize;
+                    if output_message.content.len() <= index {
+                        let output_message_content = match part_added_event.part {
+                            OutputContent::OutputText(part) => Some(OutputMessageContent::OutputText(part)),
+                            OutputContent::Refusal(refusal) => Some(OutputMessageContent::Refusal(refusal)),
+                            _ => None
+                        };
+                        if let Some(output_message_content) = output_message_content {
+                            output_message.content.push(output_message_content);
+                        }
+                    }
+                }
             }
             ResponseOutputTextDelta(text_delta_event) => {
                 let Some(Some(OutputItem::Message(output_message))) =
@@ -49,12 +63,7 @@ impl PartialResponse {
                 part.text.push_str(&text_delta_event.delta);
             }
             ResponseOutputItemDone(item_done_event) => {
-                let Some(Some(output_item)) =
-                    self.items.get_mut(item_done_event.output_index as usize)
-                else {
-                    return;
-                };
-                *output_item = item_done_event.item;
+                self.set_item(item_done_event.item, item_done_event.output_index);
             }
             ResponseCompleted(response_completed_event) => {
                 self.finish_reason = Some(ResponseFinishReason::Completed(response_completed_event.response));

@@ -51,10 +51,12 @@ impl ConversationPanel {
             .get_or_insert_with(PartialResponse::new);
         receiving_response.handle_response_stream_event(response_stream_event);
         let finished = receiving_response.finished();
+        let items = receiving_response.get_message_items();
         if is_at_bottom {
             self.scroll_to_bottom()
         }
         if finished {
+            self.items.extend(items.iter().map(|output_item| MessageItem::Output(output_item.clone())));
             self.receiving_response = None;
         }
     }
