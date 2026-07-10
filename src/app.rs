@@ -62,6 +62,11 @@ impl App<'_> {
                 Event::App(app_event) => match app_event {
                     AppEvent::ChunkReceived(chunk) => self.handle_chunk_events(chunk).await,
                     AppEvent::OpenAIErrorReceived(error) => self.handle_error_events(error).await,
+                    AppEvent::ResponseFinished(_, _) => {
+                        if let Some(pending_request) = self.conversation_panel.pending_message.take() {
+                            self.start_request(pending_request).await
+                        }
+                    }
                     AppEvent::Quit =>self.quit(),
                     AppEvent::Start => self.send_message().await
                 },
@@ -136,10 +141,10 @@ impl App<'_> {
     }
 
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent){
-        self.conversation_panel.handle_response_stream_event(response_stream_event);
-        if self.conversation_panel.receiving_response.is_none() && let Some(pending_request) = &self.conversation_panel.pending_message.take() {
-            self.start_request(pending_request.clone()).await
-        }
+        let Some((finish_reason, items)) = self.conversation_panel.handle_response_stream_event(response_stream_event) else {
+            return;
+        };
+        self.events.send(AppEvent::ResponseFinished(finish_reason, items));
     }
 
     pub async fn handle_error_events(&mut self, error: OpenAIError) {

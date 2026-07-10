@@ -4,8 +4,9 @@ use crate::response::partial_response::PartialResponse;
 use async_openai::types::responses::Item::Message;
 use async_openai::types::responses::MessageItem::Input;
 use async_openai::types::responses::OutputStatus::Completed;
-use async_openai::types::responses::{InputContent, InputItem, InputMessage, InputParam, InputRole, Item, ResponseStreamEvent};
+use async_openai::types::responses::{InputContent, InputItem, InputMessage, InputParam, InputRole, Item, OutputItem, ResponseStreamEvent};
 use tui_scrollview::ScrollViewState;
+use crate::response::response_finish_reason::ResponseFinishReason;
 
 #[derive(Debug)]
 pub struct ConversationPanel {
@@ -46,22 +47,38 @@ impl ConversationPanel {
         self.scroll_view_state.scroll_down();
     }
 
-    pub fn handle_response_stream_event(&mut self, response_stream_event: ResponseStreamEvent) {
+    pub fn handle_response_stream_event(
+        &mut self,
+        response_stream_event: ResponseStreamEvent,
+    ) -> Option<(ResponseFinishReason, Vec<OutputItem>)> {
         let is_at_bottom = self.is_at_bottom();
-        let receiving_response = self.receiving_response
+
+        let receiving_response = self
+            .receiving_response
             .get_or_insert_with(PartialResponse::new);
         receiving_response.handle_response_stream_event(response_stream_event);
         let finished = receiving_response.finished();
-        let items = receiving_response.get_message_items();
+
+        let result = if finished {
+            let (finish_reason, items) = self.receiving_response.take().unwrap().into_parts();
+            self.items.extend(
+                items
+                    .iter()
+                    .cloned()
+                    .map(MessageItem::Output),
+            );
+            Some((finish_reason.unwrap(), items))
+        } else {
+            None
+        };
+
         if is_at_bottom {
-            self.scroll_to_bottom()
+            self.scroll_to_bottom();
         }
-        if finished {
-            self.items.extend(items.iter().map(|output_item| MessageItem::Output(output_item.clone())));
-            self.receiving_response = None;
-        }
+
+        result
     }
-    
+
     pub fn add_error(&mut self, openai_error: OpenAIError) {
         self.items.push(MessageItem::OpenAIError(openai_error))
     }

@@ -88,5 +88,9 @@ impl PartialResponse {
     pub fn finished(&self) -> bool {
         self.finish_reason.is_some()
     }
+
+    pub fn into_parts(self) -> (Option<ResponseFinishReason>, Vec<OutputItem>) {
+        (self.finish_reason, self.items.into_iter().flatten().collect())
+    }
     
 }
