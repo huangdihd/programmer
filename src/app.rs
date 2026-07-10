@@ -81,6 +81,7 @@ impl App<'_> {
 
     async fn start_request(&mut self, text: String) {
         if self.conversation_panel.receiving_response.is_some() {
+            let is_at_bottom = self.conversation_panel.is_at_bottom();
             match self.conversation_panel.pending_message.as_mut() {
                 Some(pending_message) => {
                     pending_message.push('\n');
@@ -88,12 +89,12 @@ impl App<'_> {
                 }
                 None => self.conversation_panel.pending_message = Some(text),
             }
+            if is_at_bottom {
+                self.conversation_panel.scroll_to_bottom()
+            }
             return;
         }
-        self.conversation_panel.receiving_response = Some(PartialResponse::new());
-        let client = self.client.clone();
-        let sender = self.events.sender.clone();
-        let model = self.config.model.clone();
+
         let input_message = InputMessage {
             content: vec![InputContent::InputText(InputTextContent {
                 text: text.clone()
@@ -103,6 +104,10 @@ impl App<'_> {
         };
 
         self.conversation_panel.add_input_message(MessageItem::Input(input_message));
+        self.conversation_panel.receiving_response = Some(PartialResponse::new());
+        let client = self.client.clone();
+        let sender = self.events.sender.clone();
+        let model = self.config.model.clone();
         let input_param = self.conversation_panel.get_input_param();
         tokio::spawn(async move {
             let mut request = CreateResponse::default();
@@ -131,11 +136,14 @@ impl App<'_> {
     }
 
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent){
-        self.conversation_panel.handle_response_stream_event(response_stream_event)
+        self.conversation_panel.handle_response_stream_event(response_stream_event);
+        if self.conversation_panel.receiving_response.is_none() && let Some(pending_request) = &self.conversation_panel.pending_message.take() {
+            self.start_request(pending_request.clone()).await
+        }
     }
 
     pub async fn handle_error_events(&mut self, error: OpenAIError) {
-        // self.response.push_str(format!("[Error]{}\n", error).as_str());
+        self.conversation_panel.add_error(error)
     }
 
     /// Handles the key events and updates the state of [`App`].

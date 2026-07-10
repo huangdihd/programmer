@@ -1,3 +1,4 @@
+use async_openai::error::OpenAIError;
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
 use async_openai::types::responses::Item::Message;
@@ -59,6 +60,10 @@ impl ConversationPanel {
             self.items.extend(items.iter().map(|output_item| MessageItem::Output(output_item.clone())));
             self.receiving_response = None;
         }
+    }
+    
+    pub fn add_error(&mut self, openai_error: OpenAIError) {
+        self.items.push(MessageItem::OpenAIError(openai_error))
     }
 
     pub fn get_input_param(&self) -> InputParam{
