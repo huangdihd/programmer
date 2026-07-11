@@ -18,6 +18,7 @@ The program itself is the agent you are interacting with right now.
 - **Streaming responses** — see the model's answer as it is generated, token by
   token.
 - **Tool use** — the model can invoke four built-in tools:
+
   | Tool | Description |
   |---|---|
   | `command` | Run a shell command and capture stdout/stderr. |
