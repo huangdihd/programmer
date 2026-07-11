@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::time::Duration;
+
 use async_openai::types::responses::Tool;
 use serde::Deserialize;
 use serde_json::json;
@@ -32,6 +34,14 @@ pub fn tool() -> Tool {
             "command": {
                 "type": "string",
                 "description": "The shell command to execute."
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Optional timeout in seconds. If the command runs longer, it will be killed. Default: no timeout."
+            },
+            "dir": {
+                "type": "string",
+                "description": "Optional working directory for the command. Default: the project directory."
             }
         }),
         &["command"],
@@ -41,6 +51,10 @@ pub fn tool() -> Tool {
 #[derive(Deserialize)]
 struct Args {
     command: String,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default)]
+    dir: Option<String>,
 }
 
 pub async fn run(arguments: &str) -> String {
@@ -49,17 +63,26 @@ pub async fn run(arguments: &str) -> String {
         Err(error) => return format!("error: invalid arguments: {error}"),
     };
 
-    match execute(&args.command).await {
+    match execute(&args.command, args.dir.as_deref(), args.timeout).await {
         Ok((code, stdout, stderr)) => format_output(code, &stdout, &stderr),
         Err(error) => format!("error: failed to run command: {error}"),
     }
 }
 
 /// Runs the command through the platform's native shell.
-async fn execute(command: &str) -> std::io::Result<(Option<i32>, String, String)> {
+async fn execute(
+    command: &str,
+    dir: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> std::io::Result<(Option<i32>, String, String)> {
     let (program, flag) = shell();
     let mut cmd = Command::new(program);
     cmd.arg(flag).arg(command);
+    cmd.kill_on_drop(true);
+
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
 
     // On Windows, give the child its own (windowless) console. Otherwise the
     // spawned `cmd` shares the parent console and resets its input mode, which
@@ -71,7 +94,29 @@ async fn execute(command: &str) -> std::io::Result<(Option<i32>, String, String)
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let output = cmd.output().await?;
+    let child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let output = match timeout_secs {
+        Some(secs) => {
+            match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    // `child` was moved into `wait_with_output`, whose future
+                    // got cancelled. `kill_on_drop(true)` on the command
+                    // builder ensures the child process is killed on drop.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("command timed out after {secs}s"),
+                    ));
+                }
+            }
+        }
+        None => child.wait_with_output().await?,
+    };
+
     Ok((
         output.status.code(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
