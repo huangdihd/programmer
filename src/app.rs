@@ -45,33 +45,50 @@ impl App<'_> {
             terminal.draw(|frame| {
                 frame.render_widget(&mut self, frame.area())
             })?;
-            match self.events.next().await? {
-                Event::Tick => self.tick(),
-                Event::Crossterm(event) => match event {
-                    crossterm::event::Event::Key(key_event)
-                        if key_event.kind == KeyEventKind::Press =>
-                    {
-                        self.handle_key_events(key_event)?
-                    }
-                    crossterm::event::Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollDown => self.conversation_panel.scroll_down(),
-                        MouseEventKind::ScrollUp => self.conversation_panel.scroll_up(),
-                        _ => {}
-                    }
-                    _ => {}
-                },
-                Event::App(app_event) => match app_event {
-                    AppEvent::ChunkReceived(chunk) => self.handle_chunk_events(chunk).await,
-                    AppEvent::OpenAIErrorReceived(error) => self.handle_error_events(error).await,
-                    AppEvent::ResponseFinished(_) => {
-                        if let Some(pending_request) = self.conversation_panel.pending_message.take() {
-                            self.start_request(pending_request).await
-                        }
-                    }
-                    AppEvent::Quit =>self.quit(),
-                    AppEvent::Start => self.send_message().await
-                },
+            // Block for at least one event, then drain everything else that is
+            // already queued before redrawing. During streaming, chunk events
+            // arrive far faster than a frame can be drawn; handling the whole
+            // burst per redraw collapses dozens of expensive full renders into
+            // a single one.
+            let event = self.events.next().await?;
+            self.handle_event(event).await?;
+            while self.running {
+                match self.events.try_next() {
+                    Some(event) => self.handle_event(event).await?,
+                    None => break,
+                }
             }
+        }
+        Ok(())
+    }
+
+    async fn handle_event(&mut self, event: Event) -> color_eyre::Result<()> {
+        match event {
+            Event::Tick => self.tick(),
+            Event::Crossterm(event) => match event {
+                crossterm::event::Event::Key(key_event)
+                    if key_event.kind == KeyEventKind::Press =>
+                {
+                    self.handle_key_events(key_event)?
+                }
+                crossterm::event::Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollDown => self.conversation_panel.scroll_down(),
+                    MouseEventKind::ScrollUp => self.conversation_panel.scroll_up(),
+                    _ => {}
+                }
+                _ => {}
+            },
+            Event::App(app_event) => match app_event {
+                AppEvent::ChunkReceived(chunk) => self.handle_chunk_events(chunk).await,
+                AppEvent::OpenAIErrorReceived(error) => self.handle_error_events(error).await,
+                AppEvent::ResponseFinished(_) => {
+                    if let Some(pending_request) = self.conversation_panel.pending_message.take() {
+                        self.start_request(pending_request).await
+                    }
+                }
+                AppEvent::Quit => self.quit(),
+                AppEvent::Start => self.send_message().await
+            },
         }
         Ok(())
     }
@@ -145,7 +162,13 @@ impl App<'_> {
         let Some(partial_response) = self.conversation_panel.handle_response_stream_event(response_stream_event) else {
             return;
         };
-        self.conversation_panel.items.extend(partial_response.items.iter().flatten().map(|item|message_item::MessageItem::Output(item.clone().into())));
+        self.conversation_panel.items.extend(
+            partial_response
+                .items
+                .iter()
+                .flatten()
+                .map(|item| message_item::MessageItem::Output(item.clone().into())),
+        );
         self.events.send(AppEvent::ResponseFinished(partial_response));
     }
 

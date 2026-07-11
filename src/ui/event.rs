@@ -78,6 +78,16 @@ impl EventHandler {
             .ok_or_eyre("Failed to receive event")
     }
 
+    /// Returns an already-queued event without waiting, or `None` if the queue
+    /// is currently empty.
+    ///
+    /// Used to drain a burst of events (e.g. a flurry of streaming chunks) and
+    /// process them all before the next redraw, so the UI is drawn once per
+    /// batch instead of once per event.
+    pub fn try_next(&mut self) -> Option<Event> {
+        self.receiver.try_recv().ok()
+    }
+
     /// Queue an app event to be sent to the event receiver.
     ///
     /// This is useful for sending events to the event handler which will be processed by the next

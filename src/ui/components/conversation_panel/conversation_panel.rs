@@ -6,7 +6,11 @@ use async_openai::types::responses::{
     InputContent, InputItem, InputMessage, InputParam, InputRole, Item, OutputStatus,
     ResponseStreamEvent,
 };
+use ratatui_widgets::paragraph::Paragraph;
 use tui_scrollview::ScrollViewState;
+
+/// Number of rows scrolled per mouse-wheel notch.
+const SCROLL_LINES: usize = 3;
 
 const SYSTEM_PROMPT: &str = r#"You are "programmer", a coding agent written in Rust, operating in the user's
 terminal. You help with software engineering tasks: writing code, fixing bugs,
@@ -70,12 +74,33 @@ responses rendered in a terminal UI, so keep output compact.
 - Report failures honestly, including partial completion. Never claim tests
   pass if you didn't run them."#;
 
+/// Cached render output for a single finished message.
+///
+/// Historical `items` are append-only and never mutate once added, so their
+/// markdown is parsed and laid out exactly once and reused across frames. Only
+/// the streaming `receiving_response` is re-rendered every frame.
+#[derive(Debug)]
+pub(crate) struct CachedParagraph {
+    pub paragraph: Paragraph<'static>,
+    pub height: u16,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RenderCache {
+    /// The `content_width` the cached paragraphs were laid out for. When the
+    /// width changes every entry must be rebuilt.
+    pub width: u16,
+    /// Parallel to the finished prefix of `items`, indexed identically.
+    pub entries: Vec<CachedParagraph>,
+}
+
 #[derive(Debug)]
 pub struct ConversationPanel {
     pub(crate) items: Vec<MessageItem>,
     pub(crate) scroll_view_state: ScrollViewState,
     pub pending_message: Option<String>,
     pub receiving_response: Option<PartialResponse>,
+    pub(crate) render_cache: RenderCache,
 }
 
 impl ConversationPanel {
@@ -85,6 +110,7 @@ impl ConversationPanel {
             scroll_view_state: ScrollViewState::new(),
             pending_message: None,
             receiving_response: None,
+            render_cache: RenderCache::default(),
         }
     }
 
@@ -108,11 +134,15 @@ impl ConversationPanel {
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll_view_state.scroll_up();
+        for _ in 0..SCROLL_LINES {
+            self.scroll_view_state.scroll_up();
+        }
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll_view_state.scroll_down();
+        for _ in 0..SCROLL_LINES {
+            self.scroll_view_state.scroll_down();
+        }
     }
 
     pub fn handle_response_stream_event(

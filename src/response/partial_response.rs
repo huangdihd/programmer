@@ -30,6 +30,11 @@ pub enum FinalizeError {
 #[derive(Debug)]
 pub struct PartialResponse {
     pub items: Vec<Option<OutputItem>>,
+    /// Parallel to `items`: whether each output index has received its
+    /// `output_item.done` event. Used to tell whether a reasoning item is still
+    /// being generated ("Thinking...") or complete ("Thought"), since the item's
+    /// own `status` field is only populated for finalized items.
+    finished_items: Vec<bool>,
     finish_reason: Option<ResponseFinishReason>,
 }
 
@@ -37,6 +42,7 @@ impl PartialResponse {
     pub fn new() -> Self {
         PartialResponse {
             items: vec![],
+            finished_items: vec![],
             finish_reason: None,
         }
     }
@@ -44,12 +50,30 @@ impl PartialResponse {
     fn set_item(&mut self, item: OutputItem, output_index: u32) {
         if self.items.len() <= output_index as usize {
             self.items.resize((output_index + 1) as usize, None);
+            self.finished_items.resize((output_index + 1) as usize, false);
         }
         self.items[output_index as usize] = Some(item);
     }
 
-    pub fn get_message_items(&self) -> Vec<OutputItem> {
-        self.items.iter().flatten().cloned().collect()
+    fn mark_finished(&mut self, output_index: u32) {
+        if let Some(finished) = self.finished_items.get_mut(output_index as usize) {
+            *finished = true;
+        }
+    }
+
+    /// Returns the current output items paired with whether each is still in
+    /// progress (i.e. has not yet received its `output_item.done` event).
+    pub fn get_message_items(&self) -> Vec<(OutputItem, bool)> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref().map(|item| {
+                    let in_progress = !self.finished_items.get(index).copied().unwrap_or(false);
+                    (item.clone(), in_progress)
+                })
+            })
+            .collect()
     }
 
     pub fn handle_response_stream_event(&mut self, response_stream_event: ResponseStreamEvent) {
@@ -76,6 +100,7 @@ impl PartialResponse {
                 }
 
                 self.set_item(incoming, item_done_event.output_index);
+                self.mark_finished(item_done_event.output_index);
             }
 
             ResponseContentPartAdded(part_added_event) => {
@@ -436,6 +461,7 @@ impl PartialResponse {
         let PartialResponse {
             items,
             finish_reason,
+            ..
         } = self;
         (finish_reason, items.into_iter().flatten().collect())
     }
@@ -448,6 +474,7 @@ impl PartialResponse {
         let PartialResponse {
             items,
             finish_reason,
+            ..
         } = self;
 
         let mut response = match finish_reason {
