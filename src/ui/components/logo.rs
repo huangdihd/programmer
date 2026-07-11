@@ -18,14 +18,11 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::prelude::Widget;
 use ratatui_widgets::block::Block;
 
-pub struct Logo{
+pub struct Logo {}
 
-}
-
-impl Logo{
-    pub fn new() -> Self{
-        Logo {
-        }
+impl Logo {
+    pub fn new() -> Self {
+        Logo {}
     }
 }
 

@@ -75,7 +75,10 @@ impl<'a> ToolCallMessage<'a> {
             _ => {
                 // Arguments not parseable (e.g. still streaming); show them raw.
                 for line in self.call.arguments.lines() {
-                    lines.push(Line::from(Span::styled(format!("  {line}"), detail_style())));
+                    lines.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        detail_style(),
+                    )));
                 }
             }
         }

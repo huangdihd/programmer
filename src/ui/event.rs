@@ -59,7 +59,7 @@ pub enum AppEvent {
     ToolCallsCompleted(Vec<FunctionCallOutputItemParam>),
     /// Quit the application.
     Quit,
-    Start
+    Start,
 }
 
 /// Terminal event handler.

@@ -64,7 +64,10 @@ impl<'a> ReasoningMessage<'a> {
 
         if self.expanded {
             for line in text.lines() {
-                lines.push(Line::from(Span::styled(format!("  {line}"), detail_style())));
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    detail_style(),
+                )));
             }
         }
 

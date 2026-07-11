@@ -13,41 +13,46 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::ui::components::conversation_panel::conversation_panel::{CachedParagraph, ConversationPanel};
+use crate::response::message_item::MessageItem;
+use crate::ui::components::conversation_panel::conversation_panel::{
+    CachedParagraph, ConversationPanel,
+};
 use crate::ui::components::messages::assistant_message::AssistantMessage;
+use crate::ui::components::messages::error_message::ErrorMessage;
+use crate::ui::components::messages::pending_message::PendingMessage;
+use crate::ui::components::messages::tool_result::ToolResultMessage;
 use crate::ui::components::messages::user_message::UserMessage;
+use crate::ui::components::messages::welcome_message::WelcomeMessage;
+use async_openai::types::responses::{InputItem, Item};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
 use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui_widgets::paragraph::Paragraph;
 use tui_scrollview::ScrollView;
-use crate::response::message_item::MessageItem;
-use crate::ui::components::messages::pending_message::PendingMessage;
-use crate::ui::components::messages::welcome_message::WelcomeMessage;
-use crate::ui::components::messages::error_message::ErrorMessage;
-use crate::ui::components::messages::tool_result::ToolResultMessage;
-use async_openai::types::responses::{InputItem, Item};
 
 /// Builds the paragraph for a finished history item. Called at most once per
 /// item (the result is cached in [`ConversationPanel::render_cache`]).
-fn build_item_paragraph(item: &MessageItem, content_width: u16, expanded: bool) -> Paragraph<'static> {
+fn build_item_paragraph(
+    item: &MessageItem,
+    content_width: u16,
+    expanded: bool,
+) -> Paragraph<'static> {
     match item {
         MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) => {
-            ToolResultMessage::new(output).expanded(expanded).into_paragraph()
-        }
-        MessageItem::Input(input_item) => UserMessage::new(input_item).into_paragraph(),
-        MessageItem::Output(output_item) => {
-            AssistantMessage::new(output_item, content_width)
+            ToolResultMessage::new(output)
                 .expanded(expanded)
                 .into_paragraph()
         }
+        MessageItem::Input(input_item) => UserMessage::new(input_item).into_paragraph(),
+        MessageItem::Output(output_item) => AssistantMessage::new(output_item, content_width)
+            .expanded(expanded)
+            .into_paragraph(),
         MessageItem::OpenAIError(error) => ErrorMessage::new(error.to_string()).into_paragraph(),
         MessageItem::Error(message) => ErrorMessage::new(message.clone()).into_paragraph(),
     }
 }
 
 impl Widget for &mut ConversationPanel {
-
     fn render(self, area: Rect, buf: &mut Buffer) {
         let content_width = area.width.saturating_sub(1);
         let stick_to_bottom = self.stick_to_bottom;
@@ -75,7 +80,11 @@ impl Widget for &mut ConversationPanel {
             if needs_build {
                 let paragraph = build_item_paragraph(&self.items[index], content_width, expanded);
                 let height = paragraph.line_count(content_width) as u16;
-                let entry = CachedParagraph { paragraph, height, expanded };
+                let entry = CachedParagraph {
+                    paragraph,
+                    height,
+                    expanded,
+                };
                 if index < cache.entries.len() {
                     cache.entries[index] = entry;
                 } else {
@@ -137,9 +146,8 @@ impl Widget for &mut ConversationPanel {
         let max_y_offset = content_height.saturating_sub(area.height);
         let visible_top = self.scroll_view_state.offset().y.min(max_y_offset);
         let visible_bottom = visible_top.saturating_add(area.height);
-        let visible = |y: u16, height: u16| {
-            y < visible_bottom && y.saturating_add(height) > visible_top
-        };
+        let visible =
+            |y: u16, height: u16| y < visible_bottom && y.saturating_add(height) > visible_top;
 
         let mut scroll_view = ScrollView::new(Size::new(content_width, content_height));
         let mut y = 0u16;
@@ -157,7 +165,10 @@ impl Widget for &mut ConversationPanel {
         for (index, entry) in cache.entries.iter().enumerate() {
             layout.push((index, y, y.saturating_add(entry.height)));
             if visible(y, entry.height) {
-                scroll_view.render_widget(&entry.paragraph, Rect::new(0, y, content_width, entry.height));
+                scroll_view.render_widget(
+                    &entry.paragraph,
+                    Rect::new(0, y, content_width, entry.height),
+                );
             }
             y = y.saturating_add(entry.height);
         }

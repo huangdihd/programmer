@@ -30,7 +30,9 @@ impl InputPanel<'_> {
         text_area.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
         text_area.set_placeholder_text("Talk with the programmer…");
         text_area.set_placeholder_style(
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         );
 
         InputPanel { text_area }

@@ -74,7 +74,10 @@ impl<'a> ToolResultMessage<'a> {
             .map(|(index, line)| {
                 let prefix = if index == 0 { "⎿ " } else { "  " };
                 let suffix = if index == 0 && multiline { " ▾" } else { "" };
-                Line::from(Span::styled(format!("{prefix}{line}{suffix}"), detail_style()))
+                Line::from(Span::styled(
+                    format!("{prefix}{line}{suffix}"),
+                    detail_style(),
+                ))
             })
             .collect();
         if lines.is_empty() {

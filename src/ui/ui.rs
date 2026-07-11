@@ -14,18 +14,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::app::App;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    widgets::Widget,
-};
 use crate::ui::components::logo::Logo;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
 impl Widget for &mut App<'_> {
-
     fn render(self, area: Rect, buf: &mut Buffer) {
-
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([

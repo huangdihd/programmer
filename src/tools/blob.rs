@@ -62,14 +62,11 @@ pub async fn run(arguments: &str) -> String {
         Err(error) => return format!("error: invalid regex: {error}"),
     };
 
-    let root = args
-        .path
-        .clone()
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| ".".to_string())
-        });
+    let root = args.path.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
 
     let mut results = Vec::new();
     let mut count: usize = 0;
@@ -98,16 +95,15 @@ fn walk(
     results: &mut Vec<String>,
     count: &mut usize,
 ) -> Result<(), String> {
-    let metadata =
-        std::fs::metadata(root).map_err(|e| format!("cannot access {root}: {e}"))?;
+    let metadata = std::fs::metadata(root).map_err(|e| format!("cannot access {root}: {e}"))?;
 
     if metadata.is_file() {
         check_file(root, re, results, count);
         return Ok(());
     }
 
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| format!("cannot read directory {root}: {e}"))?;
+    let entries =
+        std::fs::read_dir(root).map_err(|e| format!("cannot read directory {root}: {e}"))?;
 
     for entry in entries {
         if *count >= MAX_MATCHES {
@@ -165,7 +161,8 @@ mod tests {
 
         let out = run(&format!(
             r#"{{"pattern":"auth_.*\\.rs","path":"{json_path}"}}"#
-        )).await;
+        ))
+        .await;
         assert!(out.contains("auth_service.rs"), "got: {out}");
         assert!(out.contains("auth_test.rs"), "got: {out}");
         assert!(!out.contains("main.rs"), "got: {out}");
@@ -176,13 +173,15 @@ mod tests {
 
     #[tokio::test]
     async fn blob_reports_no_matches() {
-        let dir = std::env::temp_dir().join(format!("programmer_blob_empty_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("programmer_blob_empty_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let json_path = dir.to_string_lossy().replace('\\', "\\\\");
 
         let out = run(&format!(
             r#"{{"pattern":"zzz_nonexistent","path":"{json_path}"}}"#
-        )).await;
+        ))
+        .await;
         assert!(out.starts_with("no files matching"), "got: {out}");
 
         let _ = std::fs::remove_dir_all(&dir);

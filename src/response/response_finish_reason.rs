@@ -14,7 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{Response};
+use async_openai::types::responses::Response;
 
 #[derive(Debug)]
 pub enum ResponseFinishReason {

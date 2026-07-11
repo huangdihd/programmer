@@ -69,12 +69,11 @@ pub async fn run(arguments: &str) -> String {
         Err(error) => return format!("error: invalid regex: {error}"),
     };
 
-    let root = args
-        .path
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir()
+    let root = args.path.clone().unwrap_or_else(|| {
+        std::env::current_dir()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string()));
+            .unwrap_or_else(|_| ".".to_string())
+    });
 
     let mut results = Vec::new();
     let mut count: usize = 0;
@@ -88,7 +87,9 @@ pub async fn run(arguments: &str) -> String {
     }
 
     if count >= MAX_MATCHES {
-        results.push(format!("[truncated: {count} matches, showing first {MAX_MATCHES}]"));
+        results.push(format!(
+            "[truncated: {count} matches, showing first {MAX_MATCHES}]"
+        ));
     }
 
     results.join("\n")
@@ -101,16 +102,15 @@ fn search(
     results: &mut Vec<String>,
     count: &mut usize,
 ) -> Result<(), String> {
-    let metadata = std::fs::metadata(root)
-        .map_err(|e| format!("cannot access {root}: {e}"))?;
+    let metadata = std::fs::metadata(root).map_err(|e| format!("cannot access {root}: {e}"))?;
 
     if metadata.is_file() {
         search_file(root, re, results, count);
         return Ok(());
     }
 
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| format!("cannot read directory {root}: {e}"))?;
+    let entries =
+        std::fs::read_dir(root).map_err(|e| format!("cannot read directory {root}: {e}"))?;
 
     for entry in entries {
         if *count >= MAX_MATCHES {
@@ -135,10 +135,7 @@ fn search(
                 continue;
             }
         } else if path.is_file() {
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if should_skip_file(file_name, include) {
                 continue;
             }
@@ -157,12 +154,39 @@ fn should_skip_file(file_name: &str, include: &Option<String>) -> bool {
         std::path::Path::new(file_name)
             .extension()
             .and_then(|e| e.to_str()),
-        Some("o" | "a" | "so" | "dylib" | "dll" | "exe" | "bin"
-            | "png" | "jpg" | "jpeg" | "gif" | "ico" | "svg"
-            | "mp3" | "mp4" | "avi" | "mov" | "pdf"
-            | "zip" | "tar" | "gz" | "bz2" | "xz" | "7z"
-            | "ttf" | "otf" | "woff" | "woff2"
-            | "wasm" | "class" | "pyc" | "pyo")
+        Some(
+            "o" | "a"
+                | "so"
+                | "dylib"
+                | "dll"
+                | "exe"
+                | "bin"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "ico"
+                | "svg"
+                | "mp3"
+                | "mp4"
+                | "avi"
+                | "mov"
+                | "pdf"
+                | "zip"
+                | "tar"
+                | "gz"
+                | "bz2"
+                | "xz"
+                | "7z"
+                | "ttf"
+                | "otf"
+                | "woff"
+                | "woff2"
+                | "wasm"
+                | "class"
+                | "pyc"
+                | "pyo"
+        )
     )
 }
 
@@ -223,12 +247,7 @@ fn simple_glob_match(pattern: &str, name: &str) -> bool {
     true
 }
 
-fn search_file(
-    path: &str,
-    re: &Regex,
-    results: &mut Vec<String>,
-    count: &mut usize,
-) {
+fn search_file(path: &str, re: &Regex, results: &mut Vec<String>, count: &mut usize) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return, // skip binary / unreadable files silently
@@ -278,15 +297,14 @@ mod tests {
 
         let json_path = dir.to_string_lossy().replace('\\', "\\\\");
 
-        let out = run(&format!(
-            r#"{{"pattern":"hello","path":"{json_path}"}}"#
-        )).await;
+        let out = run(&format!(r#"{{"pattern":"hello","path":"{json_path}"}}"#)).await;
         assert!(out.contains("a.rs:1:"), "got: {out}");
         assert!(out.contains("b.txt:1:"), "got: {out}");
 
         let out_filtered = run(&format!(
             r#"{{"pattern":"hello","path":"{json_path}","include":"*.rs"}}"#
-        )).await;
+        ))
+        .await;
         assert!(out_filtered.contains("a.rs"), "got: {out_filtered}");
         assert!(!out_filtered.contains("b.txt"), "got: {out_filtered}");
 
@@ -295,13 +313,15 @@ mod tests {
 
     #[tokio::test]
     async fn grep_reports_no_matches() {
-        let dir = std::env::temp_dir().join(format!("programmer_grep_empty_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("programmer_grep_empty_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let json_path = dir.to_string_lossy().replace('\\', "\\\\");
 
         let out = run(&format!(
             r#"{{"pattern":"zzz_nonexistent_xyz","path":"{json_path}"}}"#
-        )).await;
+        ))
+        .await;
         assert!(out.starts_with("no matches found"), "got: {out}");
 
         let _ = std::fs::remove_dir_all(&dir);

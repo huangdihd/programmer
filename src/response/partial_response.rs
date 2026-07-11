@@ -26,7 +26,10 @@ use async_openai::types::responses::ResponseStreamEvent::{
     ResponseReasoningTextDelta, ResponseReasoningTextDone, ResponseRefusalDelta,
     ResponseRefusalDone,
 };
-use async_openai::types::responses::{Annotation, OutputContent, OutputItem, OutputMessageContent, ReasoningItemContent, ReasoningTextContent, Response, ResponseStreamEvent, SummaryPart, SummaryTextContent};
+use async_openai::types::responses::{
+    Annotation, OutputContent, OutputItem, OutputMessageContent, ReasoningItemContent,
+    ReasoningTextContent, Response, ResponseStreamEvent, SummaryPart, SummaryTextContent,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FinalizeError {
@@ -65,7 +68,8 @@ impl PartialResponse {
     fn set_item(&mut self, item: OutputItem, output_index: u32) {
         if self.items.len() <= output_index as usize {
             self.items.resize((output_index + 1) as usize, None);
-            self.finished_items.resize((output_index + 1) as usize, false);
+            self.finished_items
+                .resize((output_index + 1) as usize, false);
         }
         self.items[output_index as usize] = Some(item);
     }
@@ -218,7 +222,8 @@ impl PartialResponse {
                 else {
                     return;
                 };
-                if output_text.annotations.len() <= annotation_added_event.annotation_index as usize {
+                if output_text.annotations.len() <= annotation_added_event.annotation_index as usize
+                {
                     if let Ok(annotation) =
                         serde_json::from_value::<Annotation>(annotation_added_event.annotation)
                     {
@@ -228,8 +233,9 @@ impl PartialResponse {
             }
 
             ResponseRefusalDelta(refusal_delta_event) => {
-                let Some(Some(OutputItem::Message(output_message))) =
-                    self.items.get_mut(refusal_delta_event.output_index as usize)
+                let Some(Some(OutputItem::Message(output_message))) = self
+                    .items
+                    .get_mut(refusal_delta_event.output_index as usize)
                 else {
                     return;
                 };
@@ -452,9 +458,8 @@ impl PartialResponse {
                 ));
             }
             ResponseFailed(response_failed_event) => {
-                self.finish_reason = Some(ResponseFinishReason::Failed(
-                    response_failed_event.response,
-                ));
+                self.finish_reason =
+                    Some(ResponseFinishReason::Failed(response_failed_event.response));
             }
             ResponseIncomplete(response_incomplete_event) => {
                 self.finish_reason = Some(ResponseFinishReason::Incomplete(
@@ -496,8 +501,16 @@ impl PartialResponse {
             Some(ResponseFinishReason::Completed(response))
             | Some(ResponseFinishReason::Failed(response))
             | Some(ResponseFinishReason::Incomplete(response)) => response,
-            Some(ResponseFinishReason::ApiError { code, message, param }) => {
-                return Err(FinalizeError::ApiError { code, message, param });
+            Some(ResponseFinishReason::ApiError {
+                code,
+                message,
+                param,
+            }) => {
+                return Err(FinalizeError::ApiError {
+                    code,
+                    message,
+                    param,
+                });
             }
             Some(ResponseFinishReason::StreamError(stream_error)) => {
                 return Err(FinalizeError::StreamError(stream_error));

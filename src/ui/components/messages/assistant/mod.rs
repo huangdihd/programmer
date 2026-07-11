@@ -13,10 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-pub mod text;
 pub mod reasoning;
-pub mod unsupported;
+pub mod text;
 pub mod tool_call;
+pub mod unsupported;
 
 use ratatui::style::{Modifier, Style};
 

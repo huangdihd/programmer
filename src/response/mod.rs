@@ -13,6 +13,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod message_item;
 pub mod partial_response;
 pub mod response_finish_reason;
-pub mod message_item;

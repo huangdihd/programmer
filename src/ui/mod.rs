@@ -13,8 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-pub mod ui;
-pub mod event;
 pub mod components;
-pub mod markdown_theme;
+pub mod event;
 pub mod markdown_code_block;
+pub mod markdown_theme;
+pub mod ui;

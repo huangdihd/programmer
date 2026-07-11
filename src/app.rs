@@ -14,17 +14,22 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::config::programmer_config::ProgrammerConfig;
+use crate::response::message_item;
 use crate::response::partial_response::PartialResponse;
 use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
 use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{CreateResponse, FunctionToolCall, InputContent, InputMessage, InputRole, InputTextContent, MessageItem, OutputItem, OutputStatus, ResponseStreamEvent};
-use async_openai::{config::OpenAIConfig, Client};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use async_openai::types::responses::{
+    CreateResponse, FunctionToolCall, InputContent, InputMessage, InputRole, InputTextContent,
+    MessageItem, OutputItem, OutputStatus, ResponseStreamEvent,
+};
+use async_openai::{Client, config::OpenAIConfig};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use crate::response::message_item;
 
 /// Application.
 #[derive(Debug)]
@@ -37,13 +42,15 @@ pub struct App<'a> {
     pub events: EventHandler,
     pub config: ProgrammerConfig,
     pub input_panel: InputPanel<'a>,
-    pub conversation_panel: ConversationPanel
+    pub conversation_panel: ConversationPanel,
 }
 
 impl App<'_> {
     /// Constructs a new instance of [`App`].
     pub async fn new(config: ProgrammerConfig) -> Self {
-        let openai_config = OpenAIConfig::default().with_api_base(&config.base_url).with_api_key(&config.api_key);
+        let openai_config = OpenAIConfig::default()
+            .with_api_base(&config.base_url)
+            .with_api_key(&config.api_key);
         Self {
             running: true,
             client: Client::with_config(openai_config),
@@ -57,9 +64,7 @@ impl App<'_> {
     /// Run the application's main loop.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         while self.running {
-            terminal.draw(|frame| {
-                frame.render_widget(&mut self, frame.area())
-            })?;
+            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
             // Block for at least one event, then drain everything else that is
             // already queued before redrawing. During streaming, chunk events
             // arrive far faster than a frame can be drawn; handling the whole
@@ -89,11 +94,11 @@ impl App<'_> {
                 crossterm::event::Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollDown => self.conversation_panel.scroll_down(),
                     MouseEventKind::ScrollUp => self.conversation_panel.scroll_up(),
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        self.conversation_panel.handle_click(mouse.column, mouse.row)
-                    }
+                    MouseEventKind::Down(MouseButton::Left) => self
+                        .conversation_panel
+                        .handle_click(mouse.column, mouse.row),
                     _ => {}
-                }
+                },
                 _ => {}
             },
             Event::App(app_event) => match app_event {
@@ -102,7 +107,9 @@ impl App<'_> {
                 AppEvent::ResponseFinished(partial_response) => {
                     let calls = function_calls(&partial_response);
                     if calls.is_empty() {
-                        if let Some(pending_request) = self.conversation_panel.pending_message.take() {
+                        if let Some(pending_request) =
+                            self.conversation_panel.pending_message.take()
+                        {
                             self.start_request(pending_request).await
                         }
                     } else {
@@ -124,7 +131,7 @@ impl App<'_> {
                     self.spawn_stream();
                 }
                 AppEvent::Quit => self.quit(),
-                AppEvent::Start => self.send_message().await
+                AppEvent::Start => self.send_message().await,
             },
         }
         Ok(())
@@ -157,13 +164,14 @@ impl App<'_> {
 
         let input_message = InputMessage {
             content: vec![InputContent::InputText(InputTextContent {
-                text: text.clone()
+                text: text.clone(),
             })],
             role: InputRole::User,
             status: Option::from(OutputStatus::Completed),
         };
 
-        self.conversation_panel.add_input_message(MessageItem::Input(input_message));
+        self.conversation_panel
+            .add_input_message(MessageItem::Input(input_message));
         self.spawn_stream();
     }
 
@@ -188,10 +196,12 @@ impl App<'_> {
                     while let Some(response_stream_event) = response_stream.next().await {
                         match response_stream_event {
                             Ok(response_event) => {
-                                let _ = sender.send(Event::App(AppEvent::ChunkReceived(response_event)));
-                            },
+                                let _ = sender
+                                    .send(Event::App(AppEvent::ChunkReceived(response_event)));
+                            }
                             Err(openai_error) => {
-                                let _ = sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
+                                let _ = sender
+                                    .send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
                             }
                         }
                     }
@@ -217,8 +227,11 @@ impl App<'_> {
         });
     }
 
-    pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent){
-        let Some(partial_response) = self.conversation_panel.handle_response_stream_event(response_stream_event) else {
+    pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent) {
+        let Some(partial_response) = self
+            .conversation_panel
+            .handle_response_stream_event(response_stream_event)
+        else {
             return;
         };
         self.conversation_panel.items.extend(
@@ -228,7 +241,8 @@ impl App<'_> {
                 .flatten()
                 .map(|item| message_item::MessageItem::Output(item.clone().into())),
         );
-        self.events.send(AppEvent::ResponseFinished(partial_response));
+        self.events
+            .send(AppEvent::ResponseFinished(partial_response));
     }
 
     pub async fn handle_error_events(&mut self, error: OpenAIError) {
@@ -245,7 +259,9 @@ impl App<'_> {
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         match key_event.code {
-            KeyCode::Char('q' | 'Q') if key_event.modifiers == KeyModifiers::CONTROL => self.events.send(AppEvent::Quit),
+            KeyCode::Char('q' | 'Q') if key_event.modifiers == KeyModifiers::CONTROL => {
+                self.events.send(AppEvent::Quit)
+            }
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
             }
@@ -269,7 +285,6 @@ impl App<'_> {
     pub fn quit(&mut self) {
         self.running = false;
     }
-
 }
 
 /// Extracts the function/tool calls the model emitted in a finished response.

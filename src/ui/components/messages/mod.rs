@@ -13,10 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-pub mod assistant_message;
 pub mod assistant;
-pub mod user_message;
-pub mod pending_message;
-pub mod welcome_message;
+pub mod assistant_message;
 pub mod error_message;
+pub mod pending_message;
 pub mod tool_result;
+pub mod user_message;
+pub mod welcome_message;

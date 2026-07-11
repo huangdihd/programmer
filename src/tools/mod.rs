@@ -13,12 +13,12 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod blob;
 pub mod command;
-pub mod read_file;
-pub mod write_file;
 pub mod edit_file;
 pub mod grep;
-pub mod blob;
+pub mod read_file;
+pub mod write_file;
 
 use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, Tool,
@@ -145,7 +145,10 @@ mod tests {
             r#"{{"path":"{json_path}","old_string":"nope","new_string":"x"}}"#
         ))
         .await;
-        assert!(missing.starts_with("error: old_string not found"), "got: {missing}");
+        assert!(
+            missing.starts_with("error: old_string not found"),
+            "got: {missing}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

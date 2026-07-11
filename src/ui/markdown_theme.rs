@@ -54,27 +54,61 @@ pub mod palette {
 pub struct AppTheme;
 
 impl RichTextTheme for AppTheme {
-    fn generation(&self) -> Generation { Generation(2) }
+    fn generation(&self) -> Generation {
+        Generation(2)
+    }
 
-    fn get_text_color(&self) -> Color { palette::TEXT }
-    fn get_muted_text_color(&self) -> Color { palette::MUTED }
+    fn get_text_color(&self) -> Color {
+        palette::TEXT
+    }
+    fn get_muted_text_color(&self) -> Color {
+        palette::MUTED
+    }
 
-    fn get_primary_color(&self) -> Color { palette::BLUE }
-    fn get_popup_selected_background(&self) -> Color { palette::SURFACE }
-    fn get_border_color(&self) -> Color { palette::BORDER }
-    fn get_focused_border_color(&self) -> Color { palette::BLUE }
+    fn get_primary_color(&self) -> Color {
+        palette::BLUE
+    }
+    fn get_popup_selected_background(&self) -> Color {
+        palette::SURFACE
+    }
+    fn get_border_color(&self) -> Color {
+        palette::BORDER
+    }
+    fn get_focused_border_color(&self) -> Color {
+        palette::BLUE
+    }
 
-    fn get_secondary_color(&self) -> Color { palette::GREEN }
-    fn get_info_color(&self) -> Color { palette::CYAN }
+    fn get_secondary_color(&self) -> Color {
+        palette::GREEN
+    }
+    fn get_info_color(&self) -> Color {
+        palette::CYAN
+    }
 
-    fn get_json_key_color(&self) -> Color { palette::BLUE }
-    fn get_json_string_color(&self) -> Color { palette::GREEN }
+    fn get_json_key_color(&self) -> Color {
+        palette::BLUE
+    }
+    fn get_json_string_color(&self) -> Color {
+        palette::GREEN
+    }
 
-    fn get_json_number_color(&self) -> Color { palette::YELLOW }
-    fn get_json_bool_color(&self) -> Color { palette::PURPLE }
-    fn get_json_null_color(&self) -> Color { palette::FAINT }
-    fn get_accent_yellow(&self) -> Color { palette::YELLOW }
-    fn get_popup_selected_text_color(&self) -> Color { palette::TEXT }
+    fn get_json_number_color(&self) -> Color {
+        palette::YELLOW
+    }
+    fn get_json_bool_color(&self) -> Color {
+        palette::PURPLE
+    }
+    fn get_json_null_color(&self) -> Color {
+        palette::FAINT
+    }
+    fn get_accent_yellow(&self) -> Color {
+        palette::YELLOW
+    }
+    fn get_popup_selected_text_color(&self) -> Color {
+        palette::TEXT
+    }
 
-    fn get_background_color(&self) -> Color { Color::Reset }
+    fn get_background_color(&self) -> Color {
+        Color::Reset
+    }
 }

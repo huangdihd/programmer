@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui_markdown::highlight::{segments_to_lines, CodeHighlighter, TreeSitterHighlighter};
+use ratatui_markdown::highlight::{CodeHighlighter, TreeSitterHighlighter, segments_to_lines};
 use ratatui_markdown::markdown::RenderHooks;
 
 use crate::ui::markdown_theme::palette;

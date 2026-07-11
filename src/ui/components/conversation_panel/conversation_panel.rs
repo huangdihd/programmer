@@ -18,8 +18,8 @@ use crate::response::partial_response::PartialResponse;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
-    FunctionCallOutputItemParam, InputContent, InputItem, InputMessage, InputParam, InputRole, Item,
-    OutputItem, OutputStatus, ResponseStreamEvent,
+    FunctionCallOutputItemParam, InputContent, InputItem, InputMessage, InputParam, InputRole,
+    Item, OutputItem, OutputStatus, ResponseStreamEvent,
 };
 use ratatui::layout::Rect;
 use ratatui_widgets::paragraph::Paragraph;
@@ -233,9 +233,10 @@ impl ConversationPanel {
     }
 
     pub fn add_input_message(&mut self, input_message_item: ApiMessageItem) {
-        self.items.push(MessageItem::Input(InputItem::Item(Item::from(
-            input_message_item,
-        ))));
+        self.items
+            .push(MessageItem::Input(InputItem::Item(Item::from(
+                input_message_item,
+            ))));
         // A new user message should always bring the view back to the bottom.
         self.stick_to_bottom = true;
     }
@@ -300,13 +301,12 @@ impl ConversationPanel {
 
     pub fn get_input_param(&self) -> InputParam {
         let system_prompt = format!("{SYSTEM_PROMPT}\n\n{}", crate::tools::environment_info());
-        let developer_message = InputItem::from(Item::Message(ApiMessageItem::Input(
-            InputMessage {
+        let developer_message =
+            InputItem::from(Item::Message(ApiMessageItem::Input(InputMessage {
                 content: vec![InputContent::InputText(system_prompt.into())],
                 role: InputRole::Developer,
                 status: Some(OutputStatus::Completed),
-            },
-        )));
+            })));
 
         let mut input_items = vec![developer_message];
         input_items.extend(
@@ -357,7 +357,10 @@ mod tests {
         let mut buf2 = Buffer::empty(area);
         (&mut panel).render(area, &mut buf2);
         let after = panel.scroll_view_state.offset().y;
-        assert!(after < bottom, "offset should decrease: {bottom} -> {after}");
+        assert!(
+            after < bottom,
+            "offset should decrease: {bottom} -> {after}"
+        );
         assert!(!panel.stick_to_bottom, "scrolling up disables auto-follow");
     }
 
