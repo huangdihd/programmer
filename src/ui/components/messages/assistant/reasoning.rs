@@ -16,7 +16,7 @@
 use async_openai::types::responses::{ReasoningItem, ReasoningItemContent, SummaryPart};
 use ratatui::text::{Line, Span, Text};
 
-use super::muted_style;
+use super::{detail_style, muted_style};
 
 /// Renders the reasoning indicator. Collapsed it's a single line ("Thinking..."
 /// while streaming, "Thought" once done); expanded it also shows the reasoning
@@ -64,7 +64,7 @@ impl<'a> ReasoningMessage<'a> {
 
         if self.expanded {
             for line in text.lines() {
-                lines.push(Line::from(Span::styled(format!("  {line}"), muted_style())));
+                lines.push(Line::from(Span::styled(format!("  {line}"), detail_style())));
             }
         }
 
