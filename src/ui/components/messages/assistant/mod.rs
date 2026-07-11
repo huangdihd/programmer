@@ -29,3 +29,8 @@ pub(crate) fn muted_style() -> Style {
         .fg(palette::MUTED)
         .add_modifier(Modifier::DIM | Modifier::ITALIC)
 }
+
+/// White style for expanded detail content (reasoning, tool calls, results).
+pub(crate) fn detail_style() -> Style {
+    Style::new().fg(palette::TEXT)
+}
