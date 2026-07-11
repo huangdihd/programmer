@@ -4,6 +4,7 @@ use ratatui::prelude::Color;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui_markdown::markdown::MarkdownRenderer;
+use crate::ui::markdown_code_block::CodeBlockHooks;
 use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::Paragraph;
 
@@ -51,7 +52,8 @@ impl<'a> AssistantMessage<'a> {
                 let render_width = self.width
                     .saturating_sub(PAD_LEFT + PAD_RIGHT)
                     .min(100);
-                let renderer = MarkdownRenderer::new(render_width as usize);
+                let renderer = MarkdownRenderer::new(render_width as usize)
+                    .with_render_hooks(Box::new(CodeBlockHooks::new(render_width as usize)));
                 let blocks = renderer.parse(&md);
                 Text::from(renderer.render(&blocks, &AppTheme))
             }
