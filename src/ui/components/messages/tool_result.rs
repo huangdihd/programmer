@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
+use crate::ui::components::messages::assistant::detail_style;
 use crate::ui::components::messages::assistant_message::EXPANDED_BG;
 use crate::ui::markdown_theme::palette;
 
@@ -47,7 +48,7 @@ impl<'a> ToolResultMessage<'a> {
     }
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
-        let dim = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
+        let muted = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
 
         let text = match &self.output.output {
             FunctionCallOutput::Text(text) => text.clone(),
@@ -62,7 +63,7 @@ impl<'a> ToolResultMessage<'a> {
             // Collapsed: a single (unwrapped) line — the first line of output.
             let first = all.first().copied().unwrap_or("[no output]");
             let caret = if multiline { " ▸" } else { "" };
-            let line = Line::from(Span::styled(format!("⎿ {first}{caret}"), dim));
+            let line = Line::from(Span::styled(format!("⎿ {first}{caret}"), muted));
             return Paragraph::new(Text::from(line)).block(block);
         }
 
@@ -73,11 +74,11 @@ impl<'a> ToolResultMessage<'a> {
             .map(|(index, line)| {
                 let prefix = if index == 0 { "⎿ " } else { "  " };
                 let suffix = if index == 0 && multiline { " ▾" } else { "" };
-                Line::from(Span::styled(format!("{prefix}{line}{suffix}"), dim))
+                Line::from(Span::styled(format!("{prefix}{line}{suffix}"), detail_style()))
             })
             .collect();
         if lines.is_empty() {
-            lines.push(Line::from(Span::styled("⎿ [no output]", dim)));
+            lines.push(Line::from(Span::styled("⎿ [no output]", detail_style())));
         }
 
         Paragraph::new(Text::from(lines))
