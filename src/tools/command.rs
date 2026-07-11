@@ -77,7 +77,15 @@ async fn execute(
 ) -> std::io::Result<(Option<i32>, String, String)> {
     let (program, flag) = shell();
     let mut cmd = Command::new(program);
-    cmd.arg(flag).arg(command);
+    cmd.arg(flag);
+    // On Windows, `Command::arg` re-quotes arguments that contain spaces,
+    // which breaks the quoting already present in `command` (e.g.
+    // `git commit -m "hello world"`).  `raw_arg` passes the string verbatim
+    // so the shell receives the intended quoting.
+    #[cfg(windows)]
+    cmd.raw_arg(command);
+    #[cfg(not(windows))]
+    cmd.arg(command);
     cmd.kill_on_drop(true);
 
     if let Some(dir) = dir {
