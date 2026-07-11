@@ -298,14 +298,24 @@ impl ConversationPanel {
             for &live_idx in &self.live_expanded_items {
                 self.expanded_items.insert(base_index + live_idx);
             }
-            self.items.extend(
+            let cancelled = partial.cancelled.load(std::sync::atomic::Ordering::Relaxed);
+            let items: Vec<OutputItem> = if cancelled {
+                // When the user cancelled, drop all function calls so they
+                // aren't shown and won't execute.
                 partial
-                    .into_aborted_items()
+                    .items
                     .into_iter()
-                    .map(MessageItem::Output),
-            );
+                    .flatten()
+                    .filter(|item| !matches!(item, OutputItem::FunctionCall(_)))
+                    .collect()
+            } else {
+                partial.into_aborted_items()
+            };
+            self.items
+                .extend(items.into_iter().map(MessageItem::Output));
         }
     }
+
 
     pub fn scroll_to_bottom(&mut self) {
         self.stick_to_bottom = true;

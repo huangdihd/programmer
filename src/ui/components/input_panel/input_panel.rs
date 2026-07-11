@@ -49,4 +49,10 @@ impl InputPanel<'_> {
     pub fn clear(&mut self) -> bool {
         self.text_area.clear()
     }
+
+    /// Replace the entire content of the text area with `text`.
+    pub fn set_content(&mut self, text: &str) {
+        self.text_area.clear();
+        self.text_area.insert_str(text);
+    }
 }

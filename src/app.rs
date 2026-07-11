@@ -299,11 +299,17 @@ impl App<'_> {
                 .expanded_items
                 .insert(base_index + live_idx);
         }
+        let cancelled = partial_response.cancelled.load(Ordering::Relaxed);
         self.conversation_panel.items.extend(
             partial_response
                 .items
                 .iter()
                 .flatten()
+                .filter(|item| {
+                    // If the request was cancelled, drop all function calls
+                    // from the response so they aren't shown or executed.
+                    !cancelled || !matches!(item, OutputItem::FunctionCall(_))
+                })
                 .map(|item| message_item::MessageItem::Output(item.clone().into())),
         );
         self.events
@@ -339,6 +345,15 @@ impl App<'_> {
             KeyCode::Esc => {
                 if self.conversation_panel.is_busy() {
                     self.events.send(AppEvent::Cancel)
+                } else {
+                    self.input_panel.input(key_event);
+                }
+            }
+            KeyCode::Up => {
+                if self.input_panel.get_content().is_empty() {
+                    if let Some(pending) = self.conversation_panel.pending_message.take() {
+                        self.input_panel.set_content(&pending);
+                    }
                 } else {
                     self.input_panel.input(key_event);
                 }
