@@ -4,9 +4,9 @@ use crate::ui::components::conversation_panel::conversation_panel::ConversationP
 use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{CreateResponse, InputContent, InputMessage, InputRole, InputTextContent, MessageItem, OutputStatus, ResponseStreamEvent};
+use async_openai::types::responses::{CreateResponse, FunctionToolCall, InputContent, InputMessage, InputRole, InputTextContent, MessageItem, OutputItem, OutputStatus, ResponseStreamEvent};
 use async_openai::{config::OpenAIConfig, Client};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use crate::response::message_item;
@@ -74,6 +74,9 @@ impl App<'_> {
                 crossterm::event::Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollDown => self.conversation_panel.scroll_down(),
                     MouseEventKind::ScrollUp => self.conversation_panel.scroll_up(),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.conversation_panel.handle_click(mouse.column, mouse.row)
+                    }
                     _ => {}
                 }
                 _ => {}
@@ -81,10 +84,29 @@ impl App<'_> {
             Event::App(app_event) => match app_event {
                 AppEvent::ChunkReceived(chunk) => self.handle_chunk_events(chunk).await,
                 AppEvent::OpenAIErrorReceived(error) => self.handle_error_events(error).await,
-                AppEvent::ResponseFinished(_) => {
-                    if let Some(pending_request) = self.conversation_panel.pending_message.take() {
-                        self.start_request(pending_request).await
+                AppEvent::ResponseFinished(partial_response) => {
+                    let calls = function_calls(&partial_response);
+                    if calls.is_empty() {
+                        if let Some(pending_request) = self.conversation_panel.pending_message.take() {
+                            self.start_request(pending_request).await
+                        }
+                    } else {
+                        self.run_tool_calls(calls);
                     }
+                }
+                AppEvent::ToolCallsCompleted(outputs) => {
+                    self.conversation_panel.tool_running = false;
+                    for output in outputs {
+                        self.conversation_panel.add_tool_output(output);
+                    }
+                    // A spawned shell can reset the console's input mode; re-assert
+                    // mouse capture so scrolling/clicks keep working afterwards.
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::event::EnableMouseCapture
+                    );
+                    // Continue the turn: send the tool results back to the model.
+                    self.spawn_stream();
                 }
                 AppEvent::Quit => self.quit(),
                 AppEvent::Start => self.send_message().await
@@ -103,7 +125,7 @@ impl App<'_> {
     }
 
     async fn start_request(&mut self, text: String) {
-        if self.conversation_panel.receiving_response.is_some() {
+        if self.conversation_panel.is_busy() {
             let is_at_bottom = self.conversation_panel.is_at_bottom();
             match self.conversation_panel.pending_message.as_mut() {
                 Some(pending_message) => {
@@ -127,6 +149,13 @@ impl App<'_> {
         };
 
         self.conversation_panel.add_input_message(MessageItem::Input(input_message));
+        self.spawn_stream();
+    }
+
+    /// Spawns a streaming response request for the current conversation state
+    /// (including tool definitions). Used both to answer a new user message and
+    /// to continue the turn after tool calls have run.
+    fn spawn_stream(&mut self) {
         self.conversation_panel.receiving_response = Some(PartialResponse::new());
         let client = self.client.clone();
         let sender = self.events.sender.clone();
@@ -137,6 +166,7 @@ impl App<'_> {
             request.stream = Option::from(true);
             request.input = input_param;
             request.model = Option::from(model);
+            request.tools = Some(crate::tools::tools());
             let stream = client.responses().create_stream(request).await;
             match stream {
                 Ok(mut response_stream) => {
@@ -155,6 +185,20 @@ impl App<'_> {
                     let _ = sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
                 }
             }
+        });
+    }
+
+    /// Runs the model's requested tool calls in the background, then reports the
+    /// outputs back to the event loop via `ToolCallsCompleted`.
+    fn run_tool_calls(&mut self, calls: Vec<FunctionToolCall>) {
+        self.conversation_panel.tool_running = true;
+        let sender = self.events.sender.clone();
+        tokio::spawn(async move {
+            let mut outputs = Vec::with_capacity(calls.len());
+            for call in &calls {
+                outputs.push(crate::tools::run_tool_call(call).await);
+            }
+            let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(outputs)));
         });
     }
 
@@ -204,4 +248,17 @@ impl App<'_> {
         self.running = false;
     }
 
+}
+
+/// Extracts the function/tool calls the model emitted in a finished response.
+fn function_calls(partial_response: &PartialResponse) -> Vec<FunctionToolCall> {
+    partial_response
+        .items
+        .iter()
+        .flatten()
+        .filter_map(|item| match item {
+            OutputItem::FunctionCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .collect()
 }

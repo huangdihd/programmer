@@ -1,6 +1,6 @@
 use crate::response::partial_response::PartialResponse;
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::ResponseStreamEvent;
+use async_openai::types::responses::{FunctionCallOutputItemParam, ResponseStreamEvent};
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
@@ -39,6 +39,9 @@ pub enum AppEvent {
     /// Receive an openai error.
     OpenAIErrorReceived(OpenAIError),
     ResponseFinished(PartialResponse),
+    /// All tool calls from the last response have run; carries their outputs to
+    /// be fed back to the model.
+    ToolCallsCompleted(Vec<FunctionCallOutputItemParam>),
     /// Quit the application.
     Quit,
     Start

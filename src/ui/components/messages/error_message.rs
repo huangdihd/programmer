@@ -1,8 +1,9 @@
-use ratatui::prelude::Color;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
+
+use crate::ui::markdown_theme::palette;
 
 const PAD_LEFT: u16 = 2;
 const PAD_RIGHT: u16 = 2;
@@ -19,8 +20,8 @@ impl ErrorMessage {
     }
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
-        let red = Color::Rgb(0xf7, 0x76, 0x8e);
-        let body = Color::Rgb(0xd8, 0x8b, 0x94);
+        let red = palette::RED;
+        let body = palette::RED_MUTED;
 
         let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
             "✕ Error",

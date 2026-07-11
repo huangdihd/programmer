@@ -3,14 +3,26 @@ use crate::response::partial_response::PartialResponse;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
-    InputContent, InputItem, InputMessage, InputParam, InputRole, Item, OutputStatus,
-    ResponseStreamEvent,
+    FunctionCallOutputItemParam, InputContent, InputItem, InputMessage, InputParam, InputRole, Item,
+    OutputItem, OutputStatus, ResponseStreamEvent,
 };
+use ratatui::layout::Rect;
 use ratatui_widgets::paragraph::Paragraph;
+use std::collections::HashSet;
 use tui_scrollview::ScrollViewState;
 
 /// Number of rows scrolled per mouse-wheel notch.
 const SCROLL_LINES: usize = 3;
+
+/// Whether an item has collapsible detail the user can click to expand.
+fn is_foldable(item: &MessageItem) -> bool {
+    matches!(
+        item,
+        MessageItem::Output(OutputItem::Reasoning(_))
+            | MessageItem::Output(OutputItem::FunctionCall(_))
+            | MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(_)))
+    )
+}
 
 const SYSTEM_PROMPT: &str = r#"You are "programmer", a coding agent written in Rust, operating in the user's
 terminal. You help with software engineering tasks: writing code, fixing bugs,
@@ -83,6 +95,9 @@ responses rendered in a terminal UI, so keep output compact.
 pub(crate) struct CachedParagraph {
     pub paragraph: Paragraph<'static>,
     pub height: u16,
+    /// The expand/collapse state this entry was built with, so it can be rebuilt
+    /// when the user toggles the item.
+    pub expanded: bool,
 }
 
 #[derive(Debug, Default)]
@@ -100,6 +115,24 @@ pub struct ConversationPanel {
     pub(crate) scroll_view_state: ScrollViewState,
     pub pending_message: Option<String>,
     pub receiving_response: Option<PartialResponse>,
+    /// True while tool calls are executing in the background (between a finished
+    /// response that requested tools and the follow-up request). The turn is
+    /// still active even though no response is streaming.
+    pub tool_running: bool,
+    /// When true the view follows new content at the bottom. Scrolling up turns
+    /// it off; scrolling back to the bottom turns it on again. This replaces
+    /// re-snapping on every chunk, which fought manual scrolling during streaming.
+    pub(crate) stick_to_bottom: bool,
+    /// Indices into `items` that the user has expanded. Foldable items (reasoning,
+    /// tool calls, tool results) render collapsed unless their index is here.
+    pub(crate) expanded_items: HashSet<usize>,
+    /// The screen area the panel last rendered into, and the scroll offset used,
+    /// so a mouse click can be mapped back to the item under the cursor.
+    view_area: Rect,
+    view_offset: u16,
+    /// Per-item vertical extent in scroll-buffer coordinates: `(index, top, bottom)`.
+    /// Recorded each render and consulted on click.
+    item_layout: Vec<(usize, u16, u16)>,
     pub(crate) render_cache: RenderCache,
 }
 
@@ -110,15 +143,73 @@ impl ConversationPanel {
             scroll_view_state: ScrollViewState::new(),
             pending_message: None,
             receiving_response: None,
+            tool_running: false,
+            stick_to_bottom: true,
+            expanded_items: HashSet::new(),
+            view_area: Rect::ZERO,
+            view_offset: 0,
+            item_layout: Vec::new(),
             render_cache: RenderCache::default(),
         }
+    }
+
+    /// Records the layout from the last render so clicks can be mapped to items.
+    pub(crate) fn set_layout(&mut self, area: Rect, offset: u16, layout: Vec<(usize, u16, u16)>) {
+        self.view_area = area;
+        self.view_offset = offset;
+        self.item_layout = layout;
+    }
+
+    /// Handles a left click at the given screen coordinates: if it lands on a
+    /// foldable item, toggle that item's expanded state.
+    pub fn handle_click(&mut self, column: u16, row: u16) {
+        let area = self.view_area;
+        let inside = area.width > 0
+            && area.height > 0
+            && column >= area.x
+            && column < area.x + area.width
+            && row >= area.y
+            && row < area.y + area.height;
+        if !inside {
+            return;
+        }
+
+        let buffer_y = (row - area.y).saturating_add(self.view_offset);
+        let hit = self
+            .item_layout
+            .iter()
+            .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
+            .map(|&(index, _, _)| index);
+
+        if let Some(index) = hit {
+            if self.items.get(index).is_some_and(is_foldable) {
+                if !self.expanded_items.remove(&index) {
+                    self.expanded_items.insert(index);
+                }
+            }
+        }
+    }
+
+    /// Whether a turn is in flight (streaming a response or running tools), in
+    /// which case new user input is queued rather than starting a new request.
+    pub fn is_busy(&self) -> bool {
+        self.receiving_response.is_some() || self.tool_running
+    }
+
+    /// Appends a tool result as a `function_call_output` input item so it is both
+    /// rendered and sent back to the model on the next request.
+    pub fn add_tool_output(&mut self, output: FunctionCallOutputItemParam) {
+        self.items.push(MessageItem::Input(InputItem::Item(
+            Item::FunctionCallOutput(output),
+        )));
     }
 
     pub fn add_input_message(&mut self, input_message_item: ApiMessageItem) {
         self.items.push(MessageItem::Input(InputItem::Item(Item::from(
             input_message_item,
         ))));
-        self.scroll_view_state.scroll_to_bottom();
+        // A new user message should always bring the view back to the bottom.
+        self.stick_to_bottom = true;
     }
 
     pub fn add_error(&mut self, openai_error: OpenAIError) {
@@ -126,6 +217,7 @@ impl ConversationPanel {
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        self.stick_to_bottom = true;
         self.scroll_view_state.scroll_to_bottom();
     }
 
@@ -134,6 +226,8 @@ impl ConversationPanel {
     }
 
     pub fn scroll_up(&mut self) {
+        // Stop following the bottom so incoming content doesn't yank the view back.
+        self.stick_to_bottom = false;
         for _ in 0..SCROLL_LINES {
             self.scroll_view_state.scroll_up();
         }
@@ -143,37 +237,33 @@ impl ConversationPanel {
         for _ in 0..SCROLL_LINES {
             self.scroll_view_state.scroll_down();
         }
+        // Reaching the bottom again re-enables auto-follow.
+        if self.scroll_view_state.is_at_bottom() {
+            self.stick_to_bottom = true;
+        }
     }
 
     pub fn handle_response_stream_event(
         &mut self,
         response_stream_event: ResponseStreamEvent,
     ) -> Option<PartialResponse> {
-        let is_at_bottom = self.is_at_bottom();
-
         let receiving_response = self
             .receiving_response
             .get_or_insert_with(PartialResponse::new);
         receiving_response.handle_response_stream_event(response_stream_event);
-        let finished = receiving_response.finished();
 
-        if is_at_bottom {
-            self.scroll_to_bottom();
-        }
-
-        if finished {
+        if receiving_response.finished() {
             self.receiving_response.take()
-        }
-        else {
+        } else {
             None
         }
-
     }
 
     pub fn get_input_param(&self) -> InputParam {
+        let system_prompt = format!("{SYSTEM_PROMPT}\n\n{}", crate::tools::environment_info());
         let developer_message = InputItem::from(Item::Message(ApiMessageItem::Input(
             InputMessage {
-                content: vec![InputContent::InputText(SYSTEM_PROMPT.into())],
+                content: vec![InputContent::InputText(system_prompt.into())],
                 role: InputRole::Developer,
                 status: Some(OutputStatus::Completed),
             },
@@ -191,5 +281,44 @@ impl ConversationPanel {
         );
 
         InputParam::Items(input_items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget;
+
+    fn user_message(text: &str) -> ApiMessageItem {
+        ApiMessageItem::Input(InputMessage {
+            content: vec![InputContent::InputText(text.into())],
+            role: InputRole::User,
+            status: Some(OutputStatus::Completed),
+        })
+    }
+
+    #[test]
+    fn render_does_not_panic_and_scroll_up_moves_the_view() {
+        let mut panel = ConversationPanel::new();
+        for i in 0..40 {
+            panel.add_input_message(user_message(&format!("message number {i}")));
+        }
+
+        let area = Rect::new(0, 0, 40, 10);
+
+        // Initial render sticks to the bottom.
+        let mut buf = Buffer::empty(area);
+        (&mut panel).render(area, &mut buf);
+        let bottom = panel.scroll_view_state.offset().y;
+        assert!(bottom > 0, "content taller than viewport should scroll");
+
+        // Scrolling up should move the view up and stay there across renders.
+        panel.scroll_up();
+        let mut buf2 = Buffer::empty(area);
+        (&mut panel).render(area, &mut buf2);
+        let after = panel.scroll_view_state.offset().y;
+        assert!(after < bottom, "offset should decrease: {bottom} -> {after}");
+        assert!(!panel.stick_to_bottom, "scrolling up disables auto-follow");
     }
 }

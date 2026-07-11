@@ -1,11 +1,12 @@
 use async_openai::types::responses::Item::Message;
 use async_openai::types::responses::MessageItem::{Input, Output};
 use async_openai::types::responses::{InputContent, InputItem, OutputMessageContent};
-use ratatui::prelude::Color;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
+
+use crate::ui::markdown_theme::palette;
 
 pub struct UserMessage<'a> {
     input_item: &'a InputItem
@@ -38,9 +39,9 @@ impl<'a> UserMessage<'a> {
             _ => "[Unsupported message]\n".to_string()
         };
 
-        let accent = Color::Rgb(0x7a, 0xa2, 0xf7);
-        let text_fg = Color::Rgb(0xd8, 0xd8, 0xd8);
-        let bar_bg = Color::Rgb(0x2a, 0x2f, 0x3a);
+        let accent = palette::BLUE;
+        let text_fg = palette::TEXT;
+        let bar_bg = palette::SURFACE;
 
         let lines: Vec<Line<'static>> = raw
             .lines()

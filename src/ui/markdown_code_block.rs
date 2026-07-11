@@ -5,11 +5,13 @@ use ratatui::text::{Line, Span};
 use ratatui_markdown::highlight::{segments_to_lines, CodeHighlighter, TreeSitterHighlighter};
 use ratatui_markdown::markdown::RenderHooks;
 
+use crate::ui::markdown_theme::palette;
+
 /// Subtle shaded panel behind code blocks (a touch lighter than the terminal
 /// background), so the block reads as distinct without any border characters.
-const CODE_BG: Color = Color::Rgb(0x1f, 0x23, 0x35);
+const CODE_BG: Color = palette::CODE_BG;
 /// Muted foreground for the language label on the top padding row.
-const LABEL_FG: Color = Color::Rgb(0x56, 0x5f, 0x89);
+const LABEL_FG: Color = palette::FAINT;
 /// Left padding inside the block.
 const INDENT: &str = "  ";
 /// Extra columns kept clear on the right so text doesn't touch the edge.
