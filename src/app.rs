@@ -281,7 +281,23 @@ impl App<'_> {
             request.input = input_param;
             request.model = Option::from(model_name);
             request.tools = Some(crate::tools::tools());
-            let stream = client.responses().create_stream(request).await;
+
+            const MAX_RETRIES: u32 = 10;
+            let mut attempt: u32 = 0;
+            let stream = loop {
+                match client.responses().create_stream(request.clone()).await {
+                    Ok(stream) => break Ok(stream),
+                    Err(e) if is_network_error(&e) && attempt < MAX_RETRIES => {
+                        if cancel_token.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        attempt += 1;
+                        let delay = std::time::Duration::from_secs(1 << (attempt - 1));
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
             match stream {
                 Ok(mut response_stream) => {
                     while let Some(response_stream_event) = response_stream.next().await {
@@ -691,6 +707,16 @@ impl App<'_> {
     /// Set running to false to quit the application.
     pub fn quit(&mut self) {
         self.running = false;
+    }
+}
+
+/// Returns `true` when the error is a transport-level network failure
+/// (DNS, connection refused, timeout, TLS error, etc.) — i.e. we never
+/// received an HTTP response from the server.
+fn is_network_error(error: &OpenAIError) -> bool {
+    match error {
+        OpenAIError::Reqwest(e) => e.status().is_none(),
+        _ => false,
     }
 }
 
