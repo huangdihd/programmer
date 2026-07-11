@@ -19,6 +19,8 @@ use async_openai::types::responses::{FunctionCallOutputItemParam, ResponseStream
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -55,8 +57,11 @@ pub enum AppEvent {
     OpenAIErrorReceived(OpenAIError),
     ResponseFinished(PartialResponse),
     /// All tool calls from the last response have run; carries their outputs to
-    /// be fed back to the model.
-    ToolCallsCompleted(Vec<FunctionCallOutputItemParam>),
+    /// be fed back to the model, plus the cancel token so stale completions
+    /// from cancelled requests can be ignored.
+    ToolCallsCompleted(Vec<FunctionCallOutputItemParam>, Arc<AtomicBool>),
+    /// Cancel the current in-flight request (streaming or tool calls).
+    Cancel,
     /// Quit the application.
     Quit,
     Start,

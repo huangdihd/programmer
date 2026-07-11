@@ -289,7 +289,8 @@ impl ConversationPanel {
     ) -> Option<PartialResponse> {
         let receiving_response = self
             .receiving_response
-            .get_or_insert_with(PartialResponse::new);
+            .as_mut()
+            .expect("handle_response_stream_event called with no receiving_response");
         receiving_response.handle_response_stream_event(response_stream_event);
 
         if receiving_response.finished() {
@@ -328,6 +329,8 @@ mod tests {
     use super::*;
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     fn user_message(text: &str) -> ApiMessageItem {
         ApiMessageItem::Input(InputMessage {
@@ -367,7 +370,7 @@ mod tests {
     #[test]
     fn abort_receiving_clears_busy_state() {
         let mut panel = ConversationPanel::new();
-        panel.receiving_response = Some(PartialResponse::new());
+        panel.receiving_response = Some(PartialResponse::new(Arc::new(AtomicBool::new(false))));
         assert!(panel.is_busy(), "receiving a response is busy");
 
         panel.abort_receiving();

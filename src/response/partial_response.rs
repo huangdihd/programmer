@@ -30,6 +30,8 @@ use async_openai::types::responses::{
     Annotation, OutputContent, OutputItem, OutputMessageContent, ReasoningItemContent,
     ReasoningTextContent, Response, ResponseStreamEvent, SummaryPart, SummaryTextContent,
 };
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FinalizeError {
@@ -54,14 +56,17 @@ pub struct PartialResponse {
     /// own `status` field is only populated for finalized items.
     finished_items: Vec<bool>,
     finish_reason: Option<ResponseFinishReason>,
+    /// Set to `true` when the user presses Escape to cancel the current request.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 impl PartialResponse {
-    pub fn new() -> Self {
+    pub fn new(cancelled: Arc<AtomicBool>) -> Self {
         PartialResponse {
             items: vec![],
             finished_items: vec![],
             finish_reason: None,
+            cancelled,
         }
     }
 

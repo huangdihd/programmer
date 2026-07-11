@@ -58,9 +58,7 @@ pub fn environment_info() -> String {
     )
 }
 
-/// Upper bound on the text handed back to the model for a single tool call, so a
-/// huge file or noisy command can't blow up the context window.
-const MAX_OUTPUT_CHARS: usize = 30_000;
+
 
 /// The full set of tool definitions advertised to the model on every request.
 pub fn tools() -> Vec<Tool> {
@@ -89,20 +87,10 @@ pub async fn run_tool_call(call: &FunctionToolCall) -> FunctionCallOutputItemPar
 
     FunctionCallOutputItemParam {
         call_id: call.call_id.clone(),
-        output: FunctionCallOutput::Text(truncate(output)),
+        output: FunctionCallOutput::Text(output),
         id: None,
         status: None,
     }
-}
-
-/// Truncates on a char boundary so we never split a UTF-8 sequence.
-fn truncate(text: String) -> String {
-    if text.chars().count() <= MAX_OUTPUT_CHARS {
-        return text;
-    }
-    let mut out: String = text.chars().take(MAX_OUTPUT_CHARS).collect();
-    out.push_str("\n[output truncated]");
-    out
 }
 
 #[cfg(test)]

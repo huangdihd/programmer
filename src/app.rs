@@ -30,6 +30,8 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Application.
 #[derive(Debug)]
@@ -105,6 +107,10 @@ impl App<'_> {
                 AppEvent::ChunkReceived(chunk) => self.handle_chunk_events(chunk).await,
                 AppEvent::OpenAIErrorReceived(error) => self.handle_error_events(error).await,
                 AppEvent::ResponseFinished(partial_response) => {
+                    if partial_response.cancelled.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    let cancel_token = partial_response.cancelled.clone();
                     let calls = function_calls(&partial_response);
                     if calls.is_empty() {
                         if let Some(pending_request) =
@@ -113,10 +119,13 @@ impl App<'_> {
                             self.start_request(pending_request).await
                         }
                     } else {
-                        self.run_tool_calls(calls);
+                        self.run_tool_calls(calls, cancel_token);
                     }
                 }
-                AppEvent::ToolCallsCompleted(outputs) => {
+                AppEvent::ToolCallsCompleted(outputs, cancel_token) => {
+                    if cancel_token.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     self.conversation_panel.tool_running = false;
                     for output in outputs {
                         self.conversation_panel.add_tool_output(output);
@@ -129,6 +138,13 @@ impl App<'_> {
                     );
                     // Continue the turn: send the tool results back to the model.
                     self.spawn_stream();
+                }
+                AppEvent::Cancel => {
+                    if let Some(partial) = &self.conversation_panel.receiving_response {
+                        partial.cancelled.store(true, Ordering::Relaxed);
+                    }
+                    self.conversation_panel.abort_receiving();
+                    self.conversation_panel.tool_running = false;
                 }
                 AppEvent::Quit => self.quit(),
                 AppEvent::Start => self.send_message().await,
@@ -179,7 +195,9 @@ impl App<'_> {
     /// (including tool definitions). Used both to answer a new user message and
     /// to continue the turn after tool calls have run.
     fn spawn_stream(&mut self) {
-        self.conversation_panel.receiving_response = Some(PartialResponse::new());
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        self.conversation_panel.receiving_response =
+            Some(PartialResponse::new(cancel_token.clone()));
         let client = self.client.clone();
         let sender = self.events.sender.clone();
         let model = self.config.model.clone();
@@ -194,6 +212,9 @@ impl App<'_> {
             match stream {
                 Ok(mut response_stream) => {
                     while let Some(response_stream_event) = response_stream.next().await {
+                        if cancel_token.load(Ordering::Relaxed) {
+                            return;
+                        }
                         match response_stream_event {
                             Ok(response_event) => {
                                 let _ = sender
@@ -207,7 +228,9 @@ impl App<'_> {
                     }
                 }
                 Err(openai_error) => {
-                    let _ = sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
+                    if !cancel_token.load(Ordering::Relaxed) {
+                        let _ = sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
+                    }
                 }
             }
         });
@@ -215,19 +238,29 @@ impl App<'_> {
 
     /// Runs the model's requested tool calls in the background, then reports the
     /// outputs back to the event loop via `ToolCallsCompleted`.
-    fn run_tool_calls(&mut self, calls: Vec<FunctionToolCall>) {
+    fn run_tool_calls(&mut self, calls: Vec<FunctionToolCall>, cancel_token: Arc<AtomicBool>) {
         self.conversation_panel.tool_running = true;
         let sender = self.events.sender.clone();
         tokio::spawn(async move {
             let mut outputs = Vec::with_capacity(calls.len());
             for call in &calls {
+                if cancel_token.load(Ordering::Relaxed) {
+                    break;
+                }
                 outputs.push(crate::tools::run_tool_call(call).await);
             }
-            let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(outputs)));
+            let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
+                outputs,
+                cancel_token,
+            )));
         });
     }
 
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent) {
+        // Ignore chunks from a cancelled stream (receiving_response was cleared).
+        if self.conversation_panel.receiving_response.is_none() {
+            return;
+        }
         let Some(partial_response) = self
             .conversation_panel
             .handle_response_stream_event(response_stream_event)
@@ -246,6 +279,10 @@ impl App<'_> {
     }
 
     pub async fn handle_error_events(&mut self, error: OpenAIError) {
+        // If no request is in flight, ignore (e.g. from a cancelled stream).
+        if !self.conversation_panel.is_busy() {
+            return;
+        }
         // The stream ended in an error, so the turn is over: stop "receiving",
         // record the error, and flush any queued message so we don't get stuck.
         self.conversation_panel.abort_receiving();
@@ -264,6 +301,13 @@ impl App<'_> {
             }
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
+            }
+            KeyCode::Esc => {
+                if self.conversation_panel.is_busy() {
+                    self.events.send(AppEvent::Cancel)
+                } else {
+                    self.input_panel.input(key_event);
+                }
             }
             KeyCode::Enter if key_event.modifiers != KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Start)
