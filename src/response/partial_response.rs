@@ -491,6 +491,22 @@ impl PartialResponse {
         (finish_reason, items.into_iter().flatten().collect())
     }
 
+    /// Consumes `self` and returns only the output items that are safe to keep
+    /// when aborting mid-stream. Incomplete function calls (which lack fully
+    /// formed arguments) are dropped so they aren't sent to the model.
+    pub fn into_aborted_items(self) -> Vec<OutputItem> {
+        self.items
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let finished = self.finished_items.get(i).copied().unwrap_or(false);
+                item.filter(|item| {
+                    !matches!(item, OutputItem::FunctionCall(_)) || finished
+                })
+            })
+            .collect()
+    }
+
     pub fn finished(&self) -> bool {
         self.finish_reason.is_some()
     }

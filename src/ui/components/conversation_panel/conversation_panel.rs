@@ -161,7 +161,16 @@ pub struct ConversationPanel {
     /// Per-item vertical extent in scroll-buffer coordinates: `(index, top, bottom)`.
     /// Recorded each render and consulted on click.
     item_layout: Vec<(usize, u16, u16)>,
+    /// Per-live-item vertical extent: `(live_index, top, bottom)`. Recorded
+    /// alongside `item_layout` so clicks on streaming items can be mapped.
+    live_item_layout: Vec<(usize, u16, u16)>,
     pub(crate) render_cache: RenderCache,
+    /// Monotonic frame counter, incremented every render. Drives the animated
+    /// "Thinking..." dots on the live reasoning indicator during streaming.
+    pub(crate) frame_count: u64,
+    /// Indices into the live (streaming) items that the user has expanded.
+    /// Cleared when a new stream starts.
+    pub(crate) live_expanded_items: HashSet<usize>,
 }
 
 impl ConversationPanel {
@@ -177,19 +186,29 @@ impl ConversationPanel {
             view_area: Rect::ZERO,
             view_offset: 0,
             item_layout: Vec::new(),
+            live_item_layout: Vec::new(),
             render_cache: RenderCache::default(),
+            frame_count: 0,
+            live_expanded_items: HashSet::new(),
         }
     }
 
     /// Records the layout from the last render so clicks can be mapped to items.
-    pub(crate) fn set_layout(&mut self, area: Rect, offset: u16, layout: Vec<(usize, u16, u16)>) {
+    pub(crate) fn set_layout(
+        &mut self,
+        area: Rect,
+        offset: u16,
+        item_layout: Vec<(usize, u16, u16)>,
+        live_item_layout: Vec<(usize, u16, u16)>,
+    ) {
         self.view_area = area;
         self.view_offset = offset;
-        self.item_layout = layout;
+        self.item_layout = item_layout;
+        self.live_item_layout = live_item_layout;
     }
 
     /// Handles a left click at the given screen coordinates: if it lands on a
-    /// foldable item, toggle that item's expanded state.
+    /// foldable item (finished or live), toggle that item's expanded state.
     pub fn handle_click(&mut self, column: u16, row: u16) {
         let area = self.view_area;
         let inside = area.width > 0
@@ -203,13 +222,26 @@ impl ConversationPanel {
         }
 
         let buffer_y = (row - area.y).saturating_add(self.view_offset);
-        let hit = self
+
+        // Live items sit after finished items in the scroll buffer; check them
+        // first so they take priority when layout ranges overlap (they shouldn't,
+        // but this is the safer ordering).
+        if let Some(&(live_idx, _, _)) = self
+            .live_item_layout
+            .iter()
+            .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
+        {
+            if !self.live_expanded_items.remove(&live_idx) {
+                self.live_expanded_items.insert(live_idx);
+            }
+            return;
+        }
+
+        if let Some(&(index, _, _)) = self
             .item_layout
             .iter()
             .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
-            .map(|&(index, _, _)| index);
-
-        if let Some(index) = hit {
+        {
             if self.items.get(index).is_some_and(is_foldable) {
                 if !self.expanded_items.remove(&index) {
                     self.expanded_items.insert(index);
@@ -251,8 +283,19 @@ impl ConversationPanel {
     /// longer considered busy.
     pub fn abort_receiving(&mut self) {
         if let Some(partial) = self.receiving_response.take() {
-            self.items
-                .extend(partial.items.into_iter().flatten().map(MessageItem::Output));
+            // Transfer live expanded state before items become historical,
+            // so reasoning/tool-call items the user expanded during streaming
+            // stay expanded instead of auto-collapsing.
+            let base_index = self.items.len();
+            for &live_idx in &self.live_expanded_items {
+                self.expanded_items.insert(base_index + live_idx);
+            }
+            self.items.extend(
+                partial
+                    .into_aborted_items()
+                    .into_iter()
+                    .map(MessageItem::Output),
+            );
         }
     }
 

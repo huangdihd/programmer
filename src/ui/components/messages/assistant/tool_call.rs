@@ -51,19 +51,21 @@ impl<'a> ToolCallMessage<'a> {
 
         if !self.expanded {
             // Collapsed: a single line — the tool name plus a one-line summary.
-            let mut spans = vec![Span::styled(format!("🔧 {}", self.call.name), accent)];
+            let mut spans = vec![
+                Span::styled("▸ ", muted),
+                Span::styled(format!("🔧 {}", self.call.name), accent),
+            ];
             let summary = one_line_summary(value.as_ref(), &self.call.arguments);
             if !summary.is_empty() {
                 spans.push(Span::styled(format!("  {summary}"), muted));
             }
-            spans.push(Span::styled(" ▸".to_string(), muted));
             return Text::from(Line::from(spans));
         }
 
         // Expanded: header plus every argument in full.
         let mut lines = vec![Line::from(vec![
+            Span::styled("▾ ", muted),
             Span::styled(format!("🔧 {}", self.call.name), accent),
-            Span::styled(" ▾".to_string(), detail_style()),
         ])];
 
         match &value {

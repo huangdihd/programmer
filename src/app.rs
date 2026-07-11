@@ -196,6 +196,7 @@ impl App<'_> {
     /// to continue the turn after tool calls have run.
     fn spawn_stream(&mut self) {
         let cancel_token = Arc::new(AtomicBool::new(false));
+        self.conversation_panel.live_expanded_items.clear();
         self.conversation_panel.receiving_response =
             Some(PartialResponse::new(cancel_token.clone()));
         let client = self.client.clone();
@@ -267,6 +268,15 @@ impl App<'_> {
         else {
             return;
         };
+        // Transfer live expanded state before items become historical,
+        // so reasoning/tool-call items the user expanded during streaming
+        // stay expanded instead of auto-collapsing.
+        let base_index = self.conversation_panel.items.len();
+        for &live_idx in &self.conversation_panel.live_expanded_items {
+            self.conversation_panel
+                .expanded_items
+                .insert(base_index + live_idx);
+        }
         self.conversation_panel.items.extend(
             partial_response
                 .items

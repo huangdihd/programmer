@@ -54,6 +54,7 @@ fn build_item_paragraph(
 
 impl Widget for &mut ConversationPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        self.frame_count = self.frame_count.wrapping_add(1);
         let content_width = area.width.saturating_sub(1);
         let stick_to_bottom = self.stick_to_bottom;
         let welcome_message = WelcomeMessage::default();
@@ -97,7 +98,7 @@ impl Widget for &mut ConversationPanel {
         }
 
         // The streaming response is the only content that changes between frames,
-        // so it is the only thing re-rendered here. Live items render collapsed.
+        // so it is the only thing re-rendered here.
         let receiving_items = self
             .receiving_response
             .as_ref()
@@ -105,9 +106,12 @@ impl Widget for &mut ConversationPanel {
             .unwrap_or_default();
         let live: Vec<(Paragraph<'static>, u16)> = receiving_items
             .iter()
-            .map(|(output_item, in_progress)| {
+            .enumerate()
+            .map(|(i, (output_item, in_progress))| {
                 let paragraph = AssistantMessage::new(output_item, content_width)
                     .in_progress(*in_progress)
+                    .expanded(self.live_expanded_items.contains(&i))
+                    .frame_count(self.frame_count)
                     .into_paragraph();
                 let height = paragraph.line_count(content_width) as u16;
                 (paragraph, height)
@@ -172,7 +176,9 @@ impl Widget for &mut ConversationPanel {
             }
             y = y.saturating_add(entry.height);
         }
-        for (paragraph, height) in &live {
+        let mut live_layout: Vec<(usize, u16, u16)> = Vec::with_capacity(live.len());
+        for (i, (paragraph, height)) in live.iter().enumerate() {
+            live_layout.push((i, y, y.saturating_add(*height)));
             if visible(y, *height) {
                 scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
             }
@@ -188,6 +194,6 @@ impl Widget for &mut ConversationPanel {
         // The scroll view has now clamped the offset to its real value; store it
         // and the layout for click hit-testing on the next event.
         let offset = self.scroll_view_state.offset().y;
-        self.set_layout(area, offset, layout);
+        self.set_layout(area, offset, layout, live_layout);
     }
 }

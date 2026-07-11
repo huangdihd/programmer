@@ -41,6 +41,8 @@ pub struct AssistantMessage<'a> {
     in_progress: bool,
     /// Whether the user has expanded this item to see its full detail.
     expanded: bool,
+    /// Monotonic frame counter for animating the "Thinking..." dots.
+    frame_count: Option<u64>,
 }
 
 impl<'a> AssistantMessage<'a> {
@@ -50,6 +52,7 @@ impl<'a> AssistantMessage<'a> {
             width,
             in_progress: false,
             expanded: false,
+            frame_count: None,
         }
     }
 
@@ -63,11 +66,17 @@ impl<'a> AssistantMessage<'a> {
         self
     }
 
+    pub fn frame_count(mut self, frame_count: u64) -> Self {
+        self.frame_count = Some(frame_count);
+        self
+    }
+
     pub fn into_paragraph(self) -> Paragraph<'static> {
         let text = match self.output_item {
             OutputItem::Message(message) => TextMessage::new(message, self.width).into_text(),
-            OutputItem::Reasoning(item) => ReasoningMessage::new(self.in_progress, item)
+            OutputItem::Reasoning(item) => ReasoningMessage::new(self.in_progress, item, self.width)
                 .expanded(self.expanded)
+                .frame_count(self.frame_count)
                 .into_text(),
             OutputItem::FunctionCall(call) => ToolCallMessage::new(call)
                 .expanded(self.expanded)

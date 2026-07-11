@@ -62,8 +62,8 @@ impl<'a> ToolResultMessage<'a> {
         if !self.expanded {
             // Collapsed: a single (unwrapped) line — the first line of output.
             let first = all.first().copied().unwrap_or("[no output]");
-            let caret = if multiline { " ▸" } else { "" };
-            let line = Line::from(Span::styled(format!("⎿ {first}{caret}"), muted));
+            let caret = if multiline { "▸ " } else { "" };
+            let line = Line::from(Span::styled(format!("{caret}⎿ {first}"), muted));
             return Paragraph::new(Text::from(line)).block(block);
         }
 
@@ -72,12 +72,15 @@ impl<'a> ToolResultMessage<'a> {
             .iter()
             .enumerate()
             .map(|(index, line)| {
-                let prefix = if index == 0 { "⎿ " } else { "  " };
-                let suffix = if index == 0 && multiline { " ▾" } else { "" };
-                Line::from(Span::styled(
-                    format!("{prefix}{line}{suffix}"),
-                    detail_style(),
-                ))
+                if index == 0 {
+                    let caret = if multiline { "▾ " } else { "" };
+                    Line::from(Span::styled(
+                        format!("{caret}⎿ {line}"),
+                        detail_style(),
+                    ))
+                } else {
+                    Line::from(Span::styled(format!("  {line}"), detail_style()))
+                }
             })
             .collect();
         if lines.is_empty() {
