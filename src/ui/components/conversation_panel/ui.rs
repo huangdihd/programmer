@@ -9,6 +9,7 @@ use tui_scrollview::ScrollView;
 use crate::response::message_item::MessageItem;
 use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
+use crate::ui::components::messages::error_message::ErrorMessage;
 
 /// Builds the paragraph for a finished history item. Called at most once per
 /// item (the result is cached in [`ConversationPanel::render_cache`]).
@@ -18,7 +19,8 @@ fn build_item_paragraph(item: &MessageItem, content_width: u16) -> Paragraph<'st
         MessageItem::Output(output_item) => {
             AssistantMessage::new(output_item, content_width).into_paragraph()
         }
-        _ => Paragraph::new("Error"),
+        MessageItem::OpenAIError(error) => ErrorMessage::new(error.to_string()).into_paragraph(),
+        MessageItem::Error(message) => ErrorMessage::new(message.clone()).into_paragraph(),
     }
 }
 
