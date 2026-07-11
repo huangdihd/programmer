@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 
 const ACCENT: Color = Color::LightBlue;
-const DIM: Color = Color::DarkGray;
+const DIM: Color = Color::Gray;
 const TEXT: Color = Color::White;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -94,6 +94,11 @@ impl WelcomeMessage {
             Line::from(""),
             Line::from(Span::styled(
                 "A coding agent written in rust",
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "© 2025 huangdihd  |  GPL-3.0-or-later  |  No warranty",
                 Style::default().fg(DIM),
             )),
         ]

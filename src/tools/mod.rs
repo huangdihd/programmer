@@ -40,16 +40,21 @@ pub fn environment_info() -> String {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let (program, _) = shell();
+    let locale = std::env::var("LANG")
+        .or_else(|_| std::env::var("LC_ALL"))
+        .unwrap_or_else(|_| "unknown".to_string());
 
     format!(
         "# Environment info\n\
          - Operating system: {os} ({arch})\n\
          - Shell for the `command` tool: {shell}\n\
-         - Working directory: {cwd}",
+         - Working directory: {cwd}\n\
+         - System language / locale: {locale}",
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         shell = program,
         cwd = cwd,
+        locale = locale,
     )
 }
 

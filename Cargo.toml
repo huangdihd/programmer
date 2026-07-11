@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "A coding agent written in rust"
 authors = ["huangdihd <hd20100104@163.com>"]
 license = "GPL-3.0-or-later"
+repository = "https://github.com/huangdihd/programmer"
+readme = "README.md"
 edition = "2024"
 
 [dependencies]
