@@ -13,10 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-pub mod completion_popup;
-pub mod conversation_panel;
-pub mod footer;
-pub mod input_panel;
-pub mod logo;
-pub mod messages;
-pub mod status_bar;
+pub mod ui;
+
+/// The completion popup widget.
+pub struct CompletionPopup<'a> {
+    /// Display strings for each candidate.
+    pub candidates: &'a [String],
+    /// Currently selected index.
+    pub selected: usize,
+    /// Scroll offset (items scrolled off the top).
+    pub scroll_offset: usize,
+}

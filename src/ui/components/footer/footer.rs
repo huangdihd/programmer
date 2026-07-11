@@ -15,21 +15,33 @@
 
 use crate::ui::components::status_bar::status_bar::StatusBar;
 
-/// Bottom bar: status indicator on the left, copyright on the right.
+/// Bottom bar: status indicator on the left, model name in the middle, copyright on the right.
 #[derive(Debug)]
 pub struct Footer {
     pub status: StatusBar,
+    pub current_model: String,
 }
 
 impl Footer {
     pub fn new() -> Self {
         Self {
             status: StatusBar::new(),
+            current_model: String::new(),
         }
     }
 
-    pub fn update(&mut self, is_receiving: bool, is_outputting_message: bool, is_creating_tool_call: bool, is_tool_running: bool) {
-        self.status
-            .update(is_receiving, is_outputting_message, is_creating_tool_call, is_tool_running);
+    pub fn update(
+        &mut self,
+        is_receiving: bool,
+        is_outputting_message: bool,
+        is_creating_tool_call: bool,
+        is_tool_running: bool,
+    ) {
+        self.status.update(
+            is_receiving,
+            is_outputting_message,
+            is_creating_tool_call,
+            is_tool_running,
+        );
     }
 }

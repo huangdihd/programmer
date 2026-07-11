@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "programmer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -1963,6 +1963,7 @@ dependencies = [
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tui-scrollview",
+ "unicode-width",
 ]
 
 [[package]]

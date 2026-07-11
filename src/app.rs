@@ -13,10 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::commands::{Command, CompletionEngine};
 use crate::config::programmer_config::ProgrammerConfig;
+use crate::providers::ProviderManager;
 use crate::response::message_item;
 use crate::response::partial_response::PartialResponse;
-use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
+use crate::ui::components::conversation_panel::conversation_panel::{
+    ConversationPanel, SelectionEnd,
+};
 use crate::ui::components::footer::footer::Footer;
 use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
@@ -25,39 +29,54 @@ use async_openai::types::responses::{
     CreateResponse, FunctionToolCall, InputContent, InputMessage, InputRole, InputTextContent,
     MessageItem, OutputItem, OutputStatus, ResponseStreamEvent,
 };
-use async_openai::{Client, config::OpenAIConfig};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Application.
-#[derive(Debug)]
 pub struct App<'a> {
     /// Is the application running?
     pub running: bool,
-    /// OpenAI client.
-    pub client: Client<OpenAIConfig>,
+    /// Multi-provider manager (replaces the single OpenAI client).
+    pub provider_manager: ProviderManager,
+    /// Currently active model in `provider/model` format.
+    pub current_model: String,
     /// Event handler.
     pub events: EventHandler,
+    /// Application configuration.
     pub config: ProgrammerConfig,
     pub input_panel: InputPanel<'a>,
     pub conversation_panel: ConversationPanel,
     pub footer: Footer,
 }
 
+impl std::fmt::Debug for App<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("App")
+            .field("running", &self.running)
+            .field("provider_manager", &self.provider_manager)
+            .field("current_model", &self.current_model)
+            .field("config", &self.config)
+            .field("input_panel", &self.input_panel)
+            .field("conversation_panel", &self.conversation_panel)
+            .field("footer", &self.footer)
+            .finish()
+    }
+}
+
 impl App<'_> {
     /// Constructs a new instance of [`App`].
     pub async fn new(config: ProgrammerConfig) -> Self {
-        let openai_config = OpenAIConfig::default()
-            .with_api_base(&config.base_url)
-            .with_api_key(&config.api_key);
+        let provider_manager = ProviderManager::new(&config).await;
+        let current_model = provider_manager.default_model();
         Self {
             running: true,
-            client: Client::with_config(openai_config),
+            provider_manager,
+            current_model,
             events: EventHandler::new(),
             config,
             input_panel: InputPanel::new(),
@@ -96,12 +115,31 @@ impl App<'_> {
                 {
                     self.handle_key_events(key_event)?
                 }
+                crossterm::event::Event::Paste(data) => self.handle_paste(data),
                 crossterm::event::Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollDown => self.conversation_panel.scroll_down(),
                     MouseEventKind::ScrollUp => self.conversation_panel.scroll_up(),
                     MouseEventKind::Down(MouseButton::Left) => self
                         .conversation_panel
-                        .handle_click(mouse.column, mouse.row),
+                        .selection_begin(mouse.column, mouse.row),
+                    MouseEventKind::Drag(MouseButton::Left) => self
+                        .conversation_panel
+                        .selection_drag(mouse.column, mouse.row),
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        match self.conversation_panel.selection_end(mouse.column, mouse.row) {
+                            SelectionEnd::Click => self
+                                .conversation_panel
+                                .handle_click(mouse.column, mouse.row),
+                            SelectionEnd::Copied(text) => {
+                                if !crate::clipboard::copy(&text) {
+                                    self.conversation_panel.add_error_string(
+                                        "failed to copy selection to clipboard",
+                                    );
+                                }
+                            }
+                            SelectionEnd::Ignored => {}
+                        }
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -163,11 +201,25 @@ impl App<'_> {
         Ok(())
     }
 
+    /// Handles text pasted into the terminal (bracketed paste). Small
+    /// single-line pastes go straight into the input; larger ones are collapsed
+    /// into a placeholder that expands back to the full text on send.
+    fn handle_paste(&mut self, data: String) {
+        let data = data.replace("\r\n", "\n").replace('\r', "\n");
+        if !data.contains('\n') && data.chars().count() <= 200 {
+            self.input_panel.insert_str(&data);
+        } else {
+            self.input_panel.add_paste(data);
+        }
+        self.update_completions();
+    }
+
     async fn send_message(&mut self) {
-        let text = self.input_panel.get_content();
+        let text = self.input_panel.expanded_content();
         if text.is_empty() {
             return;
         }
+        self.input_panel.push_history(text.clone());
         self.input_panel.clear();
         self.start_request(text).await;
     }
@@ -211,15 +263,23 @@ impl App<'_> {
         self.conversation_panel.outputting_message = false;
         self.conversation_panel.receiving_response =
             Some(PartialResponse::new(cancel_token.clone()));
-        let client = self.client.clone();
+        let (client, model_name) = match self.provider_manager.resolve(&self.current_model) {
+            Some((c, m)) => (c.clone(), m),
+            None => {
+                // Provider not found — report error and stop.
+                self.conversation_panel.abort_receiving();
+                self.conversation_panel
+                    .add_error_string(format!("unknown provider/model: {}", self.current_model));
+                return;
+            }
+        };
         let sender = self.events.sender.clone();
-        let model = self.config.model.clone();
-        let input_param = self.conversation_panel.get_input_param();
+        let input_param = self.conversation_panel.get_input_param(&self.current_model);
         tokio::spawn(async move {
             let mut request = CreateResponse::default();
             request.stream = Option::from(true);
             request.input = input_param;
-            request.model = Option::from(model);
+            request.model = Option::from(model_name);
             request.tools = Some(crate::tools::tools());
             let stream = client.responses().create_stream(request).await;
             match stream {
@@ -242,7 +302,8 @@ impl App<'_> {
                 }
                 Err(openai_error) => {
                     if !cancel_token.load(Ordering::Relaxed) {
-                        let _ = sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
+                        let _ =
+                            sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
                     }
                 }
             }
@@ -333,8 +394,116 @@ impl App<'_> {
         }
     }
 
+    /// Enter combined with any of these modifiers inserts a newline instead of sending.
+    fn is_newline_modifier(modifiers: KeyModifiers) -> bool {
+        modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+    }
+
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        // ---- completion-popup navigation (takes priority over text input) ----
+        if self
+            .input_panel
+            .completion
+            .as_ref()
+            .map_or(false, |c| c.visible)
+        {
+            match key_event.code {
+                KeyCode::Tab => {
+                    // Accept the highlighted candidate into the input; if it is
+                    // already accepted, cycle to the next candidate.
+                    let content = self.input_panel.get_content();
+                    if let Some(c) = self.input_panel.completion.as_mut() {
+                        if content == c.line(c.selected) {
+                            if c.candidates.len() == 1 {
+                                // Only candidate already accepted — done with the popup.
+                                self.input_panel.completion = None;
+                                return Ok(());
+                            }
+                            c.selected = (c.selected + 1) % c.candidates.len();
+                        }
+                        // Keep the selection inside the visible window.
+                        let visible = 10usize;
+                        if c.selected < c.scroll_offset {
+                            c.scroll_offset = c.selected;
+                        } else if c.selected >= c.scroll_offset + visible {
+                            c.scroll_offset = c.selected - visible + 1;
+                        }
+                        let text = c.line(c.selected);
+                        self.input_panel.set_content(&text);
+                    }
+                    return Ok(());
+                }
+                KeyCode::Up => {
+                    if let Some(ref mut c) = self.input_panel.completion {
+                        if c.selected > 0 {
+                            c.selected -= 1;
+                        } else {
+                            // Wrap to last item; scroll so it's visible at the bottom.
+                            c.selected = c.candidates.len().saturating_sub(1);
+                            let visible = 10usize;
+                            if c.selected >= visible {
+                                c.scroll_offset = c.selected - visible + 1;
+                            }
+                        }
+                        // Only scroll up when selected moves above the visible window.
+                        if c.selected < c.scroll_offset {
+                            c.scroll_offset = c.selected;
+                        }
+                        let text = c.line(c.selected);
+                        self.input_panel.set_content(&text);
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if let Some(ref mut c) = self.input_panel.completion {
+                        if c.selected + 1 < c.candidates.len() {
+                            c.selected += 1;
+                        } else {
+                            // Wrap to first item; reset scroll to top.
+                            c.selected = 0;
+                            c.scroll_offset = 0;
+                        }
+                        let visible = 10usize;
+                        if c.selected >= c.scroll_offset + visible {
+                            c.scroll_offset = c.selected - visible + 1;
+                        }
+                        let text = c.line(c.selected);
+                        self.input_panel.set_content(&text);
+                    }
+                    return Ok(());
+                }
+                KeyCode::Esc => {
+                    self.input_panel.completion = None;
+                    return Ok(());
+                }
+                KeyCode::Enter if Self::is_newline_modifier(key_event.modifiers) => {
+                    // Ctrl/Alt/Shift+Enter: insert newline, keep completions updated.
+                    self.input_panel.insert_newline();
+                    self.update_completions();
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    // Execute what's in the input as-is (navigation already wrote
+                    // the highlighted candidate into it), closing the popup.
+                    self.input_panel.completion = None;
+                    let text = self.input_panel.get_content();
+                    if text.starts_with('/') {
+                        self.execute_command(&text);
+                    } else {
+                        self.events.send(AppEvent::Start);
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    // Any other key: pass through to text area, then refresh completions.
+                    self.input_panel.input(key_event);
+                    self.update_completions();
+                    return Ok(());
+                }
+            }
+        }
+
         match key_event.code {
             KeyCode::Char('q' | 'Q') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
@@ -342,27 +511,77 @@ impl App<'_> {
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
             }
+            KeyCode::Tab => {
+                // Popup not visible: compute completions. A single candidate is
+                // filled in directly; multiple candidates (re)open the popup
+                // without touching the typed text.
+                let content = self.input_panel.get_content();
+                if content.starts_with('/') {
+                    self.input_panel.completion =
+                        CompletionEngine::complete(&content, &self.provider_manager);
+                    if let Some(ref c) = self.input_panel.completion {
+                        if c.candidates.len() == 1 {
+                            let text = c.line(0);
+                            self.input_panel.set_content(&text);
+                            self.input_panel.completion = None;
+                        }
+                    }
+                }
+            }
             KeyCode::Esc => {
-                if self.conversation_panel.is_busy() {
+                if self.input_panel.completion.is_some() {
+                    self.input_panel.completion = None;
+                } else if self.conversation_panel.is_busy() {
                     self.events.send(AppEvent::Cancel)
                 } else {
                     self.input_panel.input(key_event);
                 }
             }
-            KeyCode::Up => {
-                if self.input_panel.get_content().is_empty() {
-                    if let Some(pending) = self.conversation_panel.pending_message.take() {
-                        self.input_panel.set_content(&pending);
-                    }
+            KeyCode::Down => {
+                // Only navigate history from the last line; otherwise move the
+                // cursor down within multi-line text.
+                if self.input_panel.cursor_on_last_line() && self.input_panel.is_navigating_history()
+                {
+                    self.input_panel.history_down();
                 } else {
                     self.input_panel.input(key_event);
                 }
             }
-            KeyCode::Enter if key_event.modifiers != KeyModifiers::CONTROL => {
-                self.events.send(AppEvent::Start)
+            KeyCode::Up => {
+                if !self.input_panel.cursor_on_first_line() {
+                    // Move the cursor up within multi-line text.
+                    self.input_panel.input(key_event);
+                } else if self.input_panel.get_content().is_empty() {
+                    // Empty input: restore the pending message if there is one,
+                    // otherwise start navigating history.
+                    if let Some(pending) = self.conversation_panel.pending_message.take() {
+                        self.input_panel.set_content(&pending);
+                    } else {
+                        self.input_panel.history_up();
+                    }
+                } else if self.input_panel.is_navigating_history() {
+                    // Already navigating: keep going to older entries.
+                    self.input_panel.history_up();
+                } else {
+                    self.input_panel.input(key_event);
+                }
+            }
+            KeyCode::Enter if Self::is_newline_modifier(key_event.modifiers) => {
+                // Ctrl/Alt/Shift+Enter: insert newline into the text area.
+                self.input_panel.insert_newline();
+                self.update_completions();
+            }
+            KeyCode::Enter => {
+                let text = self.input_panel.get_content();
+                if text.starts_with('/') {
+                    self.execute_command(&text);
+                } else {
+                    self.events.send(AppEvent::Start);
+                }
             }
             _ => {
                 self.input_panel.input(key_event);
+                self.update_completions();
             }
         }
         Ok(())
@@ -373,6 +592,101 @@ impl App<'_> {
     /// The tick event is where you can update the state of your application with any logic that
     /// needs to be updated at a fixed frame rate. E.g. polling a server, updating an animation.
     pub fn tick(&self) {}
+
+    // ------------------------------------------------------------------
+    // Slash-command support
+    // ------------------------------------------------------------------
+
+    /// Recompute tab-completion candidates from the current input text.
+    fn update_completions(&mut self) {
+        let content = self.input_panel.get_content();
+        if content.starts_with('/') {
+            self.input_panel.completion =
+                CompletionEngine::complete(&content, &self.provider_manager);
+            // Always show popup when we have completions.
+            if let Some(ref mut c) = self.input_panel.completion {
+                c.visible = true;
+            }
+        } else {
+            self.input_panel.completion = None;
+        }
+    }
+
+    /// Parse and execute a slash command. If the command is unknown, fall back
+    /// to sending it to the AI model.
+    fn execute_command(&mut self, input: &str) {
+        let command = Command::parse(input);
+        self.input_panel.completion = None;
+        let is_known = command.is_some();
+
+        match command {
+            Some(Command::Quit) => {
+                self.input_panel.clear();
+                self.quit();
+            }
+            Some(Command::Clear) => {
+                self.input_panel.clear();
+                self.conversation_panel.clear_messages();
+            }
+            Some(Command::Model(model)) => {
+                self.input_panel.clear();
+                let model = model.trim().to_string();
+                if model.is_empty() {
+                    self.conversation_panel.add_info_string(
+                        "usage: /model <provider/model> — e.g. /model openai/gpt-4o",
+                    );
+                    return;
+                }
+                match self.provider_manager.resolve(&model) {
+                    Some(_) => {
+                        self.current_model = model;
+                        self.conversation_panel
+                            .add_info_string(format!("switched to model: {}", self.current_model));
+                    }
+                    None => {
+                        self.conversation_panel.add_error_string(format!(
+                            "unknown provider/model: {model} — use /providers to list available",
+                        ));
+                    }
+                }
+            }
+            Some(Command::Providers) => {
+                self.input_panel.clear();
+                let mut lines = vec!["Configured providers:".to_string()];
+                for name in self.provider_manager.provider_names() {
+                    let models = self
+                        .provider_manager
+                        .models_for(name)
+                        .iter()
+                        .map(|m| format!("    {name}/{m}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    lines.push(format!("  {name}:"));
+                    lines.push(models);
+                }
+                self.conversation_panel.add_info_string(lines.join("\n"));
+            }
+            Some(Command::Help) => {
+                self.input_panel.clear();
+                let mut lines: Vec<String> = Command::descriptions()
+                    .iter()
+                    .map(|(cmd, desc)| format!("  {cmd:35} {desc}"))
+                    .collect();
+                lines.insert(0, "Available commands:".to_string());
+                self.conversation_panel.add_info_string(lines.join("\n"));
+            }
+            None => {
+                // Unknown slash-command; send it to the AI as a normal message.
+                // Don't clear — let send_message handle it (which also pushes history).
+                self.events.send(AppEvent::Start);
+            }
+        }
+
+        // Push known commands to history (unknown commands go through send_message).
+        if is_known {
+            self.input_panel.push_history(input.to_string());
+        }
+    }
 
     /// Set running to false to quit the application.
     pub fn quit(&mut self) {

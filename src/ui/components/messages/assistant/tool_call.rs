@@ -13,18 +13,23 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use async_openai::types::responses::FunctionToolCall;
+use async_openai::types::responses::{
+    FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
+};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
 use crate::ui::components::messages::assistant::detail_style;
 use crate::ui::markdown_theme::palette;
 
-/// Renders a tool call the model made. Collapsed it is a single line
-/// (`⚡ command  <summary> ▸`); expanded it shows each argument in full. A caret
-/// hints that the line can be clicked to toggle.
+/// Renders a tool call the model made, together with its result once it has
+/// one. Collapsed it is the tool name plus a one-line summary, with the first
+/// line of the result below (`⎿ …`); expanded it shows each argument and the
+/// full result. A caret hints that the block can be clicked to toggle.
 pub struct ToolCallMessage<'a> {
     call: &'a FunctionToolCall,
+    /// The matching `function_call_output`, once the tool has finished.
+    output: Option<&'a FunctionCallOutputItemParam>,
     expanded: bool,
 }
 
@@ -32,8 +37,14 @@ impl<'a> ToolCallMessage<'a> {
     pub fn new(call: &'a FunctionToolCall) -> Self {
         Self {
             call,
+            output: None,
             expanded: false,
         }
+    }
+
+    pub fn output(mut self, output: Option<&'a FunctionCallOutputItemParam>) -> Self {
+        self.output = output;
+        self
     }
 
     pub fn expanded(mut self, expanded: bool) -> Self {
@@ -48,9 +59,14 @@ impl<'a> ToolCallMessage<'a> {
         let muted = Style::new().fg(palette::MUTED);
 
         let value = serde_json::from_str::<serde_json::Value>(&self.call.arguments).ok();
+        let result_text = self.output.map(|output| match &output.output {
+            FunctionCallOutput::Text(text) => text.clone(),
+            FunctionCallOutput::Content(_) => "[non-text output]".to_string(),
+        });
 
         if !self.expanded {
-            // Collapsed: a single line — the tool name plus a one-line summary.
+            // Collapsed: the tool name plus a one-line summary, then the first
+            // line of the result.
             let mut spans = vec![
                 Span::styled("▸ ", muted),
                 Span::styled(format!("🔧 {}", self.call.name), accent),
@@ -58,15 +74,23 @@ impl<'a> ToolCallMessage<'a> {
             let (summary, multiline) = one_line_summary(value.as_ref(), &self.call.arguments);
             if !summary.is_empty() {
                 let suffix = if multiline { "..." } else { "" };
-                spans.push(Span::styled(
-                    format!("  {summary}{suffix}"),
-                    muted,
-                ));
+                spans.push(Span::styled(format!("  {summary}{suffix}"), muted));
             }
-            return Text::from(Line::from(spans));
+            let mut lines = vec![Line::from(spans)];
+            if let Some(text) = &result_text {
+                let dim = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
+                let mut result_lines = text.lines();
+                let first = result_lines.next().unwrap_or("[no output]");
+                let suffix = if result_lines.next().is_some() { "..." } else { "" };
+                lines.push(Line::from(Span::styled(
+                    format!("  ⎿ {first}{suffix}"),
+                    dim,
+                )));
+            }
+            return Text::from(lines);
         }
 
-        // Expanded: header plus every argument in full.
+        // Expanded: header plus every argument and the full result.
         let mut lines = vec![Line::from(vec![
             Span::styled("▾ ", muted),
             Span::styled(format!("🔧 {}", self.call.name), accent),
@@ -86,6 +110,21 @@ impl<'a> ToolCallMessage<'a> {
                         detail_style(),
                     )));
                 }
+            }
+        }
+
+        if let Some(text) = &result_text {
+            let mut first = true;
+            for line in text.lines() {
+                let prefix = if first { "  ⎿ " } else { "    " };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{line}"),
+                    detail_style(),
+                )));
+                first = false;
+            }
+            if first {
+                lines.push(Line::from(Span::styled("  ⎿ [no output]", detail_style())));
             }
         }
 

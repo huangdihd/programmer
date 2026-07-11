@@ -22,4 +22,5 @@ pub enum MessageItem {
     Output(OutputItem),
     OpenAIError(OpenAIError),
     Error(String),
+    Info(String),
 }

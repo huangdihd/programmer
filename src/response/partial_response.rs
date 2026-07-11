@@ -30,8 +30,8 @@ use async_openai::types::responses::{
     Annotation, OutputContent, OutputItem, OutputMessageContent, ReasoningItemContent,
     ReasoningTextContent, Response, ResponseStreamEvent, SummaryPart, SummaryTextContent,
 };
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FinalizeError {
@@ -500,9 +500,7 @@ impl PartialResponse {
             .enumerate()
             .filter_map(|(i, item)| {
                 let finished = self.finished_items.get(i).copied().unwrap_or(false);
-                item.filter(|item| {
-                    !matches!(item, OutputItem::FunctionCall(_)) || finished
-                })
+                item.filter(|item| !matches!(item, OutputItem::FunctionCall(_)) || finished)
             })
             .collect()
     }

@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -21,6 +21,23 @@ use ratatui_markdown::highlight::{CodeHighlighter, TreeSitterHighlighter, segmen
 use ratatui_markdown::markdown::RenderHooks;
 
 use crate::ui::markdown_theme::palette;
+
+/// The clickable copy label on a code block's top row.
+pub const COPY_LABEL: &str = "⧉ copy";
+
+/// A clickable "copy this code block" hotspot, positioned relative to the top
+/// left of the rendered message paragraph.
+#[derive(Debug, Clone)]
+pub struct CodeCopyButton {
+    /// Row within the paragraph.
+    pub row: u16,
+    /// Inclusive start column within the paragraph.
+    pub x_start: u16,
+    /// Exclusive end column.
+    pub x_end: u16,
+    /// The code block's raw content.
+    pub content: String,
+}
 
 /// Subtle shaded panel behind code blocks (a touch lighter than the terminal
 /// background), so the block reads as distinct without any border characters.
@@ -44,11 +61,50 @@ fn highlighter() -> Arc<dyn CodeHighlighter> {
 /// instead of the library default (a left `│` gutter with corner brackets).
 pub struct CodeBlockHooks {
     width: usize,
+    /// Raw content of every rendered code block, in render order. Shared with
+    /// the caller so copy buttons can be wired up after rendering.
+    codes: Arc<Mutex<Vec<String>>>,
 }
 
 impl CodeBlockHooks {
     pub fn new(width: usize) -> Self {
-        Self { width }
+        Self {
+            width,
+            codes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Handle to the collected code block contents.
+    pub fn codes(&self) -> Arc<Mutex<Vec<String>>> {
+        self.codes.clone()
+    }
+
+    /// The block's top padding row: a dim language label on the left and the
+    /// clickable copy label on the right.
+    fn label_line(&self, lang: &str) -> Line<'static> {
+        let base = Style::default().bg(CODE_BG);
+        let label_style = Style::default().fg(LABEL_FG).bg(CODE_BG);
+
+        let mut spans = vec![Span::styled(INDENT, base)];
+        if !lang.is_empty() {
+            spans.push(Span::styled(lang.to_string(), label_style));
+        }
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+
+        let button = Span::styled(COPY_LABEL, label_style);
+        let button_width = button.width();
+        if self.width > used + button_width + RIGHT_PAD {
+            spans.push(Span::styled(
+                " ".repeat(self.width - used - button_width - RIGHT_PAD),
+                base,
+            ));
+            spans.push(button);
+            spans.push(Span::styled(" ".repeat(RIGHT_PAD), base));
+        } else if used < self.width {
+            // Too narrow for the button; just pad the row out.
+            spans.push(Span::styled(" ".repeat(self.width - used), base));
+        }
+        Line::from(spans)
     }
 
     /// A full-width row filled with the panel background.
@@ -81,6 +137,10 @@ impl CodeBlockHooks {
 
 impl RenderHooks for CodeBlockHooks {
     fn render_code_block(&self, lang: &str, content: &str) -> Option<Vec<Line<'static>>> {
+        if let Ok(mut codes) = self.codes.lock() {
+            codes.push(content.to_string());
+        }
+
         let content = content.replace('\t', "    ");
         let base = Style::default().bg(CODE_BG);
         let inner = self.width.saturating_sub(INDENT.len() + RIGHT_PAD);
@@ -90,21 +150,8 @@ impl RenderHooks for CodeBlockHooks {
 
         let mut lines = Vec::with_capacity(code_lines.len() + 2);
 
-        // Top padding row, doubling as a dim language label.
-        if lang.is_empty() {
-            lines.push(self.blank());
-        } else {
-            let mut spans = vec![
-                Span::styled(INDENT, base),
-                Span::styled(lang.to_string(), Style::default().fg(LABEL_FG).bg(CODE_BG)),
-            ];
-            let used: usize = spans.iter().map(|s| s.width()).sum();
-            if used < self.width {
-                spans.push(Span::styled(" ".repeat(self.width - used), base));
-            }
-            lines.push(Line::from(spans));
-        }
-
+        // Top padding row: dim language label plus the clickable copy label.
+        lines.push(self.label_line(lang));
         lines.extend(code_lines.into_iter().map(|line| self.shade(line)));
         lines.push(self.blank());
 

@@ -18,10 +18,14 @@ use ::config::Config;
 use ::config::Environment;
 use ::config::File;
 use app::App;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -29,7 +33,10 @@ use std::io;
 use std::path::Path;
 
 pub mod app;
+pub mod clipboard;
+pub mod commands;
 pub mod config;
+pub mod providers;
 pub mod response;
 pub mod tools;
 mod ui;
@@ -45,7 +52,21 @@ async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
+    // Without the kitty keyboard protocol, terminals send Ctrl+Enter and
+    // Shift+Enter as a plain Enter, so modifier detection needs this.
+    let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
 
     let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let programmer_config = Config::builder()
@@ -54,15 +75,33 @@ async fn main() -> color_eyre::Result<()> {
         .build()
         .unwrap_or_default();
 
-    let programmer_config: ProgrammerConfig = programmer_config.try_deserialize()?;
+    let mut programmer_config: ProgrammerConfig = programmer_config.try_deserialize()?;
+
+    // Migrate v0.1.x config (single model/base_url/api_key) to v0.2.x
+    // multi-provider format.
+    if programmer_config.migrate_if_needed() {
+        // Persist the migrated config back to disk so the old format is
+        // never seen again.
+        std::fs::write(&config_path, toml::to_string(&programmer_config)?)?;
+    }
 
     if !Path::new(config_path.as_path()).exists() {
         std::fs::write(config_path, toml::to_string(&programmer_config)?)?;
     }
 
     let result = App::new(programmer_config).await.run(terminal).await;
+    // Pop while still on the alternate screen: kitty keeps separate flag
+    // stacks per screen buffer.
+    if keyboard_enhanced {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     ratatui::restore();
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     disable_raw_mode()?;
     result
 }

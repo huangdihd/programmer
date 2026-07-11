@@ -19,8 +19,8 @@ use async_openai::types::responses::{FunctionCallOutputItemParam, ResponseStream
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tokio::sync::mpsc;
 

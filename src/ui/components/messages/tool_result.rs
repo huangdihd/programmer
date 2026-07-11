@@ -64,10 +64,7 @@ impl<'a> ToolResultMessage<'a> {
             let first = all.first().copied().unwrap_or("[no output]");
             let caret = if multiline { "▸ " } else { "" };
             let suffix = if multiline { "..." } else { "" };
-            let line = Line::from(Span::styled(
-                format!("{caret}⎿ {first}{suffix}"),
-                muted,
-            ));
+            let line = Line::from(Span::styled(format!("{caret}⎿ {first}{suffix}"), muted));
             return Paragraph::new(Text::from(line)).block(block);
         }
 
@@ -78,10 +75,7 @@ impl<'a> ToolResultMessage<'a> {
             .map(|(index, line)| {
                 if index == 0 {
                     let caret = if multiline { "▾ " } else { "" };
-                    Line::from(Span::styled(
-                        format!("{caret}⎿ {line}"),
-                        detail_style(),
-                    ))
+                    Line::from(Span::styled(format!("{caret}⎿ {line}"), detail_style()))
                 } else {
                     Line::from(Span::styled(format!("  {line}"), detail_style()))
                 }

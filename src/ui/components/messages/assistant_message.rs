@@ -13,11 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use async_openai::types::responses::OutputItem;
+use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem};
 use ratatui::prelude::Color;
 use ratatui::style::Style;
+use ratatui::text::Text;
 use ratatui_widgets::block::{Block, Padding};
-use ratatui_widgets::paragraph::Paragraph;
+use ratatui_widgets::paragraph::{Paragraph, Wrap};
+
+use crate::ui::markdown_code_block::{COPY_LABEL, CodeCopyButton};
 
 use crate::ui::components::messages::assistant::reasoning::ReasoningMessage;
 use crate::ui::components::messages::assistant::text::TextMessage;
@@ -43,6 +46,9 @@ pub struct AssistantMessage<'a> {
     expanded: bool,
     /// Monotonic frame counter for animating the "Thinking..." dots.
     frame_count: Option<u64>,
+    /// For function-call items: the matching result, rendered inline so the
+    /// call and its output appear as a single message.
+    tool_output: Option<&'a FunctionCallOutputItemParam>,
 }
 
 impl<'a> AssistantMessage<'a> {
@@ -53,7 +59,13 @@ impl<'a> AssistantMessage<'a> {
             in_progress: false,
             expanded: false,
             frame_count: None,
+            tool_output: None,
         }
+    }
+
+    pub fn tool_output(mut self, tool_output: Option<&'a FunctionCallOutputItemParam>) -> Self {
+        self.tool_output = tool_output;
+        self
     }
 
     pub fn in_progress(mut self, in_progress: bool) -> Self {
@@ -71,18 +83,25 @@ impl<'a> AssistantMessage<'a> {
         self
     }
 
-    pub fn into_paragraph(self) -> Paragraph<'static> {
-        let text = match self.output_item {
-            OutputItem::Message(message) => TextMessage::new(message, self.width).into_text(),
-            OutputItem::Reasoning(item) => ReasoningMessage::new(self.in_progress, item, self.width)
-                .expanded(self.expanded)
-                .frame_count(self.frame_count)
-                .into_text(),
-            OutputItem::FunctionCall(call) => ToolCallMessage::new(call)
-                .expanded(self.expanded)
-                .into_text(),
-            other => UnsupportedMessage::new(other).into_text(),
+    pub fn into_paragraph(self) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
+        let (text, codes) = match self.output_item {
+            OutputItem::Message(message) => TextMessage::new(message, self.width).into_parts(),
+            OutputItem::Reasoning(item) => {
+                ReasoningMessage::new(self.in_progress, item, self.width)
+                    .expanded(self.expanded)
+                    .frame_count(self.frame_count)
+                    .into_parts()
+            }
+            OutputItem::FunctionCall(call) => (
+                ToolCallMessage::new(call)
+                    .output(self.tool_output)
+                    .expanded(self.expanded)
+                    .into_text(),
+                Vec::new(),
+            ),
+            other => (UnsupportedMessage::new(other).into_text(), Vec::new()),
         };
+        let buttons = scan_copy_buttons(&text, &codes);
 
         let foldable = matches!(
             self.output_item,
@@ -93,6 +112,40 @@ impl<'a> AssistantMessage<'a> {
             block = block.style(Style::new().bg(EXPANDED_BG));
         }
 
-        Paragraph::new(text).block(block)
+        let mut paragraph = Paragraph::new(text).block(block);
+        // An expanded tool call shows the full result, whose lines can be long;
+        // wrap them like the standalone result view used to.
+        if self.expanded && matches!(self.output_item, OutputItem::FunctionCall(_)) {
+            paragraph = paragraph.wrap(Wrap { trim: false });
+        }
+        (paragraph, buttons)
     }
+}
+
+/// Locates the clickable copy labels rendered by `CodeBlockHooks` in `text` and
+/// pairs each with its code block content (the k-th label belongs to the k-th
+/// block). Coordinates are relative to the paragraph, including its padding.
+fn scan_copy_buttons(text: &Text<'_>, codes: &[String]) -> Vec<CodeCopyButton> {
+    let mut buttons = Vec::new();
+    if codes.is_empty() {
+        return buttons;
+    }
+    for (row, line) in text.lines.iter().enumerate() {
+        let mut x = 0u16;
+        for span in &line.spans {
+            let width = span.width() as u16;
+            if span.content.as_ref() == COPY_LABEL {
+                if let Some(content) = codes.get(buttons.len()) {
+                    buttons.push(CodeCopyButton {
+                        row: row as u16,
+                        x_start: PAD_LEFT + x,
+                        x_end: PAD_LEFT + x + width,
+                        content: content.clone(),
+                    });
+                }
+            }
+            x = x.saturating_add(width);
+        }
+    }
+    buttons
 }

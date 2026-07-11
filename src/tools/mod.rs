@@ -58,8 +58,6 @@ pub fn environment_info() -> String {
     )
 }
 
-
-
 /// The full set of tool definitions advertised to the model on every request.
 pub fn tools() -> Vec<Tool> {
     vec![

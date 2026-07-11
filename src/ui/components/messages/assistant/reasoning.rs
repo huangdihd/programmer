@@ -66,7 +66,9 @@ impl<'a> ReasoningMessage<'a> {
         self
     }
 
-    pub fn into_text(self) -> Text<'static> {
+    /// Renders the reasoning block, also returning the raw content of every
+    /// code block (in render order) so copy buttons can be wired up.
+    pub fn into_parts(self) -> (Text<'static>, Vec<String>) {
         // Cycle through 0..=3 dots every ~8 frames → ~133 ms per state at 60 fps.
         let dots = if self.in_progress {
             match self.frame_count {
@@ -97,13 +99,13 @@ impl<'a> ReasoningMessage<'a> {
             muted_style(),
         ))];
 
+        let mut codes = Vec::new();
         if self.expanded && !text.is_empty() {
-            let render_width = self
-                .width
-                .saturating_sub(BLOCK_PAD + INDENT)
-                .min(100);
-            let renderer = MarkdownRenderer::new(render_width as usize)
-                .with_render_hooks(Box::new(CodeBlockHooks::new(render_width as usize)));
+            let render_width = self.width.saturating_sub(BLOCK_PAD + INDENT).min(100);
+            let hooks = CodeBlockHooks::new(render_width as usize);
+            let codes_handle = hooks.codes();
+            let renderer =
+                MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
             let blocks = renderer.parse(&text);
             let md_lines = renderer.render(&blocks, &AppTheme);
             for line in md_lines {
@@ -115,9 +117,10 @@ impl<'a> ReasoningMessage<'a> {
                 );
                 lines.push(Line::from(spans));
             }
+            codes = codes_handle.lock().map(|c| c.clone()).unwrap_or_default();
         }
 
-        Text::from(lines)
+        (Text::from(lines), codes)
     }
 }
 

@@ -14,31 +14,94 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProgrammerConfig {
-    pub model: String,
+    /// The provider to use when none is specified in the model string.
+    pub default_provider: String,
+    /// All configured providers, keyed by name.
+    pub providers: HashMap<String, ProviderConfig>,
+    // Legacy fields for backward compatibility with v0.1.x configs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
+    /// Optional explicit model list. When absent, models are auto-discovered
+    /// from the provider's `/models` endpoint at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
+    /// Default model for this provider. When absent, the first model from the
+    /// list (auto-discovered or manual) is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
 }
 
 impl Default for ProgrammerConfig {
     fn default() -> Self {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "sk-...".to_string(),
+                models: None,
+                default_model: None,
+            },
+        );
         ProgrammerConfig {
-            model: "Type your model here".to_string(),
-            base_url: "Type your base_url here".to_string(),
-            api_key: "Type your api_key here".to_string(),
+            default_provider: "openai".to_string(),
+            providers,
+            model: None,
+            base_url: None,
+            api_key: None,
         }
     }
 }
 
 impl ProgrammerConfig {
-    pub fn new(model: &str, base_url: &str, api_key: &str) -> Self {
-        ProgrammerConfig {
-            model: model.to_string(),
-            base_url: base_url.to_string(),
-            api_key: api_key.to_string(),
+    /// Migrate a v0.1.x config (which only has `model`, `base_url`, `api_key`)
+    /// by promoting the legacy fields into a single "openai" provider entry.
+    /// Returns `true` if migration happened, so the caller can persist the new
+    /// config format back to disk.
+    pub fn migrate_if_needed(&mut self) -> bool {
+        if !self.providers.is_empty() {
+            return false;
         }
+
+        let base_url = match &self.base_url {
+            Some(u) if u != "Type your base_url here" => u.clone(),
+            _ => return false,
+        };
+        let api_key = match &self.api_key {
+            Some(k) if k != "Type your api_key here" => k.clone(),
+            _ => return false,
+        };
+        let model = self.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
+
+        self.providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                base_url,
+                api_key,
+                models: Some(vec![model]),
+                default_model: None,
+            },
+        );
+        self.default_provider = "openai".to_string();
+        // Clear legacy fields so they aren't serialized back.
+        self.model = None;
+        self.base_url = None;
+        self.api_key = None;
+        true
     }
 }
