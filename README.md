@@ -11,8 +11,6 @@ gives the model direct access to your project: it can read files, write files,
 edit files with surgical precision, and run shell commands — all inside a
 TUI built with [Ratatui](https://ratatui.rs).
 
-The program itself is the agent you are interacting with right now.
-
 ## Features
 
 - **Streaming responses** — see the model's answer as it is generated, token by
