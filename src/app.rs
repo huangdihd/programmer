@@ -217,7 +217,14 @@ impl App<'_> {
     }
 
     pub async fn handle_error_events(&mut self, error: OpenAIError) {
-        self.conversation_panel.add_error(error)
+        // The stream ended in an error, so the turn is over: stop "receiving",
+        // record the error, and flush any queued message so we don't get stuck.
+        self.conversation_panel.abort_receiving();
+        self.conversation_panel.tool_running = false;
+        self.conversation_panel.add_error(error);
+        if let Some(pending_request) = self.conversation_panel.pending_message.take() {
+            self.start_request(pending_request).await;
+        }
     }
 
     /// Handles the key events and updates the state of [`App`].

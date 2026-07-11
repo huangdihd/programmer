@@ -214,6 +214,17 @@ impl ConversationPanel {
 
     pub fn add_error(&mut self, openai_error: OpenAIError) {
         self.items.push(MessageItem::OpenAIError(openai_error));
+        self.stick_to_bottom = true;
+    }
+
+    /// Ends the in-flight response (e.g. after a stream error), keeping whatever
+    /// was produced so far and clearing the "receiving" state so the turn is no
+    /// longer considered busy.
+    pub fn abort_receiving(&mut self) {
+        if let Some(partial) = self.receiving_response.take() {
+            self.items
+                .extend(partial.items.into_iter().flatten().map(MessageItem::Output));
+        }
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -320,5 +331,17 @@ mod tests {
         let after = panel.scroll_view_state.offset().y;
         assert!(after < bottom, "offset should decrease: {bottom} -> {after}");
         assert!(!panel.stick_to_bottom, "scrolling up disables auto-follow");
+    }
+
+    #[test]
+    fn abort_receiving_clears_busy_state() {
+        let mut panel = ConversationPanel::new();
+        panel.receiving_response = Some(PartialResponse::new());
+        assert!(panel.is_busy(), "receiving a response is busy");
+
+        panel.abort_receiving();
+
+        assert!(panel.receiving_response.is_none());
+        assert!(!panel.is_busy(), "aborting must clear the busy state");
     }
 }
