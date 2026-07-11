@@ -1,4 +1,4 @@
-// Copyright (C) 2025 huangdihd
+// Copyright (C) 2026 huangdihd
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -14,6 +14,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 pub mod conversation_panel;
+pub mod footer;
 pub mod input_panel;
 pub mod logo;
 pub mod messages;
+pub mod status_bar;

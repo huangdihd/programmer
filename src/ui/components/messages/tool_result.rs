@@ -1,4 +1,4 @@
-// Copyright (C) 2025 huangdihd
+// Copyright (C) 2026 huangdihd
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -63,7 +63,11 @@ impl<'a> ToolResultMessage<'a> {
             // Collapsed: a single (unwrapped) line — the first line of output.
             let first = all.first().copied().unwrap_or("[no output]");
             let caret = if multiline { "▸ " } else { "" };
-            let line = Line::from(Span::styled(format!("{caret}⎿ {first}"), muted));
+            let suffix = if multiline { "..." } else { "" };
+            let line = Line::from(Span::styled(
+                format!("{caret}⎿ {first}{suffix}"),
+                muted,
+            ));
             return Paragraph::new(Text::from(line)).block(block);
         }
 

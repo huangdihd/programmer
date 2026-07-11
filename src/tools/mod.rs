@@ -1,4 +1,4 @@
-// Copyright (C) 2025 huangdihd
+// Copyright (C) 2026 huangdihd
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -72,6 +72,11 @@ pub fn tools() -> Vec<Tool> {
     ]
 }
 
+/// Maximum characters of tool output kept before truncation. The rest is
+/// discarded and a truncation notice is appended so the model knows the output
+/// was cut short.
+const MAX_OUTPUT_LENGTH: usize = 8000;
+
 /// Executes a single tool call and wraps the result as a `function_call_output`
 /// item ready to be sent back to the model.
 pub async fn run_tool_call(call: &FunctionToolCall) -> FunctionCallOutputItemParam {
@@ -85,12 +90,43 @@ pub async fn run_tool_call(call: &FunctionToolCall) -> FunctionCallOutputItemPar
         other => format!("error: unknown tool '{other}'"),
     };
 
+    let output = truncate_output(output);
+
     FunctionCallOutputItemParam {
         call_id: call.call_id.clone(),
         output: FunctionCallOutput::Text(output),
         id: None,
         status: None,
     }
+}
+
+/// Truncates `output` to at most [`MAX_OUTPUT_LENGTH`] characters. When the
+/// output exceeds the limit the first half and the last quarter are preserved,
+/// with a truncation marker in between so the model sees both the beginning and
+/// the tail of a long result (the middle is often the least interesting part).
+fn truncate_output(output: String) -> String {
+    let len = output.chars().count();
+    if len <= MAX_OUTPUT_LENGTH {
+        return output;
+    }
+    let head_keep = MAX_OUTPUT_LENGTH * 3 / 4;
+    let tail_keep = MAX_OUTPUT_LENGTH - head_keep;
+
+    let head: String = output.chars().take(head_keep).collect();
+    let tail: String = output
+        .chars()
+        .rev()
+        .take(tail_keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    format!(
+        "{head}\n\n... [truncated: {total} chars total, {skipped} chars skipped] ...\n\n{tail}",
+        total = len,
+        skipped = len - head_keep - tail_keep,
+    )
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-// Copyright (C) 2025 huangdihd
+// Copyright (C) 2026 huangdihd
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -98,7 +98,7 @@ impl WelcomeMessage {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "© 2025 huangdihd  |  GPL-3.0-or-later  |  No warranty",
+                "© 2026 huangdihd  |  GPL-3.0-or-later  |  No warranty",
                 Style::default().fg(DIM),
             )),
         ]
@@ -106,15 +106,6 @@ impl WelcomeMessage {
 
     fn right_content(&self) -> Vec<Line<'static>> {
         vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Tips for getting started",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "Type your task and press Enter",
-                Style::default().fg(TEXT),
-            )),
             Line::from(""),
             Line::from(Span::styled(
                 "Keyboard shortcuts",

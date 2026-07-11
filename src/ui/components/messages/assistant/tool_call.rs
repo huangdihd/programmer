@@ -1,4 +1,4 @@
-// Copyright (C) 2025 huangdihd
+// Copyright (C) 2026 huangdihd
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -55,9 +55,13 @@ impl<'a> ToolCallMessage<'a> {
                 Span::styled("▸ ", muted),
                 Span::styled(format!("🔧 {}", self.call.name), accent),
             ];
-            let summary = one_line_summary(value.as_ref(), &self.call.arguments);
+            let (summary, multiline) = one_line_summary(value.as_ref(), &self.call.arguments);
             if !summary.is_empty() {
-                spans.push(Span::styled(format!("  {summary}"), muted));
+                let suffix = if multiline { "..." } else { "" };
+                spans.push(Span::styled(
+                    format!("  {summary}{suffix}"),
+                    muted,
+                ));
             }
             return Text::from(Line::from(spans));
         }
@@ -91,20 +95,27 @@ impl<'a> ToolCallMessage<'a> {
 
 /// A one-line summary for the collapsed view: the command or path if present,
 /// otherwise the first non-empty argument value, truncated to a single line.
-fn one_line_summary(value: Option<&serde_json::Value>, raw: &str) -> String {
-    let first_line = |s: &str| s.lines().next().unwrap_or("").to_string();
+/// Returns `(summary, truncated)` where `truncated` is true when the original
+/// value had more than one line.
+fn one_line_summary(value: Option<&serde_json::Value>, raw: &str) -> (String, bool) {
+    let truncated = |s: &str| {
+        let mut lines = s.lines();
+        let first = lines.next().unwrap_or("").to_string();
+        let has_more = lines.next().is_some();
+        (first, has_more)
+    };
 
     if let Some(serde_json::Value::Object(map)) = value {
         for key in ["command", "path"] {
             if let Some(text) = map.get(key).and_then(|v| v.as_str()) {
-                return first_line(text);
+                return truncated(text);
             }
         }
         if let Some(text) = map.values().find_map(|v| v.as_str()) {
-            return first_line(text);
+            return truncated(text);
         }
     }
-    first_line(raw)
+    truncated(raw)
 }
 
 /// Renders one `key: value` argument, keeping multi-line values on their own

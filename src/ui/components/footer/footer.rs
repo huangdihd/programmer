@@ -13,24 +13,23 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Rect};
-use ratatui::prelude::Widget;
-use ratatui_widgets::block::Block;
+use crate::ui::components::status_bar::status_bar::StatusBar;
 
-pub struct Logo {}
-
-impl Logo {
-    pub fn new() -> Self {
-        Logo {}
-    }
+/// Bottom bar: status indicator on the left, copyright on the right.
+#[derive(Debug)]
+pub struct Footer {
+    pub status: StatusBar,
 }
 
-impl Widget for Logo {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .title("Programmer")
-            .title_alignment(Alignment::Center);
-        block.render(area, buf)
+impl Footer {
+    pub fn new() -> Self {
+        Self {
+            status: StatusBar::new(),
+        }
+    }
+
+    pub fn update(&mut self, is_receiving: bool, is_outputting_message: bool, is_creating_tool_call: bool, is_tool_running: bool) {
+        self.status
+            .update(is_receiving, is_outputting_message, is_creating_tool_call, is_tool_running);
     }
 }

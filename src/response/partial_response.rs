@@ -1,4 +1,4 @@
-// Copyright (C) 2025 huangdihd
+// Copyright (C) 2026 huangdihd
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -509,6 +509,24 @@ impl PartialResponse {
 
     pub fn finished(&self) -> bool {
         self.finish_reason.is_some()
+    }
+
+    /// Returns true if any output item in this partial response is a function
+    /// call (possibly still incomplete).
+    pub fn has_function_calls(&self) -> bool {
+        self.items.iter().any(|item| {
+            item.as_ref()
+                .is_some_and(|i| matches!(i, OutputItem::FunctionCall(_)))
+        })
+    }
+
+    /// Returns true if any output item is a normal message (not reasoning,
+    /// not a function call).
+    pub fn has_message_items(&self) -> bool {
+        self.items.iter().any(|item| {
+            item.as_ref()
+                .is_some_and(|i| matches!(i, OutputItem::Message(_)))
+        })
     }
 
     pub fn finalize(self) -> Result<Response, FinalizeError> {

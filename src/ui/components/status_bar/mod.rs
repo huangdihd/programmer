@@ -13,24 +13,5 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Rect};
-use ratatui::prelude::Widget;
-use ratatui_widgets::block::Block;
-
-pub struct Logo {}
-
-impl Logo {
-    pub fn new() -> Self {
-        Logo {}
-    }
-}
-
-impl Widget for Logo {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .title("Programmer")
-            .title_alignment(Alignment::Center);
-        block.render(area, buf)
-    }
-}
+pub mod status_bar;
+mod ui;

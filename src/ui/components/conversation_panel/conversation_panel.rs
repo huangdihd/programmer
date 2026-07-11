@@ -1,4 +1,4 @@
-// Copyright (C) 2025 huangdihd
+// Copyright (C) 2026 huangdihd
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -147,6 +147,12 @@ pub struct ConversationPanel {
     /// response that requested tools and the follow-up request). The turn is
     /// still active even though no response is streaming.
     pub tool_running: bool,
+    /// True while the model is streaming and has started emitting tool call
+    /// arguments (detected via the first function_call item in the stream).
+    pub creating_tool_call: bool,
+    /// True while the model is streaming a normal text message (not reasoning,
+    /// not a tool call).
+    pub outputting_message: bool,
     /// When true the view follows new content at the bottom. Scrolling up turns
     /// it off; scrolling back to the bottom turns it on again. This replaces
     /// re-snapping on every chunk, which fought manual scrolling during streaming.
@@ -181,6 +187,8 @@ impl ConversationPanel {
             pending_message: None,
             receiving_response: None,
             tool_running: false,
+            creating_tool_call: false,
+            outputting_message: false,
             stick_to_bottom: true,
             expanded_items: HashSet::new(),
             view_area: Rect::ZERO,

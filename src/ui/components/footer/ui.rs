@@ -13,24 +13,30 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use super::footer::Footer;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Rect};
-use ratatui::prelude::Widget;
-use ratatui_widgets::block::Block;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::Widget;
 
-pub struct Logo {}
+const DIM: Color = Color::DarkGray;
 
-impl Logo {
-    pub fn new() -> Self {
-        Logo {}
-    }
-}
-
-impl Widget for Logo {
+impl Widget for &Footer {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .title("Programmer")
-            .title_alignment(Alignment::Center);
-        block.render(area, buf)
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(28), // "GPL-3.0-or-later · © 2026"
+            ])
+            .split(area);
+
+        // Left: status indicator
+        (&self.status).render(chunks[0], buf);
+
+        // Right: copyright
+        ratatui::widgets::Paragraph::new("GPL-3.0-or-later \u{b7} \u{a9} 2026")
+            .style(Style::default().fg(DIM))
+            .render(chunks[1], buf);
     }
 }

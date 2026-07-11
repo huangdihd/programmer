@@ -1,4 +1,4 @@
-// Copyright (C) 2025 huangdihd
+// Copyright (C) 2026 huangdihd
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -17,6 +17,7 @@ use crate::config::programmer_config::ProgrammerConfig;
 use crate::response::message_item;
 use crate::response::partial_response::PartialResponse;
 use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
+use crate::ui::components::footer::footer::Footer;
 use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
@@ -45,6 +46,7 @@ pub struct App<'a> {
     pub config: ProgrammerConfig,
     pub input_panel: InputPanel<'a>,
     pub conversation_panel: ConversationPanel,
+    pub footer: Footer,
 }
 
 impl App<'_> {
@@ -60,6 +62,7 @@ impl App<'_> {
             config,
             input_panel: InputPanel::new(),
             conversation_panel: ConversationPanel::new(),
+            footer: Footer::new(),
         }
     }
 
@@ -113,6 +116,8 @@ impl App<'_> {
                     let cancel_token = partial_response.cancelled.clone();
                     let calls = function_calls(&partial_response);
                     if calls.is_empty() {
+                        self.conversation_panel.creating_tool_call = false;
+                        self.conversation_panel.outputting_message = false;
                         if let Some(pending_request) =
                             self.conversation_panel.pending_message.take()
                         {
@@ -145,6 +150,11 @@ impl App<'_> {
                     }
                     self.conversation_panel.abort_receiving();
                     self.conversation_panel.tool_running = false;
+                    self.conversation_panel.creating_tool_call = false;
+                    self.conversation_panel.outputting_message = false;
+                    if let Some(pending_request) = self.conversation_panel.pending_message.take() {
+                        self.start_request(pending_request).await;
+                    }
                 }
                 AppEvent::Quit => self.quit(),
                 AppEvent::Start => self.send_message().await,
@@ -197,6 +207,8 @@ impl App<'_> {
     fn spawn_stream(&mut self) {
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.conversation_panel.live_expanded_items.clear();
+        self.conversation_panel.creating_tool_call = false;
+        self.conversation_panel.outputting_message = false;
         self.conversation_panel.receiving_response =
             Some(PartialResponse::new(cancel_token.clone()));
         let client = self.client.clone();
@@ -241,6 +253,8 @@ impl App<'_> {
     /// outputs back to the event loop via `ToolCallsCompleted`.
     fn run_tool_calls(&mut self, calls: Vec<FunctionToolCall>, cancel_token: Arc<AtomicBool>) {
         self.conversation_panel.tool_running = true;
+        self.conversation_panel.creating_tool_call = false;
+        self.conversation_panel.outputting_message = false;
         let sender = self.events.sender.clone();
         tokio::spawn(async move {
             let mut outputs = Vec::with_capacity(calls.len());
@@ -266,6 +280,14 @@ impl App<'_> {
             .conversation_panel
             .handle_response_stream_event(response_stream_event)
         else {
+            // Check if the stream is now generating function calls.
+            if let Some(ref receiving) = self.conversation_panel.receiving_response {
+                if receiving.has_function_calls() {
+                    self.conversation_panel.creating_tool_call = true;
+                } else if receiving.has_message_items() {
+                    self.conversation_panel.outputting_message = true;
+                }
+            }
             return;
         };
         // Transfer live expanded state before items become historical,
@@ -297,6 +319,8 @@ impl App<'_> {
         // record the error, and flush any queued message so we don't get stuck.
         self.conversation_panel.abort_receiving();
         self.conversation_panel.tool_running = false;
+        self.conversation_panel.creating_tool_call = false;
+        self.conversation_panel.outputting_message = false;
         self.conversation_panel.add_error(error);
         if let Some(pending_request) = self.conversation_panel.pending_message.take() {
             self.start_request(pending_request).await;
