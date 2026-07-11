@@ -23,9 +23,11 @@ use crate::providers::ProviderManager;
 pub enum Command {
     Quit,
     Clear,
+    New,
     Model(String),
     Providers,
     Help,
+    Session,
 }
 
 impl Command {
@@ -47,23 +49,27 @@ impl Command {
         match cmd {
             "q" | "quit" | "exit" => Some(Command::Quit),
             "c" | "clear" => Some(Command::Clear),
+            "new" | "n" => Some(Command::New),
             "model" | "m" => Some(Command::Model(args)),
             "providers" => Some(Command::Providers),
             "help" | "?" => Some(Command::Help),
+            "session" | "s" => Some(Command::Session),
             _ => None,
         }
     }
 
     /// All command names (without leading `/`), for completion.
     pub fn all_commands() -> &'static [&'static str] {
-        &["model", "providers", "clear", "quit", "help"]
+        &["model", "new", "providers", "session", "clear", "quit", "help"]
     }
 
     /// Human-readable descriptions for the help text.
     pub fn descriptions() -> &'static [(&'static str, &'static str)] {
         &[
             ("/model <provider/model>", "Switch to a different model"),
+            ("/new | /n", "Start a new session (saves current)"),
             ("/providers", "List all configured providers and models"),
+            ("/session | /s", "Show current session info"),
             ("/clear | /c", "Clear the conversation history"),
             ("/quit | /q", "Exit the application"),
             ("/help | /?", "Show this help"),

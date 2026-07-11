@@ -24,3 +24,17 @@ pub enum MessageItem {
     Error(String),
     Info(String),
 }
+
+impl Clone for MessageItem {
+    fn clone(&self) -> Self {
+        match self {
+            MessageItem::Input(i) => MessageItem::Input(i.clone()),
+            MessageItem::Output(o) => MessageItem::Output(o.clone()),
+            MessageItem::OpenAIError(e) => {
+                MessageItem::Error(format!("(cloned error) {e}"))
+            }
+            MessageItem::Error(s) => MessageItem::Error(s.clone()),
+            MessageItem::Info(s) => MessageItem::Info(s.clone()),
+        }
+    }
+}

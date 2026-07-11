@@ -18,14 +18,14 @@ use crate::response::partial_response::PartialResponse;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
-    FunctionCallOutputItemParam, InputContent, InputItem, InputMessage, InputParam, InputRole,
-    Item, OutputItem, OutputStatus, ResponseStreamEvent,
+    FunctionCallOutput, FunctionCallOutputItemParam, InputContent, InputItem, InputMessage,
+    InputParam, InputRole, Item, OutputItem, OutputStatus, ResponseStreamEvent,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tui_scrollview::ScrollViewState;
 use unicode_width::UnicodeWidthStr;
 
@@ -544,6 +544,26 @@ impl ConversationPanel {
     }
 
     pub fn add_error(&mut self, openai_error: OpenAIError) {
+        // Non-conforming providers send error payloads the stream parser can't
+        // deserialize; surface the embedded API error message instead of the
+        // raw "missing field" noise when the payload is recognizable.
+        if let OpenAIError::JSONDeserialize(_, content) = &openai_error {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+                if let Some(message) = value
+                    .get("message")
+                    .or_else(|| value.get("error").and_then(|e| e.get("message")))
+                    .and_then(|m| m.as_str())
+                {
+                    let code = value
+                        .get("code")
+                        .or_else(|| value.get("error").and_then(|e| e.get("code")))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("api error");
+                    self.add_error_string(format!("{code}: {message}"));
+                    return;
+                }
+            }
+        }
         self.items.push(MessageItem::OpenAIError(openai_error));
         self.stick_to_bottom = true;
     }
@@ -566,6 +586,17 @@ impl ConversationPanel {
         self.live_expanded_items.clear();
         self.selection = None;
         self.stick_to_bottom = true;
+    }
+
+    /// Restore a previous session's items into the conversation.
+    pub fn restore_items(&mut self, items: Vec<MessageItem>) {
+        self.items = items;
+        self.stick_to_bottom = true;
+    }
+
+    /// Iterate over the current conversation items (for persistence).
+    pub fn items(&self) -> impl Iterator<Item = &MessageItem> {
+        self.items.iter()
     }
 
     /// Ends the in-flight response (e.g. after a stream error), keeping whatever
@@ -654,16 +685,49 @@ impl ConversationPanel {
                 status: Some(OutputStatus::Completed),
             })));
 
+        // Recorded function_call_output items, keyed by call id. Outputs are
+        // appended to history after the whole response (which may contain text
+        // items after the call), so their stored position can be separated from
+        // their call — but the API requires each output to directly follow its
+        // call. Emit them adjacent to the call instead of where they were stored.
+        let mut recorded_outputs: HashMap<&str, &FunctionCallOutputItemParam> = HashMap::new();
+        for item in &self.items {
+            if let MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) = item {
+                recorded_outputs.entry(output.call_id.as_str()).or_insert(output);
+            }
+        }
+
         let mut input_items = vec![developer_message];
-        input_items.extend(
-            self.items
-                .iter()
-                .filter_map(|message_item| match message_item {
-                    MessageItem::Input(input_item) => Some(input_item.clone()),
-                    MessageItem::Output(output_item) => Some(output_item.clone().into()),
-                    _ => None,
-                }),
-        );
+        for message_item in &self.items {
+            match message_item {
+                // Skip stored outputs here; they are emitted right after their call.
+                MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(_))) => {}
+                MessageItem::Input(input_item) => input_items.push(input_item.clone()),
+                MessageItem::Output(output_item) => {
+                    input_items.push(output_item.clone().into());
+                    if let OutputItem::FunctionCall(call) = output_item {
+                        let output = match recorded_outputs.remove(call.call_id.as_str()) {
+                            Some(output) => output.clone(),
+                            // A call with no recorded output (e.g. the user
+                            // cancelled while the tool was running) would make
+                            // the API reject the whole history; answer it
+                            // synthetically.
+                            None => FunctionCallOutputItemParam {
+                                call_id: call.call_id.clone(),
+                                output: FunctionCallOutput::Text(
+                                    "error: tool execution was cancelled before it completed"
+                                        .to_string(),
+                                ),
+                                id: None,
+                                status: None,
+                            },
+                        };
+                        input_items.push(InputItem::from(Item::FunctionCallOutput(output)));
+                    }
+                }
+                _ => {}
+            }
+        }
 
         InputParam::Items(input_items)
     }
@@ -710,6 +774,82 @@ mod tests {
             "offset should decrease: {bottom} -> {after}"
         );
         assert!(!panel.stick_to_bottom, "scrolling up disables auto-follow");
+    }
+
+    #[test]
+    fn function_call_outputs_directly_follow_their_calls() {
+        use async_openai::types::responses::{
+            AssistantRole, FunctionToolCall, OutputMessage, OutputMessageContent,
+            OutputTextContent,
+        };
+
+        let call = |call_id: &str| {
+            OutputItem::FunctionCall(FunctionToolCall {
+                arguments: "{}".into(),
+                call_id: call_id.into(),
+                namespace: None,
+                name: "command".into(),
+                id: None,
+                status: None,
+            })
+        };
+        let output = |call_id: &str| FunctionCallOutputItemParam {
+            call_id: call_id.into(),
+            output: FunctionCallOutput::Text("ok".into()),
+            id: None,
+            status: None,
+        };
+        let assistant_text = |text: &str| {
+            OutputItem::Message(OutputMessage {
+                content: vec![OutputMessageContent::OutputText(OutputTextContent {
+                    annotations: vec![],
+                    logprobs: None,
+                    text: text.into(),
+                })],
+                id: "msg_1".into(),
+                role: AssistantRole::Assistant,
+                phase: None,
+                status: OutputStatus::Completed,
+            })
+        };
+
+        let mut panel = ConversationPanel::new();
+        panel.add_input_message(user_message("hi"));
+        // The model emitted text *after* the call within the same response, so
+        // the recorded output ended up separated from its call by that text.
+        panel.items.push(MessageItem::Output(call("call_1")));
+        panel
+            .items
+            .push(MessageItem::Output(assistant_text("trailing text")));
+        panel.add_tool_output(output("call_1"));
+        // An orphaned call with no recorded output (cancelled mid-run).
+        panel.items.push(MessageItem::Output(call("call_2")));
+
+        let InputParam::Items(items) = panel.get_input_param("test/model") else {
+            panic!("expected an item list");
+        };
+        // Every call must be answered, and each output must directly follow its
+        // call — real outputs are re-ordered, missing ones synthesized.
+        for call_id in ["call_1", "call_2"] {
+            let call_pos = items
+                .iter()
+                .position(|item| {
+                    matches!(item, InputItem::Item(Item::FunctionCall(c)) if c.call_id == call_id)
+                })
+                .unwrap_or_else(|| panic!("{call_id} present"));
+            assert!(
+                matches!(
+                    &items[call_pos + 1],
+                    InputItem::Item(Item::FunctionCallOutput(o)) if o.call_id == call_id
+                ),
+                "output for {call_id} must directly follow its call"
+            );
+        }
+        let output_count = items
+            .iter()
+            .filter(|item| matches!(item, InputItem::Item(Item::FunctionCallOutput(_))))
+            .count();
+        assert_eq!(output_count, 2, "no duplicate or stray outputs");
     }
 
     #[test]

@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::config::programmer_config::ProgrammerConfig;
+use crate::session::SessionManager;
 use ::config::Config;
 use ::config::Environment;
 use ::config::File;
@@ -38,11 +39,114 @@ pub mod commands;
 pub mod config;
 pub mod providers;
 pub mod response;
+pub mod session;
 pub mod tools;
 mod ui;
 
+/// Parsed command-line arguments.
+struct Args {
+    /// `--resume` with an optional UUID.
+    resume: Option<Option<String>>,
+}
+
+fn parse_args() -> Args {
+    let args: Vec<String> = std::env::args().collect();
+    let mut resume: Option<Option<String>> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--resume" => {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    resume = Some(Some(args[i + 1].clone()));
+                    i += 1;
+                } else {
+                    resume = Some(None);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Args { resume }
+}
+
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
+    let args = parse_args();
+
+    // ---- resolve which session to use ----
+    let session_mgr = SessionManager::new();
+    let mut startup_messages: Vec<String> = Vec::new();
+    let (session_uuid, saved_items, saved_history) = match (args.resume, &session_mgr) {
+        // --resume <uuid>
+        (Some(Some(uuid)), Some(mgr)) => {
+            match mgr.load(&uuid) {
+                Some(session) => {
+                    let history = session.history.clone();
+                    let items = SessionManager::into_items(session);
+                    (uuid, items, history)
+                }
+                None => {
+                    startup_messages
+                        .push(format!("Session {uuid} not found, creating a new session."));
+                    let session = mgr.create();
+                    (session.uuid, Vec::new(), Vec::new())
+                }
+            }
+        }
+        // --resume (no UUID) → TUI interactive picker
+        (Some(None), Some(mgr)) => {
+            match mgr.list_all() {
+                Ok(sessions) => {
+                    let was_empty = sessions.is_empty();
+                    match session::pick_session(&sessions, mgr) {
+                        Some(uuid) => {
+                            match mgr.load(&uuid) {
+                                Some(session) => {
+                                    let history = session.history.clone();
+                                    let items = SessionManager::into_items(session);
+                                    (uuid, items, history)
+                                }
+                                None => {
+                                    // Listed but file missing — create new.
+                                    startup_messages.push(format!(
+                                        "Session {uuid} not found on disk, starting a new session."
+                                    ));
+                                    let session = mgr.create();
+                                    (session.uuid, Vec::new(), Vec::new())
+                                }
+                            }
+                        }
+                        None => {
+                            // User chose "new" or no sessions exist.
+                            if was_empty {
+                                startup_messages.push(
+                                    "No saved sessions found. Starting a new session.".into(),
+                                );
+                            }
+                            let session = mgr.create();
+                            (session.uuid, Vec::new(), Vec::new())
+                        }
+                    }
+                }
+                Err(e) => {
+                    startup_messages.push(format!("Warning: {e}"));
+                    let session = mgr.create();
+                    (session.uuid, Vec::new(), Vec::new())
+                }
+            }
+        }
+        // No --resume flag and no session manager → fresh start
+        _ => {
+            let session = session_mgr.as_ref().map(|m| m.create());
+            match session {
+                Some(s) => (s.uuid, Vec::new(), Vec::new()),
+                None => (String::new(), Vec::new(), Vec::new()),
+            }
+        }
+    };
+
+    // ---- configure ----
     let config_dir = dirs::config_dir().unwrap();
     let programmer_dir = config_dir.join("programmer");
     if !Path::new(programmer_dir.as_path()).exists() {
@@ -58,8 +162,6 @@ async fn main() -> color_eyre::Result<()> {
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
-    // Without the kitty keyboard protocol, terminals send Ctrl+Enter and
-    // Shift+Enter as a plain Enter, so modifier detection needs this.
     let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_enhanced {
         execute!(
@@ -77,11 +179,7 @@ async fn main() -> color_eyre::Result<()> {
 
     let mut programmer_config: ProgrammerConfig = programmer_config.try_deserialize()?;
 
-    // Migrate v0.1.x config (single model/base_url/api_key) to v0.2.x
-    // multi-provider format.
     if programmer_config.migrate_if_needed() {
-        // Persist the migrated config back to disk so the old format is
-        // never seen again.
         std::fs::write(&config_path, toml::to_string(&programmer_config)?)?;
     }
 
@@ -89,9 +187,20 @@ async fn main() -> color_eyre::Result<()> {
         std::fs::write(config_path, toml::to_string(&programmer_config)?)?;
     }
 
-    let result = App::new(programmer_config).await.run(terminal).await;
-    // Pop while still on the alternate screen: kitty keeps separate flag
-    // stacks per screen buffer.
+    let has_session_mgr = session_mgr.is_some();
+    let (result, final_uuid) = App::new(
+        programmer_config,
+        saved_items,
+        saved_history,
+        session_uuid,
+        session_mgr,
+        startup_messages,
+    )
+    .await
+    .run(terminal)
+    .await;
+
+    // Pop while still on the alternate screen.
     if keyboard_enhanced {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -103,5 +212,11 @@ async fn main() -> color_eyre::Result<()> {
         LeaveAlternateScreen
     )?;
     disable_raw_mode()?;
+
+    // Print resume hint so the user can continue this session later.
+    if has_session_mgr && !final_uuid.is_empty() {
+        println!("Session saved. Resume with: programmer --resume {final_uuid}");
+    }
+
     result
 }

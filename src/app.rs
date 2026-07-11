@@ -16,8 +16,9 @@
 use crate::commands::{Command, CompletionEngine};
 use crate::config::programmer_config::ProgrammerConfig;
 use crate::providers::ProviderManager;
-use crate::response::message_item;
+use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
+use crate::session::{SessionManager};
 use crate::ui::components::conversation_panel::conversation_panel::{
     ConversationPanel, SelectionEnd,
 };
@@ -26,8 +27,9 @@ use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
-    CreateResponse, FunctionToolCall, InputContent, InputMessage, InputRole, InputTextContent,
-    MessageItem, OutputItem, OutputStatus, ResponseStreamEvent,
+    CreateResponse, FunctionToolCall, InputContent, InputItem, InputMessage, InputRole,
+    InputTextContent, Item, MessageItem as ApiMessageItem, OutputItem, OutputStatus,
+    ResponseStreamEvent,
 };
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -52,6 +54,10 @@ pub struct App<'a> {
     pub input_panel: InputPanel<'a>,
     pub conversation_panel: ConversationPanel,
     pub footer: Footer,
+    /// Session UUID.
+    session_uuid: String,
+    /// Session manager for persistence.
+    session_mgr: Option<SessionManager>,
 }
 
 impl std::fmt::Debug for App<'_> {
@@ -70,40 +76,56 @@ impl std::fmt::Debug for App<'_> {
 
 impl App<'_> {
     /// Constructs a new instance of [`App`].
-    pub async fn new(config: ProgrammerConfig) -> Self {
+    pub(crate) async fn new(
+        config: ProgrammerConfig,
+        saved_items: Vec<MessageItem>,
+        saved_history: Vec<String>,
+        session_uuid: String,
+        session_mgr: Option<SessionManager>,
+        startup_messages: Vec<String>,
+    ) -> Self {
         let provider_manager = ProviderManager::new(&config).await;
         let current_model = provider_manager.default_model();
+        let mut conversation_panel = ConversationPanel::new();
+        conversation_panel.restore_items(saved_items);
+        for msg in startup_messages {
+            conversation_panel.add_info_string(msg);
+        }
+        let mut input_panel = InputPanel::new();
+        input_panel.history = saved_history;
         Self {
             running: true,
             provider_manager,
             current_model,
             events: EventHandler::new(),
             config,
-            input_panel: InputPanel::new(),
-            conversation_panel: ConversationPanel::new(),
+            input_panel,
+            conversation_panel,
             footer: Footer::new(),
+            session_uuid,
+            session_mgr,
         }
     }
 
-    /// Run the application's main loop.
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
-        while self.running {
-            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
-            // Block for at least one event, then drain everything else that is
-            // already queued before redrawing. During streaming, chunk events
-            // arrive far faster than a frame can be drawn; handling the whole
-            // burst per redraw collapses dozens of expensive full renders into
-            // a single one.
-            let event = self.events.next().await?;
-            self.handle_event(event).await?;
+    /// Run the application's main loop. Returns the final session UUID.
+    pub(crate) async fn run(mut self, mut terminal: DefaultTerminal) -> (color_eyre::Result<()>, String) {
+        let result = async {
             while self.running {
-                match self.events.try_next() {
-                    Some(event) => self.handle_event(event).await?,
-                    None => break,
+                terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+                let event = self.events.next().await?;
+                self.handle_event(event).await?;
+                while self.running {
+                    match self.events.try_next() {
+                        Some(event) => self.handle_event(event).await?,
+                        None => break,
+                    }
                 }
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        let uuid = self.session_uuid.clone();
+        (result, uuid)
     }
 
     async fn handle_event(&mut self, event: Event) -> color_eyre::Result<()> {
@@ -135,6 +157,7 @@ impl App<'_> {
                                     self.conversation_panel.add_error_string(
                                         "failed to copy selection to clipboard",
                                     );
+                                    self.save_session();
                                 }
                             }
                             SelectionEnd::Ignored => {}
@@ -146,7 +169,10 @@ impl App<'_> {
             },
             Event::App(app_event) => match app_event {
                 AppEvent::ChunkReceived(chunk) => self.handle_chunk_events(chunk).await,
-                AppEvent::OpenAIErrorReceived(error) => self.handle_error_events(error).await,
+                AppEvent::OpenAIErrorReceived(error) => {
+                    self.handle_error_events(error).await;
+                    self.save_session();
+                }
                 AppEvent::ResponseFinished(partial_response) => {
                     if partial_response.cancelled.load(Ordering::Relaxed) {
                         return Ok(());
@@ -161,6 +187,7 @@ impl App<'_> {
                         {
                             self.start_request(pending_request).await
                         }
+                        self.save_session();
                     } else {
                         self.run_tool_calls(calls, cancel_token);
                     }
@@ -173,6 +200,7 @@ impl App<'_> {
                     for output in outputs {
                         self.conversation_panel.add_tool_output(output);
                     }
+                    self.save_session();
                     // A spawned shell can reset the console's input mode; re-assert
                     // mouse capture so scrolling/clicks keep working afterwards.
                     let _ = crossterm::execute!(
@@ -190,6 +218,7 @@ impl App<'_> {
                     self.conversation_panel.tool_running = false;
                     self.conversation_panel.creating_tool_call = false;
                     self.conversation_panel.outputting_message = false;
+                    self.save_session();
                     if let Some(pending_request) = self.conversation_panel.pending_message.take() {
                         self.start_request(pending_request).await;
                     }
@@ -249,7 +278,8 @@ impl App<'_> {
         };
 
         self.conversation_panel
-            .add_input_message(MessageItem::Input(input_message));
+            .add_input_message(ApiMessageItem::Input(input_message));
+        self.save_session();
         self.spawn_stream();
     }
 
@@ -387,7 +417,7 @@ impl App<'_> {
                     // from the response so they aren't shown or executed.
                     !cancelled || !matches!(item, OutputItem::FunctionCall(_))
                 })
-                .map(|item| message_item::MessageItem::Output(item.clone().into())),
+                .map(|item| MessageItem::Output(item.clone().into())),
         );
         self.events
             .send(AppEvent::ResponseFinished(partial_response));
@@ -643,6 +673,21 @@ impl App<'_> {
             Some(Command::Clear) => {
                 self.input_panel.clear();
                 self.conversation_panel.clear_messages();
+                self.delete_session();
+                self.save_session();
+            }
+            Some(Command::New) => {
+                self.input_panel.clear();
+                // Save current session to disk before switching.
+                self.save_session();
+                self.conversation_panel.clear_messages();
+                if let Some(mgr) = &self.session_mgr {
+                    let new_session = mgr.create();
+                    self.session_uuid = new_session.uuid;
+                }
+                self.conversation_panel
+                    .add_info_string("Started a new session. Previous session saved.".to_string());
+                self.save_session();
             }
             Some(Command::Model(model)) => {
                 self.input_panel.clear();
@@ -651,6 +696,7 @@ impl App<'_> {
                     self.conversation_panel.add_info_string(
                         "usage: /model <provider/model> — e.g. /model openai/gpt-4o",
                     );
+                    self.save_session();
                     return;
                 }
                 match self.provider_manager.resolve(&model) {
@@ -665,6 +711,7 @@ impl App<'_> {
                         ));
                     }
                 }
+                self.save_session();
             }
             Some(Command::Providers) => {
                 self.input_panel.clear();
@@ -681,6 +728,32 @@ impl App<'_> {
                     lines.push(models);
                 }
                 self.conversation_panel.add_info_string(lines.join("\n"));
+                self.save_session();
+            }
+            Some(Command::Session) => {
+                self.input_panel.clear();
+                let item_count = self.conversation_panel.items().count();
+                let msg = match &self.session_mgr {
+                    Some(mgr) => {
+                        let path = mgr.dir().join(format!("{}.json", self.session_uuid));
+                        let exists = path.exists();
+                        let saved_info = if exists {
+                            "saved on disk".to_string()
+                        } else {
+                            "not yet saved".to_string()
+                        };
+                        format!(
+                            "Session: {} messages, {}\n  uuid: {}\n  path: {}",
+                            item_count,
+                            saved_info,
+                            self.session_uuid,
+                            path.display()
+                        )
+                    }
+                    None => format!("Session: {} messages (no session manager)", item_count),
+                };
+                self.conversation_panel.add_info_string(msg);
+                self.save_session();
             }
             Some(Command::Help) => {
                 self.input_panel.clear();
@@ -690,6 +763,7 @@ impl App<'_> {
                     .collect();
                 lines.insert(0, "Available commands:".to_string());
                 self.conversation_panel.add_info_string(lines.join("\n"));
+                self.save_session();
             }
             None => {
                 // Unknown slash-command; send it to the AI as a normal message.
@@ -706,7 +780,44 @@ impl App<'_> {
 
     /// Set running to false to quit the application.
     pub fn quit(&mut self) {
+        self.save_session();
         self.running = false;
+    }
+
+    /// Persist the current conversation to the session file.
+    fn save_session(&mut self) {
+        let Some(mgr) = &self.session_mgr else { return };
+        let items: Vec<MessageItem> = self.conversation_panel.items().cloned().collect();
+        let mut session = mgr.load(&self.session_uuid).unwrap_or_else(|| {
+            // File missing/corrupt — create a fresh session but keep the
+            // existing UUID so we don't drift.
+            let mut s = mgr.create();
+            s.uuid = self.session_uuid.clone();
+            s
+        });
+        // Capture first user message for the picker preview.
+        if session.first_message.is_empty() {
+            if let Some(text) = first_user_text(&items) {
+                session.first_message =
+                    crate::session::truncate_first_line(&text, 80);
+            }
+        }
+        SessionManager::set_items(&mut session, items);
+        session.history = self.input_panel.history.clone();
+        if let Err(e) = mgr.save(&mut session) {
+            self.conversation_panel
+                .add_error_string(format!("session save: {e}"));
+        }
+    }
+
+    /// Delete the session file (used after /clear).
+    fn delete_session(&mut self) {
+        if let Some(mgr) = &self.session_mgr {
+            let _ = mgr.delete(&self.session_uuid);
+            // Start a fresh session with a new UUID.
+            let new_session = mgr.create();
+            self.session_uuid = new_session.uuid;
+        }
     }
 }
 
@@ -731,4 +842,39 @@ fn function_calls(partial_response: &PartialResponse) -> Vec<FunctionToolCall> {
             _ => None,
         })
         .collect()
+}
+
+/// Extract the text of the first user message from a list of items.
+fn first_user_text(items: &[MessageItem]) -> Option<String> {
+    items.iter().find_map(|item| match item {
+        MessageItem::Input(input) => extract_input_text(input),
+        _ => None,
+    })
+}
+
+fn extract_input_text(input: &InputItem) -> Option<String> {
+    match input {
+        InputItem::Item(item) => match item {
+            Item::Message(msg) => match msg {
+                ApiMessageItem::Input(input_msg) => {
+                    input_msg.content.iter().find_map(|c| match c {
+                        InputContent::InputText(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        InputItem::EasyMessage(msg) => match &msg.content {
+            async_openai::types::responses::EasyInputContent::Text(t) => Some(t.clone()),
+            async_openai::types::responses::EasyInputContent::ContentList(parts) => {
+                parts.iter().find_map(|c| match c {
+                    InputContent::InputText(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+            }
+        },
+        _ => None,
+    }
 }
