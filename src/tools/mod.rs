@@ -17,6 +17,8 @@ pub mod command;
 pub mod read_file;
 pub mod write_file;
 pub mod edit_file;
+pub mod grep;
+pub mod blob;
 
 use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, Tool,
@@ -62,6 +64,8 @@ pub fn tools() -> Vec<Tool> {
         read_file::tool(),
         write_file::tool(),
         edit_file::tool(),
+        grep::tool(),
+        blob::tool(),
     ]
 }
 
@@ -73,6 +77,8 @@ pub async fn run_tool_call(call: &FunctionToolCall) -> FunctionCallOutputItemPar
         read_file::NAME => read_file::run(&call.arguments).await,
         write_file::NAME => write_file::run(&call.arguments).await,
         edit_file::NAME => edit_file::run(&call.arguments).await,
+        grep::NAME => grep::run(&call.arguments).await,
+        blob::NAME => blob::run(&call.arguments).await,
         other => format!("error: unknown tool '{other}'"),
     };
 
@@ -119,7 +125,7 @@ mod tests {
         assert!(wrote.starts_with("wrote"), "unexpected: {wrote}");
 
         let read = read_file::run(&format!(r#"{{"path":"{json_path}"}}"#)).await;
-        assert_eq!(read, "alpha\nbeta\n");
+        assert_eq!(read, "alpha\nbeta");
 
         let edited = edit_file::run(&format!(
             r#"{{"path":"{json_path}","old_string":"alpha","new_string":"gamma"}}"#
@@ -128,7 +134,7 @@ mod tests {
         assert_eq!(edited, format!("edited {}", path.to_string_lossy()));
 
         let read_again = read_file::run(&format!(r#"{{"path":"{json_path}"}}"#)).await;
-        assert_eq!(read_again, "gamma\nbeta\n");
+        assert_eq!(read_again, "gamma\nbeta");
 
         let missing = edit_file::run(&format!(
             r#"{{"path":"{json_path}","old_string":"nope","new_string":"x"}}"#

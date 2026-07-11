@@ -1956,6 +1956,7 @@ dependencies = [
  "ratatui-markdown",
  "ratatui-textarea",
  "ratatui-widgets",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
