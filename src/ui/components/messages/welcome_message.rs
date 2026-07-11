@@ -112,6 +112,27 @@ impl WelcomeMessage {
             )),
             Line::from(""),
             Line::from(Span::styled(
+                "Keyboard shortcuts",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("  Enter", Style::default().fg(ACCENT)),
+                Span::styled("          Send message", Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Ctrl+Q", Style::default().fg(ACCENT)),
+                Span::styled("         Quit", Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Ctrl+C", Style::default().fg(ACCENT)),
+                Span::styled("         Quit", Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Scroll", Style::default().fg(ACCENT)),
+                Span::styled("         Navigate conversation", Style::default().fg(TEXT)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
                 "Quote",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
