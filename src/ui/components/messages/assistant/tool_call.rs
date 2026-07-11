@@ -17,6 +17,7 @@ use async_openai::types::responses::FunctionToolCall;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
+use crate::ui::components::messages::assistant::detail_style;
 use crate::ui::markdown_theme::palette;
 
 /// Renders a tool call the model made. Collapsed it is a single line
@@ -44,7 +45,7 @@ impl<'a> ToolCallMessage<'a> {
         let accent = Style::new()
             .fg(palette::YELLOW)
             .add_modifier(Modifier::BOLD);
-        let dim = Style::new().fg(palette::MUTED);
+        let muted = Style::new().fg(palette::MUTED);
 
         let value = serde_json::from_str::<serde_json::Value>(&self.call.arguments).ok();
 
@@ -53,28 +54,28 @@ impl<'a> ToolCallMessage<'a> {
             let mut spans = vec![Span::styled(format!("🔧 {}", self.call.name), accent)];
             let summary = one_line_summary(value.as_ref(), &self.call.arguments);
             if !summary.is_empty() {
-                spans.push(Span::styled(format!("  {summary}"), dim));
+                spans.push(Span::styled(format!("  {summary}"), muted));
             }
-            spans.push(Span::styled(" ▸".to_string(), dim));
+            spans.push(Span::styled(" ▸".to_string(), muted));
             return Text::from(Line::from(spans));
         }
 
         // Expanded: header plus every argument in full.
         let mut lines = vec![Line::from(vec![
             Span::styled(format!("🔧 {}", self.call.name), accent),
-            Span::styled(" ▾".to_string(), dim),
+            Span::styled(" ▾".to_string(), detail_style()),
         ])];
 
         match &value {
             Some(serde_json::Value::Object(map)) => {
                 for (key, value) in map {
-                    push_field(&mut lines, key, &value_text(value), dim);
+                    push_field(&mut lines, key, &value_text(value), detail_style());
                 }
             }
             _ => {
                 // Arguments not parseable (e.g. still streaming); show them raw.
                 for line in self.call.arguments.lines() {
-                    lines.push(Line::from(Span::styled(format!("  {line}"), dim)));
+                    lines.push(Line::from(Span::styled(format!("  {line}"), detail_style())));
                 }
             }
         }
