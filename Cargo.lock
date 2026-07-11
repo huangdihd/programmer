@@ -2187,7 +2187,7 @@ dependencies = [
 [[package]]
 name = "ratatui-markdown"
 version = "0.3.6"
-source = "git+https://github.com/huangdihd/ratatui-markdown#d375232dfd7b539e788e878aaae2d55a05f228ca"
+source = "git+https://github.com/huangdihd/ratatui-markdown#5a43c54f9dc3e9fc9cc0a0b4612b5bd8c51edf2e"
 dependencies = [
  "image",
  "pest",

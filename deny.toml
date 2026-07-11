@@ -1,0 +1,34 @@
+[licenses]
+# List of explicitly allowed licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "Unlicense",
+    "CC0-1.0",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "GPL-3.0-or-later",
+    "CDLA-Permissive-2.0",
+]
+# Confidence threshold for detecting a license text
+confidence-threshold = 0.8
+
+# ratatui-markdown is our own fork; its Cargo.toml has "SySL-1.0" which
+# isn't valid SPDX and can't be parsed. The exception allows it anyway.
+[[licenses.exceptions]]
+name = "ratatui-markdown"
+allow = ["LicenseRef-sysl-1.0"]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+# ratatui-markdown is pulled from a git fork we control.
+unknown-git = "allow"
