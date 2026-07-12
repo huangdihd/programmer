@@ -31,6 +31,9 @@ TUI built with [Ratatui](https://ratatui.rs).
   user, assistant, tool calls, tool results, and errors.
 - **Pending messages** — if you type while the model is still responding, your
   input is queued and sent automatically when the turn finishes.
+- **Multi-provider** — configure multiple API backends (different keys, base URLs,
+  models) and switch between them. Manage via `/providers manage` or `--providers`
+  flag.
 - **Configurable** — set model, API base URL, and API key via a TOML config
   file or environment variables.
 
@@ -64,17 +67,28 @@ On first launch, `programmer` creates a default config file at:
 Edit it to provide your credentials:
 
 ```toml
-model = "your-model-name"
+default_provider = "openai"
+
+[providers.openai]
 base_url = "https://api.openai.com/v1"
 api_key = "sk-your-key-here"
+# models = ["gpt-4o", "gpt-4.1"]  # optional: restrict model list
+# default_model = "gpt-4o"        # optional: default model for this provider
+
+# [providers.ollama]
+# base_url = "http://localhost:11434/v1"
+# api_key = "ollama"
 ```
+
+Each provider is a `[providers.<name>]` section. `default_provider` picks which
+one is active at startup. You can add as many providers as you want.
 
 Alternatively, set environment variables (they override file values):
 
 ```sh
-export Programmer_model="gpt-4o"
-export Programmer_base_url="https://api.openai.com/v1"
-export Programmer_api_key="sk-..."
+export Programmer_default_provider="openai"
+export Programmer_providers_openai_base_url="https://api.openai.com/v1"
+export Programmer_providers_openai_api_key="sk-..."
 ```
 
 Any OpenAI-compatible `/v1/responses` endpoint works — local models served
@@ -95,6 +109,47 @@ Inside the TUI:
 | `Ctrl+C` / `Ctrl+Q` | Quit |
 | Mouse scroll | Scroll conversation history |
 | Mouse click | (on clickable areas in the conversation) |
+| `/model <name>` | Switch model |
+| `/providers manage` | Open provider management panel |
+
+### Provider management panel
+
+Open with `/providers manage` or the `--providers` flag.
+
+| Key | Action |
+|---|---|
+| `↑↓` / `jk` | Navigate provider list |
+| `Enter` | Set selected provider as default |
+| `a` | Add new provider (opens form) |
+| `e` | Edit selected provider |
+| `d` | Delete selected provider (confirm with `y`) |
+| `m` | Browse model list of selected provider |
+| `q` / `Esc` | Close panel |
+
+**In model browser (`m`):**
+
+| Key | Action |
+|---|---|
+| Type | Filter models (case-insensitive substring match) |
+| `Backspace` | Remove filter character |
+| `↑↓` / `jk` | Navigate filtered list |
+| `Enter` | Set highlighted model as `default_model` |
+| `Esc` / `q` | Back to provider list |
+
+**In add/edit form:**
+
+| Key | Action |
+|---|---|
+| `Tab` / `↑↓` | Next field |
+| `Shift+Tab` / `↑` | Previous field |
+| `Enter` | Save provider |
+| `Esc` | Cancel |
+
+When the cursor is on the **default_model** field:
+- Press **`Tab`** to open a completion popup showing models that match your input.
+- **`↑↓`** navigate the popup, **`Enter`** accepts the highlighted model,
+  **`Esc`** closes the popup.
+- Typing or pressing backspace refreshes the candidates live.
 
 When you send a message, the model responds. If it decides to use a tool
 (read a file, run a command, etc.), the tool executes automatically in the
