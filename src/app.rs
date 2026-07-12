@@ -495,7 +495,7 @@ impl App<'_> {
                 self.events.send(AppEvent::Quit);
                 return Ok(());
             }
-            match panel.handle_key(key_event, &mut self.config) {
+            match panel.handle_key(key_event, &mut self.config, &self.provider_manager) {
                 PanelAction::Close => self.provider_panel = None,
                 PanelAction::Saved => {
                     self.persist_config();

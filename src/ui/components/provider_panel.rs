@@ -22,6 +22,7 @@
 
 use crate::config::programmer_config::{ProgrammerConfig, ProviderConfig};
 use crate::providers::ProviderManager;
+use crate::ui::components::completion_popup::CompletionPopup;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -43,6 +44,19 @@ pub enum PanelAction {
 /// Editable fields of the add/edit form, in focus order.
 const FORM_LABELS: [&str; 4] = ["name", "base_url", "api_key", "default_model"];
 
+#[derive(Debug, Clone)]
+struct ModelCompletion {
+    /// Matching model names.
+    candidates: Vec<String>,
+    /// Highlighted index.
+    selected: usize,
+    /// Scroll offset for the popup (items scrolled off the top).
+    scroll_offset: usize,
+    /// The typed prefix that was used to filter.
+    #[allow(dead_code)]
+    prefix: String,
+}
+
 #[derive(Debug, Default)]
 struct Form {
     /// `Some(original_name)` when editing an existing provider.
@@ -51,6 +65,8 @@ struct Form {
     fields: [String; 4],
     focus: usize,
     error: Option<String>,
+    /// Completion popup state for the default_model field.
+    completion: Option<ModelCompletion>,
 }
 
 #[derive(Debug)]
@@ -58,6 +74,12 @@ enum Mode {
     List,
     ConfirmDelete(String),
     Form(Form),
+    /// Scrollable model list of one provider; Enter picks the default model.
+    Models {
+        provider: String,
+        filter: String,
+        selected: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -82,11 +104,17 @@ impl ProviderPanel {
     }
 
     /// Handle a key event, possibly mutating `config`.
-    pub fn handle_key(&mut self, key: KeyEvent, config: &mut ProgrammerConfig) -> PanelAction {
+    pub fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        config: &mut ProgrammerConfig,
+        pm: &ProviderManager,
+    ) -> PanelAction {
         match &mut self.mode {
-            Mode::List => self.handle_list_key(key, config),
+            Mode::List => self.handle_list_key(key, config, pm),
             Mode::ConfirmDelete(_) => self.handle_confirm_key(key, config),
-            Mode::Form(_) => self.handle_form_key(key, config),
+            Mode::Form(_) => self.handle_form_key(key, config, pm),
+            Mode::Models { .. } => self.handle_models_key(key, config, pm),
         }
     }
 
@@ -99,7 +127,12 @@ impl ProviderPanel {
         }
     }
 
-    fn handle_list_key(&mut self, key: KeyEvent, config: &mut ProgrammerConfig) -> PanelAction {
+    fn handle_list_key(
+        &mut self,
+        key: KeyEvent,
+        config: &mut ProgrammerConfig,
+        _pm: &ProviderManager,
+    ) -> PanelAction {
         let names = Self::sorted_names(config);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return PanelAction::Close,
@@ -114,6 +147,15 @@ impl ProviderPanel {
             KeyCode::Char('a') => {
                 self.mode = Mode::Form(Form::default());
             }
+            KeyCode::Char('m') => {
+                if let Some(name) = names.get(self.selected) {
+                    self.mode = Mode::Models {
+                        provider: name.clone(),
+                        filter: String::new(),
+                        selected: 0,
+                    };
+                }
+            }
             KeyCode::Char('e') => {
                 if let Some(name) = names.get(self.selected) {
                     let p = &config.providers[name];
@@ -127,6 +169,7 @@ impl ProviderPanel {
                         ],
                         focus: 0,
                         error: None,
+                        completion: None,
                     });
                 }
             }
@@ -176,28 +219,131 @@ impl ProviderPanel {
         }
     }
 
-    fn handle_form_key(&mut self, key: KeyEvent, config: &mut ProgrammerConfig) -> PanelAction {
+    fn handle_form_key(
+        &mut self,
+        key: KeyEvent,
+        config: &mut ProgrammerConfig,
+        pm: &ProviderManager,
+    ) -> PanelAction {
         let Mode::Form(form) = &mut self.mode else {
             unreachable!("handle_form_key called outside Form mode");
         };
+
+        // --- When popup is visible (only for default_model field) ---
+        if form.focus == 3 {
+            if let Some(comp) = form.completion.as_mut() {
+                match key.code {
+                    KeyCode::Esc => {
+                        form.completion = None;
+                        return PanelAction::None;
+                    }
+                    KeyCode::Tab => {
+                        if comp.candidates.len() <= 1 {
+                            form.completion = None;
+                            return PanelAction::None;
+                        }
+                        comp.selected = (comp.selected + 1) % comp.candidates.len();
+                        form.fields[3] = comp.candidates[comp.selected].clone();
+                        let visible = 10usize;
+                        if comp.selected < comp.scroll_offset {
+                            comp.scroll_offset = comp.selected;
+                        } else if comp.selected >= comp.scroll_offset + visible {
+                            comp.scroll_offset = comp.selected - visible + 1;
+                        }
+                        return PanelAction::None;
+                    }
+                    KeyCode::Up => {
+                        if comp.selected > 0 {
+                            comp.selected -= 1;
+                        } else {
+                            comp.selected = comp.candidates.len().saturating_sub(1);
+                        }
+                        if comp.selected < comp.scroll_offset {
+                            comp.scroll_offset = comp.selected;
+                        }
+                        form.fields[3] = comp.candidates[comp.selected].clone();
+                        return PanelAction::None;
+                    }
+                    KeyCode::Down => {
+                        comp.selected = (comp.selected + 1) % comp.candidates.len();
+                        let visible = 10usize;
+                        if comp.selected >= comp.scroll_offset + visible {
+                            comp.scroll_offset = comp.selected - visible + 1;
+                        }
+                        form.fields[3] = comp.candidates[comp.selected].clone();
+                        return PanelAction::None;
+                    }
+                    KeyCode::Enter => {
+                        // Accept the highlighted candidate, close popup.
+                        form.fields[3] = comp.candidates[comp.selected].clone();
+                        form.completion = None;
+                        return PanelAction::None;
+                    }
+                    KeyCode::Backspace => {
+                        form.fields[3].pop();
+                        form.completion = Self::build_completion(&form.fields[3], form, pm);
+                        return PanelAction::None;
+                    }
+                    KeyCode::Char(c) => {
+                        form.fields[3].push(c);
+                        form.completion = Self::build_completion(&form.fields[3], form, pm);
+                        return PanelAction::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Esc => {
+                form.completion = None;
                 self.mode = Mode::List;
                 return PanelAction::None;
             }
-            KeyCode::Tab | KeyCode::Down => {
+            KeyCode::Tab => {
+                if form.focus == 3 {
+                    // On default_model: open popup on first Tab, cycle on subsequent.
+                    if form.completion.is_none() {
+                        form.completion = Self::build_completion(&form.fields[3], form, pm);
+                    }
+                    if let Some(comp) = form.completion.as_mut() {
+                        if comp.candidates.len() <= 1 {
+                            if comp.candidates.len() == 1 {
+                                form.fields[3] = comp.candidates[0].clone();
+                            }
+                            form.completion = None;
+                        } else {
+                            comp.selected = (comp.selected + 1) % comp.candidates.len();
+                            form.fields[3] = comp.candidates[comp.selected].clone();
+                        }
+                    }
+                } else {
+                    form.completion = None;
+                    form.focus = (form.focus + 1) % FORM_LABELS.len();
+                }
+            }
+            KeyCode::Down => {
+                form.completion = None;
                 form.focus = (form.focus + 1) % FORM_LABELS.len();
             }
             KeyCode::BackTab | KeyCode::Up => {
+                form.completion = None;
                 form.focus = (form.focus + FORM_LABELS.len() - 1) % FORM_LABELS.len();
             }
             KeyCode::Backspace => {
                 form.fields[form.focus].pop();
+                if form.focus == 3 {
+                    form.completion = Self::build_completion(&form.fields[3], form, pm);
+                }
             }
             KeyCode::Char(c) => {
                 form.fields[form.focus].push(c);
+                if form.focus == 3 {
+                    form.completion = Self::build_completion(&form.fields[3], form, pm);
+                }
             }
             KeyCode::Enter => {
+                form.completion = None;
                 let [name, base_url, api_key, default_model] =
                     form.fields.clone().map(|f| f.trim().to_string());
                 if name.is_empty() || base_url.is_empty() || api_key.is_empty() {
@@ -238,6 +384,89 @@ impl ProviderPanel {
                     .unwrap_or(0);
                 self.mode = Mode::List;
                 return PanelAction::Saved;
+            }
+            _ => {}
+        }
+        PanelAction::None
+    }
+
+    /// Build a ModelCompletion filtered by the current prefix for the
+    /// default_model field.
+    fn build_completion(
+        prefix: &str,
+        form: &Form,
+        pm: &ProviderManager,
+    ) -> Option<ModelCompletion> {
+        let provider_name = form.original.as_deref().unwrap_or(&form.fields[0]);
+        let models = pm.models_for(provider_name);
+        if models.is_empty() {
+            return None;
+        }
+        let lower = prefix.to_lowercase();
+        let candidates: Vec<String> = models
+            .iter()
+            .filter(|m| m.to_lowercase().starts_with(&lower))
+            .map(|s| s.to_string())
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        Some(ModelCompletion {
+            candidates,
+            selected: 0,
+            scroll_offset: 0,
+            prefix: prefix.to_string(),
+        })
+    }
+
+    fn handle_models_key(
+        &mut self,
+        key: KeyEvent,
+        config: &mut ProgrammerConfig,
+        pm: &ProviderManager,
+    ) -> PanelAction {
+        let Mode::Models {
+            provider,
+            filter,
+            selected,
+        } = &mut self.mode
+        else {
+            unreachable!("handle_models_key called outside Models mode");
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::List;
+                return PanelAction::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = selected.saturating_add(1);
+            }
+            KeyCode::Backspace => {
+                filter.pop();
+                *selected = 0;
+            }
+            KeyCode::Char(c) => {
+                filter.push(c);
+                *selected = 0;
+            }
+            KeyCode::Enter => {
+                let model_names = pm.models_for(provider);
+                let f = filter.to_lowercase();
+                let filtered: Vec<&&str> = model_names
+                    .iter()
+                    .filter(|m| m.to_lowercase().contains(&f))
+                    .collect();
+                let sel = (*selected).min(filtered.len().saturating_sub(1));
+                if let Some(model) = filtered.get(sel) {
+                    if let Some(pc) = config.providers.get_mut(provider) {
+                        pc.default_model = Some(model.to_string());
+                    }
+                    self.mode = Mode::List;
+                    return PanelAction::Saved;
+                }
             }
             _ => {}
         }
@@ -329,7 +558,7 @@ impl ProviderPanel {
         }
         ratatui::widgets::StatefulWidget::render(list, chunks[1], buf, &mut list_state);
 
-        // -- Bottom bar: help, confirmation, or the add/edit form --
+        // -- Bottom bar: help, confirmation, add/edit form, or model list --
         match &self.mode {
             Mode::List => {
                 let help = Line::from(vec![
@@ -341,6 +570,8 @@ impl ProviderPanel {
                     Span::styled(" add  ", Style::default().fg(Color::Gray)),
                     Span::styled("e", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" edit  ", Style::default().fg(Color::Gray)),
+                    Span::styled("m", Style::default().fg(Color::Cyan).bold()),
+                    Span::styled(" models  ", Style::default().fg(Color::Gray)),
                     Span::styled("d", Style::default().fg(Color::Red).bold()),
                     Span::styled(" delete  ", Style::default().fg(Color::Gray)),
                     Span::styled("q/Esc", Style::default().fg(Color::Cyan).bold()),
@@ -362,7 +593,6 @@ impl ProviderPanel {
                 Paragraph::new(confirm).render(chunks[2], buf);
             }
             Mode::Form(form) => {
-                // The form replaces the list area with a bordered editor.
                 let title = if form.original.is_some() {
                     " Edit provider "
                 } else {
@@ -394,14 +624,42 @@ impl ProviderPanel {
                         Style::default().fg(Color::Red),
                     )));
                 }
-                lines.push(Line::from(vec![
-                    Span::styled("  Tab/↑↓", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" next field  ", Style::default().fg(Color::Gray)),
-                    Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" save  ", Style::default().fg(Color::Gray)),
-                    Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" cancel", Style::default().fg(Color::Gray)),
-                ]));
+                // Hint line: mention Tab completion if focused on default_model.
+                let hint = if form.focus == 3 {
+                    if form.completion.is_some() {
+                        Line::from(vec![
+                            Span::styled("  Tab", Style::default().fg(Color::Cyan).bold()),
+                            Span::styled(" next  ", Style::default().fg(Color::Gray)),
+                            Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
+                            Span::styled(" select  ", Style::default().fg(Color::Gray)),
+                            Span::styled("Enter", Style::default().fg(Color::Green).bold()),
+                            Span::styled(" accept  ", Style::default().fg(Color::Gray)),
+                            Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+                            Span::styled(" close popup  ", Style::default().fg(Color::Gray)),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::styled("  Tab", Style::default().fg(Color::Cyan).bold()),
+                            Span::styled(" complete model  ", Style::default().fg(Color::Gray)),
+                            Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
+                            Span::styled(" next field  ", Style::default().fg(Color::Gray)),
+                            Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
+                            Span::styled(" save  ", Style::default().fg(Color::Gray)),
+                            Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+                            Span::styled(" cancel", Style::default().fg(Color::Gray)),
+                        ])
+                    }
+                } else {
+                    Line::from(vec![
+                        Span::styled("  Tab/↑↓", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(" next field  ", Style::default().fg(Color::Gray)),
+                        Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(" save  ", Style::default().fg(Color::Gray)),
+                        Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(" cancel", Style::default().fg(Color::Gray)),
+                    ])
+                };
+                lines.push(hint);
 
                 let height = (lines.len() as u16 + 2).min(area.height);
                 let form_area = Rect {
@@ -411,7 +669,7 @@ impl ProviderPanel {
                     height,
                 };
                 Clear.render(form_area, buf);
-                Paragraph::new(lines)
+                Paragraph::new(lines.as_slice())
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
@@ -419,6 +677,148 @@ impl ProviderPanel {
                             .title(title),
                     )
                     .render(form_area, buf);
+
+                // ---- completion popup for default_model field ----
+                if let Some(comp) = &form.completion {
+                    let max_visible = 10u16;
+                    let count = (comp.candidates.len() as u16).min(max_visible);
+                    // The default_model field is line 3 (0-indexed) in the form.
+                    // Before it: 3 label lines + optional error line. Each line
+                    // takes 1 row. The popup floats above the form's top.
+                    let field_line = 3u16;
+                    // x offset: "  " (2) + "  default_model: " (18) = 20
+                    let value_x = form_area.x + 20;
+                    let longest = comp
+                        .candidates
+                        .iter()
+                        .map(|c| c.len())
+                        .max()
+                        .unwrap_or(0) as u16;
+                    let popup_width = (longest + 2).clamp(14, form_area.width);
+
+                    let popup_y = form_area
+                        .y
+                        .saturating_add(field_line)
+                        .saturating_sub(count);
+                    let popup_area = Rect {
+                        x: value_x.min(form_area.right().saturating_sub(popup_width)),
+                        y: popup_y.min(form_area.bottom().saturating_sub(count)),
+                        width: popup_width,
+                        height: count.min(form_area.y + field_line),
+                    };
+
+                    let popup = CompletionPopup {
+                        candidates: &comp.candidates,
+                        selected: comp.selected,
+                        scroll_offset: comp.scroll_offset,
+                    };
+                    popup.render(popup_area, buf);
+                }
+            }
+            Mode::Models {
+                provider,
+                filter,
+                selected,
+            } => {
+                let title = format!(" Models: {provider} ");
+                let model_names: Vec<&str> = pm.models_for(provider);
+                let f = filter.to_lowercase();
+                let filtered: Vec<&&str> = model_names
+                    .iter()
+                    .filter(|m| m.to_lowercase().contains(&f))
+                    .collect();
+                let sel = (*selected).min(filtered.len().saturating_sub(1));
+                let items: Vec<ListItem> = filtered
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let is_sel = i == sel;
+                        let prefix = if is_sel { "❯ " } else { "  " };
+                        let style = if is_sel {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        let line = if f.is_empty() {
+                            Line::from(Span::styled(format!("{prefix}{m}"), style))
+                        } else {
+                            let lower = m.to_lowercase();
+                            let mut spans: Vec<Span> = vec![Span::styled(prefix, style)];
+                            let mut pos = 0;
+                            while let Some(idx) = lower[pos..].find(&f) {
+                                let start = pos + idx;
+                                let end = start + f.len();
+                                if start > pos {
+                                    spans.push(Span::styled(m[pos..start].to_string(), style));
+                                }
+                                spans.push(Span::styled(
+                                    m[start..end].to_string(),
+                                    style.add_modifier(Modifier::UNDERLINED),
+                                ));
+                                pos = end;
+                            }
+                            if pos < m.len() {
+                                spans.push(Span::styled(m[pos..].to_string(), style));
+                            }
+                            Line::from(spans)
+                        };
+                        ListItem::new(line)
+                    })
+                    .collect();
+
+                let list_area = Rect {
+                    y: chunks[1].y,
+                    height: chunks[1].height + chunks[2].height,
+                    ..chunks[1]
+                };
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan))
+                            .title(title),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                let mut list_state = ListState::default();
+                if !filtered.is_empty() {
+                    list_state.select(Some(sel));
+                }
+                ratatui::widgets::StatefulWidget::render(list, list_area, buf, &mut list_state);
+
+                let hint = if f.is_empty() {
+                    Line::from(vec![
+                        Span::styled(" type", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(" to filter  ", Style::default().fg(Color::Gray)),
+                        Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(" navigate  ", Style::default().fg(Color::Gray)),
+                        Span::styled("Enter", Style::default().fg(Color::Green).bold()),
+                        Span::styled(" set as default_model  ", Style::default().fg(Color::Gray)),
+                        Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(" back", Style::default().fg(Color::Gray)),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" filter: \"{filter}\"  "),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(" navigate  ", Style::default().fg(Color::Gray)),
+                        Span::styled("Enter", Style::default().fg(Color::Green).bold()),
+                        Span::styled(" set as default_model  ", Style::default().fg(Color::Gray)),
+                        Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(" back", Style::default().fg(Color::Gray)),
+                    ])
+                };
+                Paragraph::new(hint).render(chunks[2], buf);
             }
         }
     }
@@ -432,6 +832,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn pm_stub() -> ProviderManager {
+        ProviderManager::stub(HashMap::new())
     }
 
     fn config_with(names: &[&str]) -> ProgrammerConfig {
@@ -459,20 +863,21 @@ mod tests {
     #[test]
     fn add_provider_via_form() {
         let mut config = config_with(&[]);
+        let pm = pm_stub();
         let mut panel = ProviderPanel::new();
 
-        assert_eq!(panel.handle_key(key(KeyCode::Char('a')), &mut config), PanelAction::None);
+        assert_eq!(panel.handle_key(key(KeyCode::Char('a')), &mut config, &pm), PanelAction::None);
         // Type into name field, then move through the fields.
         for c in "zai".chars() {
-            panel.handle_key(key(KeyCode::Char(c)), &mut config);
+            panel.handle_key(key(KeyCode::Char(c)), &mut config, &pm);
         }
-        panel.handle_key(key(KeyCode::Tab), &mut config);
+        panel.handle_key(key(KeyCode::Tab), &mut config, &pm);
         for c in "https://api.z.ai/v1".chars() {
-            panel.handle_key(key(KeyCode::Char(c)), &mut config);
+            panel.handle_key(key(KeyCode::Char(c)), &mut config, &pm);
         }
-        panel.handle_key(key(KeyCode::Tab), &mut config);
+        panel.handle_key(key(KeyCode::Tab), &mut config, &pm);
         panel.handle_paste("sk-secret");
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::Saved);
+        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config, &pm), PanelAction::Saved);
 
         let p = &config.providers["zai"];
         assert_eq!(p.base_url, "https://api.z.ai/v1");
@@ -484,9 +889,10 @@ mod tests {
     #[test]
     fn form_requires_mandatory_fields() {
         let mut config = config_with(&[]);
+        let pm = pm_stub();
         let mut panel = ProviderPanel::new();
-        panel.handle_key(key(KeyCode::Char('a')), &mut config);
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::None);
+        panel.handle_key(key(KeyCode::Char('a')), &mut config, &pm);
+        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config, &pm), PanelAction::None);
         assert!(matches!(&panel.mode, Mode::Form(f) if f.error.is_some()));
         assert!(config.providers.is_empty());
     }
@@ -494,12 +900,13 @@ mod tests {
     #[test]
     fn delete_provider_reassigns_default() {
         let mut config = config_with(&["alpha", "beta"]);
+        let pm = pm_stub();
         config.default_provider = "alpha".into();
         let mut panel = ProviderPanel::new();
 
         // "alpha" sorts first and is selected; delete it and confirm.
-        panel.handle_key(key(KeyCode::Char('d')), &mut config);
-        assert_eq!(panel.handle_key(key(KeyCode::Char('y')), &mut config), PanelAction::Saved);
+        panel.handle_key(key(KeyCode::Char('d')), &mut config, &pm);
+        assert_eq!(panel.handle_key(key(KeyCode::Char('y')), &mut config, &pm), PanelAction::Saved);
         assert!(!config.providers.contains_key("alpha"));
         assert_eq!(config.default_provider, "beta");
     }
@@ -507,23 +914,25 @@ mod tests {
     #[test]
     fn enter_sets_default_provider() {
         let mut config = config_with(&["alpha", "beta"]);
+        let pm = pm_stub();
         config.default_provider = "alpha".into();
         let mut panel = ProviderPanel::new();
-        panel.handle_key(key(KeyCode::Down), &mut config);
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::Saved);
+        panel.handle_key(key(KeyCode::Down), &mut config, &pm);
+        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config, &pm), PanelAction::Saved);
         assert_eq!(config.default_provider, "beta");
     }
 
     #[test]
     fn rename_does_not_clobber_existing_provider() {
         let mut config = config_with(&["alpha", "beta"]);
+        let pm = pm_stub();
         let mut panel = ProviderPanel::new();
         // Edit "alpha", rename it to "beta" — must be rejected.
-        panel.handle_key(key(KeyCode::Char('e')), &mut config);
+        panel.handle_key(key(KeyCode::Char('e')), &mut config, &pm);
         if let Mode::Form(form) = &mut panel.mode {
             form.fields[0] = "beta".into();
         }
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::None);
+        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config, &pm), PanelAction::None);
         assert!(config.providers.contains_key("alpha"));
         assert!(matches!(&panel.mode, Mode::Form(f) if f.error.is_some()));
     }

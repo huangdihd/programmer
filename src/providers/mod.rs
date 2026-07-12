@@ -157,6 +157,18 @@ impl ProviderManager {
             .map(|v| v.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default()
     }
+
+    /// Create a stub instance for tests — no clients, no models.
+    #[cfg(test)]
+    pub fn stub(models: HashMap<String, Vec<String>>) -> Self {
+        ProviderManager {
+            clients: HashMap::new(),
+            models,
+            configs: HashMap::new(),
+            default_provider: String::new(),
+            startup_errors: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
