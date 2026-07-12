@@ -47,37 +47,76 @@ mod ui;
 struct Args {
     /// `--resume` with an optional UUID.
     resume: Option<Option<String>>,
+    /// `--help`: print usage and exit.
+    help: bool,
+    /// `--session`: open the session management panel (same picker as bare
+    /// `--resume`).
+    session: bool,
+    /// `--providers`: start with the provider management panel open.
+    providers: bool,
 }
+
+const HELP_TEXT: &str = "\
+programmer — a coding agent in your terminal
+
+Usage: programmer [OPTIONS]
+
+Options:
+  --resume [uuid]   Resume a saved session; without a uuid, opens the
+                    session management panel to pick one
+  --session         Open the session management panel
+  --providers       Open the provider management panel on startup
+  -h, --help        Show this help and exit";
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
-    let mut resume: Option<Option<String>> = None;
+    let mut parsed = Args {
+        resume: None,
+        help: false,
+        session: false,
+        providers: false,
+    };
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--resume" => {
                 if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    resume = Some(Some(args[i + 1].clone()));
+                    parsed.resume = Some(Some(args[i + 1].clone()));
                     i += 1;
                 } else {
-                    resume = Some(None);
+                    parsed.resume = Some(None);
                 }
             }
+            "--session" => parsed.session = true,
+            "--providers" => parsed.providers = true,
+            "-h" | "--help" => parsed.help = true,
             _ => {}
         }
         i += 1;
     }
-    Args { resume }
+    parsed
 }
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     let args = parse_args();
 
+    if args.help {
+        println!("{HELP_TEXT}");
+        return Ok(());
+    }
+
+    // `--session` opens the same management panel as bare `--resume`.
+    let resume = if args.session && args.resume.is_none() {
+        Some(None)
+    } else {
+        args.resume
+    };
+
     // ---- resolve which session to use ----
     let session_mgr = SessionManager::new();
     let mut startup_messages: Vec<String> = Vec::new();
-    let (session_uuid, saved_items, saved_history) = match (args.resume, &session_mgr) {
+    let (session_uuid, saved_items, saved_history) = match (resume, &session_mgr) {
         // --resume <uuid>
         (Some(Some(uuid)), Some(mgr)) => {
             match mgr.load(&uuid) {
@@ -195,6 +234,7 @@ async fn main() -> color_eyre::Result<()> {
         session_uuid,
         session_mgr,
         startup_messages,
+        args.providers,
     )
     .await
     .run(terminal)

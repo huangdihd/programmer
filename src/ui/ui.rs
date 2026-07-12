@@ -21,6 +21,12 @@ use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
 impl Widget for &mut App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // The provider management panel is modal and replaces the whole UI.
+        if let Some(panel) = &self.provider_panel {
+            panel.render(&self.config, &self.provider_manager, area, buf);
+            return;
+        }
+
         // Update footer state from conversation panel.
         let is_receiving = self.conversation_panel.receiving_response.is_some();
         let is_outputting_message = self.conversation_panel.outputting_message;

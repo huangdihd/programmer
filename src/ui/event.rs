@@ -65,6 +65,9 @@ pub enum AppEvent {
     /// Quit the application.
     Quit,
     Start,
+    /// Provider config changed (via the management panel): rebuild the
+    /// provider manager from the current config.
+    ProvidersChanged,
 }
 
 /// Terminal event handler.

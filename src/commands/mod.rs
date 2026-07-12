@@ -25,7 +25,9 @@ pub enum Command {
     Clear,
     New,
     Model(String),
-    Providers,
+    /// `/providers <subcommand>` — carries the raw argument string
+    /// ("show", "manage", or anything else for the usage hint).
+    Providers(String),
     Help,
     Session,
 }
@@ -51,7 +53,7 @@ impl Command {
             "c" | "clear" => Some(Command::Clear),
             "new" | "n" => Some(Command::New),
             "model" | "m" => Some(Command::Model(args)),
-            "providers" => Some(Command::Providers),
+            "providers" | "provider" => Some(Command::Providers(args)),
             "help" | "?" => Some(Command::Help),
             "session" | "s" => Some(Command::Session),
             _ => None,
@@ -68,7 +70,8 @@ impl Command {
         &[
             ("/model <provider/model>", "Switch to a different model"),
             ("/new | /n", "Start a new session (saves current)"),
-            ("/providers", "List all configured providers and models"),
+            ("/providers show", "List all configured providers and models"),
+            ("/providers manage", "Open the provider management panel"),
             ("/session | /s", "Show current session info"),
             ("/clear | /c", "Clear the conversation history"),
             ("/quit | /q", "Exit the application"),
@@ -148,8 +151,25 @@ impl CompletionEngine {
         let cmd = parts[0];
         match cmd {
             "model" | "m" => Self::complete_model(text, cmd, pm),
+            "providers" | "provider" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
             _ => None,
         }
+    }
+
+    /// Complete a fixed set of subcommands for `cmd`.
+    fn complete_subcommand(
+        text: &str,
+        cmd: &str,
+        subcommands: &[&str],
+    ) -> Option<CompletionState> {
+        let after_cmd = text[cmd.len()..].trim_start();
+        let prefix = format!("/{} ", cmd);
+        let candidates: Vec<String> = subcommands
+            .iter()
+            .filter(|s| s.starts_with(after_cmd))
+            .map(|s| s.to_string())
+            .collect();
+        CompletionState::new(prefix, candidates)
     }
 
     fn complete_model(text: &str, cmd: &str, pm: &ProviderManager) -> Option<CompletionState> {

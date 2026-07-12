@@ -16,6 +16,11 @@
 use crate::config::programmer_config::{ProgrammerConfig, ProviderConfig};
 use async_openai::{Client, config::OpenAIConfig};
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// How long to wait for a provider's `/models` endpoint before giving up, so
+/// startup never hangs when there is no network.
+const MODEL_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Manages multiple OpenAI-compatible providers, each with its own API key,
 /// base URL, and model list (auto-discovered or manually configured).
@@ -25,6 +30,8 @@ pub struct ProviderManager {
     models: HashMap<String, Vec<String>>,
     configs: HashMap<String, ProviderConfig>,
     default_provider: String,
+    /// Errors from startup model discovery, surfaced in the UI after launch.
+    pub startup_errors: Vec<String>,
 }
 
 impl std::fmt::Debug for ProviderManager {
@@ -44,20 +51,34 @@ impl ProviderManager {
     pub async fn new(config: &ProgrammerConfig) -> Self {
         let mut clients = HashMap::new();
         let mut models: HashMap<String, Vec<String>> = HashMap::new();
+        let mut startup_errors = Vec::new();
 
-        for (name, provider_config) in &config.providers {
+        // Discover models for all providers concurrently so a slow/unreachable
+        // provider doesn't stack its timeout on top of the others.
+        let fetches = config.providers.iter().map(|(name, provider_config)| {
             let openai_config = OpenAIConfig::default()
                 .with_api_base(&provider_config.base_url)
                 .with_api_key(&provider_config.api_key);
             let client = Client::with_config(openai_config);
+            async move {
+                let result = match &provider_config.models {
+                    Some(manual) => Ok(manual.clone()),
+                    None => Self::fetch_models(&client, name).await,
+                };
+                (name.clone(), client, result)
+            }
+        });
 
-            let model_list = match &provider_config.models {
-                Some(manual) => manual.clone(),
-                None => Self::fetch_models(&client, name).await,
+        for (name, client, result) in futures::future::join_all(fetches).await {
+            let model_list = match result {
+                Ok(list) => list,
+                Err(message) => {
+                    startup_errors.push(message);
+                    Vec::new()
+                }
             };
-
             models.insert(name.clone(), model_list);
-            clients.insert(name.clone(), client);
+            clients.insert(name, client);
         }
 
         ProviderManager {
@@ -65,22 +86,30 @@ impl ProviderManager {
             models,
             configs: config.providers.clone(),
             default_provider: config.default_provider.clone(),
+            startup_errors,
         }
     }
 
-    /// Try to fetch the model list from the provider's `/models` endpoint.
-    /// On failure, returns an empty list (the provider still works, just
-    /// without completion support).
-    async fn fetch_models(client: &Client<OpenAIConfig>, name: &str) -> Vec<String> {
-        match client.models().list().await {
-            Ok(response) => response.data.into_iter().map(|m| m.id).collect(),
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to fetch models for provider '{name}': {e}\n\
-                     (provider will work but /model completion won't list its models)"
-                );
-                Vec::new()
-            }
+    /// Try to fetch the model list from the provider's `/models` endpoint,
+    /// bounded by [`MODEL_FETCH_TIMEOUT`]. On failure, returns the error
+    /// message to surface in the UI (the provider still works, just without
+    /// model completion support).
+    async fn fetch_models(
+        client: &Client<OpenAIConfig>,
+        name: &str,
+    ) -> Result<Vec<String>, String> {
+        match tokio::time::timeout(MODEL_FETCH_TIMEOUT, client.models().list()).await {
+            Ok(Ok(response)) => Ok(response.data.into_iter().map(|m| m.id).collect()),
+            Ok(Err(e)) => Err(format!(
+                "failed to fetch models for provider '{name}': {e} \
+                 (provider still works, but /model completion won't list its models)"
+            )),
+            Err(_) => Err(format!(
+                "timed out fetching models for provider '{name}' after \
+                 {}s — check your network \
+                 (provider still works, but /model completion won't list its models)",
+                MODEL_FETCH_TIMEOUT.as_secs()
+            )),
         }
     }
 
@@ -103,6 +132,8 @@ impl ProviderManager {
     /// Resolution order for the model portion:
     /// 1. provider's `default_model` config field
     /// 2. first model from the provider's model list
+    /// 3. `"default"` — model discovery failed (e.g. no network); most
+    ///    providers accept it or the user can /model to something real
     pub fn default_model(&self) -> String {
         let config = self.configs.get(&self.default_provider);
         let model = config
@@ -112,12 +143,8 @@ impl ProviderManager {
                     .get(&self.default_provider)
                     .and_then(|m| m.first().map(|s| s.as_str()))
             })
-            .unwrap_or("");
-        if model.is_empty() {
-            String::new()
-        } else {
-            format!("{}/{}", self.default_provider, model)
-        }
+            .unwrap_or("default");
+        format!("{}/{}", self.default_provider, model)
     }
 
     pub fn provider_names(&self) -> Vec<&str> {
@@ -129,5 +156,45 @@ impl ProviderManager {
             .get(provider)
             .map(|v| v.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Startup must never hang on model discovery: an unreachable provider
+    /// gets cut off by the timeout, reports an error, and falls back to
+    /// `<provider>/default`.
+    #[tokio::test]
+    async fn unreachable_provider_times_out_and_falls_back() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "offline".to_string(),
+            ProviderConfig {
+                // TEST-NET-1 black hole: connections neither succeed nor refuse.
+                base_url: "http://192.0.2.1:9".to_string(),
+                api_key: "unused".to_string(),
+                models: None,
+                default_model: None,
+            },
+        );
+        let config = ProgrammerConfig {
+            default_provider: "offline".to_string(),
+            providers,
+            model: None,
+            base_url: None,
+            api_key: None,
+        };
+
+        let start = std::time::Instant::now();
+        let manager = ProviderManager::new(&config).await;
+        assert!(
+            start.elapsed() < MODEL_FETCH_TIMEOUT + Duration::from_secs(3),
+            "startup took {:?}, model fetch is not being cut off",
+            start.elapsed()
+        );
+        assert_eq!(manager.startup_errors.len(), 1);
+        assert_eq!(manager.default_model(), "offline/default");
     }
 }

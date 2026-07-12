@@ -712,11 +712,7 @@ impl ConversationPanel {
                 status: Some(OutputStatus::Completed),
             })));
 
-        // Recorded function_call_output items, keyed by call id. Outputs are
-        // appended to history after the whole response (which may contain text
-        // items after the call), so their stored position can be separated from
-        // their call — but the API requires each output to directly follow its
-        // call. Emit them adjacent to the call instead of where they were stored.
+        // Recorded function_call_output items, keyed by call id.
         let mut recorded_outputs: HashMap<&str, &FunctionCallOutputItemParam> = HashMap::new();
         for item in &self.items {
             if let MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) = item {
@@ -724,12 +720,25 @@ impl ConversationPanel {
             }
         }
 
+        // Outputs must stay grouped after the whole assistant output block, in
+        // call order (`reasoning, call_1, call_2, output_1, output_2`), matching
+        // how OpenAI documents multi-turn tool use. Interleaving them between
+        // the calls makes chat-completions-backed providers split the block
+        // into several assistant messages, and thinking models (e.g. DeepSeek)
+        // then reject the later ones for missing reasoning content.
         let mut input_items = vec![developer_message];
+        let mut pending_outputs: Vec<InputItem> = Vec::new();
         for message_item in &self.items {
             match message_item {
-                // Skip stored outputs here; they are emitted right after their call.
-                MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(_))) => {}
-                MessageItem::Input(input_item) => input_items.push(input_item.clone()),
+                // A stored output marks the boundary after an assistant block:
+                // flush that block's outputs here, in call order.
+                MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(_))) => {
+                    input_items.append(&mut pending_outputs);
+                }
+                MessageItem::Input(input_item) => {
+                    input_items.append(&mut pending_outputs);
+                    input_items.push(input_item.clone());
+                }
                 MessageItem::Output(output_item) => {
                     input_items.push(output_item.clone().into());
                     if let OutputItem::FunctionCall(call) = output_item {
@@ -749,12 +758,13 @@ impl ConversationPanel {
                                 status: None,
                             },
                         };
-                        input_items.push(InputItem::from(Item::FunctionCallOutput(output)));
+                        pending_outputs.push(InputItem::from(Item::FunctionCallOutput(output)));
                     }
                 }
                 _ => {}
             }
         }
+        input_items.append(&mut pending_outputs);
 
         InputParam::Items(input_items)
     }
@@ -804,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn function_call_outputs_directly_follow_their_calls() {
+    fn function_call_outputs_stay_grouped_after_the_assistant_block() {
         use async_openai::types::responses::{
             AssistantRole, FunctionToolCall, OutputMessage, OutputMessageContent,
             OutputTextContent,
@@ -855,28 +865,77 @@ mod tests {
         let InputParam::Items(items) = panel.get_input_param("test/model") else {
             panic!("expected an item list");
         };
-        // Every call must be answered, and each output must directly follow its
-        // call — real outputs are re-ordered, missing ones synthesized.
-        for call_id in ["call_1", "call_2"] {
-            let call_pos = items
-                .iter()
-                .position(|item| {
-                    matches!(item, InputItem::Item(Item::FunctionCall(c)) if c.call_id == call_id)
-                })
-                .unwrap_or_else(|| panic!("{call_id} present"));
-            assert!(
-                matches!(
-                    &items[call_pos + 1],
-                    InputItem::Item(Item::FunctionCallOutput(o)) if o.call_id == call_id
-                ),
-                "output for {call_id} must directly follow its call"
-            );
-        }
-        let output_count = items
+        // Every call must be answered (missing ones synthesized), with all
+        // outputs grouped after the assistant output block in call order —
+        // never interleaved between the calls.
+        let kind = |item: &InputItem| match item {
+            InputItem::Item(Item::FunctionCall(c)) => format!("call:{}", c.call_id),
+            InputItem::Item(Item::FunctionCallOutput(o)) => format!("output:{}", o.call_id),
+            InputItem::Item(Item::Message(_)) => "message".to_string(),
+            _ => "other".to_string(),
+        };
+        let kinds: Vec<String> = items.iter().map(|i| kind(i)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message", // developer
+                "message", // user
+                "call:call_1",
+                "message", // trailing assistant text
+                "output:call_1",
+                "call:call_2",
+                "output:call_2", // synthesized for the orphaned call
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_call_outputs_are_not_interleaved_between_calls() {
+        use async_openai::types::responses::FunctionToolCall;
+
+        let call = |call_id: &str| {
+            OutputItem::FunctionCall(FunctionToolCall {
+                arguments: "{}".into(),
+                call_id: call_id.into(),
+                namespace: None,
+                name: "command".into(),
+                id: None,
+                status: None,
+            })
+        };
+        let output = |call_id: &str| FunctionCallOutputItemParam {
+            call_id: call_id.into(),
+            output: FunctionCallOutput::Text("ok".into()),
+            id: None,
+            status: None,
+        };
+
+        let mut panel = ConversationPanel::new();
+        panel.add_input_message(user_message("hi"));
+        // One response with two parallel calls; outputs recorded afterwards.
+        panel.items.push(MessageItem::Output(call("call_1")));
+        panel.items.push(MessageItem::Output(call("call_2")));
+        panel.add_tool_output(output("call_1"));
+        panel.add_tool_output(output("call_2"));
+
+        let InputParam::Items(items) = panel.get_input_param("test/model") else {
+            panic!("expected an item list");
+        };
+        let order: Vec<String> = items
             .iter()
-            .filter(|item| matches!(item, InputItem::Item(Item::FunctionCallOutput(_))))
-            .count();
-        assert_eq!(output_count, 2, "no duplicate or stray outputs");
+            .filter_map(|item| match item {
+                InputItem::Item(Item::FunctionCall(c)) => Some(format!("call:{}", c.call_id)),
+                InputItem::Item(Item::FunctionCallOutput(o)) => {
+                    Some(format!("output:{}", o.call_id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["call:call_1", "call:call_2", "output:call_1", "output:call_2"],
+            "outputs must come after both calls, never between them"
+        );
     }
 
     #[test]

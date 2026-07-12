@@ -24,6 +24,7 @@ use crate::ui::components::conversation_panel::conversation_panel::{
 };
 use crate::ui::components::footer::footer::Footer;
 use crate::ui::components::input_panel::input_panel::InputPanel;
+use crate::ui::components::provider_panel::{PanelAction, ProviderPanel};
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
@@ -54,6 +55,8 @@ pub struct App<'a> {
     pub input_panel: InputPanel<'a>,
     pub conversation_panel: ConversationPanel,
     pub footer: Footer,
+    /// Full-screen provider management panel, when open.
+    pub provider_panel: Option<ProviderPanel>,
     /// Session UUID.
     session_uuid: String,
     /// Session manager for persistence.
@@ -83,6 +86,7 @@ impl App<'_> {
         session_uuid: String,
         session_mgr: Option<SessionManager>,
         startup_messages: Vec<String>,
+        open_provider_panel: bool,
     ) -> Self {
         let provider_manager = ProviderManager::new(&config).await;
         let current_model = provider_manager.default_model();
@@ -90,6 +94,9 @@ impl App<'_> {
         conversation_panel.restore_items(saved_items);
         for msg in startup_messages {
             conversation_panel.add_info_string(msg);
+        }
+        for msg in &provider_manager.startup_errors {
+            conversation_panel.add_error_string(msg.clone());
         }
         let mut input_panel = InputPanel::new();
         input_panel.history = saved_history;
@@ -102,6 +109,7 @@ impl App<'_> {
             input_panel,
             conversation_panel,
             footer: Footer::new(),
+            provider_panel: open_provider_panel.then(ProviderPanel::new),
             session_uuid,
             session_mgr,
         }
@@ -138,6 +146,9 @@ impl App<'_> {
                     self.handle_key_events(key_event)?
                 }
                 crossterm::event::Event::Paste(data) => self.handle_paste(data),
+                // The provider panel is modal; ignore mouse interaction with
+                // the conversation behind it.
+                crossterm::event::Event::Mouse(_) if self.provider_panel.is_some() => {}
                 crossterm::event::Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollDown => self.conversation_panel.scroll_down(),
                     MouseEventKind::ScrollUp => self.conversation_panel.scroll_up(),
@@ -227,6 +238,22 @@ impl App<'_> {
                 }
                 AppEvent::Quit => self.quit(),
                 AppEvent::Start => self.send_message().await,
+                AppEvent::ProvidersChanged => {
+                    // Rebuild the manager so new/edited providers get clients
+                    // and model discovery (bounded by the fetch timeout).
+                    self.provider_manager = ProviderManager::new(&self.config).await;
+                    for msg in &self.provider_manager.startup_errors {
+                        self.conversation_panel.add_error_string(msg.clone());
+                    }
+                    // The current model may point at a removed/renamed provider.
+                    if self.provider_manager.resolve(&self.current_model).is_none() {
+                        self.current_model = self.provider_manager.default_model();
+                        self.conversation_panel.add_info_string(format!(
+                            "current model reset to: {}",
+                            self.current_model
+                        ));
+                    }
+                }
             },
         }
         Ok(())
@@ -237,6 +264,11 @@ impl App<'_> {
     /// into a placeholder that expands back to the full text on send.
     fn handle_paste(&mut self, data: String) {
         let data = data.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(panel) = self.provider_panel.as_mut() {
+            // Paste goes into the provider form (e.g. an API key).
+            panel.handle_paste(&data);
+            return;
+        }
         if !data.contains('\n') && data.chars().count() <= 200 {
             self.input_panel.insert_str(&data);
         } else {
@@ -455,6 +487,25 @@ impl App<'_> {
 
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        // ---- provider management panel (modal: swallows all input) ----
+        if let Some(panel) = self.provider_panel.as_mut() {
+            if matches!(key_event.code, KeyCode::Char('q' | 'Q' | 'c' | 'C'))
+                && key_event.modifiers == KeyModifiers::CONTROL
+            {
+                self.events.send(AppEvent::Quit);
+                return Ok(());
+            }
+            match panel.handle_key(key_event, &mut self.config) {
+                PanelAction::Close => self.provider_panel = None,
+                PanelAction::Saved => {
+                    self.persist_config();
+                    self.events.send(AppEvent::ProvidersChanged);
+                }
+                PanelAction::None => {}
+            }
+            return Ok(());
+        }
+
         // ---- completion-popup navigation (takes priority over text input) ----
         if self
             .input_panel
@@ -721,21 +772,34 @@ impl App<'_> {
                 }
                 self.save_session();
             }
-            Some(Command::Providers) => {
+            Some(Command::Providers(args)) => {
                 self.input_panel.clear();
-                let mut lines = vec!["Configured providers:".to_string()];
-                for name in self.provider_manager.provider_names() {
-                    let models = self
-                        .provider_manager
-                        .models_for(name)
-                        .iter()
-                        .map(|m| format!("    {name}/{m}"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    lines.push(format!("  {name}:"));
-                    lines.push(models);
+                match args.trim() {
+                    "show" => {
+                        let mut lines = vec!["Configured providers:".to_string()];
+                        for name in self.provider_manager.provider_names() {
+                            let models = self
+                                .provider_manager
+                                .models_for(name)
+                                .iter()
+                                .map(|m| format!("    {name}/{m}"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            lines.push(format!("  {name}:"));
+                            lines.push(models);
+                        }
+                        self.conversation_panel.add_info_string(lines.join("\n"));
+                    }
+                    "manage" => {
+                        self.provider_panel = Some(ProviderPanel::new());
+                    }
+                    _ => {
+                        self.conversation_panel.add_info_string(
+                            "usage: /providers show — list providers and models\n\
+                             \u{20}      /providers manage — open the management panel",
+                        );
+                    }
                 }
-                self.conversation_panel.add_info_string(lines.join("\n"));
                 self.save_session();
             }
             Some(Command::Session) => {
@@ -815,6 +879,26 @@ impl App<'_> {
         if let Err(e) = mgr.save(&mut session) {
             self.conversation_panel
                 .add_error_string(format!("session save: {e}"));
+        }
+    }
+
+    /// Write the current config back to `config.toml` (used by the provider
+    /// management panel).
+    fn persist_config(&mut self) {
+        let Some(config_dir) = dirs::config_dir() else {
+            self.conversation_panel
+                .add_error_string("cannot locate the config directory");
+            return;
+        };
+        let path = config_dir.join("programmer").join("config.toml");
+        let result = toml::to_string(&self.config)
+            .map_err(|e| format!("serialize config: {e}"))
+            .and_then(|s| {
+                std::fs::write(&path, s).map_err(|e| format!("write {}: {e}", path.display()))
+            });
+        if let Err(e) = result {
+            self.conversation_panel
+                .add_error_string(format!("failed to save config: {e}"));
         }
     }
 
