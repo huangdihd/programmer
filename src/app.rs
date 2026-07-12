@@ -506,8 +506,11 @@ impl App<'_> {
         if let Some(panel) = self.question_panel.as_mut() {
             match panel.handle_key(key_event) {
                 crate::ui::components::question_panel::AnswerAction::Answer(text) => {
-                    panel.answer(text);
+                    let question = panel.question_text().to_string();
+                    panel.answer(text.clone());
                     self.question_panel = None;
+                    self.conversation_panel
+                        .add_info_string(format!("❓ {}\n→ {}", question, text));
                 }
                 crate::ui::components::question_panel::AnswerAction::None => {}
             }

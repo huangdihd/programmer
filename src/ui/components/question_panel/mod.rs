@@ -66,6 +66,11 @@ impl QuestionPanel {
         }
     }
 
+    /// The question text the model asked.
+    pub fn question_text(&self) -> &str {
+        &self.question.text
+    }
+
     /// Handle a key event. Returns the answer if the user submitted one.
     pub fn handle_key(&mut self, key: KeyEvent) -> AnswerAction {
         match &mut self.mode {
