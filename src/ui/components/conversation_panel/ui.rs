@@ -24,6 +24,7 @@ use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::tool_result::ToolResultMessage;
 use crate::ui::components::messages::usage_message::UsageMessage;
 use crate::ui::components::messages::user_message::UserMessage;
+use crate::ui::components::messages::warning_message::WarningMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
 use async_openai::types::responses::{FunctionCallOutputItemParam, InputItem, Item, OutputItem};
@@ -68,6 +69,9 @@ fn build_item_paragraph(
         }
         MessageItem::Info(message) => {
             (InfoMessage::new(message.clone()).into_paragraph(), Vec::new())
+        }
+        MessageItem::Warning(message) => {
+            (WarningMessage::new(message.clone()).into_paragraph(), Vec::new())
         }
         MessageItem::Usage(input, output) => (
             UsageMessage::new(*input, *output).into_paragraph(),

@@ -101,6 +101,12 @@ impl App<'_> {
         for msg in &provider_manager.startup_errors {
             conversation_panel.add_error_string(msg.clone());
         }
+        if config.providers.is_empty() {
+            conversation_panel.add_warning_string(
+                "no providers configured — press / then type 'providers manage' to add one, \
+                 or restart with the --providers flag",
+            );
+        }
         let mut input_panel = InputPanel::new();
         input_panel.history = saved_history;
         Self {

@@ -21,4 +21,5 @@ pub mod pending_message;
 pub mod tool_result;
 pub mod usage_message;
 pub mod user_message;
+pub mod warning_message;
 pub mod welcome_message;

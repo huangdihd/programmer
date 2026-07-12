@@ -588,6 +588,11 @@ impl ConversationPanel {
         self.stick_to_bottom = true;
     }
 
+    pub fn add_warning_string(&mut self, message: impl Into<String>) {
+        self.items.push(MessageItem::Warning(message.into()));
+        self.stick_to_bottom = true;
+    }
+
     pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
         self.accumulated_usage.0 += input_tokens;
         self.accumulated_usage.1 += output_tokens;
