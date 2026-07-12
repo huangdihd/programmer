@@ -25,6 +25,7 @@ use crate::ui::components::conversation_panel::conversation_panel::{
 use crate::ui::components::footer::footer::Footer;
 use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::components::provider_panel::{PanelAction, ProviderPanel};
+use crate::ui::components::question_panel::QuestionPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
@@ -57,6 +58,8 @@ pub struct App<'a> {
     pub footer: Footer,
     /// Full-screen provider management panel, when open.
     pub provider_panel: Option<ProviderPanel>,
+    /// Modal question panel shown when the model calls `ask_user`.
+    pub question_panel: Option<QuestionPanel>,
     /// Session UUID.
     session_uuid: String,
     /// Session manager for persistence.
@@ -110,6 +113,7 @@ impl App<'_> {
             conversation_panel,
             footer: Footer::new(),
             provider_panel: open_provider_panel.then(ProviderPanel::new),
+            question_panel: None,
             session_uuid,
             session_mgr,
         }
@@ -253,6 +257,13 @@ impl App<'_> {
                             self.current_model
                         ));
                     }
+                }
+                AppEvent::QuestionPrompt {
+                    question,
+                    answer_tx,
+                } => {
+                    self.question_panel =
+                        Some(QuestionPanel::new(question, answer_tx));
                 }
             },
         }
@@ -404,7 +415,7 @@ impl App<'_> {
                 if cancel_token.load(Ordering::Relaxed) {
                     break;
                 }
-                outputs.push(crate::tools::run_tool_call(call).await);
+                outputs.push(crate::tools::run_tool_call(call, &sender).await);
             }
             let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
                 outputs,
@@ -487,6 +498,22 @@ impl App<'_> {
 
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        // ---- question panel (modal; shown when model calls ask_user) ----
+        if let Some(panel) = self.question_panel.as_mut() {
+            if key_event.code == KeyCode::Esc {
+                // Esc in text mode goes back to choice mode; in choice mode,
+                // ignore (user must answer). The panel's handle_key handles this.
+            }
+            match panel.handle_key(key_event) {
+                crate::ui::components::question_panel::AnswerAction::Answer(text) => {
+                    panel.answer(text);
+                    self.question_panel = None;
+                }
+                crate::ui::components::question_panel::AnswerAction::None => {}
+            }
+            return Ok(());
+        }
+
         // ---- provider management panel (modal: swallows all input) ----
         if let Some(panel) = self.provider_panel.as_mut() {
             if matches!(key_event.code, KeyCode::Char('q' | 'Q' | 'c' | 'C'))

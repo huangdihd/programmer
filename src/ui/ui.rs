@@ -21,6 +21,12 @@ use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
 impl Widget for &mut App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // The question panel is modal and replaces the whole UI.
+        if let Some(panel) = &self.question_panel {
+            panel.render(area, buf);
+            return;
+        }
+
         // The provider management panel is modal and replaces the whole UI.
         if let Some(panel) = &self.provider_panel {
             panel.render(&self.config, &self.provider_manager, area, buf);

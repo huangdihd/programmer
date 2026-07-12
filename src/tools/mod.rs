@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod ask_user;
 pub mod blob;
 pub mod command;
 pub mod edit_file;
@@ -67,6 +68,7 @@ pub fn tools() -> Vec<Tool> {
         edit_file::tool(),
         grep::tool(),
         blob::tool(),
+        ask_user::tool(),
     ]
 }
 
@@ -77,7 +79,10 @@ const MAX_OUTPUT_LENGTH: usize = 8000;
 
 /// Executes a single tool call and wraps the result as a `function_call_output`
 /// item ready to be sent back to the model.
-pub async fn run_tool_call(call: &FunctionToolCall) -> FunctionCallOutputItemParam {
+pub async fn run_tool_call(
+    call: &FunctionToolCall,
+    sender: &tokio::sync::mpsc::UnboundedSender<crate::ui::event::Event>,
+) -> FunctionCallOutputItemParam {
     let output = match call.name.as_str() {
         command::NAME => command::run(&call.arguments).await,
         read_file::NAME => read_file::run(&call.arguments).await,
@@ -85,6 +90,7 @@ pub async fn run_tool_call(call: &FunctionToolCall) -> FunctionCallOutputItemPar
         edit_file::NAME => edit_file::run(&call.arguments).await,
         grep::NAME => grep::run(&call.arguments).await,
         blob::NAME => blob::run(&call.arguments).await,
+        ask_user::NAME => ask_user::run(&call.arguments, sender).await,
         other => format!("error: unknown tool '{other}'"),
     };
 

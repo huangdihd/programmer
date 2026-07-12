@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::response::partial_response::PartialResponse;
+use crate::tools::ask_user::Question;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{FunctionCallOutputItemParam, ResponseStreamEvent};
 use color_eyre::eyre::OptionExt;
@@ -49,7 +50,6 @@ pub enum Event {
 /// Application events.
 ///
 /// You can extend this enum with your own custom events.
-#[derive(Debug)]
 pub enum AppEvent {
     /// Receive a chunk.
     ChunkReceived(ResponseStreamEvent),
@@ -68,6 +68,46 @@ pub enum AppEvent {
     /// Provider config changed (via the management panel): rebuild the
     /// provider manager from the current config.
     ProvidersChanged,
+    /// The `ask_user` tool is prompting the user. Carries the question and a
+    /// oneshot sender that the UI uses to send the answer back.
+    #[allow(missing_docs)]
+    QuestionPrompt {
+        question: Question,
+        answer_tx: AnswerTx,
+    },
+}
+
+/// Wraps a `oneshot::Sender<String>` for the `ask_user` tool answer channel.
+///
+/// Manual Debug impl because `oneshot::Sender` does not implement Debug.
+pub struct AnswerTx(pub tokio::sync::oneshot::Sender<String>);
+
+impl std::fmt::Debug for AnswerTx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnswerTx").finish()
+    }
+}
+
+impl std::fmt::Debug for AppEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChunkReceived(_) => f.debug_tuple("ChunkReceived").field(&"..").finish(),
+            Self::OpenAIErrorReceived(e) => f.debug_tuple("OpenAIErrorReceived").field(e).finish(),
+            Self::ResponseFinished(_) => f.debug_tuple("ResponseFinished").field(&"..").finish(),
+            Self::ToolCallsCompleted(_, _) => {
+                f.debug_tuple("ToolCallsCompleted").field(&"..").finish()
+            }
+            Self::Cancel => write!(f, "Cancel"),
+            Self::Quit => write!(f, "Quit"),
+            Self::Start => write!(f, "Start"),
+            Self::ProvidersChanged => write!(f, "ProvidersChanged"),
+            Self::QuestionPrompt { question, .. } => {
+                f.debug_struct("QuestionPrompt")
+                    .field("question", question)
+                    .finish()
+            }
+        }
+    }
 }
 
 /// Terminal event handler.

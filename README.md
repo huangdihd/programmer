@@ -15,7 +15,7 @@ TUI built with [Ratatui](https://ratatui.rs).
 
 - **Streaming responses** — see the model's answer as it is generated, token by
   token.
-- **Tool use** — the model can invoke six built-in tools:
+- **Tool use** — the model can invoke seven built-in tools:
 
   | Tool | Description |
   |---|---|
@@ -25,6 +25,7 @@ TUI built with [Ratatui](https://ratatui.rs).
   | `edit_file` | Replace an exact substring in a file — minimal, safe edits. |
   | `grep` | Search a regex pattern across files, returning path:lineno:match. |
   | `blob` | Find files by filename regex, returning matching paths. |
+  | `ask_user` | Prompt the user with yes/no, multiple choice, or free-text questions. |
 - **Markdown rendering** — model responses are rendered with syntax-highlighted
   code blocks, lists, and formatting.
 - **Conversation panel** — scrollable chat history with distinct bubbles for

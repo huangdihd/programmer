@@ -20,4 +20,5 @@ pub mod input_panel;
 pub mod logo;
 pub mod messages;
 pub mod provider_panel;
+pub mod question_panel;
 pub mod status_bar;
