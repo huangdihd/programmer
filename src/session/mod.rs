@@ -36,6 +36,7 @@ pub(crate) enum SerializableMessageItem {
     OpenAIError { message: String },
     Error(String),
     Info(String),
+    Usage { input_tokens: u32, output_tokens: u32 },
 }
 
 impl From<MessageItem> for SerializableMessageItem {
@@ -48,6 +49,10 @@ impl From<MessageItem> for SerializableMessageItem {
             },
             MessageItem::Error(s) => SerializableMessageItem::Error(s),
             MessageItem::Info(s) => SerializableMessageItem::Info(s),
+            MessageItem::Usage(i, o) => SerializableMessageItem::Usage {
+                input_tokens: i,
+                output_tokens: o,
+            },
         }
     }
 }
@@ -62,6 +67,10 @@ impl From<SerializableMessageItem> for MessageItem {
             }
             SerializableMessageItem::Error(s) => MessageItem::Error(s),
             SerializableMessageItem::Info(s) => MessageItem::Info(s),
+            SerializableMessageItem::Usage {
+                input_tokens,
+                output_tokens,
+            } => MessageItem::Usage(input_tokens, output_tokens),
         }
     }
 }

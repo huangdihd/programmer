@@ -182,6 +182,7 @@ impl App<'_> {
                     if calls.is_empty() {
                         self.conversation_panel.creating_tool_call = false;
                         self.conversation_panel.outputting_message = false;
+                        self.conversation_panel.flush_usage();
                         if let Some(pending_request) =
                             self.conversation_panel.pending_message.take()
                         {
@@ -218,6 +219,7 @@ impl App<'_> {
                     self.conversation_panel.tool_running = false;
                     self.conversation_panel.creating_tool_call = false;
                     self.conversation_panel.outputting_message = false;
+                    self.conversation_panel.flush_usage();
                     self.save_session();
                     if let Some(pending_request) = self.conversation_panel.pending_message.take() {
                         self.start_request(pending_request).await;
@@ -279,6 +281,7 @@ impl App<'_> {
 
         self.conversation_panel
             .add_input_message(ApiMessageItem::Input(input_message));
+        self.conversation_panel.reset_accumulated_usage();
         self.save_session();
         self.spawn_stream();
     }
@@ -407,6 +410,7 @@ impl App<'_> {
                 .insert(base_index + live_idx);
         }
         let cancelled = partial_response.cancelled.load(Ordering::Relaxed);
+        let usage = partial_response.usage;
         self.conversation_panel.items.extend(
             partial_response
                 .items
@@ -419,6 +423,9 @@ impl App<'_> {
                 })
                 .map(|item| MessageItem::Output(item.clone().into())),
         );
+        if let Some((input, output)) = usage {
+            self.conversation_panel.add_usage(input, output);
+        }
         self.events
             .send(AppEvent::ResponseFinished(partial_response));
     }
@@ -434,6 +441,7 @@ impl App<'_> {
         self.conversation_panel.tool_running = false;
         self.conversation_panel.creating_tool_call = false;
         self.conversation_panel.outputting_message = false;
+        self.conversation_panel.flush_usage();
         self.conversation_panel.add_error(error);
         if let Some(pending_request) = self.conversation_panel.pending_message.take() {
             self.start_request(pending_request).await;

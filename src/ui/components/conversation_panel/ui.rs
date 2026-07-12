@@ -22,6 +22,7 @@ use crate::ui::components::messages::error_message::ErrorMessage;
 use crate::ui::components::messages::info_message::InfoMessage;
 use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::tool_result::ToolResultMessage;
+use crate::ui::components::messages::usage_message::UsageMessage;
 use crate::ui::components::messages::user_message::UserMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
@@ -68,6 +69,10 @@ fn build_item_paragraph(
         MessageItem::Info(message) => {
             (InfoMessage::new(message.clone()).into_paragraph(), Vec::new())
         }
+        MessageItem::Usage(input, output) => (
+            UsageMessage::new(*input, *output).into_paragraph(),
+            Vec::new(),
+        )
     }
 }
 

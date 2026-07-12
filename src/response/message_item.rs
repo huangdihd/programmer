@@ -23,6 +23,7 @@ pub enum MessageItem {
     OpenAIError(OpenAIError),
     Error(String),
     Info(String),
+    Usage(u32, u32), // (input_tokens, output_tokens)
 }
 
 impl Clone for MessageItem {
@@ -35,6 +36,7 @@ impl Clone for MessageItem {
             }
             MessageItem::Error(s) => MessageItem::Error(s.clone()),
             MessageItem::Info(s) => MessageItem::Info(s.clone()),
+            MessageItem::Usage(i, o) => MessageItem::Usage(*i, *o),
         }
     }
 }

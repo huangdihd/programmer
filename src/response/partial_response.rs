@@ -58,6 +58,8 @@ pub struct PartialResponse {
     finish_reason: Option<ResponseFinishReason>,
     /// Set to `true` when the user presses Escape to cancel the current request.
     pub cancelled: Arc<AtomicBool>,
+    /// Token usage from the completed response: (input_tokens, output_tokens).
+    pub usage: Option<(u32, u32)>,
 }
 
 impl PartialResponse {
@@ -67,6 +69,7 @@ impl PartialResponse {
             finished_items: vec![],
             finish_reason: None,
             cancelled,
+            usage: None,
         }
     }
 
@@ -458,15 +461,24 @@ impl PartialResponse {
             }
 
             ResponseCompleted(response_completed_event) => {
+                if let Some(ref u) = response_completed_event.response.usage {
+                    self.usage = Some((u.input_tokens, u.output_tokens));
+                }
                 self.finish_reason = Some(ResponseFinishReason::Completed(
                     response_completed_event.response,
                 ));
             }
             ResponseFailed(response_failed_event) => {
+                if let Some(ref u) = response_failed_event.response.usage {
+                    self.usage = Some((u.input_tokens, u.output_tokens));
+                }
                 self.finish_reason =
                     Some(ResponseFinishReason::Failed(response_failed_event.response));
             }
             ResponseIncomplete(response_incomplete_event) => {
+                if let Some(ref u) = response_incomplete_event.response.usage {
+                    self.usage = Some((u.input_tokens, u.output_tokens));
+                }
                 self.finish_reason = Some(ResponseFinishReason::Incomplete(
                     response_incomplete_event.response,
                 ));

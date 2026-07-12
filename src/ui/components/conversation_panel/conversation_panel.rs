@@ -136,6 +136,8 @@ responses rendered in a terminal UI, so keep output compact.
 - Verify your work. After making changes, build and/or run tests when possible,
   using the project's own toolchain (cargo, npm, pytest, make, …). If
   verification fails, fix it before reporting done.
+- After completing a change, consider whether related documentation or tests
+  need to be updated. Mention it if so — don't silently skip it.
 - If a task is ambiguous, make the reasonable choice and state your assumption
   in one line. Only ask a clarifying question when the ambiguity would lead to
   significantly different implementations.
@@ -257,6 +259,9 @@ pub struct ConversationPanel {
     pub(crate) scroll_view_state: ScrollViewState,
     pub pending_message: Option<String>,
     pub receiving_response: Option<PartialResponse>,
+    /// Accumulated token usage across all responses in the current turn
+    /// (a turn may span multiple responses when tool calls are involved).
+    pub accumulated_usage: (u32, u32),
     /// True while tool calls are executing in the background (between a finished
     /// response that requested tools and the follow-up request). The turn is
     /// still active even though no response is streaming.
@@ -323,6 +328,7 @@ impl ConversationPanel {
             selection: None,
             live_paragraphs: Vec::new(),
             pending_layout: None,
+            accumulated_usage: (0, 0),
         }
     }
 
@@ -578,6 +584,26 @@ impl ConversationPanel {
         self.stick_to_bottom = true;
     }
 
+    pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
+        self.accumulated_usage.0 += input_tokens;
+        self.accumulated_usage.1 += output_tokens;
+    }
+
+    /// Flush the accumulated usage as a message and reset the counter.
+    pub fn flush_usage(&mut self) {
+        let (input, output) = self.accumulated_usage;
+        if input > 0 || output > 0 {
+            self.items.push(MessageItem::Usage(input, output));
+            self.accumulated_usage = (0, 0);
+            self.stick_to_bottom = true;
+        }
+    }
+
+    /// Reset the accumulated usage counter (on /clear, new session, etc.).
+    pub fn reset_accumulated_usage(&mut self) {
+        self.accumulated_usage = (0, 0);
+    }
+
     /// Clear all conversation history and pending state.
     pub fn clear_messages(&mut self) {
         self.items.clear();
@@ -586,6 +612,7 @@ impl ConversationPanel {
         self.live_expanded_items.clear();
         self.selection = None;
         self.stick_to_bottom = true;
+        self.accumulated_usage = (0, 0);
     }
 
     /// Restore a previous session's items into the conversation.
