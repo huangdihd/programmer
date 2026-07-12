@@ -21,12 +21,6 @@ use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
 impl Widget for &mut App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // The question panel is modal and replaces the whole UI.
-        if let Some(panel) = &self.question_panel {
-            panel.render(area, buf);
-            return;
-        }
-
         // The provider management panel is modal and replaces the whole UI.
         if let Some(panel) = &self.provider_panel {
             panel.render(&self.config, &self.provider_manager, area, buf);
@@ -46,19 +40,32 @@ impl Widget for &mut App<'_> {
         );
         self.footer.current_model = self.current_model.clone();
 
+        // When the model is asking a question, the bottom area grows to show
+        // the question + options/input; the conversation panel shrinks.
+        let question_height: u16 = self
+            .question_panel
+            .as_ref()
+            .map(|q| q.needed_height())
+            .unwrap_or(3);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(2),
-                Constraint::Length(3),
+                Constraint::Length(question_height),
                 Constraint::Length(1),
             ])
             .split(area);
         let logo = Logo::new();
         logo.render(chunks[0], buf);
         self.conversation_panel.render(chunks[1], buf);
-        self.input_panel.render(chunks[2], buf);
+
+        if let Some(panel) = &self.question_panel {
+            panel.render(chunks[2], buf);
+        } else {
+            self.input_panel.render(chunks[2], buf);
+        }
         (&self.footer).render(chunks[3], buf);
 
         // ---- completion popup (floats above the input panel) ----

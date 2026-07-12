@@ -13,11 +13,12 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Modal question panel shown when the model calls the `ask_user` tool.
+//! Question panel shown at the bottom of the screen when the model calls
+//! the `ask_user` tool. Replaces the input panel area with a taller widget
+//! showing the question, options, and/or free-text input.
 //!
-//! Renders yes/no buttons, multiple choice lists, or free-text input.
 //! Pressing Enter sends the answer back to the blocked tool call via a
-//! oneshot channel, then the panel closes.
+//! oneshot channel, then the input panel is restored.
 
 pub mod ui;
 
@@ -54,8 +55,8 @@ impl QuestionPanel {
     pub fn new(question: Question, answer_tx: AnswerTx) -> Self {
         let mode = match &question.kind {
             QuestionKind::Choice { .. } => Mode::Choice { selected: 0 },
-            QuestionKind::Text { input } => Mode::Text {
-                input: input.clone(),
+            QuestionKind::Text { .. } => Mode::Text {
+                input: String::new(),
             },
         };
         QuestionPanel {
@@ -63,10 +64,6 @@ impl QuestionPanel {
             mode,
             answer_tx: Some(answer_tx),
         }
-    }
-
-    pub fn question(&self) -> &Question {
-        &self.question
     }
 
     /// Handle a key event. Returns the answer if the user submitted one.
@@ -116,12 +113,7 @@ impl QuestionPanel {
                     AnswerAction::None
                 }
                 KeyCode::Enter => {
-                    let answer = if input.trim().is_empty() {
-                        input.clone()
-                    } else {
-                        input.clone()
-                    };
-                    AnswerAction::Answer(answer)
+                    AnswerAction::Answer(input.clone())
                 }
                 KeyCode::Backspace => {
                     input.pop();

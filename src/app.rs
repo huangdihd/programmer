@@ -498,12 +498,8 @@ impl App<'_> {
 
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        // ---- question panel (modal; shown when model calls ask_user) ----
+        // ---- question panel (shown when model calls ask_user) ----
         if let Some(panel) = self.question_panel.as_mut() {
-            if key_event.code == KeyCode::Esc {
-                // Esc in text mode goes back to choice mode; in choice mode,
-                // ignore (user must answer). The panel's handle_key handles this.
-            }
             match panel.handle_key(key_event) {
                 crate::ui::components::question_panel::AnswerAction::Answer(text) => {
                     panel.answer(text);
