@@ -24,13 +24,17 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 impl QuestionPanel {
     /// The number of rows this panel needs (excluding borders).
     pub fn needed_height(&self) -> u16 {
-        let question_lines = (self.question.text.len().max(1) as u16 / 40).max(1);
-        let choice_count = match &self.question.kind {
-            QuestionKind::Choice { options, .. } => options.len() as u16,
-            QuestionKind::Text { .. } => 0,
-        };
-        // question + blank + options + blank + hint
-        question_lines + 1 + choice_count + 1 + 1
+        let question_lines = (self.question.text.len() as u16 / 40 + 1).max(1);
+        match &self.question.kind {
+            QuestionKind::Choice { options, .. } => {
+                // question + options + hint
+                (question_lines + options.len() as u16 + 1).max(3)
+            }
+            QuestionKind::Text { .. } => {
+                // question + input + hint
+                (question_lines + 2).max(3)
+            }
+        }
     }
 
     /// Render the question panel into the given area (bottom of screen).
@@ -41,26 +45,24 @@ impl QuestionPanel {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .split(inner);
-
-        // Question text.
-        Paragraph::new(self.question.text.as_str())
-            .style(Style::default().fg(Color::White).bold())
-            .wrap(Wrap { trim: true })
-            .render(chunks[0], buf);
-
-        // Choices + input + hint bar in the bottom row.
         match (&self.question.kind, &self.mode) {
             (QuestionKind::Choice { options, .. }, Mode::Choice { selected }) => {
-                // Render options inline horizontally when they fit, or stacked.
-                let options_area = Rect {
-                    y: inner.bottom().saturating_sub(options.len() as u16 + 1),
-                    height: options.len() as u16 + 1,
-                    ..inner
-                };
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),
+                        Constraint::Length(options.len() as u16),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+
+                // Question text.
+                Paragraph::new(self.question.text.as_str())
+                    .style(Style::default().fg(Color::White).bold())
+                    .wrap(Wrap { trim: true })
+                    .render(chunks[0], buf);
+
+                // Options.
                 let lines: Vec<Line> = options
                     .iter()
                     .enumerate()
@@ -77,44 +79,42 @@ impl QuestionPanel {
                         };
                         Line::from(vec![
                             Span::styled("  ", Style::default()),
-                            Span::styled(
-                                format!("{marker} {opt}"),
-                                style,
-                            ),
+                            Span::styled(format!("{marker} {opt}"), style),
                         ])
                     })
                     .collect();
-                Paragraph::new(lines).render(options_area, buf);
+                Paragraph::new(lines).render(chunks[1], buf);
 
-                // Hint in the very last row.
+                // Hint.
                 let hint = Line::from(vec![
                     Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Enter", Style::default().fg(Color::Green).bold()),
                     Span::styled(" confirm", Style::default().fg(Color::DarkGray)),
                 ]);
-                Paragraph::new(hint).render(
-                    Rect {
-                        y: inner.bottom().saturating_sub(1),
-                        height: 1,
-                        ..inner
-                    },
-                    buf,
-                );
+                Paragraph::new(hint).render(chunks[2], buf);
             }
             (QuestionKind::Choice { .. }, Mode::Text { input }) => {
-                // "Other…" free text on one line.
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+
+                Paragraph::new(self.question.text.as_str())
+                    .style(Style::default().fg(Color::White).bold())
+                    .wrap(Wrap { trim: true })
+                    .render(chunks[0], buf);
+
                 let input_line = Line::from(vec![
                     Span::styled("  ❯ ", Style::default().fg(Color::Cyan)),
                     Span::styled(input.clone(), Style::default().fg(Color::White)),
                     Span::styled("▏", Style::default().fg(Color::Cyan)),
                 ]);
-                let input_area = Rect {
-                    y: inner.bottom().saturating_sub(2),
-                    height: 1,
-                    ..inner
-                };
-                Paragraph::new(input_line).render(input_area, buf);
+                Paragraph::new(input_line).render(chunks[1], buf);
 
                 let hint = Line::from(vec![
                     Span::styled("Enter", Style::default().fg(Color::Green).bold()),
@@ -122,40 +122,35 @@ impl QuestionPanel {
                     Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" back", Style::default().fg(Color::DarkGray)),
                 ]);
-                Paragraph::new(hint).render(
-                    Rect {
-                        y: inner.bottom().saturating_sub(1),
-                        height: 1,
-                        ..inner
-                    },
-                    buf,
-                );
+                Paragraph::new(hint).render(chunks[2], buf);
             }
             (QuestionKind::Text { .. }, Mode::Text { input }) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+
+                Paragraph::new(self.question.text.as_str())
+                    .style(Style::default().fg(Color::White).bold())
+                    .wrap(Wrap { trim: true })
+                    .render(chunks[0], buf);
+
                 let input_line = Line::from(vec![
                     Span::styled("  ❯ ", Style::default().fg(Color::Cyan)),
                     Span::styled(input.clone(), Style::default().fg(Color::White)),
                     Span::styled("▏", Style::default().fg(Color::Cyan)),
                 ]);
-                let input_area = Rect {
-                    y: inner.bottom().saturating_sub(2),
-                    height: 1,
-                    ..inner
-                };
-                Paragraph::new(input_line).render(input_area, buf);
+                Paragraph::new(input_line).render(chunks[1], buf);
 
                 let hint = Line::from(vec![
                     Span::styled("Enter", Style::default().fg(Color::Green).bold()),
                     Span::styled(" submit", Style::default().fg(Color::DarkGray)),
                 ]);
-                Paragraph::new(hint).render(
-                    Rect {
-                        y: inner.bottom().saturating_sub(1),
-                        height: 1,
-                        ..inner
-                    },
-                    buf,
-                );
+                Paragraph::new(hint).render(chunks[2], buf);
             }
             _ => {}
         }
