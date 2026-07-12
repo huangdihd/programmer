@@ -32,20 +32,11 @@ impl Widget for &StatusBar {
             StatusState::Outputting => ("▸", "Outputting", OUTPUT),
             StatusState::CreatingToolCall => ("⚒", "Creating tool call", WARN),
             StatusState::ToolRunning => ("⚡", "Running tools", WARN),
+            StatusState::WaitingAnswer => ("?", "Waiting for answer", ACCENT),
         };
 
-        // Build the status text: icon + label + optional elapsed time.
-        let mut text = format!(" {} {} ", icon, label);
-        if let Some(dur) = self.elapsed() {
-            let secs = dur.as_secs_f64();
-            if secs < 60.0 {
-                text.push_str(&format!("({:.1}s)", secs));
-            } else {
-                let m = (secs / 60.0) as u64;
-                let s = secs % 60.0;
-                text.push_str(&format!("({}m {:.0}s)", m, s));
-            }
-        }
+        // Build the status text: just icon + label.
+        let text = format!(" {} {} ", icon, label);
 
         ratatui::widgets::Paragraph::new(text)
             .style(Style::default().fg(color).add_modifier(Modifier::BOLD))

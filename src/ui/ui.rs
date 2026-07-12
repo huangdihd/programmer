@@ -16,6 +16,7 @@
 use crate::app::App;
 use crate::ui::components::completion_popup::CompletionPopup;
 use crate::ui::components::logo::Logo;
+use crate::ui::components::status_bar::status_bar::StatusState;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
@@ -38,6 +39,10 @@ impl Widget for &mut App<'_> {
             is_creating_tool_call,
             is_tool_running,
         );
+        // Override status when the model is waiting for user input.
+        if self.question_panel.is_some() {
+            self.footer.status.status = StatusState::WaitingAnswer;
+        }
         self.footer.current_model = self.current_model.clone();
 
         // When the model is asking a question, the bottom area grows to show
