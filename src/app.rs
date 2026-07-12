@@ -275,8 +275,12 @@ impl App<'_> {
     /// into a placeholder that expands back to the full text on send.
     fn handle_paste(&mut self, data: String) {
         let data = data.replace("\r\n", "\n").replace('\r', "\n");
+        // IME-committed text arrives as paste; route to question panel first.
+        if let Some(panel) = self.question_panel.as_mut() {
+            panel.handle_paste(&data);
+            return;
+        }
         if let Some(panel) = self.provider_panel.as_mut() {
-            // Paste goes into the provider form (e.g. an API key).
             panel.handle_paste(&data);
             return;
         }

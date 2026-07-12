@@ -134,6 +134,14 @@ impl QuestionPanel {
             tx.send(text);
         }
     }
+
+    /// Append pasted text in text-input mode.
+    pub fn handle_paste(&mut self, data: &str) {
+        if let Mode::Text { input } = &mut self.mode {
+            let clean: String = data.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+            input.push_str(&clean);
+        }
+    }
 }
 
 impl Drop for QuestionPanel {
