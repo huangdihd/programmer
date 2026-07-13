@@ -21,6 +21,7 @@ pub mod diagnostics;
 pub mod edit_file;
 pub mod grep;
 pub mod read_file;
+pub mod todo;
 pub mod write_file;
 
 use async_openai::types::responses::{
@@ -80,8 +81,11 @@ pub fn environment_info() -> String {
 }
 
 /// The full set of tool definitions advertised to the model on every request.
-pub fn tools() -> Vec<Tool> {
-    vec![
+///
+/// When `mcp` is provided, tools discovered from MCP servers are merged into
+/// the list with `mcp__<server>__<tool>` names.
+pub(crate) fn tools(mcp: Option<&crate::mcp::McpManager>) -> Vec<Tool> {
+    let mut tools: Vec<Tool> = vec![
         command::tool(),
         read_file::tool(),
         write_file::tool(),
@@ -91,7 +95,52 @@ pub fn tools() -> Vec<Tool> {
         ask_user::tool(),
         configure_diagnostics::tool(),
         diagnostics::tool(),
-    ]
+        todo::tool(),
+    ];
+
+    if let Some(mgr) = mcp {
+        for (fqn, mcp_tool) in mgr.all_tools() {
+            tools.push(mcp_function_tool(
+                &fqn,
+                mcp_tool.description,
+                mcp_tool.inputSchema,
+            ));
+        }
+    }
+
+    tools
+}
+
+/// Bridge one MCP tool into an OpenAI function tool.
+///
+/// An MCP tool's `inputSchema` is already a complete JSON Schema object (with
+/// its own `properties`/`required`), so it becomes the function `parameters`
+/// verbatim. Wrapping it in another `{ properties: … }` would misplace its
+/// `required` array as a property value and the API rejects the whole tool.
+/// MCP schemas rarely satisfy OpenAI's strict-mode constraints, so strict
+/// validation is disabled for them.
+fn mcp_function_tool(
+    fqn: &str,
+    description: Option<String>,
+    input_schema: serde_json::Value,
+) -> Tool {
+    use async_openai::types::responses::FunctionTool;
+
+    let description = description.unwrap_or_else(|| format!("MCP tool: {fqn}"));
+    let parameters = if input_schema.is_object() {
+        input_schema
+    } else {
+        // No-parameter tools may send a null/empty schema; give the API a
+        // valid empty object rather than a bare scalar.
+        serde_json::json!({ "type": "object", "properties": {} })
+    };
+    Tool::Function(FunctionTool {
+        name: fqn.to_string(),
+        description: Some(description),
+        parameters: Some(parameters),
+        strict: Some(false),
+        defer_loading: None,
+    })
 }
 
 /// Maximum characters of tool output kept before truncation. The rest is
@@ -101,21 +150,51 @@ const MAX_OUTPUT_LENGTH: usize = 8000;
 
 /// Executes a single tool call and wraps the result as a `function_call_output`
 /// item ready to be sent back to the model.
-pub async fn run_tool_call(
+///
+/// When `mcp` is provided and the tool name starts with `mcp__`, the call is
+/// forwarded to the appropriate MCP server.
+pub(crate) async fn run_tool_call(
     call: &FunctionToolCall,
     sender: &tokio::sync::mpsc::UnboundedSender<crate::ui::event::Event>,
+    mcp: Option<&crate::mcp::McpManager>,
 ) -> FunctionCallOutputItemParam {
-    let output = match call.name.as_str() {
-        command::NAME => command::run(&call.arguments).await,
-        read_file::NAME => read_file::run(&call.arguments).await,
-        write_file::NAME => write_file::run(&call.arguments).await,
-        edit_file::NAME => edit_file::run(&call.arguments).await,
-        grep::NAME => grep::run(&call.arguments).await,
-        blob::NAME => blob::run(&call.arguments).await,
-        ask_user::NAME => ask_user::run(&call.arguments, sender).await,
-        configure_diagnostics::NAME => configure_diagnostics::run(&call.arguments).await,
-        diagnostics::NAME => diagnostics::run(&call.arguments).await,
-        other => format!("error: unknown tool '{other}'"),
+    let output = if call.name.starts_with("mcp__") {
+        if let Some(mgr) = mcp {
+            match mgr
+                .call_tool(
+                    &call.name,
+                    serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null),
+                )
+                .await
+            {
+                Ok(result) => result
+                    .content
+                    .iter()
+                    .map(|c| match c {
+                        crate::mcp::types::ToolContent::Text { text } => text.clone(),
+                        _ => "[non-text MCP content]".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Err(e) => format!("error: MCP tool call failed: {e}"),
+            }
+        } else {
+            "error: MCP not available (no servers connected)".to_string()
+        }
+    } else {
+        match call.name.as_str() {
+            command::NAME => command::run(&call.arguments).await,
+            read_file::NAME => read_file::run(&call.arguments).await,
+            write_file::NAME => write_file::run(&call.arguments).await,
+            edit_file::NAME => edit_file::run(&call.arguments).await,
+            grep::NAME => grep::run(&call.arguments).await,
+            blob::NAME => blob::run(&call.arguments).await,
+            ask_user::NAME => ask_user::run(&call.arguments, sender).await,
+            configure_diagnostics::NAME => configure_diagnostics::run(&call.arguments).await,
+            diagnostics::NAME => diagnostics::run(&call.arguments).await,
+            todo::NAME => todo::run(&call.arguments).await,
+            other => format!("error: unknown tool '{other}'"),
+        }
     };
 
     let output = truncate_output(output);
@@ -160,6 +239,39 @@ fn truncate_output(output: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_schema_passes_through_without_rewrapping() {
+        // A typical MCP inputSchema with a required field.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"]
+        });
+        let Tool::Function(f) =
+            mcp_function_tool("mcp__codegraph__search", Some("desc".into()), schema.clone())
+        else {
+            panic!("expected a function tool");
+        };
+        // Parameters must be the schema verbatim — NOT wrapped so that
+        // `required` lands inside `properties` (which the API rejects).
+        assert_eq!(f.parameters.as_ref().unwrap(), &schema);
+        assert_eq!(f.parameters.as_ref().unwrap()["required"], serde_json::json!(["query"]));
+        assert!(f.parameters.as_ref().unwrap()["properties"].get("required").is_none());
+        assert_eq!(f.strict, Some(false));
+        assert_eq!(f.name, "mcp__codegraph__search");
+    }
+
+    #[test]
+    fn mcp_non_object_schema_becomes_empty_object() {
+        let Tool::Function(f) =
+            mcp_function_tool("mcp__x__y", None, serde_json::Value::Null)
+        else {
+            panic!("expected a function tool");
+        };
+        assert_eq!(f.parameters.as_ref().unwrap()["type"], "object");
+        assert!(f.description.as_deref().unwrap().contains("mcp__x__y"));
+    }
 
     #[tokio::test]
     async fn command_runs_and_captures_output() {

@@ -39,9 +39,12 @@ pub mod clipboard;
 pub mod commands;
 pub mod config;
 pub mod diagnostics;
+pub mod mcp;
 pub mod providers;
 pub mod response;
 pub mod session;
+pub mod skills;
+pub mod todos;
 pub mod tools;
 mod ui;
 
@@ -118,20 +121,21 @@ async fn main() -> color_eyre::Result<()> {
     // ---- resolve which session to use ----
     let session_mgr = SessionManager::new();
     let mut startup_messages: Vec<String> = Vec::new();
-    let (session_uuid, saved_items, saved_history) = match (resume, &session_mgr) {
+    let (session_uuid, saved_items, saved_history, saved_todos) = match (resume, &session_mgr) {
         // --resume <uuid>
         (Some(Some(uuid)), Some(mgr)) => {
             match mgr.load(&uuid) {
                 Some(session) => {
                     let history = session.history.clone();
+                    let todos = session.todos.clone();
                     let items = SessionManager::into_items(session);
-                    (uuid, items, history)
+                    (uuid, items, history, todos)
                 }
                 None => {
                     startup_messages
                         .push(format!("Session {uuid} not found, creating a new session."));
                     let session = mgr.create();
-                    (session.uuid, Vec::new(), Vec::new())
+                    (session.uuid, Vec::new(), Vec::new(), Vec::new())
                 }
             }
         }
@@ -145,8 +149,9 @@ async fn main() -> color_eyre::Result<()> {
                             match mgr.load(&uuid) {
                                 Some(session) => {
                                     let history = session.history.clone();
+                                    let todos = session.todos.clone();
                                     let items = SessionManager::into_items(session);
-                                    (uuid, items, history)
+                                    (uuid, items, history, todos)
                                 }
                                 None => {
                                     // Listed but file missing — create new.
@@ -154,7 +159,7 @@ async fn main() -> color_eyre::Result<()> {
                                         "Session {uuid} not found on disk, starting a new session."
                                     ));
                                     let session = mgr.create();
-                                    (session.uuid, Vec::new(), Vec::new())
+                                    (session.uuid, Vec::new(), Vec::new(), Vec::new())
                                 }
                             }
                         }
@@ -166,14 +171,14 @@ async fn main() -> color_eyre::Result<()> {
                                 );
                             }
                             let session = mgr.create();
-                            (session.uuid, Vec::new(), Vec::new())
+                            (session.uuid, Vec::new(), Vec::new(), Vec::new())
                         }
                     }
                 }
                 Err(e) => {
                     startup_messages.push(format!("Warning: {e}"));
                     let session = mgr.create();
-                    (session.uuid, Vec::new(), Vec::new())
+                    (session.uuid, Vec::new(), Vec::new(), Vec::new())
                 }
             }
         }
@@ -181,8 +186,8 @@ async fn main() -> color_eyre::Result<()> {
         _ => {
             let session = session_mgr.as_ref().map(|m| m.create());
             match session {
-                Some(s) => (s.uuid, Vec::new(), Vec::new()),
-                None => (String::new(), Vec::new(), Vec::new()),
+                Some(s) => (s.uuid, Vec::new(), Vec::new(), Vec::new()),
+                None => (String::new(), Vec::new(), Vec::new(), Vec::new()),
             }
         }
     };
@@ -233,6 +238,7 @@ async fn main() -> color_eyre::Result<()> {
         programmer_config,
         saved_items,
         saved_history,
+        saved_todos,
         session_uuid,
         session_mgr,
         startup_messages,

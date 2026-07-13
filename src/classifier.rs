@@ -20,7 +20,11 @@
 //! Adding a new mode (e.g. "Paranoid" with parameter-level rules) only
 //! requires implementing the trait and wiring up a new variant.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::mcp::types::McpPolicy;
 
 // ---------------------------------------------------------------------------
 // Verdict
@@ -56,15 +60,61 @@ pub trait Classifier: Send + Sync {
 /// Tool names considered "dangerous" — they mutate state or run commands.
 /// `configure_diagnostics` writes a profile and test-runs its checker commands,
 /// so it is gated like `command`.
+///
+/// MCP tools (names starting with `mcp__`) are not listed here because we can't
+/// know their semantics at compile time. Instead they are routed through
+/// [`classify_mcp_policy`] first, which resolves per-server policies.
+/// A [`McpPolicy::Trusted`] tool is allowed immediately; a [`McpPolicy::Review`]
+/// tool falls through to the normal classifier.
 const DANGEROUS_TOOLS: &[&str] =
     &["command", "write_file", "edit_file", "configure_diagnostics"];
 
+/// Extract the MCP server name from a fully-qualified tool name like
+/// `mcp__codegraph__search` → `"codegraph"`. Returns `None` for built-in tools.
+pub fn mcp_server_name(tool_name: &str) -> Option<&str> {
+    tool_name
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        .map(|(server, _tool)| server)
+}
+
+/// Resolve the [`Verdict`] for an MCP tool based on its server's configured
+/// [`McpPolicy`]. Returns `Some(Allow)` for [`McpPolicy::Trusted`]; returns
+/// `None` for [`McpPolicy::Review`], meaning the caller should fall through
+/// to the normal classifier (sync or LLM, depending on the current work mode).
+pub(crate) fn classify_mcp_policy(
+    tool_name: &str,
+    policies: &HashMap<String, McpPolicy>,
+) -> Option<Verdict> {
+    let server = mcp_server_name(tool_name)?;
+    match policies.get(server).unwrap_or(&McpPolicy::Review) {
+        McpPolicy::Trusted => Some(Verdict::Allow),
+        McpPolicy::Review => None,
+    }
+}
+
 /// Manual mode: every dangerous tool call must be approved.
-pub struct ManualClassifier;
+/// MCP tools are classified according to their server's [`McpPolicy`].
+pub struct ManualClassifier {
+    mcp_policies: HashMap<String, McpPolicy>,
+}
+
+impl ManualClassifier {
+    pub(crate) fn new(mcp_policies: HashMap<String, McpPolicy>) -> Self {
+        ManualClassifier { mcp_policies }
+    }
+}
 
 impl Classifier for ManualClassifier {
     fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
-        if DANGEROUS_TOOLS.contains(&tool_name) {
+        // MCP tools: consult per-server policy first.
+        if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
+            return verdict;
+        }
+        // Built-in tools: ask for dangerous, allow for safe.
+        // Unknown MCP tools (not in any server's policy map) are treated as
+        // dangerous — we can't know their semantics.
+        if DANGEROUS_TOOLS.contains(&tool_name) || tool_name.starts_with("mcp__") {
             Verdict::Ask {
                 reason: format!("{tool_name} requires approval in Manual mode"),
             }
@@ -76,13 +126,29 @@ impl Classifier for ManualClassifier {
 
 /// Auto-allow edits: write/edit tools are silently approved, but commands
 /// and other dangerous tools still require user approval.
-pub struct AllowEditsClassifier;
+/// MCP tools are classified according to their server's [`McpPolicy`].
+pub struct AllowEditsClassifier {
+    mcp_policies: HashMap<String, McpPolicy>,
+}
+
+impl AllowEditsClassifier {
+    pub(crate) fn new(mcp_policies: HashMap<String, McpPolicy>) -> Self {
+        AllowEditsClassifier { mcp_policies }
+    }
+}
 
 impl Classifier for AllowEditsClassifier {
     fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
-        // In Allow Edits mode, only commands and configure_diagnostics
-        // (which runs arbitrary checkers) require approval.
-        if tool_name == "command" || tool_name == "configure_diagnostics" {
+        // MCP tools: consult per-server policy first.
+        if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
+            return verdict;
+        }
+        // In Allow Edits mode, only commands, configure_diagnostics, and
+        // MCP tools with the Review policy require approval.
+        if tool_name == "command"
+            || tool_name == "configure_diagnostics"
+            || tool_name.starts_with("mcp__")
+        {
             Verdict::Ask {
                 reason: format!("{tool_name} requires approval in Allow Edits mode"),
             }
@@ -164,10 +230,12 @@ impl WorkMode {
     /// Return the synchronous classifier for this mode. Auto has no sync
     /// classifier (it uses [`classify_tool_call`]); it falls back to asking so
     /// callers that ignore [`uses_llm_classifier`] stay safe.
-    pub fn classifier(&self) -> Box<dyn Classifier> {
+    pub(crate) fn classifier(&self, mcp_policies: HashMap<String, McpPolicy>) -> Box<dyn Classifier> {
         match self {
-            WorkMode::Manual | WorkMode::Auto => Box::new(ManualClassifier),
-            WorkMode::AllowEdits => Box::new(AllowEditsClassifier),
+            WorkMode::Manual | WorkMode::Auto => {
+                Box::new(ManualClassifier::new(mcp_policies))
+            }
+            WorkMode::AllowEdits => Box::new(AllowEditsClassifier::new(mcp_policies)),
             WorkMode::Yolo => Box::new(YoloClassifier),
         }
     }
@@ -175,8 +243,12 @@ impl WorkMode {
 
 /// Whether a tool call needs LLM review in Auto mode. Read-only tools are
 /// always safe; only state-mutating tools are sent to the classifier.
+/// MCP tools are always treated as potentially dangerous (we can't know their
+/// semantics at compile time), but their server's [`McpPolicy`] is checked
+/// first in [`spawn_auto_classification`] — a [`McpPolicy::Trusted`] server
+/// bypasses the LLM entirely.
 pub fn needs_review(tool_name: &str) -> bool {
-    DANGEROUS_TOOLS.contains(&tool_name)
+    DANGEROUS_TOOLS.contains(&tool_name) || tool_name.starts_with("mcp__")
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +578,7 @@ mod tests {
     use super::*;
 
     fn classify(mode: WorkMode, name: &str) -> Verdict {
-        mode.classifier().classify(name, r#"{}"#)
+        mode.classifier(HashMap::new()).classify(name, r#"{}"#)
     }
 
     #[test]
@@ -593,5 +665,88 @@ mod tests {
         assert!(needs_review("edit_file"));
         assert!(!needs_review("read_file"));
         assert!(!needs_review("grep"));
+        // All MCP tools require review (we can't know their semantics).
+        assert!(needs_review("mcp__filesystem__read_file"));
+        assert!(needs_review("mcp__codegraph__search"));
+    }
+
+    #[test]
+    fn mcp_server_name_parsing() {
+        assert_eq!(mcp_server_name("mcp__codegraph__search"), Some("codegraph"));
+        assert_eq!(mcp_server_name("mcp__fs__read"), Some("fs"));
+        assert_eq!(mcp_server_name("command"), None);
+        assert_eq!(mcp_server_name("mcp__incomplete"), None);
+    }
+
+    #[test]
+    fn mcp_policy_trusted_returns_allow() {
+        let mut policies = HashMap::new();
+        policies.insert("codegraph".to_string(), McpPolicy::Trusted);
+        let v = classify_mcp_policy("mcp__codegraph__search", &policies);
+        assert!(matches!(v, Some(Verdict::Allow)));
+        // Server not in map defaults to Review → None.
+        let v = classify_mcp_policy("mcp__unknown__tool", &policies);
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn mcp_policy_review_returns_none() {
+        let mut policies = HashMap::new();
+        policies.insert("codegraph".to_string(), McpPolicy::Review);
+        let v = classify_mcp_policy("mcp__codegraph__search", &policies);
+        assert!(v.is_none()); // Falls through to normal classifier.
+    }
+
+    #[test]
+    fn builtin_tool_not_affected_by_mcp_policy() {
+        let mut policies = HashMap::new();
+        policies.insert("command".to_string(), McpPolicy::Trusted);
+        // "command" is a built-in tool, not an MCP tool — policy doesn't apply.
+        let v = classify_mcp_policy("command", &policies);
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn manual_mode_trusted_mcp_allowed() {
+        let mut policies = HashMap::new();
+        policies.insert("fs".to_string(), McpPolicy::Trusted);
+        let c = ManualClassifier::new(policies);
+        // MCP tool with Trusted policy: auto-approved even in Manual mode.
+        assert!(matches!(c.classify("mcp__fs__write", r#"{}"#), Verdict::Allow));
+    }
+
+    #[test]
+    fn manual_mode_review_mcp_asks() {
+        let mut policies = HashMap::new();
+        policies.insert("db".to_string(), McpPolicy::Review);
+        let c = ManualClassifier::new(policies);
+        // MCP tool with Review policy: Ask in Manual mode.
+        assert!(matches!(
+            c.classify("mcp__db__query", r#"{}"#),
+            Verdict::Ask { .. }
+        ));
+        // Built-in dangerous: still Ask.
+        assert!(matches!(c.classify("command", r#"{}"#), Verdict::Ask { .. }));
+    }
+
+    #[test]
+    fn allow_edits_trusted_mcp_allowed() {
+        let mut policies = HashMap::new();
+        policies.insert("fs".to_string(), McpPolicy::Trusted);
+        let c = AllowEditsClassifier::new(policies);
+        // MCP tool with Trusted policy: Allow in Allow Edits mode.
+        assert!(matches!(c.classify("mcp__fs__read", r#"{}"#), Verdict::Allow));
+    }
+
+    #[test]
+    fn allow_edits_review_mcp_asks() {
+        let mut policies = HashMap::new();
+        policies.insert("db".to_string(), McpPolicy::Review);
+        let c = AllowEditsClassifier::new(policies);
+        // MCP tool with Review policy: Ask in Allow Edits mode.
+        assert!(matches!(
+            c.classify("mcp__db__query", r#"{}"#),
+            Verdict::Ask { .. }
+        ));
     }
 }

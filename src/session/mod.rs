@@ -118,6 +118,12 @@ pub(crate) struct Session {
     /// Auto-mode classifier model when last saved, restored on resume.
     #[serde(default)]
     pub(crate) classifier_model: Option<String>,
+    /// Todo list carried with the session, restored on resume.
+    #[serde(default)]
+    pub(crate) todos: Vec<crate::todos::Todo>,
+    /// Names of activated skills, restored on resume.
+    #[serde(default)]
+    pub(crate) activated_skills: Vec<String>,
 }
 
 pub(crate) struct SessionManager {
@@ -177,6 +183,8 @@ impl SessionManager {
             work_mode: None,
             current_model: None,
             classifier_model: None,
+            todos: Vec::new(),
+            activated_skills: Vec::new(),
         }
     }
 

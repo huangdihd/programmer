@@ -26,7 +26,10 @@ use crate::ui::components::conversation_panel::conversation_panel::{
 use crate::ui::components::footer::footer::Footer;
 use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::components::provider_panel::{PanelAction, ProviderPanel};
+use crate::ui::components::skills_panel::SkillsPanel;
+use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::question_panel::QuestionPanel;
+use crate::ui::components::todo_panel::TodoPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
@@ -40,6 +43,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -65,8 +69,20 @@ pub struct App<'a> {
     pub footer: Footer,
     /// Full-screen provider management panel, when open.
     pub provider_panel: Option<ProviderPanel>,
+    /// Full-screen skills management panel, when open.
+    pub skills_panel: Option<SkillsPanel>,
+    /// Full-screen MCP server management panel, when open.
+    pub mcp_panel: Option<McpPanel>,
     /// Modal question panel shown when the model calls `ask_user`.
     pub question_panel: Option<QuestionPanel>,
+    /// Todo-list panel shown with `/todo`.
+    pub todo_panel: Option<TodoPanel>,
+    /// In-memory todo list synced with the global todos file and the session.
+    pub todo_list: crate::todos::TodoList,
+    /// Loaded agent skills, with activation state.
+    pub(crate) skill_registry: crate::skills::SkillRegistry,
+    /// MCP server manager (None if no servers configured).
+    pub(crate) mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
     /// Current safety/work mode.
     pub work_mode: WorkMode,
     /// Pending tool-call approvals in Manual mode: (call, reason).
@@ -118,6 +134,7 @@ impl App<'_> {
         mut config: ProgrammerConfig,
         saved_items: Vec<MessageItem>,
         saved_history: Vec<String>,
+        saved_todos: Vec<crate::todos::Todo>,
         session_uuid: String,
         session_mgr: Option<SessionManager>,
         startup_messages: Vec<String>,
@@ -130,6 +147,7 @@ impl App<'_> {
         // Restore per-session settings (work mode, chat model, classifier model)
         // so resuming a session comes back the way you left it. Unknown models
         // (e.g. a provider that was since removed) fall back to the default.
+        let mut saved_activated_skills: Vec<String> = Vec::new();
         if let Some(mgr) = &session_mgr {
             if let Some(saved) = mgr.load(&session_uuid) {
                 if let Some(wm) = saved.work_mode {
@@ -143,6 +161,7 @@ impl App<'_> {
                 if saved.classifier_model.is_some() {
                     config.classifier_model = saved.classifier_model;
                 }
+                saved_activated_skills = saved.activated_skills;
             }
         }
         let mut conversation_panel = ConversationPanel::new();
@@ -161,7 +180,7 @@ impl App<'_> {
         }
         let mut input_panel = InputPanel::new();
         input_panel.history = saved_history;
-        Self {
+        let mut app = Self {
             running: true,
             provider_manager,
             current_model,
@@ -171,7 +190,15 @@ impl App<'_> {
             conversation_panel,
             footer: Footer::new(),
             provider_panel: open_provider_panel.then(ProviderPanel::new),
+            skills_panel: None,
+            mcp_panel: None,
             question_panel: None,
+            todo_panel: None,
+            todo_list: {
+                let list = crate::todos::TodoList { todos: saved_todos };
+                let _ = list.save_to_file();
+                list
+            },
             work_mode,
             approval_queue: Vec::new(),
             approved_calls: Vec::new(),
@@ -184,8 +211,36 @@ impl App<'_> {
             lsp_configured: lsp_checker_configured(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
             session_uuid,
+            skill_registry: crate::skills::SkillRegistry::load(),
+            mcp_manager: None, // populated below after async init
             session_mgr,
+        };
+
+        // Restore activated skills from the saved session.
+        if !saved_activated_skills.is_empty() {
+            app.skill_registry
+                .set_activated(&saved_activated_skills);
         }
+
+        // Bring up configured MCP servers (spawn, handshake, discover tools).
+        // Skipped entirely when none are configured, so the common case pays
+        // nothing. Failures are surfaced in the conversation, not fatal.
+        if !app.config.mcp_servers.is_empty() {
+            let mcp = crate::mcp::McpManager::from_config(&app.config.mcp_servers).await;
+            for err in &mcp.startup_errors {
+                app.conversation_panel.add_error_string(err.clone());
+            }
+            if mcp.is_connected() {
+                app.conversation_panel.add_info_string(format!(
+                    "MCP: connected {} server(s), {} tool(s) available",
+                    mcp.server_count(),
+                    mcp.all_tools().len(),
+                ));
+            }
+            app.mcp_manager = Some(std::sync::Arc::new(mcp));
+        }
+
+        app
     }
 
     /// Run the application's main loop. Returns the final session UUID.
@@ -292,6 +347,9 @@ impl App<'_> {
                     for output in outputs {
                         self.conversation_panel.add_tool_output(output);
                     }
+                    // Refresh todo_list from the global file — the todo tool
+                    // may have mutated it during this batch.
+                    self.todo_list = crate::todos::TodoList::load();
                     self.save_session();
                     // A spawned shell can reset the console's input mode; re-assert
                     // mouse capture so scrolling/clicks keep working afterwards.
@@ -384,6 +442,29 @@ impl App<'_> {
                             "current model reset to: {}",
                             self.current_model
                         ));
+                    }
+                }
+                AppEvent::McpChanged => {
+                    // Re-spawn the MCP manager from the edited config. Tearing
+                    // down the old one drops its child processes on drop.
+                    if self.config.mcp_servers.is_empty() {
+                        self.mcp_manager = None;
+                        self.conversation_panel
+                            .add_info_string("MCP servers cleared.".to_string());
+                    } else {
+                        let mcp = crate::mcp::McpManager::from_config(
+                            &self.config.mcp_servers,
+                        )
+                        .await;
+                        for err in &mcp.startup_errors {
+                            self.conversation_panel.add_error_string(err.clone());
+                        }
+                        self.conversation_panel.add_info_string(format!(
+                            "MCP reloaded: {} server(s), {} tool(s) available",
+                            mcp.server_count(),
+                            mcp.all_tools().len(),
+                        ));
+                        self.mcp_manager = Some(std::sync::Arc::new(mcp));
                     }
                 }
                 AppEvent::QuestionPrompt {
@@ -480,10 +561,11 @@ impl App<'_> {
         // Annotate and run approved calls.
         let sender = self.events.sender.clone();
         let cancel_token = Arc::new(AtomicBool::new(false));
+        let mcp = self.mcp_manager.clone();
         tokio::spawn(async move {
             let mut outputs = Vec::new();
             for call in &calls {
-                let mut out = crate::tools::run_tool_call(call, &sender).await;
+                let mut out = crate::tools::run_tool_call(call, &sender, mcp.as_deref()).await;
                 let text = match &out.output {
                     FunctionCallOutput::Text(t) => t.clone(),
                     _ => String::new(),
@@ -511,6 +593,10 @@ impl App<'_> {
             return;
         }
         if let Some(panel) = self.provider_panel.as_mut() {
+            panel.handle_paste(&data);
+            return;
+        }
+        if let Some(panel) = self.mcp_panel.as_mut() {
             panel.handle_paste(&data);
             return;
         }
@@ -595,13 +681,17 @@ impl App<'_> {
         let sender = self.events.sender.clone();
         let retrying = self.stream_retrying.clone();
         retrying.store(false, Ordering::Relaxed);
-        let input_param = self.conversation_panel.get_input_param(&self.current_model);
+        let input_param = self.conversation_panel.get_input_param(
+            &self.current_model,
+            self.skill_registry.combined_prompt().as_deref(),
+        );
+        let mcp = self.mcp_manager.clone();
         tokio::spawn(async move {
             let mut request = CreateResponse::default();
             request.stream = Option::from(true);
             request.input = input_param;
             request.model = Option::from(model_name);
-            request.tools = Some(crate::tools::tools());
+            request.tools = Some(crate::tools::tools(mcp.as_deref()));
 
             const MAX_RETRIES: u32 = 10;
             let mut attempt: u32 = 0;
@@ -659,7 +749,7 @@ impl App<'_> {
         }
 
         self.conversation_panel.phase = ActivePhase::ToolRunning;
-        let classifier = self.work_mode.classifier();
+        let classifier = self.work_mode.classifier(self.build_mcp_policy_map());
 
         // Split calls: allowed (run now), denied (error now), pending (queue
         // for approval).
@@ -735,6 +825,7 @@ impl App<'_> {
         let sender = self.events.sender.clone();
         let no_lp = self.classifier_no_logprobs.clone();
         let (light_context, full_context) = self.build_classifier_context();
+        let mcp_policies = self.build_mcp_policy_map();
 
         tokio::spawn(async move {
             // One decision per call, preserving call order. Read-only tools
@@ -756,9 +847,23 @@ impl App<'_> {
                     let light_context = &light_context;
                     let full_context = &full_context;
                     let cancel_token = &cancel_token;
+                    let mcp_policies = &mcp_policies;
                     async move {
                         if cancel_token.load(Ordering::Relaxed) {
                             return None;
+                        }
+                        // MCP server policy check: Trusted → allow,
+                        // Review → fall through to LLM classifier.
+                        if let Some(verdict) =
+                            crate::classifier::classify_mcp_policy(&call.name, mcp_policies)
+                        {
+                            return Some(match verdict {
+                                crate::classifier::Verdict::Allow => Decision::Allow(call),
+                                crate::classifier::Verdict::Ask { reason }
+                                | crate::classifier::Verdict::Deny { reason } => {
+                                    Decision::Deny(classifier_denied_output(&call, &reason))
+                                }
+                            });
                         }
                         if !crate::classifier::needs_review(&call.name) {
                             return Some(Decision::Allow(call));
@@ -815,9 +920,20 @@ impl App<'_> {
         });
     }
 
+    /// Build a map of MCP server name → [`McpPolicy`] from the config, so
+    /// classifiers can look up per-server policies without touching config.
+    fn build_mcp_policy_map(&self) -> HashMap<String, crate::mcp::types::McpPolicy> {
+        self.config
+            .mcp_servers
+            .iter()
+            .map(|s| (s.name.clone(), s.auto_approve))
+            .collect()
+    }
+
     /// Compact context handed to the Auto-mode classifier so it judges tool
     /// calls against the actual task, not in isolation: the working directory,
     /// the user's latest request, and the recent tool calls this turn.
+    ///
     /// Build two classifier contexts:
     ///   - light: cwd + user request only (fast yes/no path, ~cheap).
     ///   - full:  light + assistant replies, tool outputs, call history
@@ -1115,13 +1231,14 @@ impl App<'_> {
     ) {
         self.conversation_panel.phase = ActivePhase::ToolRunning;
         let sender = self.events.sender.clone();
+        let mcp = self.mcp_manager.clone();
         tokio::spawn(async move {
             let mut outputs = denied;
             for call in &allowed {
                 if cancel_token.load(Ordering::Relaxed) {
                     break;
                 }
-                let mut out = crate::tools::run_tool_call(call, &sender).await;
+                let mut out = crate::tools::run_tool_call(call, &sender, mcp.as_deref()).await;
                 let text = match &out.output {
                     FunctionCallOutput::Text(t) => t.clone(),
                     _ => String::new(),
@@ -1229,6 +1346,19 @@ impl App<'_> {
             return Ok(());
         }
 
+        // ---- todo panel (shown with /todo) ----
+        if let Some(panel) = self.todo_panel.as_mut() {
+            match panel.handle_key(key_event) {
+                crate::ui::components::todo_panel::PanelAction::Close => {
+                    self.todo_panel = None;
+                    // Refresh from the global file since the panel mutated it.
+                    self.todo_list = crate::todos::TodoList::load();
+                }
+                crate::ui::components::todo_panel::PanelAction::None => {}
+            }
+            return Ok(());
+        }
+
         // ---- Ctrl+T: cycle work mode ----
         if key_event.code == KeyCode::Char('t')
             && key_event.modifiers == KeyModifiers::CONTROL
@@ -1253,6 +1383,38 @@ impl App<'_> {
                     self.events.send(AppEvent::ProvidersChanged);
                 }
                 PanelAction::None => {}
+            }
+            return Ok(());
+        }
+
+        // ---- skills management panel (modal) ----
+        if let Some(panel) = self.skills_panel.as_mut() {
+            use crate::ui::components::skills_panel::PanelAction as SkillsAction;
+            match panel.handle_key(key_event, &mut self.skill_registry) {
+                SkillsAction::Close => self.skills_panel = None,
+                // Persist the new active set with the session.
+                SkillsAction::Saved => self.save_session(),
+                SkillsAction::None => {}
+            }
+            return Ok(());
+        }
+
+        // ---- MCP management panel (modal) ----
+        if let Some(panel) = self.mcp_panel.as_mut() {
+            use crate::ui::components::mcp_panel::PanelAction as McpAction;
+            if matches!(key_event.code, KeyCode::Char('q' | 'Q' | 'c' | 'C'))
+                && key_event.modifiers == KeyModifiers::CONTROL
+            {
+                self.events.send(AppEvent::Quit);
+                return Ok(());
+            }
+            match panel.handle_key(key_event, &mut self.config) {
+                McpAction::Close => self.mcp_panel = None,
+                McpAction::Saved => {
+                    self.persist_config();
+                    self.events.send(AppEvent::McpChanged);
+                }
+                McpAction::None => {}
             }
             return Ok(());
         }
@@ -1374,7 +1536,7 @@ impl App<'_> {
                 let content = self.input_panel.get_content();
                 if content.starts_with('/') {
                     self.input_panel.completion =
-                        CompletionEngine::complete(&content, &self.provider_manager);
+                        CompletionEngine::complete(&content, &self.provider_manager, &self.skill_registry);
                     if let Some(ref c) = self.input_panel.completion {
                         if c.candidates.len() == 1 {
                             let text = c.line(0);
@@ -1458,7 +1620,7 @@ impl App<'_> {
         let content = self.input_panel.get_content();
         if content.starts_with('/') {
             self.input_panel.completion =
-                CompletionEngine::complete(&content, &self.provider_manager);
+                CompletionEngine::complete(&content, &self.provider_manager, &self.skill_registry);
             // Always show popup when we have completions.
             if let Some(ref mut c) = self.input_panel.completion {
                 c.visible = true;
@@ -1485,6 +1647,8 @@ impl App<'_> {
                 self.conversation_panel.clear_messages();
                 self.reset_diagnostics_state();
                 self.delete_session();
+                self.todo_list = crate::todos::TodoList::default();
+                crate::todos::TodoList::clear_file();
                 self.save_session();
             }
             Some(Command::New) => {
@@ -1497,6 +1661,8 @@ impl App<'_> {
                     let new_session = mgr.create();
                     self.session_uuid = new_session.uuid;
                 }
+                self.todo_list = crate::todos::TodoList::default();
+                crate::todos::TodoList::clear_file();
                 self.conversation_panel
                     .add_info_string("Started a new session. Previous session saved.".to_string());
                 self.save_session();
@@ -1663,6 +1829,134 @@ impl App<'_> {
                 // Run as a normal agent turn driven by a synthetic prompt.
                 self.events.send(AppEvent::StartInit);
             }
+            Some(Command::Todo) => {
+                self.input_panel.clear();
+                let list = self.todo_list.clone();
+                self.todo_panel = Some(TodoPanel::new(list));
+            }
+            Some(Command::Skill(arg)) => {
+                self.input_panel.clear();
+                match arg.as_str() {
+                    "" | "list" => {
+                        let lines: Vec<String> = self
+                            .skill_registry
+                            .names()
+                            .iter()
+                            .map(|name| {
+                                let marker = if self
+                                    .skill_registry
+                                    .activated_names()
+                                    .contains(name)
+                                {
+                                    " (*)"
+                                } else {
+                                    ""
+                                };
+                                let desc = self
+                                    .skill_registry
+                                    .get(name)
+                                    .map(|s| s.description.as_str())
+                                    .unwrap_or("");
+                                format!("  {name}{marker}  {desc}")
+                            })
+                            .collect();
+                        if lines.is_empty() {
+                            self.conversation_panel
+                                .add_info_string("No skills installed. Place SKILL.md files in .programmer/skills/<name>/ or ~/.config/programmer/skills/<name>/.".to_string());
+                        } else {
+                            let mut out =
+                                vec!["Available skills ((*) = active):".to_string()];
+                            out.extend(lines);
+                            self.conversation_panel.add_info_string(out.join("\n"));
+                        }
+                    }
+                    "off" | "none" | "clear" => {
+                        if self.skill_registry.has_active() {
+                            let names: Vec<String> = self
+                                .skill_registry
+                                .activated_names()
+                                .iter()
+                                .map(|n| n.clone())
+                                .collect();
+                            self.skill_registry.clear();
+                            self.conversation_panel.add_info_string(format!(
+                                "Skills deactivated: {}",
+                                names.join(", ")
+                            ));
+                        } else {
+                            self.conversation_panel
+                                .add_info_string("No skills are currently active.");
+                        }
+                    }
+                    "manage" => {
+                        self.skills_panel = Some(SkillsPanel::new());
+                    }
+                    name => {
+                        if self.skill_registry.activate(name) {
+                            self.conversation_panel.add_info_string(format!(
+                                "Skill activated: {name}"
+                            ));
+                        } else {
+                            self.conversation_panel.add_error_string(format!(
+                                "Skill '{name}' not found. Use /skill list to see available skills."
+                            ));
+                        }
+                    }
+                }
+                self.save_session();
+            }
+            Some(Command::Mcp(args)) => {
+                self.input_panel.clear();
+                match args.trim() {
+                    "show" => {
+                        if self.config.mcp_servers.is_empty() {
+                            self.conversation_panel.add_info_string(
+                                "No MCP servers configured. Use /mcp manage to add one."
+                                    .to_string(),
+                            );
+                        } else {
+                            let mut lines = vec!["Configured MCP servers:".to_string()];
+                            for s in &self.config.mcp_servers {
+                                let connected = self
+                                    .mcp_manager
+                                    .as_ref()
+                                    .map(|m| {
+                                        m.all_tools()
+                                            .iter()
+                                            .filter(|(fqn, _)| {
+                                                fqn.strip_prefix("mcp__")
+                                                    .and_then(|r| r.split_once("__"))
+                                                    .map(|(srv, _)| srv == s.name)
+                                                    .unwrap_or(false)
+                                            })
+                                            .count()
+                                    })
+                                    .unwrap_or(0);
+                                let cmdline = if s.args.is_empty() {
+                                    s.command.clone()
+                                } else {
+                                    format!("{} {}", s.command, s.args.join(" "))
+                                };
+                                lines.push(format!(
+                                    "  {}: {cmdline}  ({connected} tools)",
+                                    s.name
+                                ));
+                            }
+                            self.conversation_panel.add_info_string(lines.join("\n"));
+                        }
+                    }
+                    "manage" => {
+                        self.mcp_panel = Some(McpPanel::new());
+                    }
+                    _ => {
+                        self.conversation_panel.add_info_string(
+                            "usage: /mcp show — list MCP servers and their status\n\
+                             \u{20}      /mcp manage — open the management panel",
+                        );
+                    }
+                }
+                self.save_session();
+            }
             Some(Command::Help) => {
                 self.input_panel.clear();
                 let mut lines: Vec<String> = Command::descriptions()
@@ -1715,6 +2009,8 @@ impl App<'_> {
         session.work_mode = Some(self.work_mode);
         session.current_model = Some(self.current_model.clone());
         session.classifier_model = self.config.classifier_model.clone();
+        session.todos = self.todo_list.todos.clone();
+        session.activated_skills = self.skill_registry.activated_names().to_vec();
         if let Err(e) = mgr.save(&mut session) {
             self.conversation_panel
                 .add_error_string(format!("session save: {e}"));

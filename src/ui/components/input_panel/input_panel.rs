@@ -58,6 +58,23 @@ impl InputPanel<'_> {
         self.text_area.lines().join("\n")
     }
 
+    /// Maximum number of text rows the input grows to before it stops
+    /// expanding and scrolls internally instead.
+    pub const MAX_VISIBLE_LINES: usize = 10;
+
+    /// Total height (including the top + bottom border) the panel needs to show
+    /// its current content. Grows with multi-line input up to
+    /// [`Self::MAX_VISIBLE_LINES`] so long messages get room without letting the
+    /// input take over the whole screen.
+    pub fn needed_height(&self) -> u16 {
+        let lines = self
+            .text_area
+            .lines()
+            .len()
+            .clamp(1, Self::MAX_VISIBLE_LINES);
+        lines as u16 + 2 // top + bottom border rows
+    }
+
     /// The input content with paste placeholders expanded to their full text.
     pub fn expanded_content(&self) -> String {
         let mut text = self.get_content();

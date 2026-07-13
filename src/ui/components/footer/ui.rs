@@ -33,6 +33,14 @@ impl Widget for &Footer {
         let mode_len = mode_text.len() as u16;
         let model_len = self.current_model.len() as u16;
 
+        // Active skills indicator — only shown when skills are active.
+        let skill_text = if self.active_skills.is_empty() {
+            String::new()
+        } else {
+            format!(" \u{1f3af} {} ", self.active_skills)
+        };
+        let skill_len = skill_text.chars().count() as u16;
+
         // LSP indicator: shown whenever the project has an LSP checker
         // configured (from startup) or a server is live. Command-backend
         // projects see no extra clutter.
@@ -60,11 +68,12 @@ impl Widget for &Footer {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(mode_len), // work mode (leftmost)
-                Constraint::Min(1),           // status
+                Constraint::Length(mode_len),  // work mode (leftmost)
+                Constraint::Length(skill_len), // active skills
+                Constraint::Min(1),            // status
                 Constraint::Length(if model_len > 0 { model_len + 2 } else { 0 }), // model
-                Constraint::Length(lsp_len),  // LSP status
-                Constraint::Length(28),       // "GPL-3.0-or-later · © 2026"
+                Constraint::Length(lsp_len),   // LSP status
+                Constraint::Length(28),        // "GPL-3.0-or-later · © 2026"
             ])
             .split(area);
 
@@ -79,26 +88,33 @@ impl Widget for &Footer {
             .style(mode_style)
             .render(chunks[0], buf);
 
+        // Active skills (if any)
+        if !skill_text.is_empty() {
+            ratatui::widgets::Paragraph::new(skill_text)
+                .style(Style::default().fg(Color::LightMagenta))
+                .render(chunks[1], buf);
+        }
+
         // Status indicator
-        (&self.status).render(chunks[1], buf);
+        (&self.status).render(chunks[2], buf);
 
         // Model name
         if !self.current_model.is_empty() {
             ratatui::widgets::Paragraph::new(format!(" {} ", self.current_model))
                 .style(Style::default().fg(ACCENT))
-                .render(chunks[2], buf);
+                .render(chunks[3], buf);
         }
 
         // LSP status (empty string renders nothing)
         if !lsp_text.is_empty() {
             ratatui::widgets::Paragraph::new(lsp_text)
                 .style(lsp_style)
-                .render(chunks[3], buf);
+                .render(chunks[4], buf);
         }
 
         // Right: copyright
         ratatui::widgets::Paragraph::new("GPL-3.0-or-later \u{b7} \u{a9} 2026")
             .style(Style::default().fg(DIM))
-            .render(chunks[4], buf);
+            .render(chunks[5], buf);
     }
 }

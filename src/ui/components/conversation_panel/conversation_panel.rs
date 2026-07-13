@@ -466,6 +466,20 @@ impl ConversationPanel {
 
     /// Mouse dragged with the left button held: extend the selection.
     pub fn selection_drag(&mut self, column: u16, row: u16) {
+        // Auto-scroll when dragging against the top/bottom edge so the
+        // selection can extend past the visible window. The terminal clamps the
+        // mouse row to its bounds, so a drag beyond the edge keeps arriving at
+        // the edge row — treat that as "scroll and keep selecting". Selection
+        // coordinates are absolute (buffer) positions, so scrolling moves the
+        // window while the anchor stays put and the head reaches new content.
+        let area = self.view_area;
+        if self.selection.is_some() && area.height > 0 {
+            if row >= area.bottom().saturating_sub(1) {
+                self.scroll_down();
+            } else if row <= area.y {
+                self.scroll_up();
+            }
+        }
         let Some(pos) = self.to_buffer_pos(column, row, true) else {
             return;
         };
@@ -755,11 +769,15 @@ impl ConversationPanel {
         }
     }
 
-    pub fn get_input_param(&self, current_model: &str) -> InputParam {
-        let system_prompt = format!(
+    pub fn get_input_param(&self, current_model: &str, skill_prompt: Option<&str>) -> InputParam {
+        let mut system_prompt = format!(
             "{SYSTEM_PROMPT}\n\nYou are running as model: {current_model}\n\n{}",
             crate::tools::environment_info()
         );
+        if let Some(prompt) = skill_prompt {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(prompt);
+        }
         let developer_message =
             InputItem::from(Item::Message(ApiMessageItem::Input(InputMessage {
                 content: vec![InputContent::InputText(system_prompt.into())],
@@ -795,6 +813,17 @@ impl ConversationPanel {
                     input_items.push(input_item.clone());
                 }
                 MessageItem::Output(output_item) => {
+                    // A non-call output (an assistant message or reasoning the
+                    // model emitted *after* its tool calls) closes the tool-call
+                    // block: flush the pending outputs first so every
+                    // `function_call` stays immediately followed by its
+                    // `function_call_output`. Otherwise a trailing message wedges
+                    // between a call and its output, and chat-completions-backed
+                    // providers reject the assistant tool_calls message for not
+                    // being followed by tool results.
+                    if !matches!(output_item, OutputItem::FunctionCall(_)) {
+                        input_items.append(&mut pending_outputs);
+                    }
                     input_items.push(output_item.clone().into());
                     if let OutputItem::FunctionCall(call) = output_item {
                         let output = match recorded_outputs.remove(call.call_id.as_str()) {
@@ -917,7 +946,7 @@ mod tests {
         // An orphaned call with no recorded output (cancelled mid-run).
         panel.items.push(MessageItem::Output(call("call_2")));
 
-        let InputParam::Items(items) = panel.get_input_param("test/model") else {
+        let InputParam::Items(items) = panel.get_input_param("test/model", None) else {
             panic!("expected an item list");
         };
         // Every call must be answered (missing ones synthesized), with all
@@ -930,14 +959,18 @@ mod tests {
             _ => "other".to_string(),
         };
         let kinds: Vec<String> = items.iter().map(|i| kind(i)).collect();
+        // Each call must be immediately followed by its output; a message the
+        // model emitted after the call is pushed out to *after* that output, so
+        // the assistant tool_calls block is always answered by tool results
+        // before any other message — what chat-completions providers require.
         assert_eq!(
             kinds,
             vec![
                 "message", // developer
                 "message", // user
                 "call:call_1",
-                "message", // trailing assistant text
                 "output:call_1",
+                "message", // trailing assistant text, moved after the output
                 "call:call_2",
                 "output:call_2", // synthesized for the orphaned call
             ]
@@ -973,7 +1006,7 @@ mod tests {
         panel.add_tool_output(output("call_1"));
         panel.add_tool_output(output("call_2"));
 
-        let InputParam::Items(items) = panel.get_input_param("test/model") else {
+        let InputParam::Items(items) = panel.get_input_param("test/model", None) else {
             panic!("expected an item list");
         };
         let order: Vec<String> = items

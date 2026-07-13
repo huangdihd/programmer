@@ -133,13 +133,18 @@ async fn execute(
 }
 
 fn format_output(code: Option<i32>, stdout: &str, stderr: &str) -> String {
+    // CLIs often force colour and draw progress bars even when their output is
+    // a pipe; clean the terminal control noise so the conversation and the
+    // tokens sent to the model stay readable.
+    let stdout = clean_terminal_output(stdout);
+    let stderr = clean_terminal_output(stderr);
     let mut result = String::new();
     if !stdout.is_empty() {
-        result.push_str(stdout);
+        result.push_str(&stdout);
     }
     if !stderr.is_empty() {
         push_line_break(&mut result);
-        result.push_str(stderr);
+        result.push_str(&stderr);
     }
     if code.unwrap_or(-1) != 0 {
         push_line_break(&mut result);
@@ -155,4 +160,132 @@ fn push_line_break(text: &mut String) {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
+}
+
+#[cfg(test)]
+mod clean_tests {
+    use super::*;
+
+    #[test]
+    fn strips_sgr_colour_codes() {
+        let input = "\u{1b}[38;2;206;146;23m\u{1b}[1mhi\u{1b}[0m there";
+        assert_eq!(clean_terminal_output(input), "hi there");
+    }
+
+    #[test]
+    fn strips_erase_line_and_keeps_text() {
+        let input = "start\u{1b}[Kend";
+        assert_eq!(clean_terminal_output(input), "startend");
+    }
+
+    #[test]
+    fn collapses_progress_bar_redraws() {
+        // A carriage-return progress bar keeps rewriting the same line.
+        let input = "Parsing  0%\rParsing 40%\rParsing 100%";
+        assert_eq!(clean_terminal_output(input), "Parsing 100%");
+    }
+
+    #[test]
+    fn ansi_progress_bar_reduces_to_final_frame() {
+        // ESC[K (erase) + CR redraw, as emitted by many CLIs.
+        let input =
+            "\u{1b}[K\rload \u{1b}[32m10%\u{1b}[0m\u{1b}[K\rload \u{1b}[32m100%\u{1b}[0m";
+        assert_eq!(clean_terminal_output(input), "load 100%");
+    }
+
+    #[test]
+    fn plain_text_is_unchanged() {
+        let input = "line one\nline two\n";
+        assert_eq!(clean_terminal_output(input), "line one\nline two\n");
+    }
+}
+
+/// Strip terminal control noise from captured command output: ANSI escape
+/// sequences (colours, cursor moves, line erases) and carriage-return redraws
+/// (progress bars). The result is the plain text a human would ultimately see.
+fn clean_terminal_output(input: &str) -> String {
+    let stripped = strip_ansi(input);
+    let mut out = String::with_capacity(stripped.len());
+    for (i, line) in stripped.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.contains('\r') {
+            out.push_str(&apply_carriage_returns(line));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Remove ANSI escape sequences: CSI (`ESC [ … final`), OSC (`ESC ] … BEL/ST`),
+/// and other two-byte `ESC x` sequences.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                // CSI: consume params/intermediates up to a final byte @–~.
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&nc) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                // OSC: consume until BEL or ST (ESC \).
+                while let Some(&nc) = chars.peek() {
+                    if nc == '\u{07}' {
+                        chars.next();
+                        break;
+                    }
+                    if nc == '\u{1b}' {
+                        chars.next();
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            // A lone ESC or a short sequence (charset selection, etc.): drop the
+            // ESC and its single following byte.
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Apply carriage-return semantics within a single line: `\r` moves the write
+/// cursor back to column 0, so later text overwrites earlier text. Collapses a
+/// progress bar's many redraws down to its final frame.
+fn apply_carriage_returns(line: &str) -> String {
+    let mut buf: Vec<char> = Vec::new();
+    let mut pos = 0usize;
+    for c in line.chars() {
+        if c == '\r' {
+            pos = 0;
+        } else {
+            if pos < buf.len() {
+                buf[pos] = c;
+            } else {
+                buf.push(c);
+            }
+            pos += 1;
+        }
+    }
+    buf.into_iter().collect()
 }

@@ -92,6 +92,9 @@ pub enum AppEvent {
     /// Provider config changed (via the management panel): rebuild the
     /// provider manager from the current config.
     ProvidersChanged,
+    /// MCP server config changed (via the management panel): re-spawn the
+    /// MCP manager from the current config.
+    McpChanged,
     /// The `ask_user` tool is prompting the user. Carries the question and a
     /// oneshot sender that the UI uses to send the answer back.
     #[allow(missing_docs)]
@@ -132,6 +135,7 @@ impl std::fmt::Debug for AppEvent {
             Self::Start => write!(f, "Start"),
             Self::StartInit => write!(f, "StartInit"),
             Self::ProvidersChanged => write!(f, "ProvidersChanged"),
+            Self::McpChanged => write!(f, "McpChanged"),
             Self::QuestionPrompt { question, .. } => {
                 f.debug_struct("QuestionPrompt")
                     .field("question", question)

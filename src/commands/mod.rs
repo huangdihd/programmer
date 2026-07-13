@@ -39,6 +39,11 @@ pub enum Command {
     Init,
     Help,
     Session,
+    Todo,
+    /// `/skill <name|list|off>` — activate, list, or clear skills.
+    Skill(String),
+    /// `/mcp <show|manage>` — list or manage MCP servers.
+    Mcp(String),
 }
 
 impl Command {
@@ -68,6 +73,9 @@ impl Command {
             "init" => Some(Command::Init),
             "help" | "?" => Some(Command::Help),
             "session" | "s" => Some(Command::Session),
+            "todo" | "todos" | "t" => Some(Command::Todo),
+            "skill" | "skills" => Some(Command::Skill(args)),
+            "mcp" => Some(Command::Mcp(args)),
             _ => None,
         }
     }
@@ -75,8 +83,8 @@ impl Command {
     /// All command names (without leading `/`), for completion.
     pub fn all_commands() -> &'static [&'static str] {
         &[
-            "model", "new", "providers", "session", "mode", "classifier", "init", "clear",
-            "quit", "help",
+            "model", "new", "providers", "session", "mode", "classifier", "init", "todo", "skill",
+            "mcp", "clear", "quit", "help",
         ]
     }
 
@@ -87,6 +95,11 @@ impl Command {
             ("/mode <manual|edits|auto>", "Set work mode (or cycle with Ctrl+T)"),
             ("/classifier [provider/model]", "Set/show the Auto-mode classifier model"),
             ("/init", "Explore the project, write PROGRAMMER.md, set up diagnostics"),
+            ("/skill <name|list|off>", "Activate, list, or clear agent skills"),
+            ("/skill manage", "Open the skills management panel"),
+            ("/mcp show", "List configured MCP servers and their status"),
+            ("/mcp manage", "Open the MCP server management panel"),
+            ("/todo | /t", "Open the todo list panel"),
             ("/new | /n", "Start a new session (saves current)"),
             ("/providers show", "List all configured providers and models"),
             ("/providers manage", "Open the provider management panel"),
@@ -147,7 +160,11 @@ impl CompletionEngine {
     ///
     /// Returns `None` when the input does not trigger completions (e.g. doesn't
     /// start with `/`) or when no candidates match.
-    pub fn complete(input: &str, pm: &ProviderManager) -> Option<CompletionState> {
+    pub(crate) fn complete(
+        input: &str,
+        pm: &ProviderManager,
+        skill_registry: &crate::skills::SkillRegistry,
+    ) -> Option<CompletionState> {
         if !input.starts_with('/') {
             return None;
         }
@@ -172,6 +189,8 @@ impl CompletionEngine {
             "classifier" => Self::complete_model(text, cmd, pm),
             "mode" => Self::complete_subcommand(text, cmd, &["manual", "edits", "auto"]),
             "providers" | "provider" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
+            "skill" | "skills" => Self::complete_skill(text, cmd, skill_registry),
+            "mcp" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
             _ => None,
         }
     }
@@ -228,5 +247,33 @@ impl CompletionEngine {
             .map(|p| format!("{}/", p))
             .collect();
         CompletionState::new(prefix, providers)
+    }
+
+    fn complete_skill(
+        text: &str,
+        cmd: &str,
+        reg: &crate::skills::SkillRegistry,
+    ) -> Option<CompletionState> {
+        let after_cmd = text[cmd.len()..].trim_start();
+        let prefix = format!("/{} ", cmd);
+        let builtins = ["list", "off", "manage"];
+        if after_cmd.is_empty() {
+            let mut candidates: Vec<String> = builtins.iter().map(|s| s.to_string()).collect();
+            for name in reg.names() {
+                candidates.push(name.clone());
+            }
+            return CompletionState::new(prefix, candidates);
+        }
+        let mut candidates: Vec<String> = builtins
+            .iter()
+            .filter(|s| s.starts_with(after_cmd))
+            .map(|s| s.to_string())
+            .collect();
+        for name in reg.names() {
+            if name.starts_with(after_cmd) {
+                candidates.push(name.clone());
+            }
+        }
+        CompletionState::new(prefix, candidates)
     }
 }

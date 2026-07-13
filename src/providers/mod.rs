@@ -196,6 +196,7 @@ mod tests {
             providers,
             classifier_model: None,
             allow_yolo: false,
+            mcp_servers: Vec::new(),
             model: None,
             base_url: None,
             api_key: None,

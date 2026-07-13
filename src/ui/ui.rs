@@ -65,6 +65,16 @@ impl Widget for &mut App<'_> {
             panel.render(&self.config, &self.provider_manager, area, buf);
             return;
         }
+        // The skills management panel is modal and replaces the whole UI.
+        if let Some(panel) = &self.skills_panel {
+            panel.render(&self.skill_registry, area, buf);
+            return;
+        }
+        // The MCP management panel is modal and replaces the whole UI.
+        if let Some(panel) = &self.mcp_panel {
+            panel.render(&self.config, self.mcp_manager.as_deref(), area, buf);
+            return;
+        }
 
         // Resolve the single status the footer should show, then let the
         // status bar track its own busy timer.
@@ -72,6 +82,10 @@ impl Widget for &mut App<'_> {
         self.footer.work_mode = self.work_mode;
         self.footer.current_model = self.current_model.clone();
         self.footer.lsp_configured = self.lsp_configured;
+        self.footer.active_skills = self
+            .skill_registry
+            .activated_names()
+            .join(",");
 
         // When the model is asking a question or waiting for approval,
         // the bottom area grows; the conversation panel shrinks.
@@ -89,23 +103,65 @@ impl Widget for &mut App<'_> {
             ).len() as u16;
             4 + detail_count + 4 // title + reason + details + options
         };
-        let bottom_height = question_height.max(approval_height);
+        // The bottom row is either a modal (question / approval) or the input.
+        // When it's the input, let it grow with multi-line content.
+        let bottom_height = if self.question_panel.is_some() {
+            question_height
+        } else if !self.approval_queue.is_empty() {
+            approval_height
+        } else {
+            self.input_panel.needed_height()
+        };
+
+        // Show a compact todo bar when there are items and the full modal
+        // isn't open.
+        let has_todo_bar = !self.todo_list.todos.is_empty() && self.todo_panel.is_none();
+        let todo_bar_height: u16 = if has_todo_bar { 1 } else { 0 };
+
+        // Named indices into the constraint array so they don't drift when
+        // rows are added or removed.
+        const POS_LOGO: usize = 0;
+        const POS_CONV: usize = 1;
+        const POS_TODO: usize = 2;
+        const POS_BOTTOM: usize = 3;
+        const POS_FOOTER: usize = 4;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Min(2),
-                Constraint::Length(bottom_height),
-                Constraint::Length(1),
+                Constraint::Length(1),               // POS_LOGO
+                Constraint::Min(2),                  // POS_CONV
+                Constraint::Length(todo_bar_height), // POS_TODO
+                Constraint::Length(bottom_height),   // POS_BOTTOM
+                Constraint::Length(1),               // POS_FOOTER
             ])
             .split(area);
         let logo = Logo::new();
-        logo.render(chunks[0], buf);
-        self.conversation_panel.render(chunks[1], buf);
+        logo.render(chunks[POS_LOGO], buf);
+        self.conversation_panel.render(chunks[POS_CONV], buf);
+
+        // ---- compact todo bar (inline, above the input area) ----
+        if has_todo_bar {
+            let pending = self.todo_list.todos.iter().filter(|t| t.status == crate::todos::TodoStatus::Pending).count();
+            let in_progress = self.todo_list.todos.iter().filter(|t| t.status == crate::todos::TodoStatus::InProgress).count();
+            let completed = self.todo_list.todos.iter().filter(|t| t.status == crate::todos::TodoStatus::Completed).count();
+            let mut parts = Vec::new();
+            if pending > 0 { parts.push(format!("{} pending", pending)); }
+            if in_progress > 0 { parts.push(format!("{} in progress", in_progress)); }
+            if completed > 0 { parts.push(format!("{} completed", completed)); }
+            let summary = parts.join(", ");
+            let line = Line::from(vec![
+                Span::styled(" ☐ Todos: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(summary, Style::default().fg(Color::Gray)),
+                Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("/todo", Style::default().fg(Color::Cyan)),
+                Span::styled(" to manage", Style::default().fg(Color::DarkGray)),
+            ]);
+            Paragraph::new(line).render(chunks[POS_TODO], buf);
+        }
 
         if let Some(panel) = &self.question_panel {
-            panel.render(chunks[2], buf);
+            panel.render(chunks[POS_BOTTOM], buf);
         } else if !self.approval_queue.is_empty() {
             let current = self.approved_calls.len() + 1;
             let total = self.approved_calls.len() + self.approval_queue.len();
@@ -152,11 +208,11 @@ impl Widget for &mut App<'_> {
                         .borders(Borders::TOP)
                         .border_style(Style::default().fg(Color::Yellow)),
                 )
-                .render(chunks[2], buf);
+                .render(chunks[POS_BOTTOM], buf);
         } else {
-            self.input_panel.render(chunks[2], buf);
+            self.input_panel.render(chunks[POS_BOTTOM], buf);
         }
-        (&self.footer).render(chunks[3], buf);
+        (&self.footer).render(chunks[POS_FOOTER], buf);
 
         // ---- completion popup (floats above the input panel) ----
         if let Some(ref completion) = self.input_panel.completion {
@@ -165,20 +221,20 @@ impl Widget for &mut App<'_> {
                 let count = (completion.candidates.len() as u16).min(max_visible);
                 let popup_height = count;
 
-                let token_x = chunks[2].x + 2 + completion.prefix.len() as u16;
+                let token_x = chunks[POS_BOTTOM].x + 2 + completion.prefix.len() as u16;
                 let longest = completion
                     .candidates
                     .iter()
                     .map(|c| c.len())
                     .max()
                     .unwrap_or(0) as u16;
-                let popup_width = (longest + 2).clamp(10, chunks[2].width);
+                let popup_width = (longest + 2).clamp(10, chunks[POS_BOTTOM].width);
 
                 let popup_area = Rect {
-                    x: token_x.min(chunks[2].right().saturating_sub(popup_width)),
-                    y: chunks[2].y.saturating_sub(popup_height),
+                    x: token_x.min(chunks[POS_BOTTOM].right().saturating_sub(popup_width)),
+                    y: chunks[POS_BOTTOM].y.saturating_sub(popup_height),
                     width: popup_width,
-                    height: popup_height.min(chunks[2].y),
+                    height: popup_height.min(chunks[POS_BOTTOM].y),
                 };
 
                 let popup = CompletionPopup {
@@ -188,6 +244,39 @@ impl Widget for &mut App<'_> {
                 };
                 popup.render(popup_area, buf);
             }
+        }
+
+        // ---- todo panel (floating overlay, centered) ----
+        if let Some(panel) = &self.todo_panel {
+            let panel_height = panel.needed_height().min(area.height.saturating_sub(4));
+            let panel_width = (area.width / 2 + 20).min(area.width.saturating_sub(4));
+            let x = area.x + (area.width.saturating_sub(panel_width)) / 2;
+            let y = area.y + (area.height.saturating_sub(panel_height)) / 2;
+            let panel_area = Rect {
+                x,
+                y,
+                width: panel_width,
+                height: panel_height,
+            };
+            // Dim the background.
+            for row in area.y..area.y + area.height {
+                for col in area.x..area.x + area.width {
+                    if let Some(cell) = buf.cell_mut((col, row)) {
+                        if col < panel_area.x
+                            || col >= panel_area.x + panel_area.width
+                            || row < panel_area.y
+                            || row >= panel_area.y + panel_area.height
+                        {
+                            cell.set_style(
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::DIM),
+                            );
+                        }
+                    }
+                }
+            }
+            panel.render(panel_area, buf);
         }
     }
 }

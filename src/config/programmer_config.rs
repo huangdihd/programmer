@@ -31,6 +31,11 @@ pub struct ProgrammerConfig {
     /// it can't be reached by the normal Ctrl+T cycle or a bare `/mode yolo`.
     #[serde(default)]
     pub allow_yolo: bool,
+    /// Configured MCP (Model Context Protocol) servers. Each entry is spawned
+    /// as a child process at startup; its tools are bridged into the tool list
+    /// as `mcp__<server>__<tool>`. Empty by default (no servers, no overhead).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) mcp_servers: Vec<crate::mcp::types::McpServerConfig>,
     // Legacy fields for backward compatibility with v0.1.x configs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -71,6 +76,7 @@ impl Default for ProgrammerConfig {
             providers,
             classifier_model: None,
             allow_yolo: false,
+            mcp_servers: Vec::new(),
             model: None,
             base_url: None,
             api_key: None,
@@ -113,5 +119,42 @@ impl ProgrammerConfig {
         self.base_url = None;
         self.api_key = None;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::types::McpServerConfig;
+
+    #[test]
+    fn mcp_servers_round_trip_through_toml() {
+        // TOML places array-of-tables after scalar keys; make sure a config
+        // carrying MCP servers (with args + env) serializes and parses back.
+        let mut config = ProgrammerConfig::default();
+        config.mcp_servers.push(McpServerConfig {
+            name: "filesystem".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+            env: std::collections::HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
+            auto_approve: Default::default(),
+        });
+
+        let serialized = toml::to_string(&config).expect("serialize");
+        let parsed: ProgrammerConfig = toml::from_str(&serialized).expect("deserialize");
+
+        assert_eq!(parsed.mcp_servers.len(), 1);
+        assert_eq!(parsed.mcp_servers[0].name, "filesystem");
+        assert_eq!(parsed.mcp_servers[0].command, "npx");
+        assert_eq!(parsed.mcp_servers[0].args.len(), 2);
+        assert_eq!(parsed.mcp_servers[0].env.get("API_KEY").unwrap(), "secret");
+    }
+
+    #[test]
+    fn empty_mcp_servers_not_serialized() {
+        // With no servers the key is skipped entirely (no empty array noise).
+        let config = ProgrammerConfig::default();
+        let serialized = toml::to_string(&config).expect("serialize");
+        assert!(!serialized.contains("mcp_servers"));
     }
 }
