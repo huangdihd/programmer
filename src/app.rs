@@ -63,8 +63,11 @@ pub struct App<'a> {
     pub question_panel: Option<QuestionPanel>,
     /// Current safety/work mode.
     pub work_mode: WorkMode,
-    /// Pending tool-call approvals (Manual mode).
-    approval_queue: Vec<(FunctionToolCall, String)>,
+    /// Pending tool-call approvals in Manual mode: (call, reason).
+    /// Processed one-at-a-time; approved calls are collected and run afterwards.
+    pub(crate) approval_queue: Vec<(FunctionToolCall, String)>,
+    /// Calls the user has approved so far (waiting for all to be decided).
+    pub(crate) approved_calls: Vec<FunctionToolCall>,
     /// Session UUID.
     session_uuid: String,
     /// Session manager for persistence.
@@ -127,6 +130,7 @@ impl App<'_> {
             question_panel: None,
             work_mode: WorkMode::default(),
             approval_queue: Vec::new(),
+            approved_calls: Vec::new(),
             session_uuid,
             session_mgr,
         }
@@ -281,6 +285,103 @@ impl App<'_> {
             },
         }
         Ok(())
+    }
+
+    /// Handle approval keys when tool calls are queued in Manual mode.
+    fn handle_approval_key(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        match key_event.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some((call, _)) = self.approval_queue.drain(..1).next() {
+                    self.approved_calls.push(call);
+                }
+                self.check_approval_done();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some((call, reason)) = self.approval_queue.drain(..1).next() {
+                    self.conversation_panel.add_info_string(format!(
+                        "🛡 Denied: {} ({})",
+                        call.name, reason
+                    ));
+                    // Send a fake error output so the model knows it was denied.
+                    let output = FunctionCallOutputItemParam {
+                        call_id: call.call_id.clone(),
+                        output: FunctionCallOutput::Text(format!(
+                            "error: tool call denied by user in Manual mode — {} ({})",
+                            call.name, reason
+                        )),
+                        id: None,
+                        status: None,
+                    };
+                    self.conversation_panel.add_tool_output(output);
+                }
+                self.check_approval_done();
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // Approve all remaining.
+                let approved: Vec<FunctionToolCall> =
+                    self.approval_queue.drain(..).map(|(c, _)| c).collect();
+                self.approved_calls.extend(approved);
+                self.check_approval_done();
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                // Deny all remaining.
+                for (call, reason) in self.approval_queue.drain(..) {
+                    self.conversation_panel.add_info_string(format!(
+                        "🛡 Denied: {} ({})",
+                        call.name, reason
+                    ));
+                    let output = FunctionCallOutputItemParam {
+                        call_id: call.call_id.clone(),
+                        output: FunctionCallOutput::Text(format!(
+                            "error: tool call denied by user in Manual mode — {} ({})",
+                            call.name, reason
+                        )),
+                        id: None,
+                        status: None,
+                    };
+                    self.conversation_panel.add_tool_output(output);
+                }
+                self.check_approval_done();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// If the approval queue is empty, run the approved calls and continue.
+    fn check_approval_done(&mut self) {
+        if !self.approval_queue.is_empty() {
+            return;
+        }
+        let calls = std::mem::take(&mut self.approved_calls);
+        if calls.is_empty() {
+            // All denied – tool_running was already cleared; resume the turn
+            // so denied outputs get fed back to the model.
+            self.spawn_stream();
+            return;
+        }
+
+        // Annotate and run approved calls.
+        let sender = self.events.sender.clone();
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            let mut outputs = Vec::new();
+            for call in &calls {
+                let mut out = crate::tools::run_tool_call(call, &sender).await;
+                let text = match &out.output {
+                    FunctionCallOutput::Text(t) => t.clone(),
+                    _ => String::new(),
+                };
+                out.output = FunctionCallOutput::Text(format!(
+                    "[approved by user in Manual mode]\n{text}"
+                ));
+                outputs.push(out);
+            }
+            let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
+                outputs,
+                cancel_token,
+            )));
+        });
     }
 
     /// Handles text pasted into the terminal (bracketed paste). Small
@@ -476,20 +577,18 @@ impl App<'_> {
             let label = self.work_mode.label().to_string();
             tokio::spawn(async move {
                 let mut outputs = Vec::new();
-                // Add denied outputs first so they appear in order.
                 outputs.extend(denied_outputs);
                 for call in &calls_to_run {
                     if cancel_token.load(Ordering::Relaxed) {
                         break;
                     }
                     let mut out = crate::tools::run_tool_call(call, &sender).await;
-                    // Annotate output with approval source.
+                    let text = match &out.output {
+                        FunctionCallOutput::Text(t) => t.clone(),
+                        _ => String::new(),
+                    };
                     out.output = FunctionCallOutput::Text(format!(
-                        "[auto-approved in {label} mode]\n{}",
-                        match &out.output {
-                            FunctionCallOutput::Text(t) => t.clone(),
-                            _ => String::new(),
-                        }
+                        "[auto-approved in {label} mode]\n{text}"
                     ));
                     outputs.push(out);
                 }
@@ -578,6 +677,10 @@ impl App<'_> {
 
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        // ---- tool-call approval (Manual mode) ----
+        if !self.approval_queue.is_empty() {
+            return self.handle_approval_key(key_event);
+        }
         // ---- question panel (shown when model calls ask_user) ----
         if let Some(panel) = self.question_panel.as_mut() {
             match panel.handle_key(key_event) {

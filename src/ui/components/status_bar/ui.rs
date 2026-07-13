@@ -33,6 +33,7 @@ impl Widget for &StatusBar {
             StatusState::CreatingToolCall => ("⚒", "Creating tool call", WARN),
             StatusState::ToolRunning => ("⚡", "Running tools", WARN),
             StatusState::WaitingAnswer => ("?", "Waiting for answer", ACCENT),
+            StatusState::WaitingApproval => ("🛡", "Waiting for approval", WARN),
         };
 
         // Build the status text: just icon + label.

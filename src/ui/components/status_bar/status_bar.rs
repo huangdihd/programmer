@@ -28,6 +28,8 @@ pub enum StatusState {
     ToolRunning,
     /// The model called `ask_user` and is waiting for the user's response.
     WaitingAnswer,
+    /// Tool calls are queued for approval in Manual mode.
+    WaitingApproval,
 }
 
 #[derive(Debug)]
