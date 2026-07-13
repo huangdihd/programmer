@@ -34,6 +34,7 @@ use std::io;
 use std::path::Path;
 
 pub mod app;
+pub mod classifier;
 pub mod clipboard;
 pub mod commands;
 pub mod config;

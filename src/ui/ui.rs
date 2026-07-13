@@ -43,6 +43,7 @@ impl Widget for &mut App<'_> {
         if self.question_panel.is_some() {
             self.footer.status.status = StatusState::WaitingAnswer;
         }
+        self.footer.work_mode = self.work_mode;
         self.footer.current_model = self.current_model.clone();
 
         // When the model is asking a question, the bottom area grows to show

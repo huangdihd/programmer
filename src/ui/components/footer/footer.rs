@@ -13,13 +13,16 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::classifier::WorkMode;
 use crate::ui::components::status_bar::status_bar::StatusBar;
 
-/// Bottom bar: status indicator on the left, model name in the middle, copyright on the right.
+/// Bottom bar: status indicator on the left, work mode, model name in
+/// the middle, copyright on the right.
 #[derive(Debug)]
 pub struct Footer {
     pub status: StatusBar,
     pub current_model: String,
+    pub work_mode: WorkMode,
 }
 
 impl Footer {
@@ -27,6 +30,7 @@ impl Footer {
         Self {
             status: StatusBar::new(),
             current_model: String::new(),
+            work_mode: WorkMode::default(),
         }
     }
 

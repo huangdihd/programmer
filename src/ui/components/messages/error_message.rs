@@ -15,7 +15,8 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui_widgets::block::{Block, Padding};
+use ratatui::widgets::{Block, Borders};
+use ratatui_widgets::block::Padding;
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use crate::ui::markdown_theme::palette;
@@ -52,6 +53,11 @@ impl ErrorMessage {
 
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
-            .block(Block::default().padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 1)))
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .border_style(Style::new().fg(red))
+                    .padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 1)),
+            )
     }
 }

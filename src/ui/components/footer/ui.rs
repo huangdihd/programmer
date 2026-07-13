@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::footer::Footer;
+use crate::classifier::WorkMode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -24,12 +25,19 @@ const ACCENT: Color = Color::LightBlue;
 
 impl Widget for &Footer {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let mode_text = format!(
+            "  {} {} ",
+            self.work_mode.icon(),
+            self.work_mode.label()
+        );
+        let mode_len = mode_text.len() as u16;
         let model_len = self.current_model.len() as u16;
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Min(1),
-                Constraint::Length(if model_len > 0 { model_len + 2 } else { 0 }),
+                Constraint::Min(1),   // status
+                Constraint::Length(mode_len), // work mode
+                Constraint::Length(if model_len > 0 { model_len + 2 } else { 0 }), // model
                 Constraint::Length(28), // "GPL-3.0-or-later · © 2026"
             ])
             .split(area);
@@ -37,16 +45,26 @@ impl Widget for &Footer {
         // Left: status indicator
         (&self.status).render(chunks[0], buf);
 
+        // Work mode pill
+        let mode_style = match self.work_mode {
+            WorkMode::Manual => Style::default().fg(Color::LightRed),
+            WorkMode::AllowEdits => Style::default().fg(Color::LightGreen),
+            WorkMode::Yolo => Style::default().fg(Color::LightYellow),
+        };
+        ratatui::widgets::Paragraph::new(mode_text)
+            .style(mode_style)
+            .render(chunks[1], buf);
+
         // Middle: current model name
         if !self.current_model.is_empty() {
             ratatui::widgets::Paragraph::new(format!(" {} ", self.current_model))
                 .style(Style::default().fg(ACCENT))
-                .render(chunks[1], buf);
+                .render(chunks[2], buf);
         }
 
         // Right: copyright
         ratatui::widgets::Paragraph::new("GPL-3.0-or-later \u{b7} \u{a9} 2026")
             .style(Style::default().fg(DIM))
-            .render(chunks[2], buf);
+            .render(chunks[3], buf);
     }
 }

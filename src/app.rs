@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::classifier::WorkMode;
 use crate::commands::{Command, CompletionEngine};
 use crate::config::programmer_config::ProgrammerConfig;
 use crate::providers::ProviderManager;
@@ -29,9 +30,9 @@ use crate::ui::components::question_panel::QuestionPanel;
 use crate::ui::event::{AppEvent, Event, EventHandler};
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
-    CreateResponse, FunctionToolCall, InputContent, InputItem, InputMessage, InputRole,
-    InputTextContent, Item, MessageItem as ApiMessageItem, OutputItem, OutputStatus,
-    ResponseStreamEvent,
+    CreateResponse, FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
+    InputContent, InputItem, InputMessage, InputRole, InputTextContent, Item,
+    MessageItem as ApiMessageItem, OutputItem, OutputStatus, ResponseStreamEvent,
 };
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -60,6 +61,10 @@ pub struct App<'a> {
     pub provider_panel: Option<ProviderPanel>,
     /// Modal question panel shown when the model calls `ask_user`.
     pub question_panel: Option<QuestionPanel>,
+    /// Current safety/work mode.
+    pub work_mode: WorkMode,
+    /// Pending tool-call approvals (Manual mode).
+    approval_queue: Vec<(FunctionToolCall, String)>,
     /// Session UUID.
     session_uuid: String,
     /// Session manager for persistence.
@@ -120,6 +125,8 @@ impl App<'_> {
             footer: Footer::new(),
             provider_panel: open_provider_panel.then(ProviderPanel::new),
             question_panel: None,
+            work_mode: WorkMode::default(),
+            approval_queue: Vec::new(),
             session_uuid,
             session_mgr,
         }
@@ -418,20 +425,83 @@ impl App<'_> {
         self.conversation_panel.tool_running = true;
         self.conversation_panel.creating_tool_call = false;
         self.conversation_panel.outputting_message = false;
-        let sender = self.events.sender.clone();
-        tokio::spawn(async move {
-            let mut outputs = Vec::with_capacity(calls.len());
-            for call in &calls {
-                if cancel_token.load(Ordering::Relaxed) {
-                    break;
+
+        let classifier = self.work_mode.classifier();
+
+        // Split calls: allowed (run now), denied (error now), pending (queue
+        // for approval).
+        let mut allowed: Vec<&FunctionToolCall> = Vec::new();
+        let mut queued: Vec<(FunctionToolCall, String)> = Vec::new();
+        let mut denied_outputs = Vec::new();
+
+        for call in &calls {
+            match classifier.classify(&call.name, &call.arguments) {
+                crate::classifier::Verdict::Allow => {
+                    allowed.push(call);
                 }
-                outputs.push(crate::tools::run_tool_call(call, &sender).await);
+                crate::classifier::Verdict::Deny { reason } => {
+                    denied_outputs.push(FunctionCallOutputItemParam {
+                        call_id: call.call_id.clone(),
+                        output: FunctionCallOutput::Text(format!(
+                            "error: tool call blocked by classifier — {reason}"
+                        )),
+                        id: None,
+                        status: None,
+                    });
+                }
+                crate::classifier::Verdict::Ask { reason } => {
+                    queued.push((call.clone(), reason));
+                }
             }
-            let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
-                outputs,
-                cancel_token,
-            )));
-        });
+        }
+
+        // If there are denied outputs, add them to conversation immediately.
+        for output in &denied_outputs {
+            self.conversation_panel.add_tool_output(output.clone());
+        }
+
+        // If there are calls awaiting approval, queue them and exit tool_running
+        // so the UI can show the prompt.
+        if !queued.is_empty() {
+            self.approval_queue = queued;
+            self.conversation_panel.tool_running = false;
+            return; // Will be restarted when user approves.
+        }
+
+        // No approval needed — run allowed calls immediately.
+        if !allowed.is_empty() || !denied_outputs.is_empty() {
+            let sender = self.events.sender.clone();
+            let calls_to_run: Vec<FunctionToolCall> =
+                allowed.iter().map(|c| (*c).clone()).collect();
+            let label = self.work_mode.label().to_string();
+            tokio::spawn(async move {
+                let mut outputs = Vec::new();
+                // Add denied outputs first so they appear in order.
+                outputs.extend(denied_outputs);
+                for call in &calls_to_run {
+                    if cancel_token.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut out = crate::tools::run_tool_call(call, &sender).await;
+                    // Annotate output with approval source.
+                    out.output = FunctionCallOutput::Text(format!(
+                        "[auto-approved in {label} mode]\n{}",
+                        match &out.output {
+                            FunctionCallOutput::Text(t) => t.clone(),
+                            _ => String::new(),
+                        }
+                    ));
+                    outputs.push(out);
+                }
+                let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
+                    outputs,
+                    cancel_token,
+                )));
+            });
+        } else {
+            // All calls were denied — send empty list to unblock the turn.
+            self.conversation_panel.tool_running = false;
+        }
     }
 
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent) {
@@ -520,6 +590,20 @@ impl App<'_> {
                 }
                 crate::ui::components::question_panel::AnswerAction::None => {}
             }
+            return Ok(());
+        }
+
+        // ---- Ctrl+T: cycle work mode ----
+        if key_event.code == KeyCode::Char('t')
+            && key_event.modifiers == KeyModifiers::CONTROL
+        {
+            self.work_mode = self.work_mode.next();
+            self.conversation_panel.add_info_string(format!(
+                "{} Work mode: {}",
+                self.work_mode.icon(),
+                self.work_mode.label()
+            ));
+            self.persist_config();
             return Ok(());
         }
 
@@ -807,6 +891,32 @@ impl App<'_> {
                     }
                 }
                 self.save_session();
+            }
+            Some(Command::Mode(arg)) => {
+                self.input_panel.clear();
+                let prev = self.work_mode;
+                match arg.trim().to_lowercase().as_str() {
+                    "manual" => self.work_mode = WorkMode::Manual,
+                    "edits" | "edit" | "allowedits" | "allow" => {
+                        self.work_mode = WorkMode::AllowEdits
+                    }
+                    "yolo" => self.work_mode = WorkMode::Yolo,
+                    "" => self.work_mode = self.work_mode.next(),
+                    other => {
+                        self.conversation_panel.add_error_string(format!(
+                            "unknown mode '{other}' — use manual, edits, or yolo"
+                        ));
+                        return;
+                    }
+                }
+                if self.work_mode != prev {
+                    self.persist_config();
+                }
+                self.conversation_panel.add_info_string(format!(
+                    "{} Work mode: {}",
+                    self.work_mode.icon(),
+                    self.work_mode.label()
+                ));
             }
             Some(Command::Providers(args)) => {
                 self.input_panel.clear();

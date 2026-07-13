@@ -28,6 +28,8 @@ pub enum Command {
     /// `/providers <subcommand>` — carries the raw argument string
     /// ("show", "manage", or anything else for the usage hint).
     Providers(String),
+    /// `/mode <manual|edits|yolo>` — cycle/set work mode.
+    Mode(String),
     Help,
     Session,
 }
@@ -54,6 +56,7 @@ impl Command {
             "new" | "n" => Some(Command::New),
             "model" | "m" => Some(Command::Model(args)),
             "providers" | "provider" => Some(Command::Providers(args)),
+            "mode" => Some(Command::Mode(args)),
             "help" | "?" => Some(Command::Help),
             "session" | "s" => Some(Command::Session),
             _ => None,
@@ -62,13 +65,14 @@ impl Command {
 
     /// All command names (without leading `/`), for completion.
     pub fn all_commands() -> &'static [&'static str] {
-        &["model", "new", "providers", "session", "clear", "quit", "help"]
+        &["model", "new", "providers", "session", "mode", "clear", "quit", "help"]
     }
 
     /// Human-readable descriptions for the help text.
     pub fn descriptions() -> &'static [(&'static str, &'static str)] {
         &[
             ("/model <provider/model>", "Switch to a different model"),
+            ("/mode <manual|edits|yolo>", "Set work mode (or cycle with Ctrl+T)"),
             ("/new | /n", "Start a new session (saves current)"),
             ("/providers show", "List all configured providers and models"),
             ("/providers manage", "Open the provider management panel"),
