@@ -426,7 +426,11 @@ impl App<'_> {
                 AppEvent::Quit => self.quit(),
                 AppEvent::Start => self.send_message().await,
                 AppEvent::StartInit => {
-                    self.start_request_as(init_prompt(), InputRole::Developer).await;
+                    self.conversation_panel.add_meta("\u{25B8} Initializing project\u{2026}", init_prompt());
+                    self.conversation_panel.reset_accumulated_usage();
+                    self.maybe_seed_diagnostics_baseline();
+                    self.save_session();
+                    self.spawn_stream();
                 }
                 AppEvent::ProvidersChanged => {
                     // Rebuild the manager so new/edited providers get clients
@@ -954,7 +958,7 @@ impl App<'_> {
         // Skip hidden developer messages (diagnostics feedback, the /init prompt)
         // so they aren't mistaken for the user's own words.
         if let Some(msg) = items.iter().rev().find_map(|it| match it {
-            MessageItem::Input(input) if !it.is_hidden_developer() => extract_input_text(input),
+            MessageItem::Input(input) => extract_input_text(input),
             _ => None,
         }) {
             let user = format!(
@@ -1095,7 +1099,7 @@ impl App<'_> {
             }
         }
         self.conversation_panel
-            .add_input_message(make_developer_message(text));
+            .add_meta("\u{25B8} System", text);
     }
 
     /// After a file-editing batch, run diagnostics (if configured) and count the
@@ -2119,23 +2123,7 @@ fn overview_reminder() -> String {
      stays an accurate map for future sessions. If nothing meaningful changed, \
      ignore this."
         .to_string()
-}
-
-/// Build a hidden `Developer`-role message. It is sent to the model (and is
-/// visible to the classifier) but never rendered as a user bubble — see
-/// [`MessageItem::is_hidden_developer`].
-fn make_developer_message(text: String) -> ApiMessageItem {
-    ApiMessageItem::Input(InputMessage {
-        content: vec![InputContent::InputText(InputTextContent { text })],
-        role: InputRole::Developer,
-        status: Some(OutputStatus::Completed),
-    })
-}
-
-/// The synthetic user prompt that drives `/init`. It reuses the normal agent
-/// loop and existing tools (read/grep/blob, write_file, configure_diagnostics)
-/// rather than any bespoke initialization code.
-fn init_prompt() -> String {
+}fn init_prompt() -> String {
     "Initialize this project for our future work together. Do the following, in order:\n\
      \n\
      1. Explore the repository to understand it: read the README and any build \
@@ -2199,7 +2187,7 @@ fn first_user_text(items: &[MessageItem]) -> Option<String> {
     items.iter().find_map(|item| match item {
         // Skip hidden developer prompts (e.g. `/init`) so they don't become the
         // session's preview text.
-        MessageItem::Input(input) if !item.is_hidden_developer() => extract_input_text(input),
+        MessageItem::Input(input) => extract_input_text(input),
         _ => None,
     })
 }

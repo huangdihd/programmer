@@ -14,9 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{
-    InputItem, InputRole, Item, MessageItem as ApiMessageItem, OutputItem,
-};
+use async_openai::types::responses::{InputItem, OutputItem};
 
 #[derive(Debug)]
 pub enum MessageItem {
@@ -26,22 +24,11 @@ pub enum MessageItem {
     Error(String),
     Warning(String),
     Info(String),
+    /// A visible system-level instruction sent to the model as a user message.
+    /// `label` is displayed in the conversation (e.g. "\u{25B8} \u{521D}\u{59CB}\u{5316}\u{9879}\u{76EE}\u{2026}").
+    /// `text` is the full instruction sent to the model.
+    Meta { label: String, text: String },
     Usage(u32, u32), // (input_tokens, output_tokens)
-}
-
-impl MessageItem {
-    /// Whether this is a hidden `Developer`-role input message — used to carry
-    /// instructions (like the `/init` prompt or diagnostics feedback) to the
-    /// model without rendering them as a user bubble. Such items are still sent
-    /// to the API and are visible to the classifier; they are only skipped by
-    /// the UI and by user-facing summaries (e.g. the session preview).
-    pub fn is_hidden_developer(&self) -> bool {
-        matches!(
-            self,
-            MessageItem::Input(InputItem::Item(Item::Message(ApiMessageItem::Input(msg))))
-                if msg.role == InputRole::Developer
-        )
-    }
 }
 
 impl Clone for MessageItem {
@@ -55,6 +42,10 @@ impl Clone for MessageItem {
             MessageItem::Error(s) => MessageItem::Error(s.clone()),
             MessageItem::Warning(s) => MessageItem::Warning(s.clone()),
             MessageItem::Info(s) => MessageItem::Info(s.clone()),
+            MessageItem::Meta { label, text } => MessageItem::Meta {
+                label: label.clone(),
+                text: text.clone(),
+            },
             MessageItem::Usage(i, o) => MessageItem::Usage(*i, *o),
         }
     }

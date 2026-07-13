@@ -37,6 +37,7 @@ pub(crate) enum SerializableMessageItem {
     Error(String),
     Warning(String),
     Info(String),
+    Meta { label: String, text: String },
     Usage { input_tokens: u32, output_tokens: u32 },
 }
 
@@ -51,6 +52,7 @@ impl From<MessageItem> for SerializableMessageItem {
             MessageItem::Error(s) => SerializableMessageItem::Error(s),
             MessageItem::Warning(s) => SerializableMessageItem::Warning(s),
             MessageItem::Info(s) => SerializableMessageItem::Info(s),
+            MessageItem::Meta { label, text } => SerializableMessageItem::Meta { label, text },
             MessageItem::Usage(i, o) => SerializableMessageItem::Usage {
                 input_tokens: i,
                 output_tokens: o,
@@ -70,6 +72,7 @@ impl From<SerializableMessageItem> for MessageItem {
             SerializableMessageItem::Error(s) => MessageItem::Error(s),
             SerializableMessageItem::Warning(s) => MessageItem::Warning(s),
             SerializableMessageItem::Info(s) => MessageItem::Info(s),
+            SerializableMessageItem::Meta { label, text } => MessageItem::Meta { label, text },
             SerializableMessageItem::Usage {
                 input_tokens,
                 output_tokens,

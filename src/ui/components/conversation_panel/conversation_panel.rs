@@ -19,7 +19,7 @@ use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, InputContent, InputItem, InputMessage,
-    InputParam, InputRole, Item, OutputItem, OutputStatus, ResponseStreamEvent,
+    InputParam, InputRole, InputTextContent, Item, OutputItem, OutputStatus, ResponseStreamEvent,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -648,6 +648,14 @@ impl ConversationPanel {
         self.stick_to_bottom = true;
     }
 
+    pub fn add_meta(&mut self, label: impl Into<String>, text: impl Into<String>) {
+        self.items.push(MessageItem::Meta {
+            label: label.into(),
+            text: text.into(),
+        });
+        self.stick_to_bottom = true;
+    }
+
     pub fn add_warning_string(&mut self, message: impl Into<String>) {
         self.items.push(MessageItem::Warning(message.into()));
         self.stick_to_bottom = true;
@@ -811,6 +819,14 @@ impl ConversationPanel {
                 MessageItem::Input(input_item) => {
                     input_items.append(&mut pending_outputs);
                     input_items.push(input_item.clone());
+                }
+                MessageItem::Meta { text, .. } => {
+                    input_items.append(&mut pending_outputs);
+                    input_items.push(InputItem::from(Item::Message(ApiMessageItem::Input(InputMessage {
+                        content: vec![InputContent::InputText(InputTextContent { text: text.clone() })],
+                        role: InputRole::User,
+                        status: Some(OutputStatus::Completed),
+                    }))));
                 }
                 MessageItem::Output(output_item) => {
                     // A non-call output (an assistant message or reasoning the

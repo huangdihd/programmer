@@ -70,6 +70,9 @@ fn build_item_paragraph(
         MessageItem::Info(message) => {
             (InfoMessage::new(message.clone()).into_paragraph(), Vec::new())
         }
+        MessageItem::Meta { label, .. } => {
+            (InfoMessage::new(format!("\u{25B8} {}", label)).into_paragraph(), Vec::new())
+        }
         MessageItem::Warning(message) => {
             (WarningMessage::new(message.clone()).into_paragraph(), Vec::new())
         }
@@ -133,9 +136,6 @@ impl Widget for &mut ConversationPanel {
                     false,
                     outputs_by_call.get(call.call_id.as_str()).copied(),
                 ),
-                // Hidden developer prompts (`/init`, diagnostics feedback) are
-                // sent to the model but never drawn.
-                item if item.is_hidden_developer() => (true, None),
                 _ => (false, None),
             };
             let has_output = tool_output.is_some();
