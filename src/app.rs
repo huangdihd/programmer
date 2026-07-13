@@ -68,6 +68,8 @@ pub struct App<'a> {
     pub(crate) approval_queue: Vec<(FunctionToolCall, String)>,
     /// Calls the user has approved so far (waiting for all to be decided).
     pub(crate) approved_calls: Vec<FunctionToolCall>,
+    /// Which option is highlighted in the approval UI (0=approve,1=deny,2=approve all,3=deny all).
+    pub(crate) approval_selected: usize,
     /// Session UUID.
     session_uuid: String,
     /// Session manager for persistence.
@@ -131,6 +133,7 @@ impl App<'_> {
             work_mode: WorkMode::default(),
             approval_queue: Vec::new(),
             approved_calls: Vec::new(),
+            approval_selected: 0,
             session_uuid,
             session_mgr,
         }
@@ -290,62 +293,67 @@ impl App<'_> {
     /// Handle approval keys when tool calls are queued in Manual mode.
     fn handle_approval_key(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         match key_event.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some((call, _)) = self.approval_queue.drain(..1).next() {
-                    self.approved_calls.push(call);
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.approval_selected = self.approval_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                if self.approval_selected + 1 < 4 {
+                    self.approval_selected += 1;
                 }
-                self.check_approval_done();
             }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                if let Some((call, reason)) = self.approval_queue.drain(..1).next() {
-                    self.conversation_panel.add_info_string(format!(
-                        "🛡 Denied: {} ({})",
-                        call.name, reason
-                    ));
-                    // Send a fake error output so the model knows it was denied.
-                    let output = FunctionCallOutputItemParam {
-                        call_id: call.call_id.clone(),
-                        output: FunctionCallOutput::Text(format!(
-                            "error: tool call denied by user in Manual mode — {} ({})",
-                            call.name, reason
-                        )),
-                        id: None,
-                        status: None,
-                    };
-                    self.conversation_panel.add_tool_output(output);
+            KeyCode::Enter => match self.approval_selected {
+                0 => {
+                    if let Some((call, _)) = self.approval_queue.drain(..1).next() {
+                        self.approved_calls.push(call);
+                    }
+                    self.approval_selected = 0;
+                    self.check_approval_done();
                 }
-                self.check_approval_done();
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                // Approve all remaining.
-                let approved: Vec<FunctionToolCall> =
-                    self.approval_queue.drain(..).map(|(c, _)| c).collect();
-                self.approved_calls.extend(approved);
-                self.check_approval_done();
-            }
-            KeyCode::Char('d') | KeyCode::Char('D') => {
-                // Deny all remaining.
-                for (call, reason) in self.approval_queue.drain(..) {
-                    self.conversation_panel.add_info_string(format!(
-                        "🛡 Denied: {} ({})",
-                        call.name, reason
-                    ));
-                    let output = FunctionCallOutputItemParam {
-                        call_id: call.call_id.clone(),
-                        output: FunctionCallOutput::Text(format!(
-                            "error: tool call denied by user in Manual mode — {} ({})",
-                            call.name, reason
-                        )),
-                        id: None,
-                        status: None,
-                    };
-                    self.conversation_panel.add_tool_output(output);
+                1 => {
+                    let denied = self.approval_queue.drain(..1).next();
+                    if let Some((call, reason)) = denied {
+                        self.deny_single_call(call, reason);
+                    }
+                    self.approval_selected = 0;
+                    self.check_approval_done();
                 }
-                self.check_approval_done();
-            }
+                2 => {
+                    let approved: Vec<FunctionToolCall> =
+                        self.approval_queue.drain(..).map(|(c, _)| c).collect();
+                    self.approved_calls.extend(approved);
+                    self.approval_selected = 0;
+                    self.check_approval_done();
+                }
+                3 => {
+                    let denied: Vec<_> = self.approval_queue.drain(..).collect();
+                    for (call, reason) in denied {
+                        self.deny_single_call(call, reason);
+                    }
+                    self.approval_selected = 0;
+                    self.check_approval_done();
+                }
+                _ => {}
+            },
             _ => {}
         }
         Ok(())
+    }
+
+    fn deny_single_call(&mut self, call: FunctionToolCall, reason: String) {
+        self.conversation_panel.add_info_string(format!(
+            "🛡 Denied: {} ({})",
+            call.name, reason
+        ));
+        let output = FunctionCallOutputItemParam {
+            call_id: call.call_id,
+            output: FunctionCallOutput::Text(format!(
+                "error: tool call denied by user — {} ({})",
+                call.name, reason
+            )),
+            id: None,
+            status: None,
+        };
+        self.conversation_panel.add_tool_output(output);
     }
 
     /// If the approval queue is empty, run the approved calls and continue.

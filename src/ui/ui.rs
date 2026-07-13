@@ -58,7 +58,7 @@ impl Widget for &mut App<'_> {
             .as_ref()
             .map(|q| q.needed_height())
             .unwrap_or(3);
-        let approval_height: u16 = if self.approval_queue.is_empty() { 3 } else { 4 };
+        let approval_height: u16 = if self.approval_queue.is_empty() { 3 } else { 8 };
         let bottom_height = question_height.max(approval_height);
 
         let chunks = Layout::default()
@@ -82,6 +82,22 @@ impl Widget for &mut App<'_> {
             let (call, reason) = &self.approval_queue[0];
             let args_preview: String =
                 call.arguments.chars().take(70).collect();
+
+            let labels = ["Approve", "Deny", "Approve all", "Deny all"];
+            let sel = self.approval_selected;
+            let option_lines: Vec<Line> = labels.iter().enumerate().map(|(i, label)| {
+                let marker = if i == sel { "❯" } else { " " };
+                let style = if i == sel {
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(format!("{marker} {label}"), style),
+                ])
+            }).collect();
+
             let lines = vec![
                 Line::from(vec![
                     Span::styled("🛡  ", Style::default().fg(Color::Yellow)),
@@ -105,17 +121,10 @@ impl Widget for &mut App<'_> {
                     Span::styled("  reason: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(reason.as_str(), Style::default().fg(Color::Yellow)),
                 ]),
-                Line::from(vec![
-                    Span::styled("[y]", Style::default().fg(Color::Green).bold()),
-                    Span::styled(" approve  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("[n]", Style::default().fg(Color::Red).bold()),
-                    Span::styled(" deny  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("[a]", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" approve all  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("[d]", Style::default().fg(Color::Magenta).bold()),
-                    Span::styled(" deny all", Style::default().fg(Color::DarkGray)),
-                ]),
-            ];
+            ]
+            .into_iter()
+            .chain(option_lines)
+            .collect::<Vec<Line>>();
             Paragraph::new(lines)
                 .block(
                     Block::default()
