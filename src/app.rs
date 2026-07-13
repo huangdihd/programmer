@@ -32,7 +32,7 @@ use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
     CreateResponse, FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
     InputContent, InputItem, InputMessage, InputRole, InputTextContent, Item,
-    MessageItem as ApiMessageItem, OutputItem, OutputMessageContent, OutputStatus,
+    MessageItem as ApiMessageItem, OutputItem, OutputStatus,
     ResponseStreamEvent,
 };
 use crossterm::event::{
@@ -743,91 +743,47 @@ impl App<'_> {
 
         // ---- full context only below this line ----
 
-        // Recent assistant text replies — so the reasoned path knows what the
-        // model has been planning before it asked to run this tool call.
-        let assistant_texts: Vec<String> = items
+        // Assistant reply metadata only (no raw text — prevents prompt
+        // injection via the model's own output or tool results it echoes).
+        let assistant_count = items
             .iter()
             .rev()
-            .filter_map(|it| match it {
-                MessageItem::Output(OutputItem::Message(msg)) => {
-                    let text: String = msg
-                        .content
-                        .iter()
-                        .filter_map(|c| match c {
-                            OutputMessageContent::OutputText(t) => Some(t.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(truncate_chars(text.trim(), 500))
-                    }
-                }
-                _ => None,
-            })
+            .filter(|it| matches!(it, MessageItem::Output(OutputItem::Message(_))))
             .take(3)
-            .collect();
-        if !assistant_texts.is_empty() {
-            full.push(format!(
-                "Assistant's recent replies:\n{}",
-                assistant_texts
-                    .into_iter()
-                    .rev()
-                    .enumerate()
-                    .map(|(i, t)| format!("[{i}] {t}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ));
+            .count();
+        if assistant_count > 0 {
+            full.push(format!("Assistant has sent {assistant_count} message(s) this turn."));
         }
 
-        // Recent tool call outputs — so the reasoned path sees what data the
-        // model has already gathered.
-        let tool_outputs: Vec<String> = items
+        // Tool call outcome metadata only (name + status + size — no raw
+        // output content, to prevent injection from file contents, command
+        // output, or URLs embedded in tool results).
+        let tool_outcomes: Vec<String> = items
             .iter()
             .rev()
             .filter_map(|it| match it {
+                MessageItem::Output(OutputItem::FunctionCall(fc)) => {
+                    Some(format!("  {} — pending", fc.name))
+                }
                 MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(fco))) => {
                     let output_text = match &fco.output {
                         FunctionCallOutput::Text(t) => t.as_str(),
-                        _ => return None,
+                        _ => "",
                     };
                     let name = fco.call_id.as_str();
-                    let truncated = truncate_chars(output_text.trim(), 300);
-                    if truncated.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{name}: {truncated}"))
-                    }
+                    let len = output_text.len();
+                    let status = if output_text.is_empty() { "empty" } else { "ok" };
+                    Some(format!("  {name} — {status}, {len} chars"))
                 }
                 _ => None,
             })
-            .take(5)
+            .take(10)
             .collect();
-        if !tool_outputs.is_empty() {
+        if !tool_outcomes.is_empty() {
             full.push(format!(
-                "Recent tool outputs:\n{}",
-                tool_outputs.into_iter().rev().enumerate()
-                    .map(|(i, t)| format!("[{i}] {t}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                "Tool calls this turn:\n{}",
+                tool_outcomes.into_iter().rev().collect::<Vec<_>>().join("\n")
             ));
-        }
-
-        // The last few tool calls this turn give the reasoned path the flow.
-        let mut recent: Vec<String> = items
-            .iter()
-            .rev()
-            .filter_map(|it| match it {
-                MessageItem::Output(OutputItem::FunctionCall(fc)) => Some(fc.name.clone()),
-                _ => None,
-            })
-            .take(5)
-            .collect();
-        if !recent.is_empty() {
-            recent.reverse();
-            full.push(format!("Recent tool calls this turn: {}", recent.join(", ")));
         }
 
         (light.join("\n\n"), full.join("\n\n"))
