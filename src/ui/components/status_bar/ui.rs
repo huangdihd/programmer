@@ -28,21 +28,18 @@ impl Widget for &StatusBar {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let (icon, label, color) = match self.status {
             StatusState::Idle => ("●", "Ready", DIM),
+            StatusState::Connecting => ("◌", "Connecting", ACCENT),
+            StatusState::Retrying => ("↻", "Retrying", WARN),
             StatusState::Thinking => ("●", "Thinking", ACCENT),
             StatusState::Outputting => ("▸", "Outputting", OUTPUT),
             StatusState::CreatingToolCall => ("⚒", "Creating tool call", WARN),
             StatusState::ToolRunning => ("⚡", "Running tools", WARN),
+            StatusState::Classifying => ("◍", "Classifying", ACCENT),
             StatusState::WaitingAnswer => ("?", "Waiting for answer", ACCENT),
             StatusState::WaitingApproval => ("🛡", "Waiting for approval", WARN),
         };
 
-        let busy = matches!(
-            self.status,
-            StatusState::Thinking
-                | StatusState::Outputting
-                | StatusState::CreatingToolCall
-                | StatusState::ToolRunning
-        );
+        let busy = self.status.is_busy();
         let mut text = format!(" {} {} ", icon, label);
         if busy {
             if let Some(dur) = self.elapsed() {

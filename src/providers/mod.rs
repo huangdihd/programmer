@@ -194,6 +194,8 @@ mod tests {
         let config = ProgrammerConfig {
             default_provider: "offline".to_string(),
             providers,
+            classifier_model: None,
+            allow_yolo: false,
             model: None,
             base_url: None,
             api_key: None,

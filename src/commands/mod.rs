@@ -28,8 +28,12 @@ pub enum Command {
     /// `/providers <subcommand>` — carries the raw argument string
     /// ("show", "manage", or anything else for the usage hint).
     Providers(String),
-    /// `/mode <manual|edits|yolo>` — cycle/set work mode.
+    /// `/mode <manual|edits|auto|yolo>` — cycle/set work mode.
     Mode(String),
+    /// `/classifier [provider/model]` — set or show the Auto-mode classifier
+    /// model. Empty argument shows the current setting; "clear"/"default"
+    /// resets it to the chat model.
+    Classifier(String),
     Help,
     Session,
 }
@@ -57,6 +61,7 @@ impl Command {
             "model" | "m" => Some(Command::Model(args)),
             "providers" | "provider" => Some(Command::Providers(args)),
             "mode" => Some(Command::Mode(args)),
+            "classifier" => Some(Command::Classifier(args)),
             "help" | "?" => Some(Command::Help),
             "session" | "s" => Some(Command::Session),
             _ => None,
@@ -65,14 +70,15 @@ impl Command {
 
     /// All command names (without leading `/`), for completion.
     pub fn all_commands() -> &'static [&'static str] {
-        &["model", "new", "providers", "session", "mode", "clear", "quit", "help"]
+        &["model", "new", "providers", "session", "mode", "classifier", "clear", "quit", "help"]
     }
 
     /// Human-readable descriptions for the help text.
     pub fn descriptions() -> &'static [(&'static str, &'static str)] {
         &[
             ("/model <provider/model>", "Switch to a different model"),
-            ("/mode <manual|edits|yolo>", "Set work mode (or cycle with Ctrl+T)"),
+            ("/mode <manual|edits|auto>", "Set work mode (or cycle with Ctrl+T)"),
+            ("/classifier [provider/model]", "Set/show the Auto-mode classifier model"),
             ("/new | /n", "Start a new session (saves current)"),
             ("/providers show", "List all configured providers and models"),
             ("/providers manage", "Open the provider management panel"),
@@ -155,6 +161,8 @@ impl CompletionEngine {
         let cmd = parts[0];
         match cmd {
             "model" | "m" => Self::complete_model(text, cmd, pm),
+            "classifier" => Self::complete_model(text, cmd, pm),
+            "mode" => Self::complete_subcommand(text, cmd, &["manual", "edits", "auto"]),
             "providers" | "provider" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
             _ => None,
         }

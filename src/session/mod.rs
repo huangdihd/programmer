@@ -109,6 +109,15 @@ pub(crate) struct Session {
     /// Input history (most recent last).
     #[serde(default)]
     pub(crate) history: Vec<String>,
+    /// Work mode in effect when the session was last saved, restored on resume.
+    #[serde(default)]
+    pub(crate) work_mode: Option<crate::classifier::WorkMode>,
+    /// Chat model in use when last saved (`provider/model`), restored on resume.
+    #[serde(default)]
+    pub(crate) current_model: Option<String>,
+    /// Auto-mode classifier model when last saved, restored on resume.
+    #[serde(default)]
+    pub(crate) classifier_model: Option<String>,
 }
 
 pub(crate) struct SessionManager {
@@ -165,6 +174,9 @@ impl SessionManager {
             message_count: 0,
             items: Vec::new(),
             history: Vec::new(),
+            work_mode: None,
+            current_model: None,
+            classifier_model: None,
         }
     }
 

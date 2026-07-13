@@ -16,7 +16,9 @@
 use crate::response::partial_response::PartialResponse;
 use crate::tools::ask_user::Question;
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{FunctionCallOutputItemParam, ResponseStreamEvent};
+use async_openai::types::responses::{
+    FunctionCallOutputItemParam, FunctionToolCall, ResponseStreamEvent,
+};
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
@@ -60,6 +62,13 @@ pub enum AppEvent {
     /// be fed back to the model, plus the cancel token so stale completions
     /// from cancelled requests can be ignored.
     ToolCallsCompleted(Vec<FunctionCallOutputItemParam>, Arc<AtomicBool>),
+    /// Auto-mode LLM classification finished. Carries the calls cleared to run,
+    /// the denial outputs to feed back to the model, and the cancel token.
+    ClassificationCompleted {
+        allowed: Vec<FunctionToolCall>,
+        denied: Vec<FunctionCallOutputItemParam>,
+        cancel_token: Arc<AtomicBool>,
+    },
     /// Cancel the current in-flight request (streaming or tool calls).
     Cancel,
     /// Quit the application.
@@ -96,6 +105,9 @@ impl std::fmt::Debug for AppEvent {
             Self::ResponseFinished(_) => f.debug_tuple("ResponseFinished").field(&"..").finish(),
             Self::ToolCallsCompleted(_, _) => {
                 f.debug_tuple("ToolCallsCompleted").field(&"..").finish()
+            }
+            Self::ClassificationCompleted { .. } => {
+                f.debug_struct("ClassificationCompleted").finish()
             }
             Self::Cancel => write!(f, "Cancel"),
             Self::Quit => write!(f, "Quit"),

@@ -15,6 +15,7 @@
 
 use crate::app::App;
 use crate::ui::components::completion_popup::CompletionPopup;
+use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
 use crate::ui::components::logo::Logo;
 use crate::ui::components::status_bar::status_bar::StatusState;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -22,6 +23,39 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+impl App<'_> {
+    /// The single status the footer shows, by precedence: user-input waits
+    /// first, then the current busy phase, then idle.
+    fn resolve_status(&self) -> StatusState {
+        if self.question_panel.is_some() {
+            return StatusState::WaitingAnswer;
+        }
+        if !self.approval_queue.is_empty() {
+            return StatusState::WaitingApproval;
+        }
+        let cp = &self.conversation_panel;
+        match cp.phase {
+            ActivePhase::Classifying => StatusState::Classifying,
+            ActivePhase::ToolRunning => StatusState::ToolRunning,
+            ActivePhase::CreatingToolCall => StatusState::CreatingToolCall,
+            ActivePhase::Outputting => StatusState::Outputting,
+            ActivePhase::None => match &cp.receiving_response {
+                // Request in flight but nothing has streamed back yet: either
+                // still connecting, or backing off between retries.
+                Some(partial) if !partial.started() => {
+                    if self.stream_retrying.load(std::sync::atomic::Ordering::Relaxed) {
+                        StatusState::Retrying
+                    } else {
+                        StatusState::Connecting
+                    }
+                }
+                Some(_) => StatusState::Thinking,
+                None => StatusState::Idle,
+            },
+        }
+    }
+}
 
 impl Widget for &mut App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -31,23 +65,9 @@ impl Widget for &mut App<'_> {
             return;
         }
 
-        // Update footer state from conversation panel.
-        let is_receiving = self.conversation_panel.receiving_response.is_some();
-        let is_outputting_message = self.conversation_panel.outputting_message;
-        let is_creating_tool_call = self.conversation_panel.creating_tool_call;
-        let is_tool_running = self.conversation_panel.tool_running;
-        self.footer.update(
-            is_receiving,
-            is_outputting_message,
-            is_creating_tool_call,
-            is_tool_running,
-        );
-        // Override status when the model is waiting for user input.
-        if self.question_panel.is_some() {
-            self.footer.status.status = StatusState::WaitingAnswer;
-        } else if !self.approval_queue.is_empty() {
-            self.footer.status.status = StatusState::WaitingApproval;
-        }
+        // Resolve the single status the footer should show, then let the
+        // status bar track its own busy timer.
+        self.footer.status.set(self.resolve_status());
         self.footer.work_mode = self.work_mode;
         self.footer.current_model = self.current_model.clone();
 

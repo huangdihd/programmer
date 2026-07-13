@@ -103,7 +103,10 @@ pub enum WorkMode {
     #[default]
     #[serde(alias = "edits")]
     AllowEdits,
-    /// All tool calls execute without any interception.
+    /// An LLM classifier decides per tool call whether to auto-approve.
+    Auto,
+    /// All tool calls execute without any interception. Gated behind
+    /// `allow_yolo` in the config — not reachable via the normal cycle.
     Yolo,
 }
 
@@ -113,6 +116,7 @@ impl WorkMode {
         match self {
             WorkMode::Manual => "Manual",
             WorkMode::AllowEdits => "Allow Edits",
+            WorkMode::Auto => "Auto",
             WorkMode::Yolo => "YOLO",
         }
     }
@@ -122,27 +126,355 @@ impl WorkMode {
         match self {
             WorkMode::Manual => "🛡",
             WorkMode::AllowEdits => "✏️",
+            WorkMode::Auto => "🤖",
             WorkMode::Yolo => "⚡",
         }
     }
 
-    /// Cycle to the next mode.
+    /// Cycle to the next mode. YOLO is excluded from the cycle; it must be
+    /// selected explicitly via `/mode yolo` and requires `allow_yolo`.
     pub fn next(self) -> WorkMode {
         match self {
             WorkMode::Manual => WorkMode::AllowEdits,
-            WorkMode::AllowEdits => WorkMode::Yolo,
+            WorkMode::AllowEdits => WorkMode::Auto,
+            WorkMode::Auto => WorkMode::Manual,
+            // If somehow in YOLO, cycling returns to the normal ring.
             WorkMode::Yolo => WorkMode::Manual,
         }
     }
 
-    /// Return the classifier for this mode.
+    /// Whether this mode classifies tool calls with an async LLM call rather
+    /// than the synchronous rule-based [`Classifier`].
+    pub fn uses_llm_classifier(&self) -> bool {
+        matches!(self, WorkMode::Auto)
+    }
+
+    /// Return the synchronous classifier for this mode. Auto has no sync
+    /// classifier (it uses [`classify_tool_call`]); it falls back to asking so
+    /// callers that ignore [`uses_llm_classifier`] stay safe.
     pub fn classifier(&self) -> Box<dyn Classifier> {
         match self {
-            WorkMode::Manual => Box::new(ManualClassifier),
+            WorkMode::Manual | WorkMode::Auto => Box::new(ManualClassifier),
             WorkMode::AllowEdits => Box::new(AllowEditsClassifier),
             WorkMode::Yolo => Box::new(YoloClassifier),
         }
     }
+}
+
+/// Whether a tool call needs LLM review in Auto mode. Read-only tools are
+/// always safe; only state-mutating tools are sent to the classifier.
+pub fn needs_review(tool_name: &str) -> bool {
+    DANGEROUS_TOOLS.contains(&tool_name)
+}
+
+// ---------------------------------------------------------------------------
+// LLM classifier (Auto mode)
+// ---------------------------------------------------------------------------
+
+use async_openai::config::OpenAIConfig;
+use async_openai::types::responses::{
+    CreateResponse, IncludeEnum, InputParam, OutputItem, OutputMessageContent,
+};
+use async_openai::Client;
+
+/// Minimum share `P(yes) / (P(yes) + P(no))` the fast (logprob) path requires
+/// before it auto-approves — the "safety margin". Anything below falls through
+/// to a reasoned deny.
+const APPROVE_MARGIN: f64 = 0.7;
+
+/// Output-token ceiling for every classifier call. It is a *ceiling*, not a
+/// target: a non-reasoning model answers in one token and stops, so this costs
+/// nothing extra there; a reasoning model gets enough room to finish thinking
+/// before it emits the answer token whose logprobs we read.
+const CLASSIFIER_MAX_TOKENS: u32 = 2048;
+
+/// Instructions shared by every classifier call.
+const CLASSIFIER_INSTRUCTIONS: &str = "\
+You are a security gate for an autonomous coding agent working inside a user's \
+git repository. For each proposed tool call, decide whether it is safe to \
+auto-approve WITHOUT a human in the loop.
+
+Approve routine, reversible, in-workspace actions: building, running tests, \
+reading files, editing or creating files inside the project, and safe local \
+git operations (status, diff, add, commit).
+
+Do NOT approve actions that are destructive, hard to reverse, or reach outside \
+the workspace: `rm -rf` or deletion of broad/unknown paths, force-pushing or \
+history rewrites, editing files outside the project, modifying system or global \
+config, piping remote scripts into a shell, network calls to unknown hosts, \
+anything that could exfiltrate secrets or credentials, or commands whose intent \
+is unclear.";
+
+/// The outcome of one LLM classification, plus whether the provider turned out
+/// not to support logprobs (so the caller can cache that and skip the fast
+/// path next time).
+pub struct ClassifyOutcome {
+    pub verdict: Verdict,
+    pub logprobs_missing: bool,
+}
+
+/// Result of the fast single-token yes/no probe.
+enum FastResult {
+    Approved,
+    Denied,
+    /// Chosen token wasn't a clear yes/no — fall back to the reasoned path.
+    Ambiguous,
+    /// Provider returned no logprobs — fall back and remember it.
+    NoLogprobs,
+}
+
+/// Classify one tool call with the LLM.
+///
+/// `try_logprobs` should be `false` when the model is already known not to
+/// support logprobs, so we skip straight to the merged reason-generating call.
+pub async fn classify_tool_call(
+    client: &Client<OpenAIConfig>,
+    model: &str,
+    tool_name: &str,
+    arguments: &str,
+    context: &str,
+    try_logprobs: bool,
+) -> ClassifyOutcome {
+    if try_logprobs {
+        match classify_fast(client, model, tool_name, arguments, context).await {
+            Ok(FastResult::Approved) => {
+                return ClassifyOutcome {
+                    verdict: Verdict::Allow,
+                    logprobs_missing: false,
+                };
+            }
+            Ok(FastResult::Denied) => {
+                let reason = generate_denial_reason(client, model, tool_name, arguments, context)
+                    .await
+                    .unwrap_or_else(|| {
+                        "classifier judged this call unsafe to auto-approve".to_string()
+                    });
+                return ClassifyOutcome {
+                    verdict: Verdict::Deny { reason },
+                    logprobs_missing: false,
+                };
+            }
+            Ok(FastResult::Ambiguous) => {
+                // Decide + explain in one merged call, but logprobs do work.
+                return ClassifyOutcome {
+                    verdict: classify_reasoned(client, model, tool_name, arguments, context).await,
+                    logprobs_missing: false,
+                };
+            }
+            Ok(FastResult::NoLogprobs) => {
+                return ClassifyOutcome {
+                    verdict: classify_reasoned(client, model, tool_name, arguments, context).await,
+                    logprobs_missing: true,
+                };
+            }
+            Err(e) => {
+                return ClassifyOutcome {
+                    verdict: Verdict::Deny {
+                        reason: format!("classifier error: {e}"),
+                    },
+                    logprobs_missing: false,
+                };
+            }
+        }
+    }
+
+    // Known to lack logprobs: go straight to the merged path.
+    ClassifyOutcome {
+        verdict: classify_reasoned(client, model, tool_name, arguments, context).await,
+        logprobs_missing: true,
+    }
+}
+
+/// Assemble the per-call prompt body: optional turn context followed by the
+/// tool name and arguments under review.
+fn call_block(context: &str, tool_name: &str, arguments: &str) -> String {
+    if context.trim().is_empty() {
+        format!("Tool: {tool_name}\nArguments:\n{arguments}")
+    } else {
+        format!("Context:\n{context}\n\nTool: {tool_name}\nArguments:\n{arguments}")
+    }
+}
+
+/// Build a base classifier request (non-streaming, deterministic, no tools).
+fn base_request(model: &str, prompt: String) -> CreateResponse {
+    CreateResponse {
+        model: Some(model.to_string()),
+        input: InputParam::Text(prompt),
+        instructions: Some(CLASSIFIER_INSTRUCTIONS.to_string()),
+        temperature: Some(0.0),
+        store: Some(false),
+        ..Default::default()
+    }
+}
+
+/// Pull the first assistant text out of a response, with its logprobs.
+fn first_text(response: &async_openai::types::responses::Response) -> Option<&OutputMessageContent> {
+    response.output.iter().find_map(|item| match item {
+        OutputItem::Message(msg) => msg.content.first(),
+        _ => None,
+    })
+}
+
+/// Fast path: make the model answer yes/no, then compare `P(yes)` vs `P(no)` in
+/// the logprobs of the *first message-content token*.
+///
+/// We deliberately do NOT cap at one token. A reasoning model spends its first
+/// tokens on a separate `reasoning` output item — the answer only appears once
+/// `message` content begins, and reasoning logprobs never land in
+/// `message.output_text`. So the first content token is always the yes/no
+/// answer, for reasoning and non-reasoning models alike.
+async fn classify_fast(
+    client: &Client<OpenAIConfig>,
+    model: &str,
+    tool_name: &str,
+    arguments: &str,
+    context: &str,
+) -> Result<FastResult, String> {
+    let prompt = format!(
+        "{}\n\nIs this call safe to auto-approve? \
+         Answer with exactly one word: yes or no.",
+        call_block(context, tool_name, arguments)
+    );
+    let mut req = base_request(model, prompt);
+    req.max_output_tokens = Some(CLASSIFIER_MAX_TOKENS);
+    req.top_logprobs = Some(20);
+    req.include = Some(vec![IncludeEnum::MessageOutputTextLogprobs]);
+
+    let response = client
+        .responses()
+        .create(req)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let Some(OutputMessageContent::OutputText(text)) = first_text(&response) else {
+        return Ok(FastResult::Ambiguous);
+    };
+    let Some(logprobs) = &text.logprobs else {
+        return Ok(FastResult::NoLogprobs);
+    };
+    let Some(first) = logprobs.first() else {
+        return Ok(FastResult::NoLogprobs);
+    };
+
+    // Candidate set is the chosen token plus its alternatives.
+    let mut p_yes = 0.0_f64;
+    let mut p_no = 0.0_f64;
+    let chosen = std::iter::once((first.token.as_str(), first.logprob));
+    let alts = first
+        .top_logprobs
+        .iter()
+        .map(|t| (t.token.as_str(), t.logprob));
+    for (token, logprob) in chosen.chain(alts) {
+        match yes_no_bucket(token) {
+            Some(true) => p_yes += logprob.exp(),
+            Some(false) => p_no += logprob.exp(),
+            None => {}
+        }
+    }
+
+    if p_yes == 0.0 && p_no == 0.0 {
+        return Ok(FastResult::Ambiguous);
+    }
+    let share_yes = p_yes / (p_yes + p_no);
+    if share_yes >= APPROVE_MARGIN {
+        Ok(FastResult::Approved)
+    } else {
+        Ok(FastResult::Denied)
+    }
+}
+
+/// Normalise a token to yes (`Some(true)`), no (`Some(false)`), or neither.
+fn yes_no_bucket(token: &str) -> Option<bool> {
+    let t = token.trim().trim_matches(|c: char| !c.is_alphanumeric());
+    match t.to_ascii_lowercase().as_str() {
+        "yes" | "y" => Some(true),
+        "no" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+/// Ask the model to justify a denial in one sentence (used after the fast path
+/// decided "no", so the agent learns why).
+async fn generate_denial_reason(
+    client: &Client<OpenAIConfig>,
+    model: &str,
+    tool_name: &str,
+    arguments: &str,
+    context: &str,
+) -> Option<String> {
+    let prompt = format!(
+        "{}\n\nThis tool call is NOT safe to auto-approve. In one sentence, state \
+         the specific risk so the agent can adjust. Reply with only the reason.",
+        call_block(context, tool_name, arguments)
+    );
+    let mut req = base_request(model, prompt);
+    req.max_output_tokens = Some(CLASSIFIER_MAX_TOKENS);
+    let response = client.responses().create(req).await.ok()?;
+    match first_text(&response) {
+        Some(OutputMessageContent::OutputText(t)) if !t.text.trim().is_empty() => {
+            Some(t.text.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Merged path: decide and explain in a single generation. Used when the model
+/// lacks logprobs, or when the fast token was ambiguous.
+async fn classify_reasoned(
+    client: &Client<OpenAIConfig>,
+    model: &str,
+    tool_name: &str,
+    arguments: &str,
+    context: &str,
+) -> Verdict {
+    let prompt = format!(
+        "{}\n\nDecide whether this is safe to auto-approve. Reply on a single \
+         line, exactly one of:\n\
+         APPROVE\n\
+         DENY: <one-sentence reason>",
+        call_block(context, tool_name, arguments)
+    );
+    let mut req = base_request(model, prompt);
+    req.max_output_tokens = Some(CLASSIFIER_MAX_TOKENS);
+
+    let response = match client.responses().create(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Verdict::Deny {
+                reason: format!("classifier error: {e}"),
+            };
+        }
+    };
+
+    let text = match first_text(&response) {
+        Some(OutputMessageContent::OutputText(t)) => t.text.trim().to_string(),
+        _ => String::new(),
+    };
+    parse_reasoned(&text)
+}
+
+/// Parse the merged path's reply into a verdict.
+fn parse_reasoned(text: &str) -> Verdict {
+    let trimmed = text.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("APPROVE") {
+        return Verdict::Allow;
+    }
+    // Everything else is treated as a denial; extract the reason after "DENY".
+    let reason = trimmed
+        .strip_prefix("DENY")
+        .or_else(|| trimmed.strip_prefix("deny"))
+        .map(|r| r.trim_start_matches([':', '-', ' ']).trim())
+        .filter(|r| !r.is_empty())
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| {
+            if trimmed.is_empty() {
+                "classifier returned no decision".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        });
+    Verdict::Deny { reason }
 }
 
 #[cfg(test)]
@@ -176,9 +508,59 @@ mod tests {
     }
 
     #[test]
-    fn mode_cycle() {
+    fn mode_cycle_excludes_yolo() {
         assert_eq!(WorkMode::Manual.next(), WorkMode::AllowEdits);
-        assert_eq!(WorkMode::AllowEdits.next(), WorkMode::Yolo);
-        assert_eq!(WorkMode::Yolo.next(), WorkMode::Manual);
+        assert_eq!(WorkMode::AllowEdits.next(), WorkMode::Auto);
+        assert_eq!(WorkMode::Auto.next(), WorkMode::Manual);
+        // YOLO is never produced by cycling.
+        assert_ne!(WorkMode::Manual.next(), WorkMode::Yolo);
+        assert_ne!(WorkMode::AllowEdits.next(), WorkMode::Yolo);
+        assert_ne!(WorkMode::Auto.next(), WorkMode::Yolo);
+    }
+
+    #[test]
+    fn auto_uses_llm_classifier() {
+        assert!(WorkMode::Auto.uses_llm_classifier());
+        assert!(!WorkMode::Manual.uses_llm_classifier());
+        assert!(!WorkMode::AllowEdits.uses_llm_classifier());
+    }
+
+    #[test]
+    fn yes_no_bucketing() {
+        assert_eq!(yes_no_bucket("yes"), Some(true));
+        assert_eq!(yes_no_bucket(" Yes"), Some(true));
+        assert_eq!(yes_no_bucket("YES"), Some(true));
+        assert_eq!(yes_no_bucket("no"), Some(false));
+        assert_eq!(yes_no_bucket(" No."), Some(false));
+        assert_eq!(yes_no_bucket("maybe"), None);
+        assert_eq!(yes_no_bucket("yep"), None);
+    }
+
+    #[test]
+    fn parse_reasoned_verdicts() {
+        assert!(matches!(parse_reasoned("APPROVE"), Verdict::Allow));
+        assert!(matches!(parse_reasoned("approve"), Verdict::Allow));
+        match parse_reasoned("DENY: rm -rf on a broad path is irreversible") {
+            Verdict::Deny { reason } => assert!(reason.contains("irreversible")),
+            _ => panic!("expected deny"),
+        }
+        // Unrecognised output defaults to deny with the text as the reason.
+        match parse_reasoned("this looks risky") {
+            Verdict::Deny { reason } => assert_eq!(reason, "this looks risky"),
+            _ => panic!("expected deny"),
+        }
+        match parse_reasoned("") {
+            Verdict::Deny { reason } => assert!(!reason.is_empty()),
+            _ => panic!("expected deny"),
+        }
+    }
+
+    #[test]
+    fn needs_review_only_mutating() {
+        assert!(needs_review("command"));
+        assert!(needs_review("write_file"));
+        assert!(needs_review("edit_file"));
+        assert!(!needs_review("read_file"));
+        assert!(!needs_review("grep"));
     }
 }

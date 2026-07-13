@@ -34,18 +34,4 @@ impl Footer {
         }
     }
 
-    pub fn update(
-        &mut self,
-        is_receiving: bool,
-        is_outputting_message: bool,
-        is_creating_tool_call: bool,
-        is_tool_running: bool,
-    ) {
-        self.status.update(
-            is_receiving,
-            is_outputting_message,
-            is_creating_tool_call,
-            is_tool_running,
-        );
-    }
 }

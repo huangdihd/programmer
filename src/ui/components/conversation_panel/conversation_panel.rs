@@ -33,6 +33,26 @@ use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
 
+/// The active work phase of a turn. Exactly one is in effect at a time; the
+/// old design tracked these as separate booleans that could, in principle,
+/// contradict each other. "Thinking" is intentionally absent — it is derived
+/// from [`ActivePhase::None`] plus an in-flight `receiving_response`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActivePhase {
+    /// Neither outputting, calling tools, nor classifying. When a response is
+    /// still streaming this reads as "Thinking"; otherwise the turn is idle.
+    #[default]
+    None,
+    /// The model is streaming a normal text message.
+    Outputting,
+    /// The model is streaming tool-call arguments.
+    CreatingToolCall,
+    /// Tool calls are executing in the background.
+    ToolRunning,
+    /// The Auto-mode LLM classifier is deciding tool-call approvals.
+    Classifying,
+}
+
 /// Number of rows scrolled per mouse-wheel notch.
 const SCROLL_LINES: usize = 3;
 
@@ -266,16 +286,12 @@ pub struct ConversationPanel {
     /// Accumulated token usage across all responses in the current turn
     /// (a turn may span multiple responses when tool calls are involved).
     pub accumulated_usage: (u32, u32),
-    /// True while tool calls are executing in the background (between a finished
-    /// response that requested tools and the follow-up request). The turn is
-    /// still active even though no response is streaming.
-    pub tool_running: bool,
-    /// True while the model is streaming and has started emitting tool call
-    /// arguments (detected via the first function_call item in the stream).
-    pub creating_tool_call: bool,
-    /// True while the model is streaming a normal text message (not reasoning,
-    /// not a tool call).
-    pub outputting_message: bool,
+    /// The current active work phase of the turn. Replaces the old cluster of
+    /// mutually-exclusive `tool_running`/`creating_tool_call`/… booleans:
+    /// exactly one phase is active at a time, so a single enum models it
+    /// without invalid combinations. "Thinking" is not a phase — it is derived
+    /// from [`ActivePhase::None`] while a response is still streaming.
+    pub phase: ActivePhase,
     /// When true the view follows new content at the bottom. Scrolling up turns
     /// it off; scrolling back to the bottom turns it on again. This replaces
     /// re-snapping on every chunk, which fought manual scrolling during streaming.
@@ -317,9 +333,7 @@ impl ConversationPanel {
             scroll_view_state: ScrollViewState::new(),
             pending_message: None,
             receiving_response: None,
-            tool_running: false,
-            creating_tool_call: false,
-            outputting_message: false,
+            phase: ActivePhase::None,
             stick_to_bottom: true,
             expanded_items: HashSet::new(),
             view_area: Rect::ZERO,
@@ -533,7 +547,11 @@ impl ConversationPanel {
     /// Whether a turn is in flight (streaming a response or running tools), in
     /// which case new user input is queued rather than starting a new request.
     pub fn is_busy(&self) -> bool {
-        self.receiving_response.is_some() || self.tool_running
+        self.receiving_response.is_some()
+            || matches!(
+                self.phase,
+                ActivePhase::ToolRunning | ActivePhase::Classifying
+            )
     }
 
     /// Appends a tool result as a `function_call_output` input item so it is both

@@ -23,6 +23,14 @@ pub struct ProgrammerConfig {
     pub default_provider: String,
     /// All configured providers, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
+    /// Model used by the Auto-mode LLM tool-call classifier, as a
+    /// `provider/model` string. When absent, the current chat model is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_model: Option<String>,
+    /// YOLO mode (run every tool call unchecked) is gated behind this flag so
+    /// it can't be reached by the normal Ctrl+T cycle or a bare `/mode yolo`.
+    #[serde(default)]
+    pub allow_yolo: bool,
     // Legacy fields for backward compatibility with v0.1.x configs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -61,6 +69,8 @@ impl Default for ProgrammerConfig {
         ProgrammerConfig {
             default_provider: "openai".to_string(),
             providers,
+            classifier_model: None,
+            allow_yolo: false,
             model: None,
             base_url: None,
             api_key: None,

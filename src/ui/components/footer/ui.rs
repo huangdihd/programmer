@@ -46,6 +46,7 @@ impl Widget for &Footer {
         let mode_style = match self.work_mode {
             WorkMode::Manual => Style::default().fg(Color::LightRed),
             WorkMode::AllowEdits => Style::default().fg(Color::LightGreen),
+            WorkMode::Auto => Style::default().fg(Color::LightCyan),
             WorkMode::Yolo => Style::default().fg(Color::LightYellow),
         };
         ratatui::widgets::Paragraph::new(mode_text)

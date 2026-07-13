@@ -21,7 +21,7 @@ use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
 use crate::session::{SessionManager};
 use crate::ui::components::conversation_panel::conversation_panel::{
-    ConversationPanel, SelectionEnd,
+    ActivePhase, ConversationPanel, SelectionEnd,
 };
 use crate::ui::components::footer::footer::Footer;
 use crate::ui::components::input_panel::input_panel::InputPanel;
@@ -70,6 +70,12 @@ pub struct App<'a> {
     pub(crate) approved_calls: Vec<FunctionToolCall>,
     /// Which option is highlighted in the approval UI (0=approve,1=deny,2=approve all,3=deny all).
     pub(crate) approval_selected: usize,
+    /// Classifier models discovered not to support logprobs, so Auto mode skips
+    /// the single-token fast path and goes straight to the merged reasoned call.
+    classifier_no_logprobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// True while the stream task is backing off between connection retries, so
+    /// the status bar can show "Retrying" instead of "Connecting".
+    pub(crate) stream_retrying: Arc<AtomicBool>,
     /// Session UUID.
     session_uuid: String,
     /// Session manager for persistence.
@@ -93,7 +99,7 @@ impl std::fmt::Debug for App<'_> {
 impl App<'_> {
     /// Constructs a new instance of [`App`].
     pub(crate) async fn new(
-        config: ProgrammerConfig,
+        mut config: ProgrammerConfig,
         saved_items: Vec<MessageItem>,
         saved_history: Vec<String>,
         session_uuid: String,
@@ -102,7 +108,27 @@ impl App<'_> {
         open_provider_panel: bool,
     ) -> Self {
         let provider_manager = ProviderManager::new(&config).await;
-        let current_model = provider_manager.default_model();
+        let mut current_model = provider_manager.default_model();
+        let mut work_mode = WorkMode::default();
+
+        // Restore per-session settings (work mode, chat model, classifier model)
+        // so resuming a session comes back the way you left it. Unknown models
+        // (e.g. a provider that was since removed) fall back to the default.
+        if let Some(mgr) = &session_mgr {
+            if let Some(saved) = mgr.load(&session_uuid) {
+                if let Some(wm) = saved.work_mode {
+                    work_mode = wm;
+                }
+                if let Some(model) = saved.current_model {
+                    if provider_manager.resolve(&model).is_some() {
+                        current_model = model;
+                    }
+                }
+                if saved.classifier_model.is_some() {
+                    config.classifier_model = saved.classifier_model;
+                }
+            }
+        }
         let mut conversation_panel = ConversationPanel::new();
         conversation_panel.restore_items(saved_items);
         for msg in startup_messages {
@@ -130,10 +156,14 @@ impl App<'_> {
             footer: Footer::new(),
             provider_panel: open_provider_panel.then(ProviderPanel::new),
             question_panel: None,
-            work_mode: WorkMode::default(),
+            work_mode,
             approval_queue: Vec::new(),
             approved_calls: Vec::new(),
             approval_selected: 0,
+            classifier_no_logprobs: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+            stream_retrying: Arc::new(AtomicBool::new(false)),
             session_uuid,
             session_mgr,
         }
@@ -215,8 +245,7 @@ impl App<'_> {
                     let cancel_token = partial_response.cancelled.clone();
                     let calls = function_calls(&partial_response);
                     if calls.is_empty() {
-                        self.conversation_panel.creating_tool_call = false;
-                        self.conversation_panel.outputting_message = false;
+                        self.conversation_panel.phase = ActivePhase::None;
                         self.conversation_panel.flush_usage();
                         if let Some(pending_request) =
                             self.conversation_panel.pending_message.take()
@@ -232,7 +261,7 @@ impl App<'_> {
                     if cancel_token.load(Ordering::Relaxed) {
                         return Ok(());
                     }
-                    self.conversation_panel.tool_running = false;
+                    self.conversation_panel.phase = ActivePhase::None;
                     for output in outputs {
                         self.conversation_panel.add_tool_output(output);
                     }
@@ -246,14 +275,34 @@ impl App<'_> {
                     // Continue the turn: send the tool results back to the model.
                     self.spawn_stream();
                 }
+                AppEvent::ClassificationCompleted {
+                    allowed,
+                    denied,
+                    cancel_token,
+                } => {
+                    if cancel_token.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    if allowed.is_empty() {
+                        // Everything was denied: feed the denial outputs back and
+                        // resume the turn so the agent can adjust.
+                        self.conversation_panel.phase = ActivePhase::None;
+                        for output in denied {
+                            self.conversation_panel.add_tool_output(output);
+                        }
+                        self.save_session();
+                        self.spawn_stream();
+                    } else {
+                        // Denials ride along and are added once by ToolCallsCompleted.
+                        self.spawn_run(allowed, denied, cancel_token, "Auto".to_string());
+                    }
+                }
                 AppEvent::Cancel => {
                     if let Some(partial) = &self.conversation_panel.receiving_response {
                         partial.cancelled.store(true, Ordering::Relaxed);
                     }
                     self.conversation_panel.abort_receiving();
-                    self.conversation_panel.tool_running = false;
-                    self.conversation_panel.creating_tool_call = false;
-                    self.conversation_panel.outputting_message = false;
+                    self.conversation_panel.phase = ActivePhase::None;
                     self.conversation_panel.flush_usage();
                     self.save_session();
                     if let Some(pending_request) = self.conversation_panel.pending_message.take() {
@@ -461,8 +510,7 @@ impl App<'_> {
     fn spawn_stream(&mut self) {
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.conversation_panel.live_expanded_items.clear();
-        self.conversation_panel.creating_tool_call = false;
-        self.conversation_panel.outputting_message = false;
+        self.conversation_panel.phase = ActivePhase::None;
         self.conversation_panel.receiving_response =
             Some(PartialResponse::new(cancel_token.clone()));
         let (client, model_name) = match self.provider_manager.resolve(&self.current_model) {
@@ -476,6 +524,8 @@ impl App<'_> {
             }
         };
         let sender = self.events.sender.clone();
+        let retrying = self.stream_retrying.clone();
+        retrying.store(false, Ordering::Relaxed);
         let input_param = self.conversation_panel.get_input_param(&self.current_model);
         tokio::spawn(async move {
             let mut request = CreateResponse::default();
@@ -489,17 +539,19 @@ impl App<'_> {
             let stream = loop {
                 match client.responses().create_stream(request.clone()).await {
                     Ok(stream) => break Ok(stream),
-                    Err(e) if is_network_error(&e) && attempt < MAX_RETRIES => {
+                    Err(e) if is_retryable(&e) && attempt < MAX_RETRIES => {
                         if cancel_token.load(Ordering::Relaxed) {
+                            retrying.store(false, Ordering::Relaxed);
                             return;
                         }
                         attempt += 1;
-                        let delay = std::time::Duration::from_secs(1 << (attempt - 1));
-                        tokio::time::sleep(delay).await;
+                        retrying.store(true, Ordering::Relaxed);
+                        tokio::time::sleep(backoff_delay(attempt)).await;
                     }
                     Err(e) => break Err(e),
                 }
             };
+            retrying.store(false, Ordering::Relaxed);
             match stream {
                 Ok(mut response_stream) => {
                     while let Some(response_stream_event) = response_stream.next().await {
@@ -531,84 +583,203 @@ impl App<'_> {
     /// Runs the model's requested tool calls in the background, then reports the
     /// outputs back to the event loop via `ToolCallsCompleted`.
     fn run_tool_calls(&mut self, calls: Vec<FunctionToolCall>, cancel_token: Arc<AtomicBool>) {
-        self.conversation_panel.tool_running = true;
-        self.conversation_panel.creating_tool_call = false;
-        self.conversation_panel.outputting_message = false;
+        // Auto mode classifies each call with an async LLM call first.
+        if self.work_mode.uses_llm_classifier() {
+            self.spawn_auto_classification(calls, cancel_token);
+            return;
+        }
 
+        self.conversation_panel.phase = ActivePhase::ToolRunning;
         let classifier = self.work_mode.classifier();
 
         // Split calls: allowed (run now), denied (error now), pending (queue
         // for approval).
-        let mut allowed: Vec<&FunctionToolCall> = Vec::new();
+        let mut allowed: Vec<FunctionToolCall> = Vec::new();
         let mut queued: Vec<(FunctionToolCall, String)> = Vec::new();
-        let mut denied_outputs = Vec::new();
+        let mut denied: Vec<FunctionCallOutputItemParam> = Vec::new();
 
         for call in &calls {
             match classifier.classify(&call.name, &call.arguments) {
-                crate::classifier::Verdict::Allow => {
-                    allowed.push(call);
-                }
+                crate::classifier::Verdict::Allow => allowed.push(call.clone()),
                 crate::classifier::Verdict::Deny { reason } => {
-                    denied_outputs.push(FunctionCallOutputItemParam {
-                        call_id: call.call_id.clone(),
-                        output: FunctionCallOutput::Text(format!(
-                            "error: tool call blocked by classifier — {reason}"
-                        )),
-                        id: None,
-                        status: None,
-                    });
+                    denied.push(classifier_denied_output(call, &reason))
                 }
                 crate::classifier::Verdict::Ask { reason } => {
-                    queued.push((call.clone(), reason));
+                    queued.push((call.clone(), reason))
                 }
             }
         }
 
-        // If there are denied outputs, add them to conversation immediately.
-        for output in &denied_outputs {
-            self.conversation_panel.add_tool_output(output.clone());
-        }
-
-        // If there are calls awaiting approval, queue them and exit tool_running
-        // so the UI can show the prompt.
+        // Calls awaiting approval: queue them and leave the busy phase so the
+        // UI can show the prompt. Feed any denials back now, since they won't
+        // ride along with the later approval run.
         if !queued.is_empty() {
+            for output in denied {
+                self.conversation_panel.add_tool_output(output);
+            }
             self.approval_queue = queued;
-            self.conversation_panel.tool_running = false;
-            return; // Will be restarted when user approves.
+            self.conversation_panel.phase = ActivePhase::None;
+            return; // Will be restarted when the user approves.
         }
 
-        // No approval needed — run allowed calls immediately.
-        if !allowed.is_empty() || !denied_outputs.is_empty() {
-            let sender = self.events.sender.clone();
-            let calls_to_run: Vec<FunctionToolCall> =
-                allowed.iter().map(|c| (*c).clone()).collect();
-            let label = self.work_mode.label().to_string();
-            tokio::spawn(async move {
-                let mut outputs = Vec::new();
-                outputs.extend(denied_outputs);
-                for call in &calls_to_run {
-                    if cancel_token.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let mut out = crate::tools::run_tool_call(call, &sender).await;
-                    let text = match &out.output {
-                        FunctionCallOutput::Text(t) => t.clone(),
-                        _ => String::new(),
-                    };
-                    out.output = FunctionCallOutput::Text(format!(
-                        "[auto-approved in {label} mode]\n{text}"
-                    ));
-                    outputs.push(out);
-                }
-                let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
-                    outputs,
-                    cancel_token,
-                )));
-            });
-        } else {
-            // All calls were denied — send empty list to unblock the turn.
-            self.conversation_panel.tool_running = false;
+        if allowed.is_empty() && denied.is_empty() {
+            self.conversation_panel.phase = ActivePhase::None;
+            return;
         }
+
+        let label = self.work_mode.label().to_string();
+        self.spawn_run(allowed, denied, cancel_token, label);
+    }
+
+    /// Auto mode: classify each mutating call with the LLM, then hand the
+    /// verdicts back via [`AppEvent::ClassificationCompleted`]. Read-only tools
+    /// skip the classifier and are always allowed.
+    fn spawn_auto_classification(
+        &mut self,
+        calls: Vec<FunctionToolCall>,
+        cancel_token: Arc<AtomicBool>,
+    ) {
+        self.conversation_panel.phase = ActivePhase::Classifying;
+
+        // Resolve the classifier model (falls back to the chat model).
+        let model_str = self
+            .config
+            .classifier_model
+            .clone()
+            .unwrap_or_else(|| self.current_model.clone());
+        let (client, model_name) = match self.provider_manager.resolve(&model_str) {
+            Some((c, m)) => (c.clone(), m),
+            None => {
+                self.conversation_panel.add_error_string(format!(
+                    "classifier model '{model_str}' not found — set a valid \
+                     classifier_model (or /classifier <provider/model>)"
+                ));
+                self.conversation_panel.phase = ActivePhase::None;
+                return;
+            }
+        };
+
+        let sender = self.events.sender.clone();
+        let no_lp = self.classifier_no_logprobs.clone();
+        let context = self.build_classifier_context();
+
+        tokio::spawn(async move {
+            let mut allowed: Vec<FunctionToolCall> = Vec::new();
+            let mut denied: Vec<FunctionCallOutputItemParam> = Vec::new();
+
+            for call in &calls {
+                if cancel_token.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !crate::classifier::needs_review(&call.name) {
+                    allowed.push(call.clone());
+                    continue;
+                }
+
+                let try_logprobs = !no_lp.lock().unwrap().contains(&model_name);
+                let outcome = crate::classifier::classify_tool_call(
+                    &client,
+                    &model_name,
+                    &call.name,
+                    &call.arguments,
+                    &context,
+                    try_logprobs,
+                )
+                .await;
+                if outcome.logprobs_missing {
+                    no_lp.lock().unwrap().insert(model_name.clone());
+                }
+
+                match outcome.verdict {
+                    crate::classifier::Verdict::Allow => allowed.push(call.clone()),
+                    crate::classifier::Verdict::Deny { reason }
+                    | crate::classifier::Verdict::Ask { reason } => {
+                        denied.push(classifier_denied_output(call, &reason))
+                    }
+                }
+            }
+
+            let _ = sender.send(Event::App(AppEvent::ClassificationCompleted {
+                allowed,
+                denied,
+                cancel_token,
+            }));
+        });
+    }
+
+    /// Compact context handed to the Auto-mode classifier so it judges tool
+    /// calls against the actual task, not in isolation: the working directory,
+    /// the user's latest request, and the recent tool calls this turn.
+    fn build_classifier_context(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        if let Ok(cwd) = std::env::current_dir() {
+            parts.push(format!("Working directory: {}", cwd.display()));
+        }
+
+        let items: Vec<&MessageItem> = self.conversation_panel.items().collect();
+
+        // The user's most recent request drives whether an action is expected.
+        if let Some(msg) = items.iter().rev().find_map(|it| match it {
+            MessageItem::Input(input) => extract_input_text(input),
+            _ => None,
+        }) {
+            parts.push(format!(
+                "User's latest request:\n{}",
+                truncate_chars(msg.trim(), 800)
+            ));
+        }
+
+        // The last few tool calls this turn give the classifier the flow.
+        let mut recent: Vec<String> = items
+            .iter()
+            .rev()
+            .filter_map(|it| match it {
+                MessageItem::Output(OutputItem::FunctionCall(fc)) => Some(fc.name.clone()),
+                _ => None,
+            })
+            .take(5)
+            .collect();
+        if !recent.is_empty() {
+            recent.reverse();
+            parts.push(format!("Recent tool calls this turn: {}", recent.join(", ")));
+        }
+
+        parts.join("\n\n")
+    }
+
+    /// Run `allowed` tool calls in the background, prepend the `denied` outputs,
+    /// and report everything back via [`AppEvent::ToolCallsCompleted`].
+    fn spawn_run(
+        &mut self,
+        allowed: Vec<FunctionToolCall>,
+        denied: Vec<FunctionCallOutputItemParam>,
+        cancel_token: Arc<AtomicBool>,
+        label: String,
+    ) {
+        self.conversation_panel.phase = ActivePhase::ToolRunning;
+        let sender = self.events.sender.clone();
+        tokio::spawn(async move {
+            let mut outputs = denied;
+            for call in &allowed {
+                if cancel_token.load(Ordering::Relaxed) {
+                    break;
+                }
+                let mut out = crate::tools::run_tool_call(call, &sender).await;
+                let text = match &out.output {
+                    FunctionCallOutput::Text(t) => t.clone(),
+                    _ => String::new(),
+                };
+                out.output = FunctionCallOutput::Text(format!(
+                    "[auto-approved in {label} mode]\n{text}"
+                ));
+                outputs.push(out);
+            }
+            let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
+                outputs,
+                cancel_token,
+            )));
+        });
     }
 
     pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent) {
@@ -623,9 +794,9 @@ impl App<'_> {
             // Check if the stream is now generating function calls.
             if let Some(ref receiving) = self.conversation_panel.receiving_response {
                 if receiving.has_function_calls() {
-                    self.conversation_panel.creating_tool_call = true;
+                    self.conversation_panel.phase = ActivePhase::CreatingToolCall;
                 } else if receiving.has_message_items() {
-                    self.conversation_panel.outputting_message = true;
+                    self.conversation_panel.phase = ActivePhase::Outputting;
                 }
             }
             return;
@@ -668,9 +839,7 @@ impl App<'_> {
         // The stream ended in an error, so the turn is over: stop "receiving",
         // record the error, and flush any queued message so we don't get stuck.
         self.conversation_panel.abort_receiving();
-        self.conversation_panel.tool_running = false;
-        self.conversation_panel.creating_tool_call = false;
-        self.conversation_panel.outputting_message = false;
+        self.conversation_panel.phase = ActivePhase::None;
         self.conversation_panel.flush_usage();
         self.conversation_panel.add_error(error);
         if let Some(pending_request) = self.conversation_panel.pending_message.take() {
@@ -1006,11 +1175,24 @@ impl App<'_> {
                     "edits" | "edit" | "allowedits" | "allow" => {
                         self.work_mode = WorkMode::AllowEdits
                     }
-                    "yolo" => self.work_mode = WorkMode::Yolo,
+                    "auto" => self.work_mode = WorkMode::Auto,
+                    "yolo" => {
+                        if self.config.allow_yolo {
+                            self.work_mode = WorkMode::Yolo;
+                        } else {
+                            self.conversation_panel.add_error_string(
+                                "YOLO mode runs every tool call unchecked and is \
+                                 disabled by default — set `allow_yolo = true` in \
+                                 config to enable it"
+                                    .to_string(),
+                            );
+                            return;
+                        }
+                    }
                     "" => self.work_mode = self.work_mode.next(),
                     other => {
                         self.conversation_panel.add_error_string(format!(
-                            "unknown mode '{other}' — use manual, edits, or yolo"
+                            "unknown mode '{other}' — use manual, edits, or auto"
                         ));
                         return;
                     }
@@ -1018,6 +1200,45 @@ impl App<'_> {
                 if self.work_mode != prev {
                     self.persist_config();
                 }
+            }
+            Some(Command::Classifier(arg)) => {
+                self.input_panel.clear();
+                let arg = arg.trim().to_string();
+                match arg.as_str() {
+                    "" => {
+                        let current = self
+                            .config
+                            .classifier_model
+                            .clone()
+                            .unwrap_or_else(|| format!("{} (chat model)", self.current_model));
+                        self.conversation_panel.add_info_string(format!(
+                            "classifier model: {current}\n\
+                             usage: /classifier <provider/model> to set, \
+                             /classifier clear to reset to the chat model"
+                        ));
+                    }
+                    "clear" | "default" | "reset" => {
+                        self.config.classifier_model = None;
+                        self.conversation_panel.add_info_string(
+                            "classifier model reset — Auto mode now uses the chat model",
+                        );
+                        self.persist_config();
+                    }
+                    model => match self.provider_manager.resolve(model) {
+                        Some(_) => {
+                            self.config.classifier_model = Some(model.to_string());
+                            self.conversation_panel
+                                .add_info_string(format!("classifier model set to: {model}"));
+                            self.persist_config();
+                        }
+                        None => {
+                            self.conversation_panel.add_error_string(format!(
+                                "unknown provider/model: {model} — use /providers to list available"
+                            ));
+                        }
+                    },
+                }
+                self.save_session();
             }
             Some(Command::Providers(args)) => {
                 self.input_panel.clear();
@@ -1123,6 +1344,9 @@ impl App<'_> {
         }
         SessionManager::set_items(&mut session, items);
         session.history = self.input_panel.history.clone();
+        session.work_mode = Some(self.work_mode);
+        session.current_model = Some(self.current_model.clone());
+        session.classifier_model = self.config.classifier_model.clone();
         if let Err(e) = mgr.save(&mut session) {
             self.conversation_panel
                 .add_error_string(format!("session save: {e}"));
@@ -1163,10 +1387,59 @@ impl App<'_> {
 /// Returns `true` when the error is a transport-level network failure
 /// (DNS, connection refused, timeout, TLS error, etc.) — i.e. we never
 /// received an HTTP response from the server.
-fn is_network_error(error: &OpenAIError) -> bool {
+/// Whether a failed `create_stream` is worth retrying: transport-level errors
+/// with no HTTP status (connection refused, DNS, reset), plus transient server
+/// responses (429 rate-limit and 5xx gateway/overload codes).
+fn is_retryable(error: &OpenAIError) -> bool {
     match error {
-        OpenAIError::Reqwest(e) => e.status().is_none(),
+        OpenAIError::Reqwest(e) => match e.status() {
+            None => true,
+            Some(status) => {
+                status.as_u16() == 429
+                    || matches!(status.as_u16(), 500 | 502 | 503 | 504)
+            }
+        },
         _ => false,
+    }
+}
+
+/// Exponential backoff for retry `attempt` (1-based): `2^(attempt-1)` seconds
+/// capped at 30s, plus up to ~500ms of jitter to avoid synchronized retries.
+fn backoff_delay(attempt: u32) -> std::time::Duration {
+    const CAP_SECS: u64 = 30;
+    let base = 1u64.checked_shl(attempt - 1).unwrap_or(CAP_SECS).min(CAP_SECS);
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() as u64) % 500)
+        .unwrap_or(0);
+    std::time::Duration::from_secs(base) + std::time::Duration::from_millis(jitter_ms)
+}
+
+/// Truncate to at most `max` characters (on a char boundary), appending an
+/// ellipsis when clipped. Used to keep classifier context compact.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Build a `function_call_output` carrying a classifier denial, fed back to the
+/// model so it learns why the call was blocked and can adjust.
+fn classifier_denied_output(
+    call: &FunctionToolCall,
+    reason: &str,
+) -> FunctionCallOutputItemParam {
+    FunctionCallOutputItemParam {
+        call_id: call.call_id.clone(),
+        output: FunctionCallOutput::Text(format!(
+            "error: tool call blocked by classifier — {reason}"
+        )),
+        id: None,
+        status: None,
     }
 }
 

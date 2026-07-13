@@ -521,6 +521,13 @@ impl PartialResponse {
         self.finish_reason.is_some()
     }
 
+    /// Whether any output has arrived yet. False in the window between the
+    /// request being sent and the first output item streaming back, which the
+    /// UI shows as "Connecting" rather than "Thinking".
+    pub fn started(&self) -> bool {
+        self.items.iter().any(Option::is_some) || self.usage.is_some()
+    }
+
     /// Returns true if any output item in this partial response is a function
     /// call (possibly still incomplete).
     pub fn has_function_calls(&self) -> bool {

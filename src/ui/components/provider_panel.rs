@@ -854,6 +854,8 @@ mod tests {
         ProgrammerConfig {
             default_provider: names.first().unwrap_or(&"").to_string(),
             providers,
+            classifier_model: None,
+            allow_yolo: false,
             model: None,
             base_url: None,
             api_key: None,
