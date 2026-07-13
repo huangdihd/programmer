@@ -53,8 +53,11 @@ pub trait Classifier: Send + Sync {
 // Standard classifiers
 // ---------------------------------------------------------------------------
 
-/// Tool names considered "dangerous" — they mutate state.
-const DANGEROUS_TOOLS: &[&str] = &["command", "write_file", "edit_file"];
+/// Tool names considered "dangerous" — they mutate state or run commands.
+/// `configure_diagnostics` writes a profile and test-runs its checker commands,
+/// so it is gated like `command`.
+const DANGEROUS_TOOLS: &[&str] =
+    &["command", "write_file", "edit_file", "configure_diagnostics"];
 
 /// Manual mode: every dangerous tool call must be approved.
 pub struct ManualClassifier;

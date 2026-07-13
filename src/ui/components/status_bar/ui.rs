@@ -34,7 +34,8 @@ impl Widget for &StatusBar {
             StatusState::Outputting => ("▸", "Outputting", OUTPUT),
             StatusState::CreatingToolCall => ("⚒", "Creating tool call", WARN),
             StatusState::ToolRunning => ("⚡", "Running tools", WARN),
-            StatusState::Classifying => ("◍", "Classifying", ACCENT),
+            StatusState::Classifying => ("◍", "Evaluating", ACCENT),
+            StatusState::Checking => ("◇", "Checking diagnostics", ACCENT),
             StatusState::WaitingAnswer => ("?", "Waiting for answer", ACCENT),
             StatusState::WaitingApproval => ("🛡", "Waiting for approval", WARN),
         };

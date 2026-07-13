@@ -51,6 +51,8 @@ pub enum ActivePhase {
     ToolRunning,
     /// The Auto-mode LLM classifier is deciding tool-call approvals.
     Classifying,
+    /// Diagnostics checkers are running after an edit.
+    Checking,
 }
 
 /// Number of rows scrolled per mouse-wheel notch.
@@ -560,6 +562,32 @@ impl ConversationPanel {
         self.items.push(MessageItem::Input(InputItem::Item(
             Item::FunctionCallOutput(output),
         )));
+    }
+
+    /// Append text to the stored output of the tool call identified by
+    /// `call_id`, so post-edit feedback (diagnostics) renders inside that call's
+    /// result — visible when the user expands it — and is sent to the model as
+    /// part of the tool result. Returns whether a matching output was found.
+    ///
+    /// This is the one place `items` is mutated rather than appended, so the
+    /// affected cache entry is dropped to force a re-render.
+    pub fn append_to_tool_output(&mut self, call_id: &str, extra: &str) -> bool {
+        for item in self.items.iter_mut() {
+            if let MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) = item {
+                if output.call_id == call_id {
+                    match &mut output.output {
+                        FunctionCallOutput::Text(text) => text.push_str(extra),
+                        other => *other = FunctionCallOutput::Text(extra.trim_start().to_string()),
+                    }
+                    // The result renders inside its call's entry, which isn't
+                    // necessarily adjacent (a batch interleaves several calls and
+                    // outputs). Drop the whole cache so it rebuilds cleanly.
+                    self.render_cache.entries.clear();
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn add_input_message(&mut self, input_message_item: ApiMessageItem) {

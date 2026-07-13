@@ -1,0 +1,6 @@
+[[checkers]]
+name = "cargo-check"
+kind = "command"
+command = "cargo check --message-format=json"
+parser = "rustc-json"
+run_on = ["*.rs"]

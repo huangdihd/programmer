@@ -43,6 +43,11 @@ use ratatui::DefaultTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Maximum number of Auto-mode classifier LLM requests in flight at once.
+/// Mutating calls within a single turn are classified concurrently up to this
+/// bound; the rest queue and start as slots free up.
+const MAX_CONCURRENT_CLASSIFICATIONS: usize = 4;
+
 /// Application.
 pub struct App<'a> {
     /// Is the application running?
@@ -74,6 +79,13 @@ pub struct App<'a> {
     /// Classifier models discovered not to support logprobs, so Auto mode skips
     /// the single-token fast path and goes straight to the merged reasoned call.
     classifier_no_logprobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The last full diagnostics snapshot, used to diff after each edit so the
+    /// model is told which problems it introduced vs. resolved. `None` until the
+    /// first run of the session (which just establishes the baseline).
+    diagnostics_baseline: Option<Vec<crate::diagnostics::Diagnostic>>,
+    /// Count of turns that edited files, driving the periodic reminder to keep
+    /// `PROGRAMMER.md` up to date.
+    mutating_turns: usize,
     /// True while the stream task is backing off between connection retries, so
     /// the status bar can show "Retrying" instead of "Connecting".
     pub(crate) stream_retrying: Arc<AtomicBool>,
@@ -164,6 +176,8 @@ impl App<'_> {
             classifier_no_logprobs: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            diagnostics_baseline: None,
+            mutating_turns: 0,
             stream_retrying: Arc::new(AtomicBool::new(false)),
             session_uuid,
             session_mgr,
@@ -263,6 +277,9 @@ impl App<'_> {
                         return Ok(());
                     }
                     self.conversation_panel.phase = ActivePhase::None;
+                    // Did this batch edit any files? (Checked before the outputs
+                    // are consumed, using the call_id → tool-name map.)
+                    let edited_files = self.batch_edited_files(&outputs);
                     for output in outputs {
                         self.conversation_panel.add_tool_output(output);
                     }
@@ -273,7 +290,25 @@ impl App<'_> {
                         std::io::stdout(),
                         crossterm::event::EnableMouseCapture
                     );
-                    // Continue the turn: send the tool results back to the model.
+                    // After an edit, run diagnostics (and maybe a PROGRAMMER.md
+                    // reminder) before resuming; that path continues the turn
+                    // itself. Otherwise resume immediately.
+                    if !self.continue_with_diagnostics(edited_files, cancel_token.clone()) {
+                        self.spawn_stream();
+                    }
+                }
+                AppEvent::DiagnosticsCompleted {
+                    snapshot,
+                    reminder_due,
+                    cancel_token,
+                } => {
+                    if cancel_token.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    self.conversation_panel.phase = ActivePhase::None;
+                    self.apply_diagnostics(snapshot, reminder_due);
+                    self.save_session();
+                    // Resume the turn so the model sees the feedback (if any).
                     self.spawn_stream();
                 }
                 AppEvent::ClassificationCompleted {
@@ -305,6 +340,8 @@ impl App<'_> {
                     self.conversation_panel.abort_receiving();
                     self.conversation_panel.phase = ActivePhase::None;
                     self.conversation_panel.flush_usage();
+                    self.conversation_panel
+                        .add_info_string("Request cancelled by user.".to_string());
                     self.save_session();
                     if let Some(pending_request) = self.conversation_panel.pending_message.take() {
                         self.start_request(pending_request).await;
@@ -312,6 +349,9 @@ impl App<'_> {
                 }
                 AppEvent::Quit => self.quit(),
                 AppEvent::Start => self.send_message().await,
+                AppEvent::StartInit => {
+                    self.start_request_as(init_prompt(), InputRole::Developer).await;
+                }
                 AppEvent::ProvidersChanged => {
                     // Rebuild the manager so new/edited providers get clients
                     // and model discovery (bounded by the fetch timeout).
@@ -475,6 +515,13 @@ impl App<'_> {
     }
 
     async fn start_request(&mut self, text: String) {
+        self.start_request_as(text, InputRole::User).await;
+    }
+
+    /// Start a turn from a message with the given role. `User` is a normal user
+    /// message; `Developer` carries a hidden instruction (like `/init`) that
+    /// reaches the model and the classifier but isn't drawn as a user bubble.
+    async fn start_request_as(&mut self, text: String, role: InputRole) {
         if self.conversation_panel.is_busy() {
             let is_at_bottom = self.conversation_panel.is_at_bottom();
             match self.conversation_panel.pending_message.as_mut() {
@@ -494,7 +541,7 @@ impl App<'_> {
             content: vec![InputContent::InputText(InputTextContent {
                 text: text.clone(),
             })],
-            role: InputRole::User,
+            role,
             status: Option::from(OutputStatus::Completed),
         };
 
@@ -635,6 +682,10 @@ impl App<'_> {
     /// Auto mode: classify each mutating call with the LLM, then hand the
     /// verdicts back via [`AppEvent::ClassificationCompleted`]. Read-only tools
     /// skip the classifier and are always allowed.
+    ///
+    /// Mutating calls are classified concurrently, capped at
+    /// [`MAX_CONCURRENT_CLASSIFICATIONS`] in-flight LLM requests so a large
+    /// batch doesn't fan out into an unbounded burst against the provider.
     fn spawn_auto_classification(
         &mut self,
         calls: Vec<FunctionToolCall>,
@@ -665,39 +716,73 @@ impl App<'_> {
         let (light_context, full_context) = self.build_classifier_context();
 
         tokio::spawn(async move {
+            // One decision per call, preserving call order. Read-only tools
+            // resolve immediately; mutating tools hit the LLM. `buffered` runs
+            // up to MAX_CONCURRENT_CLASSIFICATIONS futures at once and yields
+            // their results in input order.
+            enum Decision {
+                Allow(FunctionToolCall),
+                Deny(FunctionCallOutputItemParam),
+            }
+
+            let decisions: Vec<Option<Decision>> = futures::stream::iter(
+                calls.into_iter().map(|call| {
+                    // Re-borrow per future so `async move` captures copies of the
+                    // references, leaving the owned values in this task's scope.
+                    let client = &client;
+                    let model_name = &model_name;
+                    let no_lp = &no_lp;
+                    let light_context = &light_context;
+                    let full_context = &full_context;
+                    let cancel_token = &cancel_token;
+                    async move {
+                        if cancel_token.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        if !crate::classifier::needs_review(&call.name) {
+                            return Some(Decision::Allow(call));
+                        }
+
+                        let try_logprobs = !no_lp.lock().unwrap().contains(model_name);
+                        let outcome = crate::classifier::classify_tool_call(
+                            client,
+                            model_name,
+                            &call.name,
+                            &call.arguments,
+                            light_context,
+                            full_context,
+                            try_logprobs,
+                        )
+                        .await;
+                        if outcome.logprobs_missing {
+                            no_lp.lock().unwrap().insert(model_name.clone());
+                        }
+
+                        Some(match outcome.verdict {
+                            crate::classifier::Verdict::Allow => Decision::Allow(call),
+                            crate::classifier::Verdict::Deny { reason }
+                            | crate::classifier::Verdict::Ask { reason } => {
+                                Decision::Deny(classifier_denied_output(&call, &reason))
+                            }
+                        })
+                    }
+                }),
+            )
+            .buffered(MAX_CONCURRENT_CLASSIFICATIONS)
+            .collect()
+            .await;
+
+            // A cancel that landed mid-classification: drop the whole batch.
+            if cancel_token.load(Ordering::Relaxed) {
+                return;
+            }
+
             let mut allowed: Vec<FunctionToolCall> = Vec::new();
             let mut denied: Vec<FunctionCallOutputItemParam> = Vec::new();
-
-            for call in &calls {
-                if cancel_token.load(Ordering::Relaxed) {
-                    return;
-                }
-                if !crate::classifier::needs_review(&call.name) {
-                    allowed.push(call.clone());
-                    continue;
-                }
-
-                let try_logprobs = !no_lp.lock().unwrap().contains(&model_name);
-                let outcome = crate::classifier::classify_tool_call(
-                    &client,
-                    &model_name,
-                    &call.name,
-                    &call.arguments,
-                    &light_context,
-                    &full_context,
-                    try_logprobs,
-                )
-                .await;
-                if outcome.logprobs_missing {
-                    no_lp.lock().unwrap().insert(model_name.clone());
-                }
-
-                match outcome.verdict {
-                    crate::classifier::Verdict::Allow => allowed.push(call.clone()),
-                    crate::classifier::Verdict::Deny { reason }
-                    | crate::classifier::Verdict::Ask { reason } => {
-                        denied.push(classifier_denied_output(call, &reason))
-                    }
+            for decision in decisions.into_iter().flatten() {
+                match decision {
+                    Decision::Allow(call) => allowed.push(call),
+                    Decision::Deny(output) => denied.push(output),
                 }
             }
 
@@ -729,8 +814,10 @@ impl App<'_> {
         let items: Vec<&MessageItem> = self.conversation_panel.items().collect();
 
         // The user's most recent request drives whether an action is expected.
+        // Skip hidden developer messages (diagnostics feedback, the /init prompt)
+        // so they aren't mistaken for the user's own words.
         if let Some(msg) = items.iter().rev().find_map(|it| match it {
-            MessageItem::Input(input) => extract_input_text(input),
+            MessageItem::Input(input) if !it.is_hidden_developer() => extract_input_text(input),
             _ => None,
         }) {
             let user = format!(
@@ -755,6 +842,18 @@ impl App<'_> {
             full.push(format!("Assistant has sent {assistant_count} message(s) this turn."));
         }
 
+        // Map each call_id to its tool name so an outcome row can report the
+        // tool that produced it rather than an opaque id.
+        let call_names: std::collections::HashMap<&str, &str> = items
+            .iter()
+            .filter_map(|it| match it {
+                MessageItem::Output(OutputItem::FunctionCall(fc)) => {
+                    Some((fc.call_id.as_str(), fc.name.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+
         // Tool call outcome metadata only (name + status + size — no raw
         // output content, to prevent injection from file contents, command
         // output, or URLs embedded in tool results).
@@ -770,7 +869,11 @@ impl App<'_> {
                         FunctionCallOutput::Text(t) => t.as_str(),
                         _ => "",
                     };
-                    let name = fco.call_id.as_str();
+                    // Fall back to the call_id if the matching call isn't in view.
+                    let name = call_names
+                        .get(fco.call_id.as_str())
+                        .copied()
+                        .unwrap_or(fco.call_id.as_str());
                     let len = output_text.len();
                     let status = if output_text.is_empty() { "empty" } else { "ok" };
                     Some(format!("  {name} — {status}, {len} chars"))
@@ -787,6 +890,171 @@ impl App<'_> {
         }
 
         (light.join("\n\n"), full.join("\n\n"))
+    }
+
+    /// Whether any output in this batch was produced by a file-editing tool
+    /// (`write_file`/`edit_file`), determined by mapping each output's call id
+    /// back to the tool that produced it.
+    fn batch_edited_files(&self, outputs: &[FunctionCallOutputItemParam]) -> bool {
+        let names: std::collections::HashMap<&str, &str> = self
+            .conversation_panel
+            .items()
+            .filter_map(|it| match it {
+                MessageItem::Output(OutputItem::FunctionCall(fc)) => {
+                    Some((fc.call_id.as_str(), fc.name.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        outputs.iter().any(|o| {
+            matches!(
+                names.get(o.call_id.as_str()).copied(),
+                Some(crate::tools::write_file::NAME) | Some(crate::tools::edit_file::NAME)
+            )
+        })
+    }
+
+    /// The call id of the most recent file-editing tool output, so post-edit
+    /// feedback can be attached to the edit that triggered it.
+    fn last_edit_output_call_id(&self) -> Option<String> {
+        let names: std::collections::HashMap<&str, &str> = self
+            .conversation_panel
+            .items()
+            .filter_map(|it| match it {
+                MessageItem::Output(OutputItem::FunctionCall(fc)) => {
+                    Some((fc.call_id.as_str(), fc.name.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        self.conversation_panel
+            .items()
+            .filter_map(|it| match it {
+                MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(fco))) => {
+                    let name = names.get(fco.call_id.as_str()).copied();
+                    matches!(
+                        name,
+                        Some(crate::tools::write_file::NAME) | Some(crate::tools::edit_file::NAME)
+                    )
+                    .then(|| fco.call_id.clone())
+                }
+                _ => None,
+            })
+            .last()
+    }
+
+    /// Deliver post-edit feedback (a diagnostics summary and/or a reminder).
+    /// Preferred placement is inside the triggering edit's tool result, so the
+    /// user can expand and see it; if the edit's output can't be found, fall
+    /// back to a hidden developer message. Either way the model sees it.
+    fn emit_post_edit_feedback(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(call_id) = self.last_edit_output_call_id() {
+            let block = format!("\n\n--- Post-edit check ---\n{text}");
+            if self.conversation_panel.append_to_tool_output(&call_id, &block) {
+                return;
+            }
+        }
+        self.conversation_panel
+            .add_input_message(make_developer_message(text));
+    }
+
+    /// After a file-editing batch, run diagnostics (if configured) and count the
+    /// turn toward the periodic PROGRAMMER.md reminder. Returns `true` when it
+    /// spawned an async diagnostics run that will continue the turn itself via
+    /// [`AppEvent::DiagnosticsCompleted`]; `false` means the caller should
+    /// resume the stream normally.
+    fn continue_with_diagnostics(
+        &mut self,
+        edited_files: bool,
+        cancel_token: Arc<AtomicBool>,
+    ) -> bool {
+        if !edited_files {
+            return false;
+        }
+        self.mutating_turns += 1;
+        let reminder_due = self.mutating_turns % OVERVIEW_REMINDER_EVERY == 0
+            && std::path::Path::new("PROGRAMMER.md").exists();
+
+        if std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
+            self.spawn_diagnostics(reminder_due, cancel_token);
+            return true;
+        }
+
+        // No profile to run, but the overview reminder may still be due.
+        if reminder_due {
+            self.emit_post_edit_feedback(overview_reminder());
+            self.save_session();
+        }
+        false
+    }
+
+    /// Forget the diagnostics baseline and edit counter — called when the
+    /// conversation is cleared or a new session starts, so the next edit
+    /// re-establishes a baseline instead of diffing against a stale one.
+    fn reset_diagnostics_state(&mut self) {
+        self.diagnostics_baseline = None;
+        self.mutating_turns = 0;
+    }
+
+    /// Spawn the diagnostics checkers in the background; the result comes back as
+    /// [`AppEvent::DiagnosticsCompleted`].
+    fn spawn_diagnostics(&mut self, reminder_due: bool, cancel_token: Arc<AtomicBool>) {
+        self.conversation_panel.phase = ActivePhase::Checking;
+        let sender = self.events.sender.clone();
+        tokio::spawn(async move {
+            let cwd = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
+            let snapshot = crate::diagnostics::collect(&cwd).await.unwrap_or_default();
+            let _ = sender.send(Event::App(AppEvent::DiagnosticsCompleted {
+                snapshot,
+                reminder_due,
+                cancel_token,
+            }));
+        });
+    }
+
+    /// Fold a fresh diagnostics snapshot into the conversation: diff it against
+    /// the baseline, update the baseline, and inject a hidden developer message
+    /// carrying the change summary, any checker errors, and (when due) the
+    /// PROGRAMMER.md reminder. Adds nothing when there's nothing to report.
+    fn apply_diagnostics(&mut self, snapshot: crate::diagnostics::Snapshot, reminder_due: bool) {
+        let mut parts: Vec<String> = Vec::new();
+
+        match &self.diagnostics_baseline {
+            Some(old) => {
+                let d = crate::diagnostics::diff(old, &snapshot.diagnostics);
+                if let Some(summary) = d.summary() {
+                    parts.push(summary);
+                }
+            }
+            None => {
+                // First run of the session only establishes the baseline. We
+                // have no "before" snapshot to diff against, so we can't say
+                // whether this edit caused these — just report the current count
+                // neutrally and attribute changes from here on.
+                if !snapshot.diagnostics.is_empty() {
+                    parts.push(format!(
+                        "Diagnostics baseline established: {} problem(s) \
+                         currently in the project. Future edits will report \
+                         changes relative to this.",
+                        snapshot.diagnostics.len()
+                    ));
+                }
+            }
+        }
+        for e in &snapshot.errors {
+            parts.push(format!("Diagnostics checker error: {e}"));
+        }
+        self.diagnostics_baseline = Some(snapshot.diagnostics);
+
+        if reminder_due {
+            parts.push(overview_reminder());
+        }
+
+        self.emit_post_edit_feedback(parts.join("\n\n"));
     }
 
     /// Run `allowed` tool calls in the background, prepend the `denied` outputs,
@@ -1168,6 +1436,7 @@ impl App<'_> {
             Some(Command::Clear) => {
                 self.input_panel.clear();
                 self.conversation_panel.clear_messages();
+                self.reset_diagnostics_state();
                 self.delete_session();
                 self.save_session();
             }
@@ -1176,6 +1445,7 @@ impl App<'_> {
                 // Save current session to disk before switching.
                 self.save_session();
                 self.conversation_panel.clear_messages();
+                self.reset_diagnostics_state();
                 if let Some(mgr) = &self.session_mgr {
                     let new_session = mgr.create();
                     self.session_uuid = new_session.uuid;
@@ -1336,6 +1606,16 @@ impl App<'_> {
                 self.conversation_panel.add_info_string(msg);
                 self.save_session();
             }
+            Some(Command::Init) => {
+                self.input_panel.clear();
+                self.conversation_panel.add_info_string(
+                    "Initializing project: exploring the codebase, writing \
+                     PROGRAMMER.md, and setting up diagnostics…"
+                        .to_string(),
+                );
+                // Run as a normal agent turn driven by a synthetic prompt.
+                self.events.send(AppEvent::StartInit);
+            }
             Some(Command::Help) => {
                 self.input_panel.clear();
                 let mut lines: Vec<String> = Command::descriptions()
@@ -1470,6 +1750,61 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Build a `function_call_output` carrying a classifier denial, fed back to the
 /// model so it learns why the call was blocked and can adjust.
+/// How many file-editing turns pass between reminders to refresh PROGRAMMER.md.
+const OVERVIEW_REMINDER_EVERY: usize = 5;
+
+/// The hidden developer message nudging the agent to keep PROGRAMMER.md current.
+fn overview_reminder() -> String {
+    "Reminder: several edits have accumulated since PROGRAMMER.md was last \
+     written. If the architecture, build/test commands, directory layout, or \
+     conventions have changed, update PROGRAMMER.md now with write_file so it \
+     stays an accurate map for future sessions. If nothing meaningful changed, \
+     ignore this."
+        .to_string()
+}
+
+/// Build a hidden `Developer`-role message. It is sent to the model (and is
+/// visible to the classifier) but never rendered as a user bubble — see
+/// [`MessageItem::is_hidden_developer`].
+fn make_developer_message(text: String) -> ApiMessageItem {
+    ApiMessageItem::Input(InputMessage {
+        content: vec![InputContent::InputText(InputTextContent { text })],
+        role: InputRole::Developer,
+        status: Some(OutputStatus::Completed),
+    })
+}
+
+/// The synthetic user prompt that drives `/init`. It reuses the normal agent
+/// loop and existing tools (read/grep/blob, write_file, configure_diagnostics)
+/// rather than any bespoke initialization code.
+fn init_prompt() -> String {
+    "Initialize this project for our future work together. Do the following, in order:\n\
+     \n\
+     1. Explore the repository to understand it: read the README and any build \
+     manifests (Cargo.toml, package.json, pyproject.toml, go.mod, etc.), and skim \
+     the main source directories to learn the architecture, entry points, and \
+     conventions. Ground everything in what you actually read — do not invent.\n\
+     \n\
+     2. Write a concise `PROGRAMMER.md` at the repository root capturing your \
+     understanding: a one-paragraph overview, the tech stack, how to build / test / \
+     run, the layout of key directories, and any notable conventions or gotchas. \
+     Keep it tight and factual — it is a map for future sessions, not marketing.\n\
+     \n\
+     3. Set up diagnostics so edits get IDE-style error feedback. Determine how \
+     this project surfaces compile/lint errors and call `configure_diagnostics` \
+     with a profile of one-shot checker commands. Common cases: Rust → \
+     `cargo check --message-format=json` with parser `rustc-json`; TypeScript → \
+     `tsc --noEmit` with parser `tsc`; C/C++/others that print \
+     `file:line:col: severity: message` → parser `gnu`; anything else → parser \
+     `regex` with a `pattern` you write. Prefer commands that terminate (NOT \
+     watch/dev-servers). The tool test-runs each checker and refuses to save a \
+     profile that doesn't work, so iterate until it saves. If you genuinely can't \
+     find a suitable checker, note that in PROGRAMMER.md and skip this step.\n\
+     \n\
+     When done, briefly summarize what you set up."
+        .to_string()
+}
+
 fn classifier_denied_output(
     call: &FunctionToolCall,
     reason: &str,
@@ -1500,7 +1835,9 @@ fn function_calls(partial_response: &PartialResponse) -> Vec<FunctionToolCall> {
 /// Extract the text of the first user message from a list of items.
 fn first_user_text(items: &[MessageItem]) -> Option<String> {
     items.iter().find_map(|item| match item {
-        MessageItem::Input(input) => extract_input_text(input),
+        // Skip hidden developer prompts (e.g. `/init`) so they don't become the
+        // session's preview text.
+        MessageItem::Input(input) if !item.is_hidden_developer() => extract_input_text(input),
         _ => None,
     })
 }

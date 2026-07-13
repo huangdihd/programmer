@@ -34,6 +34,9 @@ pub enum Command {
     /// model. Empty argument shows the current setting; "clear"/"default"
     /// resets it to the chat model.
     Classifier(String),
+    /// `/init` — have the agent explore the project, write `PROGRAMMER.md`, and
+    /// configure the diagnostics profile.
+    Init,
     Help,
     Session,
 }
@@ -62,6 +65,7 @@ impl Command {
             "providers" | "provider" => Some(Command::Providers(args)),
             "mode" => Some(Command::Mode(args)),
             "classifier" => Some(Command::Classifier(args)),
+            "init" => Some(Command::Init),
             "help" | "?" => Some(Command::Help),
             "session" | "s" => Some(Command::Session),
             _ => None,
@@ -70,7 +74,10 @@ impl Command {
 
     /// All command names (without leading `/`), for completion.
     pub fn all_commands() -> &'static [&'static str] {
-        &["model", "new", "providers", "session", "mode", "classifier", "clear", "quit", "help"]
+        &[
+            "model", "new", "providers", "session", "mode", "classifier", "init", "clear",
+            "quit", "help",
+        ]
     }
 
     /// Human-readable descriptions for the help text.
@@ -79,6 +86,7 @@ impl Command {
             ("/model <provider/model>", "Switch to a different model"),
             ("/mode <manual|edits|auto>", "Set work mode (or cycle with Ctrl+T)"),
             ("/classifier [provider/model]", "Set/show the Auto-mode classifier model"),
+            ("/init", "Explore the project, write PROGRAMMER.md, set up diagnostics"),
             ("/new | /n", "Start a new session (saves current)"),
             ("/providers show", "List all configured providers and models"),
             ("/providers manage", "Open the provider management panel"),

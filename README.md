@@ -15,7 +15,7 @@ TUI built with [Ratatui](https://ratatui.rs).
 
 - **Streaming responses** — see the model's answer as it is generated, token by
   token.
-- **Tool use** — the model can invoke seven built-in tools:
+- **Tool use** — the model can invoke eight built-in tools:
 
   | Tool | Description |
   |---|---|
@@ -26,8 +26,15 @@ TUI built with [Ratatui](https://ratatui.rs).
   | `grep` | Search a regex pattern across files, returning path:lineno:match. |
   | `blob` | Find files by filename regex, returning matching paths. |
   | `ask_user` | Prompt the user with yes/no, multiple choice, or free-text questions. |
+  | `configure_diagnostics` | Set up the project's IDE-style diagnostics (language-agnostic checkers). |
 - **Markdown rendering** — model responses are rendered with syntax-highlighted
   code blocks, lists, and formatting.
+- **IDE-style diagnostics** — after every code edit, the TUI runs a predefined
+  set of checkers (e.g. `cargo check`, `tsc --noEmit`) and reports which errors
+  were introduced or resolved. Language-agnostic — works with any checker that
+  outputs parseable diagnostics (rustc JSON, GNU-style, TypeScript, or custom
+  regex patterns). Configured via `/init` or the `configure_diagnostics` tool
+  and stored in `.programmer/diagnostics.toml`.
 - **Conversation panel** — scrollable chat history with distinct bubbles for
   user, assistant, tool calls, tool results, and errors.
 - **Pending messages** — if you type while the model is still responding, your
@@ -274,6 +281,7 @@ src/
 ├── clipboard.rs      # Copy-to-clipboard support
 ├── response/         # Parsing OpenAI response stream events
 ├── tools/            # Tool definitions + execution (command, read_file, etc.)
+├── diagnostics/      # Project diagnostics pipeline (profile, parser, runner, diff)
 └── ui/               # Terminal UI (ratatui)
     ├── components/
     │   ├── conversation_panel/   # Chat history rendering

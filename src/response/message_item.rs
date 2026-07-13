@@ -14,7 +14,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{InputItem, OutputItem};
+use async_openai::types::responses::{
+    InputItem, InputRole, Item, MessageItem as ApiMessageItem, OutputItem,
+};
 
 #[derive(Debug)]
 pub enum MessageItem {
@@ -25,6 +27,21 @@ pub enum MessageItem {
     Warning(String),
     Info(String),
     Usage(u32, u32), // (input_tokens, output_tokens)
+}
+
+impl MessageItem {
+    /// Whether this is a hidden `Developer`-role input message — used to carry
+    /// instructions (like the `/init` prompt or diagnostics feedback) to the
+    /// model without rendering them as a user bubble. Such items are still sent
+    /// to the API and are visible to the classifier; they are only skipped by
+    /// the UI and by user-facing summaries (e.g. the session preview).
+    pub fn is_hidden_developer(&self) -> bool {
+        matches!(
+            self,
+            MessageItem::Input(InputItem::Item(Item::Message(ApiMessageItem::Input(msg))))
+                if msg.role == InputRole::Developer
+        )
+    }
 }
 
 impl Clone for MessageItem {

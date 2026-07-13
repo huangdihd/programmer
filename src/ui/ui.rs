@@ -37,6 +37,7 @@ impl App<'_> {
         let cp = &self.conversation_panel;
         match cp.phase {
             ActivePhase::Classifying => StatusState::Classifying,
+            ActivePhase::Checking => StatusState::Checking,
             ActivePhase::ToolRunning => StatusState::ToolRunning,
             ActivePhase::CreatingToolCall => StatusState::CreatingToolCall,
             ActivePhase::Outputting => StatusState::Outputting,

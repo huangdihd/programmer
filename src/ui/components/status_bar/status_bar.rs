@@ -34,6 +34,8 @@ pub enum StatusState {
     ToolRunning,
     /// The Auto-mode LLM classifier is deciding whether to approve tool calls.
     Classifying,
+    /// Diagnostics checkers are running after an edit.
+    Checking,
     /// The model called `ask_user` and is waiting for the user's response.
     WaitingAnswer,
     /// Tool calls are queued for approval in Manual mode.

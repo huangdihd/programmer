@@ -16,6 +16,8 @@
 pub mod ask_user;
 pub mod blob;
 pub mod command;
+pub mod configure_diagnostics;
+pub mod diagnostics;
 pub mod edit_file;
 pub mod grep;
 pub mod read_file;
@@ -45,7 +47,7 @@ pub fn environment_info() -> String {
         .or_else(|_| std::env::var("LC_ALL"))
         .unwrap_or_else(|_| "unknown".to_string());
 
-    format!(
+    let mut info = format!(
         "# Environment info\n\
          - Operating system: {os} ({arch})\n\
          - Shell for the `command` tool: {shell}\n\
@@ -56,7 +58,25 @@ pub fn environment_info() -> String {
         shell = program,
         cwd = cwd,
         locale = locale,
-    )
+    );
+
+    // Point the model at project resources without spending tokens on their
+    // contents — it can read them on demand when relevant.
+    if std::path::Path::new("PROGRAMMER.md").exists() {
+        info.push_str(
+            "\n- A project overview exists at PROGRAMMER.md — read it with \
+             read_file when you need project context.",
+        );
+    }
+    if std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
+        info.push_str(
+            "\n- A diagnostics profile is configured; edits are checked \
+             automatically. Re-run setup any time with the /init flow or by \
+             calling configure_diagnostics.",
+        );
+    }
+
+    info
 }
 
 /// The full set of tool definitions advertised to the model on every request.
@@ -69,6 +89,8 @@ pub fn tools() -> Vec<Tool> {
         grep::tool(),
         blob::tool(),
         ask_user::tool(),
+        configure_diagnostics::tool(),
+        diagnostics::tool(),
     ]
 }
 
@@ -91,6 +113,8 @@ pub async fn run_tool_call(
         grep::NAME => grep::run(&call.arguments).await,
         blob::NAME => blob::run(&call.arguments).await,
         ask_user::NAME => ask_user::run(&call.arguments, sender).await,
+        configure_diagnostics::NAME => configure_diagnostics::run(&call.arguments).await,
+        diagnostics::NAME => diagnostics::run(&call.arguments).await,
         other => format!("error: unknown tool '{other}'"),
     };
 

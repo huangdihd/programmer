@@ -22,10 +22,18 @@ use ratatui::text::{Line, Span, Text};
 use crate::ui::components::messages::assistant::detail_style;
 use crate::ui::markdown_theme::palette;
 
+/// Whether a tool output indicates failure (starts with "error:").
+pub fn is_failure(output_text: &str) -> bool {
+    output_text.trim_start().to_ascii_lowercase().starts_with("error:")
+}
+
 /// Renders a tool call the model made, together with its result once it has
 /// one. Collapsed it is the tool name plus a one-line summary, with the first
 /// line of the result below (`⎿ …`); expanded it shows each argument and the
 /// full result. A caret hints that the block can be clicked to toggle.
+/// 
+/// Successful calls render in green; failed calls (output starts with
+/// "error:") render in red.
 pub struct ToolCallMessage<'a> {
     call: &'a FunctionToolCall,
     /// The matching `function_call_output`, once the tool has finished.
@@ -53,16 +61,20 @@ impl<'a> ToolCallMessage<'a> {
     }
 
     pub fn into_text(self) -> Text<'static> {
-        let accent = Style::new()
-            .fg(palette::YELLOW)
-            .add_modifier(Modifier::BOLD);
-        let muted = Style::new().fg(palette::MUTED);
-
-        let value = serde_json::from_str::<serde_json::Value>(&self.call.arguments).ok();
         let result_text = self.output.map(|output| match &output.output {
             FunctionCallOutput::Text(text) => text.clone(),
             FunctionCallOutput::Content(_) => "[non-text output]".to_string(),
         });
+        let failed = result_text.as_deref().map(is_failure).unwrap_or(false);
+
+        let status_color = if failed { palette::RED } else { palette::GREEN };
+        let status_char = if failed { "✗" } else { "✓" };
+        let accent = Style::new()
+            .fg(status_color)
+            .add_modifier(Modifier::BOLD);
+        let muted = Style::new().fg(palette::MUTED);
+
+        let value = serde_json::from_str::<serde_json::Value>(&self.call.arguments).ok();
 
         if !self.expanded {
             // Collapsed: the tool name plus a one-line summary, then the first
@@ -78,7 +90,11 @@ impl<'a> ToolCallMessage<'a> {
             }
             let mut lines = vec![Line::from(spans)];
             if let Some(text) = &result_text {
-                let dim = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
+                let dim = if failed {
+                    Style::new().fg(palette::RED_MUTED)
+                } else {
+                    Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM)
+                };
                 let mut result_lines = text.lines();
                 let first = result_lines.next().unwrap_or("[no output]");
                 let suffix = if result_lines.next().is_some() { "..." } else { "" };
@@ -86,6 +102,9 @@ impl<'a> ToolCallMessage<'a> {
                     format!("  ⎿ {first}{suffix}"),
                     dim,
                 )));
+            } else if !failed {
+                // No result yet (still running): show pending indicator.
+                lines.push(Line::from(Span::styled("  ⎿ …", muted)));
             }
             return Text::from(lines);
         }
@@ -114,12 +133,17 @@ impl<'a> ToolCallMessage<'a> {
         }
 
         if let Some(text) = &result_text {
+            let result_style = if failed {
+                Style::new().fg(palette::RED_MUTED)
+            } else {
+                detail_style()
+            };
             let mut first = true;
             for line in text.lines() {
-                let prefix = if first { "  ⎿ " } else { "    " };
+                let prefix = format!("  {} {status_char} ", if first { "⎿" } else { " " });
                 lines.push(Line::from(Span::styled(
                     format!("{prefix}{line}"),
-                    detail_style(),
+                    result_style,
                 )));
                 first = false;
             }

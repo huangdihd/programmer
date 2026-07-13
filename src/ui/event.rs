@@ -69,11 +69,22 @@ pub enum AppEvent {
         denied: Vec<FunctionCallOutputItemParam>,
         cancel_token: Arc<AtomicBool>,
     },
+    /// Diagnostics checkers finished after an edit. Carries the fresh snapshot
+    /// to diff against the baseline, whether a PROGRAMMER.md update reminder is
+    /// due this turn, and the cancel token.
+    DiagnosticsCompleted {
+        snapshot: crate::diagnostics::Snapshot,
+        reminder_due: bool,
+        cancel_token: Arc<AtomicBool>,
+    },
     /// Cancel the current in-flight request (streaming or tool calls).
     Cancel,
     /// Quit the application.
     Quit,
     Start,
+    /// `/init` was invoked: kick off the project-initialization turn (explore,
+    /// write PROGRAMMER.md, configure diagnostics) with a synthetic prompt.
+    StartInit,
     /// Provider config changed (via the management panel): rebuild the
     /// provider manager from the current config.
     ProvidersChanged,
@@ -109,9 +120,13 @@ impl std::fmt::Debug for AppEvent {
             Self::ClassificationCompleted { .. } => {
                 f.debug_struct("ClassificationCompleted").finish()
             }
+            Self::DiagnosticsCompleted { .. } => {
+                f.debug_struct("DiagnosticsCompleted").finish()
+            }
             Self::Cancel => write!(f, "Cancel"),
             Self::Quit => write!(f, "Quit"),
             Self::Start => write!(f, "Start"),
+            Self::StartInit => write!(f, "StartInit"),
             Self::ProvidersChanged => write!(f, "ProvidersChanged"),
             Self::QuestionPrompt { question, .. } => {
                 f.debug_struct("QuestionPrompt")

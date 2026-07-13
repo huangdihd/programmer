@@ -14,12 +14,13 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use async_openai::types::responses::{FunctionCallOutput, FunctionCallOutputItemParam};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use crate::ui::components::messages::assistant::detail_style;
+use crate::ui::components::messages::assistant::tool_call::is_failure;
 use crate::ui::components::messages::assistant_message::EXPANDED_BG;
 use crate::ui::markdown_theme::palette;
 
@@ -48,11 +49,15 @@ impl<'a> ToolResultMessage<'a> {
     }
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
-        let muted = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
-
         let text = match &self.output.output {
             FunctionCallOutput::Text(text) => text.clone(),
             FunctionCallOutput::Content(_) => "[non-text output]".to_string(),
+        };
+        let failed = is_failure(&text);
+        let result_style = if failed {
+            Style::new().fg(palette::RED_MUTED)
+        } else {
+            detail_style()
         };
 
         let all: Vec<&str> = text.lines().collect();
@@ -64,7 +69,7 @@ impl<'a> ToolResultMessage<'a> {
             let first = all.first().copied().unwrap_or("[no output]");
             let caret = if multiline { "▸ " } else { "" };
             let suffix = if multiline { "..." } else { "" };
-            let line = Line::from(Span::styled(format!("{caret}⎿ {first}{suffix}"), muted));
+            let line = Line::from(Span::styled(format!("{caret}⎿ {first}{suffix}"), result_style));
             return Paragraph::new(Text::from(line)).block(block);
         }
 
@@ -75,14 +80,14 @@ impl<'a> ToolResultMessage<'a> {
             .map(|(index, line)| {
                 if index == 0 {
                     let caret = if multiline { "▾ " } else { "" };
-                    Line::from(Span::styled(format!("{caret}⎿ {line}"), detail_style()))
+                    Line::from(Span::styled(format!("{caret}⎿ {line}"), result_style))
                 } else {
-                    Line::from(Span::styled(format!("  {line}"), detail_style()))
+                    Line::from(Span::styled(format!("  {line}"), result_style))
                 }
             })
             .collect();
         if lines.is_empty() {
-            lines.push(Line::from(Span::styled("⎿ [no output]", detail_style())));
+            lines.push(Line::from(Span::styled("⎿ [no output]", result_style)));
         }
 
         Paragraph::new(Text::from(lines))
