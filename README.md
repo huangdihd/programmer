@@ -37,6 +37,8 @@ TUI built with [Ratatui](https://ratatui.rs).
   flag.
 - **Configurable** — set model, API base URL, and API key via a TOML config
   file or environment variables.
+- **Session management** — multi-session support with UUIDs, auto-save on each
+  turn, resume with `--resume [uuid]`, restart with `/new`.
 
 ## Installation
 
@@ -65,10 +67,27 @@ On first launch, `programmer` creates a default config file at:
 - **macOS:** `~/Library/Application Support/programmer/config.toml`
 - **Windows:** `%APPDATA%\programmer\config.toml`
 
-Edit it to provide your credentials:
+### Minimal config
 
 ```toml
 default_provider = "openai"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-your-key-here"
+```
+
+### Full config
+
+```toml
+default_provider = "openai"
+
+# Separate model for the Auto-mode classifier (faster = better).
+# Falls back to the chat model when absent. Must be a non-reasoning model.
+classifier_model = "openai/gpt-4o-mini"
+
+# Gate YOLO mode behind this flag so it can't be entered by accident.
+allow_yolo = true
 
 [providers.openai]
 base_url = "https://api.openai.com/v1"
@@ -81,10 +100,17 @@ api_key = "sk-your-key-here"
 # api_key = "ollama"
 ```
 
-Each provider is a `[providers.<name>]` section. `default_provider` picks which
-one is active at startup. You can add as many providers as you want.
+| Field | Default | Description |
+|---|---|---|
+| `default_provider` | `"openai"` | Active provider at startup. |
+| `classifier_model` | (chat model) | `provider/model` for the Auto-mode classifier. Must be a **non-reasoning** model (see [Auto mode](#work-modes)). |
+| `allow_yolo` | `false` | Whether `/mode yolo` and `Ctrl+T` can reach YOLO mode. |
 
-Alternatively, set environment variables (they override file values):
+Each provider is a `[providers.<name>]` section. You can add as many as you want.
+
+### Environment variables
+
+Environment variables override file values:
 
 ```sh
 export Programmer_default_provider="openai"
@@ -96,22 +122,100 @@ Any OpenAI-compatible `/v1/responses` endpoint works — local models served
 by Ollama, LM Studio, vLLM, etc. are supported as long as they expose the
 Responses API.
 
+## Work modes
+
+`programmer` has four safety modes that control how tool calls are approved.
+Cycle with `Ctrl+T` or `/mode <name>`.
+
+| Mode | Icon | Behaviour |
+|---|---|---|
+| **Manual** | 🛡 | Every write/edit/command call shows an approval prompt. Read-only tools run automatically. |
+| **Allow Edits** | ✏️ | All tool calls auto-approve — no prompts, no LLM overhead. Default mode. |
+| **Auto** | 🤖 | Write/edit/command calls are classified by a separate LLM each turn. See below. |
+| **YOLO** | ⚡ | Everything runs unchecked. Gated behind `allow_yolo = true` in config. |
+
+### Auto mode classifier
+
+In Auto mode, every **mutating** tool call (`command`, `write_file`, `edit_file`)
+is sent to a classifier LLM before execution. Read-only tools (`read_file`,
+`grep`, `blob`, `ask_user`) always bypass the classifier.
+
+**How it works — two-pass with fast path:**
+
+1. **Fast probe** (`~1 token`): The classifier gets lightweight context
+   (working directory + user request) and is asked: "Should this be
+   auto-approved? yes or no." The `yes`/`no` logprob on the first token
+   decides immediately — no reasoning needed, no extra cost.
+
+2. **Reasoned fallback** (only when needed): If the fast path is uncertain
+   (`no`, ambiguous token, or no logprobs available), the classifier
+   re-evaluates with **full context** — assistant replies, tool outputs, and
+   recent call history — and produces a reasoned `APPROVE` or
+   `DENY: <reason>`.
+
+**User override — per-operation:** The classifier's instructions tell it
+to respect explicit per-operation instructions in the user's message:
+- "I agree to X, don't do Y" → approve X, deny Y.
+- "Go ahead" on a specific previously-denied call → approve it.
+- Vague statements ("be careful") do NOT count as overrides.
+
+**Threat model:** The classifier watches for four categories:
+- **Overreach** — destructive path to an otherwise valid goal.
+- **Honest mistake** — misunderstanding the user's intent.
+- **Prompt injection** — external content manipulating the agent.
+- **Model misalignment** — the agent pursuing unrequested goals.
+
+#### ⚠️ Thinking/reasoning models
+
+The classifier **does not work with reasoning models** (DeepSeek-R1,
+o1, o3, etc.). These models spend their first N tokens on a hidden
+reasoning trace; the yes/no answer token never appears in the first
+content token, so the fast-path logprob probe fails.
+
+**Use a non-reasoning model for the classifier.** Set it explicitly:
+```
+/classifier openai/gpt-4o-mini
+```
+or in config:
+```toml
+classifier_model = "openai/gpt-4o-mini"
+```
+
+If the classifier model turns out to be a thinking model, all Auto-mode
+calls will be denied with a clear error message. Switch it to a
+non-reasoning model to fix.
+
 ## Usage
 
 ```sh
 programmer
 ```
 
-Inside the TUI:
+### Keyboard shortcuts
 
 | Key | Action |
 |---|---|
-| Type + `Enter` | Send message |
+| `Enter` | Send message |
+| `Ctrl+T` | Cycle work mode (Manual → AllowEdits → Auto) |
 | `Ctrl+C` / `Ctrl+Q` | Quit |
 | Mouse scroll | Scroll conversation history |
-| Mouse click | (on clickable areas in the conversation) |
-| `/model <name>` | Switch model |
-| `/providers manage` | Open provider management panel |
+
+### Slash commands
+
+| Command | Action |
+|---|---|
+| `/model <provider/model>` | Switch to a different model |
+| `/mode <manual\|edits\|auto>` | Set work mode (or cycle with `Ctrl+T`) |
+| `/mode yolo` | Enter YOLO mode (requires `allow_yolo = true`) |
+| `/classifier [provider/model]` | Set/show the Auto-mode classifier model |
+| `/classifier clear` | Reset classifier to the chat model |
+| `/new` `/n` | Start a new session (auto-saves current) |
+| `/session` `/s` | Show current session UUID and info |
+| `/providers show` | List all configured providers and models |
+| `/providers manage` | Open the provider management panel |
+| `/clear` `/c` | Clear the conversation history |
+| `/quit` `/q` | Exit the application |
+| `/help` `/?` | Show all commands |
 
 ### Provider management panel
 
@@ -146,15 +250,16 @@ Open with `/providers manage` or the `--providers` flag.
 | `Enter` | Save provider |
 | `Esc` | Cancel |
 
-When the cursor is on the **default_model** field:
-- Press **`Tab`** to open a completion popup showing models that match your input.
-- **`↑↓`** navigate the popup, **`Enter`** accepts the highlighted model,
-  **`Esc`** closes the popup.
-- Typing or pressing backspace refreshes the candidates live.
+### Session management
 
-When you send a message, the model responds. If it decides to use a tool
-(read a file, run a command, etc.), the tool executes automatically in the
-background and the results are fed back to the model to continue.
+Sessions are saved to `~/.config/programmer/sessions/<uuid>.json`.
+
+| Flag / command | Action |
+|---|---|
+| `programmer --resume` | Interactive picker to choose a saved session |
+| `programmer --resume <uuid>` | Resume a specific session |
+| `/new` `/n` | Save current session and start fresh |
+| `/session` `/s` | Show current session UUID |
 
 ## Project structure
 
@@ -163,12 +268,17 @@ src/
 ├── main.rs           # Entry point, terminal setup, config loading
 ├── app.rs            # Application state, event loop, stream management
 ├── config/           # Configuration struct + deserialization
+├── classifier.rs     # Tool-call classifier (Auto mode, fast + reasoned paths)
+├── commands/         # Slash-command parsing + tab completion
+├── session/          # Multi-session persistence (UUID-keyed JSON)
+├── clipboard.rs      # Copy-to-clipboard support
 ├── response/         # Parsing OpenAI response stream events
 ├── tools/            # Tool definitions + execution (command, read_file, etc.)
 └── ui/               # Terminal UI (ratatui)
     ├── components/
     │   ├── conversation_panel/   # Chat history rendering
     │   ├── input_panel/          # User input textarea
+    │   ├── footer/               # Status bar (mode, model, session)
     │   └── messages/             # Individual message bubble renderers
     ├── markdown_code_block.rs    # Code block rendering
     └── markdown_theme.rs         # Markdown colour theme
