@@ -32,7 +32,8 @@ use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
     CreateResponse, FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
     InputContent, InputItem, InputMessage, InputRole, InputTextContent, Item,
-    MessageItem as ApiMessageItem, OutputItem, OutputStatus, ResponseStreamEvent,
+    MessageItem as ApiMessageItem, OutputItem, OutputMessageContent, OutputStatus,
+    ResponseStreamEvent,
 };
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -661,7 +662,7 @@ impl App<'_> {
 
         let sender = self.events.sender.clone();
         let no_lp = self.classifier_no_logprobs.clone();
-        let context = self.build_classifier_context();
+        let (light_context, full_context) = self.build_classifier_context();
 
         tokio::spawn(async move {
             let mut allowed: Vec<FunctionToolCall> = Vec::new();
@@ -682,7 +683,8 @@ impl App<'_> {
                     &model_name,
                     &call.name,
                     &call.arguments,
-                    &context,
+                    &light_context,
+                    &full_context,
                     try_logprobs,
                 )
                 .await;
@@ -710,11 +712,18 @@ impl App<'_> {
     /// Compact context handed to the Auto-mode classifier so it judges tool
     /// calls against the actual task, not in isolation: the working directory,
     /// the user's latest request, and the recent tool calls this turn.
-    fn build_classifier_context(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
+    /// Build two classifier contexts:
+    ///   - light: cwd + user request only (fast yes/no path, ~cheap).
+    ///   - full:  light + assistant replies, tool outputs, call history
+    ///            (reasoned fallback, sent only when re-evaluating).
+    fn build_classifier_context(&self) -> (String, String) {
+        let mut light = Vec::new();
+        let mut full: Vec<String> = Vec::new();
 
         if let Ok(cwd) = std::env::current_dir() {
-            parts.push(format!("Working directory: {}", cwd.display()));
+            let dir = format!("Working directory: {}", cwd.display());
+            light.push(dir.clone());
+            full.push(dir);
         }
 
         let items: Vec<&MessageItem> = self.conversation_panel.items().collect();
@@ -724,13 +733,89 @@ impl App<'_> {
             MessageItem::Input(input) => extract_input_text(input),
             _ => None,
         }) {
-            parts.push(format!(
+            let user = format!(
                 "User's latest request:\n{}",
                 truncate_chars(msg.trim(), 800)
+            );
+            light.push(user.clone());
+            full.push(user);
+        }
+
+        // ---- full context only below this line ----
+
+        // Recent assistant text replies — so the reasoned path knows what the
+        // model has been planning before it asked to run this tool call.
+        let assistant_texts: Vec<String> = items
+            .iter()
+            .rev()
+            .filter_map(|it| match it {
+                MessageItem::Output(OutputItem::Message(msg)) => {
+                    let text: String = msg
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            OutputMessageContent::OutputText(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(truncate_chars(text.trim(), 500))
+                    }
+                }
+                _ => None,
+            })
+            .take(3)
+            .collect();
+        if !assistant_texts.is_empty() {
+            full.push(format!(
+                "Assistant's recent replies:\n{}",
+                assistant_texts
+                    .into_iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(i, t)| format!("[{i}] {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
 
-        // The last few tool calls this turn give the classifier the flow.
+        // Recent tool call outputs — so the reasoned path sees what data the
+        // model has already gathered.
+        let tool_outputs: Vec<String> = items
+            .iter()
+            .rev()
+            .filter_map(|it| match it {
+                MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(fco))) => {
+                    let output_text = match &fco.output {
+                        FunctionCallOutput::Text(t) => t.as_str(),
+                        _ => return None,
+                    };
+                    let name = fco.call_id.as_str();
+                    let truncated = truncate_chars(output_text.trim(), 300);
+                    if truncated.is_empty() {
+                        None
+                    } else {
+                        Some(format!("{name}: {truncated}"))
+                    }
+                }
+                _ => None,
+            })
+            .take(5)
+            .collect();
+        if !tool_outputs.is_empty() {
+            full.push(format!(
+                "Recent tool outputs:\n{}",
+                tool_outputs.into_iter().rev().enumerate()
+                    .map(|(i, t)| format!("[{i}] {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+
+        // The last few tool calls this turn give the reasoned path the flow.
         let mut recent: Vec<String> = items
             .iter()
             .rev()
@@ -742,10 +827,10 @@ impl App<'_> {
             .collect();
         if !recent.is_empty() {
             recent.reverse();
-            parts.push(format!("Recent tool calls this turn: {}", recent.join(", ")));
+            full.push(format!("Recent tool calls this turn: {}", recent.join(", ")));
         }
 
-        parts.join("\n\n")
+        (light.join("\n\n"), full.join("\n\n"))
     }
 
     /// Run `allowed` tool calls in the background, prepend the `denied` outputs,
