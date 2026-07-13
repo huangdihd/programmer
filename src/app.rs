@@ -709,11 +709,6 @@ impl App<'_> {
             && key_event.modifiers == KeyModifiers::CONTROL
         {
             self.work_mode = self.work_mode.next();
-            self.conversation_panel.add_info_string(format!(
-                "{} Work mode: {}",
-                self.work_mode.icon(),
-                self.work_mode.label()
-            ));
             self.persist_config();
             return Ok(());
         }
@@ -1023,11 +1018,6 @@ impl App<'_> {
                 if self.work_mode != prev {
                     self.persist_config();
                 }
-                self.conversation_panel.add_info_string(format!(
-                    "{} Work mode: {}",
-                    self.work_mode.icon(),
-                    self.work_mode.label()
-                ));
             }
             Some(Command::Providers(args)) => {
                 self.input_panel.clear();

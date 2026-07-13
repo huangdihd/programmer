@@ -58,7 +58,15 @@ impl Widget for &mut App<'_> {
             .as_ref()
             .map(|q| q.needed_height())
             .unwrap_or(3);
-        let approval_height: u16 = if self.approval_queue.is_empty() { 3 } else { 8 };
+        let approval_height: u16 = if self.approval_queue.is_empty() {
+            3
+        } else {
+            let detail_count = format_tool_details(
+                &self.approval_queue[0].0.name,
+                &self.approval_queue[0].0.arguments,
+            ).len() as u16;
+            4 + detail_count + 4 // title + reason + details + options
+        };
         let bottom_height = question_height.max(approval_height);
 
         let chunks = Layout::default()
@@ -80,8 +88,7 @@ impl Widget for &mut App<'_> {
             let current = self.approved_calls.len() + 1;
             let total = self.approved_calls.len() + self.approval_queue.len();
             let (call, reason) = &self.approval_queue[0];
-            let args_preview: String =
-                call.arguments.chars().take(70).collect();
+            let detail_lines = format_tool_details(&call.name, &call.arguments);
 
             let labels = ["Approve", "Deny", "Approve all", "Deny all"];
             let sel = self.approval_selected;
@@ -98,7 +105,7 @@ impl Widget for &mut App<'_> {
                 ])
             }).collect();
 
-            let lines = vec![
+            let mut lines: Vec<Line> = vec![
                 Line::from(vec![
                     Span::styled("🛡  ", Style::default().fg(Color::Yellow)),
                     Span::styled(
@@ -109,22 +116,14 @@ impl Widget for &mut App<'_> {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(
-                        format!("{name}: {args}",
-                            name = call.name,
-                            args = args_preview),
-                        Style::default().fg(Color::Gray),
-                    ),
-                ]),
-                Line::from(vec![
                     Span::styled("  reason: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(reason.as_str(), Style::default().fg(Color::Yellow)),
                 ]),
-            ]
-            .into_iter()
-            .chain(option_lines)
-            .collect::<Vec<Line>>();
+            ];
+            for line in &detail_lines {
+                lines.push(Line::from(Span::styled(format!("  {line}"), Style::default().fg(Color::Gray))));
+            }
+            lines.extend(option_lines);
             Paragraph::new(lines)
                 .block(
                     Block::default()
@@ -168,5 +167,72 @@ impl Widget for &mut App<'_> {
                 popup.render(popup_area, buf);
             }
         }
+    }
+}
+
+/// Parse a tool call's JSON arguments into human-readable lines.
+fn format_tool_details(tool_name: &str, arguments: &str) -> Vec<String> {
+    let v: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(_) => return vec![arguments.to_string()],
+    };
+    match tool_name {
+        "command" => {
+            let mut lines = Vec::new();
+            if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                lines.push(format!("command: {cmd}"));
+            }
+            if let Some(dir) = v.get("dir").and_then(|d| d.as_str()) {
+                lines.push(format!("  dir: {dir}"));
+            }
+            if let Some(t) = v.get("timeout") {
+                lines.push(format!("  timeout: {t}s"));
+            }
+            if lines.is_empty() { lines.push(arguments.to_string()); }
+            lines
+        }
+        "write_file" => {
+            let mut lines = Vec::new();
+            if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+                lines.push(format!("path: {path}"));
+            }
+            if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
+                let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n");
+                let tail = if content.lines().count() > 5 { "…" } else { "" };
+                lines.push(format!("content: {preview}{tail} ({len} bytes)", len = content.len()));
+            }
+            if lines.is_empty() { lines.push(arguments.to_string()); }
+            lines
+        }
+        "edit_file" => {
+            let mut lines = Vec::new();
+            if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+                lines.push(format!("path: {path}"));
+            }
+            if let Some(old) = v.get("old_string").and_then(|o| o.as_str()) {
+                let preview: String = old.chars().take(80).collect();
+                lines.push(format!("old: {preview}"));
+            }
+            if let Some(new) = v.get("new_string").and_then(|n| n.as_str()) {
+                let preview: String = new.chars().take(80).collect();
+                lines.push(format!("new: {preview}"));
+            }
+            if lines.is_empty() { lines.push(arguments.to_string()); }
+            lines
+        }
+        "read_file" => {
+            let mut lines = Vec::new();
+            if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+                lines.push(format!("path: {path}"));
+            }
+            if let Some(offset) = v.get("offset") {
+                lines.push(format!("  offset: {offset}"));
+            }
+            if let Some(limit) = v.get("limit") {
+                lines.push(format!("  limit: {limit}"));
+            }
+            lines
+        }
+        _ => vec![arguments.to_string()],
     }
 }
