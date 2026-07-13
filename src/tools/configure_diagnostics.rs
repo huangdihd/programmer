@@ -42,12 +42,18 @@ pub fn tool() -> Tool {
          validated and every checker is test-run once; if anything fails to run \
          the profile is NOT saved and the error is returned so you can fix it. On \
          success it is written to `.programmer/diagnostics.toml`.\n\n\
-         Each checker is a `[[checkers]]` table with: `name`, `command` (a \
-         one-shot shell command — NOT a watch/dev-server), `parser` (one of the \
-         presets `rustc-json`, `tsc`, `gnu`, or the literal `regex`), optional \
+         Each checker is a `[[checkers]]` table with: `name`; optional `kind` \
+         (`command`, the default, or `lsp`); `command`; `parser` (one of the \
+         presets `rustc-json`, `tsc`, `gnu`, or the literal `regex`); optional \
          `pattern` (required when parser is `regex`; a regex with named groups \
-         `file`, `line`, `col`, `severity`, `code`, `message`), and optional \
-         `run_on` (file globs whose edits trigger this checker; empty = always).",
+         `file`, `line`, `col`, `severity`, `code`, `message`); and optional \
+         `run_on` (file globs whose edits trigger this checker; empty = always).\n\n\
+         For `kind = \"command\"` (default): `command` is a one-shot shell \
+         command — NOT a watch/dev-server — and `parser` handles its output. \
+         For `kind = \"lsp\"`: `command` launches a language server over stdio \
+         (e.g. `rust-analyzer`, `clangd`, `typescript-language-server --stdio`); \
+         `parser` is ignored. LSP is more accurate but re-initializes each run, \
+         so it is slower — prefer a command checker unless the project needs it.",
         json!({
             "profile_toml": {
                 "type": "string",

@@ -86,6 +86,9 @@ pub struct App<'a> {
     /// Count of turns that edited files, driving the periodic reminder to keep
     /// `PROGRAMMER.md` up to date.
     mutating_turns: usize,
+    /// Whether the project's diagnostics profile declares an LSP checker, so the
+    /// footer shows the LSP block from startup (before any server has started).
+    pub(crate) lsp_configured: bool,
     /// True while the stream task is backing off between connection retries, so
     /// the status bar can show "Retrying" instead of "Connecting".
     pub(crate) stream_retrying: Arc<AtomicBool>,
@@ -178,6 +181,7 @@ impl App<'_> {
             )),
             diagnostics_baseline: None,
             mutating_turns: 0,
+            lsp_configured: lsp_checker_configured(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
             session_uuid,
             session_mgr,
@@ -201,6 +205,8 @@ impl App<'_> {
             Ok(())
         }
         .await;
+        // Tear down any warm LSP servers started during the session.
+        crate::diagnostics::shutdown_lsp().await;
         let uuid = self.session_uuid.clone();
         (result, uuid)
     }
@@ -277,6 +283,9 @@ impl App<'_> {
                         return Ok(());
                     }
                     self.conversation_panel.phase = ActivePhase::None;
+                    // A tool (e.g. /init, configure_diagnostics) may have written
+                    // the profile — refresh whether LSP is configured.
+                    self.lsp_configured = lsp_checker_configured();
                     // Did this batch edit any files? (Checked before the outputs
                     // are consumed, using the call_id → tool-name map.)
                     let edited_files = self.batch_edited_files(&outputs);
@@ -300,9 +309,18 @@ impl App<'_> {
                 AppEvent::DiagnosticsCompleted {
                     snapshot,
                     reminder_due,
+                    seed,
                     cancel_token,
                 } => {
                     if cancel_token.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    if seed {
+                        // Background baseline seed: just record it. Don't touch
+                        // the phase, inject anything, or continue a turn.
+                        if self.diagnostics_baseline.is_none() {
+                            self.diagnostics_baseline = Some(snapshot.diagnostics);
+                        }
                         return Ok(());
                     }
                     self.conversation_panel.phase = ActivePhase::None;
@@ -548,6 +566,9 @@ impl App<'_> {
         self.conversation_panel
             .add_input_message(ApiMessageItem::Input(input_message));
         self.conversation_panel.reset_accumulated_usage();
+        // Kick off a baseline diagnostics run (once per session) so the first
+        // edit can be diffed against the project's pre-edit state.
+        self.maybe_seed_diagnostics_baseline();
         self.save_session();
         self.spawn_stream();
     }
@@ -1011,7 +1032,33 @@ impl App<'_> {
             let _ = sender.send(Event::App(AppEvent::DiagnosticsCompleted {
                 snapshot,
                 reminder_due,
+                seed: false,
                 cancel_token,
+            }));
+        });
+    }
+
+    /// On the first turn of a session with a diagnostics profile, run the
+    /// checkers once in the background to establish a baseline — so the *first*
+    /// edit already has a "before" state to diff against, instead of silently
+    /// becoming the baseline itself. No-op once a baseline exists.
+    fn maybe_seed_diagnostics_baseline(&mut self) {
+        if self.diagnostics_baseline.is_some() {
+            return;
+        }
+        if !std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
+            return;
+        }
+        let sender = self.events.sender.clone();
+        tokio::spawn(async move {
+            let cwd = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
+            let snapshot = crate::diagnostics::collect(&cwd).await.unwrap_or_default();
+            let _ = sender.send(Event::App(AppEvent::DiagnosticsCompleted {
+                snapshot,
+                reminder_due: false,
+                seed: true,
+                cancel_token: Arc::new(AtomicBool::new(false)),
             }));
         });
     }
@@ -1753,6 +1800,21 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// How many file-editing turns pass between reminders to refresh PROGRAMMER.md.
 const OVERVIEW_REMINDER_EVERY: usize = 5;
 
+/// Whether the project's diagnostics profile declares at least one LSP checker.
+/// Cheap enough to call when the profile may have changed (startup, after a
+/// tool batch), but not every render frame.
+fn lsp_checker_configured() -> bool {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
+    matches!(
+        crate::diagnostics::DiagnosticsProfile::load(&cwd),
+        Some(Ok(profile))
+            if profile
+                .checkers
+                .iter()
+                .any(|c| c.kind == crate::diagnostics::CheckerKind::Lsp)
+    )
+}
+
 /// The hidden developer message nudging the agent to keep PROGRAMMER.md current.
 fn overview_reminder() -> String {
     "Reminder: several edits have accumulated since PROGRAMMER.md was last \
@@ -1797,9 +1859,13 @@ fn init_prompt() -> String {
      `tsc --noEmit` with parser `tsc`; C/C++/others that print \
      `file:line:col: severity: message` → parser `gnu`; anything else → parser \
      `regex` with a `pattern` you write. Prefer commands that terminate (NOT \
-     watch/dev-servers). The tool test-runs each checker and refuses to save a \
-     profile that doesn't work, so iterate until it saves. If you genuinely can't \
-     find a suitable checker, note that in PROGRAMMER.md and skip this step.\n\
+     watch/dev-servers). A language server may be used instead via \
+     `kind = \"lsp\"` with `command` set to its launch line (e.g. `clangd`), but \
+     it re-initializes each run and is slower, so favour a command checker unless \
+     there's a clear reason. The tool test-runs each checker and refuses to save \
+     a profile that doesn't work, so iterate until it saves. If you genuinely \
+     can't find a suitable checker, note that in PROGRAMMER.md and skip this \
+     step.\n\
      \n\
      When done, briefly summarize what you set up."
         .to_string()

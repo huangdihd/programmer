@@ -71,6 +71,7 @@ impl Widget for &mut App<'_> {
         self.footer.status.set(self.resolve_status());
         self.footer.work_mode = self.work_mode;
         self.footer.current_model = self.current_model.clone();
+        self.footer.lsp_configured = self.lsp_configured;
 
         // When the model is asking a question or waiting for approval,
         // the bottom area grows; the conversation panel shrinks.

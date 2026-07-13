@@ -40,11 +40,12 @@ pub struct DiagnosticsProfile {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckerKind {
-    /// Run a shell command and parse its output (the only backend in P1).
+    /// Run a shell command and parse its output.
     #[default]
     Command,
-    /// Talk to a language server. Parsed and stored, but running one is a later
-    /// phase — [`super::run_checker`] reports it as unsupported for now.
+    /// Drive a language server (one-shot): initialize, open the `run_on` files,
+    /// and collect `publishDiagnostics`. `command` is the server launch line
+    /// (e.g. `rust-analyzer`, `clangd`, `typescript-language-server --stdio`).
     Lsp,
 }
 

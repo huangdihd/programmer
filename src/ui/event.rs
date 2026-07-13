@@ -75,6 +75,10 @@ pub enum AppEvent {
     DiagnosticsCompleted {
         snapshot: crate::diagnostics::Snapshot,
         reminder_due: bool,
+        /// A background baseline seed (session start) rather than a post-edit
+        /// run: record the snapshot as the baseline without injecting feedback
+        /// or continuing a turn.
+        seed: bool,
         cancel_token: Arc<AtomicBool>,
     },
     /// Cancel the current in-flight request (streaming or tool calls).

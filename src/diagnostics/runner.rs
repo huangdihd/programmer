@@ -32,10 +32,7 @@ use super::{parse_output, Checker, CheckerKind, Diagnostic};
 /// non-empty list.
 pub async fn run_checker(checker: &Checker, cwd: &Path) -> Result<Vec<Diagnostic>, String> {
     if checker.kind == CheckerKind::Lsp {
-        return Err(format!(
-            "checker '{}': the LSP backend isn't wired up yet",
-            checker.name
-        ));
+        return super::lsp::collect_lsp(checker, cwd).await;
     }
 
     // Resolve the parser before spawning so a broken profile fails fast without
@@ -100,10 +97,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lsp_backend_is_reported_unsupported() {
-        let mut checker = command_checker("noop", "gnu");
+    async fn lsp_checker_that_isnt_a_server_errors() {
+        // `true` exits immediately with no LSP handshake, so the initialize
+        // response never arrives and the backend reports a run failure rather
+        // than pretending the project is clean.
+        let mut checker = command_checker("true", "gnu");
         checker.kind = CheckerKind::Lsp;
         let err = run_checker(&checker, Path::new(".")).await.unwrap_err();
-        assert!(err.contains("LSP"));
+        assert!(err.contains("initialize"), "got: {err}");
     }
 }

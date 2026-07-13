@@ -74,12 +74,21 @@ impl Classifier for ManualClassifier {
     }
 }
 
-/// Auto-allow edits: write/edit/command are silently approved.
+/// Auto-allow edits: write/edit tools are silently approved, but commands
+/// and other dangerous tools still require user approval.
 pub struct AllowEditsClassifier;
 
 impl Classifier for AllowEditsClassifier {
-    fn classify(&self, _tool_name: &str, _arguments: &str) -> Verdict {
-        Verdict::Allow
+    fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
+        // In Allow Edits mode, only commands and configure_diagnostics
+        // (which runs arbitrary checkers) require approval.
+        if tool_name == "command" || tool_name == "configure_diagnostics" {
+            Verdict::Ask {
+                reason: format!("{tool_name} requires approval in Allow Edits mode"),
+            }
+        } else {
+            Verdict::Allow
+        }
     }
 }
 
@@ -102,7 +111,7 @@ impl Classifier for YoloClassifier {
 pub enum WorkMode {
     /// Every write/edit/command tool call requires user approval.
     Manual,
-    /// Write/edit/command are auto-allowed.
+    /// Write/edit tools are auto-allowed; commands still require approval.
     #[default]
     #[serde(alias = "edits")]
     AllowEdits,
@@ -516,9 +525,16 @@ mod tests {
     }
 
     #[test]
-    fn allow_edits_allows_all() {
-        assert!(matches!(classify(WorkMode::AllowEdits, "command"), Verdict::Allow));
+    fn allow_edits_allows_edits_but_not_commands() {
+        // Commands still require approval.
+        assert!(matches!(classify(WorkMode::AllowEdits, "command"), Verdict::Ask { .. }));
+        assert!(matches!(
+            classify(WorkMode::AllowEdits, "configure_diagnostics"),
+            Verdict::Ask { .. }
+        ));
+        // Edit and read tools are auto-approved.
         assert!(matches!(classify(WorkMode::AllowEdits, "write_file"), Verdict::Allow));
+        assert!(matches!(classify(WorkMode::AllowEdits, "edit_file"), Verdict::Allow));
         assert!(matches!(classify(WorkMode::AllowEdits, "read_file"), Verdict::Allow));
     }
 

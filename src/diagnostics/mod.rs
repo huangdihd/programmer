@@ -22,10 +22,12 @@
 //! and which it *resolved* after an edit. Nothing here talks to the model or
 //! the UI; it is pure, testable logic that later phases wire into the app.
 
+mod lsp;
 mod parse;
 mod profile;
 mod runner;
 
+pub use lsp::{shutdown_all as shutdown_lsp, status as lsp_status, LspStatus};
 pub use parse::{parse_output, Parser};
 pub use profile::{Checker, CheckerKind, DiagnosticsProfile, PROFILE_PATH};
 pub use runner::run_checker;
@@ -193,9 +195,7 @@ pub async fn collect(cwd: &Path) -> Option<Snapshot> {
     let mut diagnostics = Vec::new();
     let mut errors = Vec::new();
     for checker in &profile.checkers {
-        if checker.kind == CheckerKind::Lsp {
-            continue; // handled by the LSP backend in a later phase
-        }
+        // `run_checker` dispatches to the command or LSP backend by kind.
         match run_checker(checker, cwd).await {
             Ok(mut ds) => diagnostics.append(&mut ds),
             Err(e) => errors.push(e),
