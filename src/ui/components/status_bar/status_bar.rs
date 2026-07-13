@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::time::Instant;
+
 /// What the agent is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusState {
@@ -35,12 +37,15 @@ pub enum StatusState {
 #[derive(Debug)]
 pub struct StatusBar {
     pub status: StatusState,
+    /// When the current busy phase began.
+    busy_start: Option<Instant>,
 }
 
 impl StatusBar {
     pub fn new() -> Self {
         Self {
             status: StatusState::Idle,
+            busy_start: None,
         }
     }
 
@@ -51,7 +56,7 @@ impl StatusBar {
         is_creating_tool_call: bool,
         is_tool_running: bool,
     ) {
-        self.status = if is_tool_running {
+        let new_state = if is_tool_running {
             StatusState::ToolRunning
         } else if is_creating_tool_call {
             StatusState::CreatingToolCall
@@ -62,5 +67,18 @@ impl StatusBar {
         } else {
             StatusState::Idle
         };
+
+        if new_state != self.status {
+            self.status = new_state;
+            self.busy_start = if matches!(new_state, StatusState::Thinking | StatusState::Outputting | StatusState::CreatingToolCall | StatusState::ToolRunning) {
+                Some(Instant::now())
+            } else {
+                None
+            };
+        }
+    }
+
+    pub fn elapsed(&self) -> Option<std::time::Duration> {
+        self.busy_start.map(|start| start.elapsed())
     }
 }

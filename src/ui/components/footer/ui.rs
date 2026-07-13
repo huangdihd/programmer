@@ -35,17 +35,14 @@ impl Widget for &Footer {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Min(1),   // status
-                Constraint::Length(mode_len), // work mode
+                Constraint::Length(mode_len), // work mode (leftmost)
+                Constraint::Min(1),           // status
                 Constraint::Length(if model_len > 0 { model_len + 2 } else { 0 }), // model
-                Constraint::Length(28), // "GPL-3.0-or-later · © 2026"
+                Constraint::Length(28),       // "GPL-3.0-or-later · © 2026"
             ])
             .split(area);
 
-        // Left: status indicator
-        (&self.status).render(chunks[0], buf);
-
-        // Work mode pill
+        // Far left: work mode pill
         let mode_style = match self.work_mode {
             WorkMode::Manual => Style::default().fg(Color::LightRed),
             WorkMode::AllowEdits => Style::default().fg(Color::LightGreen),
@@ -53,9 +50,12 @@ impl Widget for &Footer {
         };
         ratatui::widgets::Paragraph::new(mode_text)
             .style(mode_style)
-            .render(chunks[1], buf);
+            .render(chunks[0], buf);
 
-        // Middle: current model name
+        // Status indicator
+        (&self.status).render(chunks[1], buf);
+
+        // Model name
         if !self.current_model.is_empty() {
             ratatui::widgets::Paragraph::new(format!(" {} ", self.current_model))
                 .style(Style::default().fg(ACCENT))

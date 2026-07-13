@@ -36,8 +36,26 @@ impl Widget for &StatusBar {
             StatusState::WaitingApproval => ("🛡", "Waiting for approval", WARN),
         };
 
-        // Build the status text: just icon + label.
-        let text = format!(" {} {} ", icon, label);
+        let busy = matches!(
+            self.status,
+            StatusState::Thinking
+                | StatusState::Outputting
+                | StatusState::CreatingToolCall
+                | StatusState::ToolRunning
+        );
+        let mut text = format!(" {} {} ", icon, label);
+        if busy {
+            if let Some(dur) = self.elapsed() {
+                let secs = dur.as_secs_f64();
+                if secs < 60.0 {
+                    text.push_str(&format!("({:.1}s)", secs));
+                } else {
+                    let m = (secs / 60.0) as u64;
+                    let s = secs % 60.0;
+                    text.push_str(&format!("({}m {:.0}s)", m, s));
+                }
+            }
+        }
 
         ratatui::widgets::Paragraph::new(text)
             .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
