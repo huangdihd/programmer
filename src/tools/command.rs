@@ -37,7 +37,7 @@ pub fn tool() -> Tool {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Optional timeout in seconds. If the command runs longer, it will be killed. Default: no timeout."
+                "description": "Optional timeout in seconds. If the command runs longer, it will be killed. Default: 120."
             },
             "dir": {
                 "type": "string",
@@ -57,15 +57,24 @@ struct Args {
     dir: Option<String>,
 }
 
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(error) => return format!("error: invalid arguments: {error}"),
+        Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
-    match execute(&args.command, args.dir.as_deref(), args.timeout).await {
-        Ok((code, stdout, stderr)) => format_output(code, &stdout, &stderr),
-        Err(error) => format!("error: failed to run command: {error}"),
+    match execute(&args.command, args.dir.as_deref(), Some(args.timeout.unwrap_or(120))).await {
+        Ok((code, stdout, stderr)) => {
+            // The exit code is the authoritative success signal — a non-zero
+            // status means the command failed, regardless of what it printed.
+            let output = format_output(code, &stdout, &stderr);
+            if code.unwrap_or(-1) != 0 {
+                Err(output)
+            } else {
+                Ok(output)
+            }
+        }
+        Err(error) => Err(format!("error: failed to run command: {error}")),
     }
 }
 
@@ -133,23 +142,29 @@ async fn execute(
 }
 
 fn format_output(code: Option<i32>, stdout: &str, stderr: &str) -> String {
+    let failed = code.unwrap_or(-1) != 0;
     // CLIs often force colour and draw progress bars even when their output is
     // a pipe; clean the terminal control noise so the conversation and the
     // tokens sent to the model stay readable.
     let stdout = clean_terminal_output(stdout);
     let stderr = clean_terminal_output(stderr);
-    let mut result = String::new();
+    let mut body = String::new();
     if !stdout.is_empty() {
-        result.push_str(&stdout);
+        body.push_str(&stdout);
     }
     if !stderr.is_empty() {
-        push_line_break(&mut result);
-        result.push_str(&stderr);
+        push_line_break(&mut body);
+        body.push_str(&stderr);
     }
-    if code.unwrap_or(-1) != 0 {
-        push_line_break(&mut result);
-        result.push_str(&format!("[exit code: {}]", code.unwrap_or(-1)));
+    if failed {
+        push_line_break(&mut body);
+        body.push_str(&format!("[exit code: {}]", code.unwrap_or(-1)));
     }
+    let mut result = String::new();
+    if failed {
+        result.push_str("error: ");
+    }
+    result.push_str(&body);
     if result.is_empty() {
         result.push_str("[no output]");
     }
@@ -179,113 +194,137 @@ mod clean_tests {
     }
 
     #[test]
-    fn collapses_progress_bar_redraws() {
-        // A carriage-return progress bar keeps rewriting the same line.
-        let input = "Parsing  0%\rParsing 40%\rParsing 100%";
-        assert_eq!(clean_terminal_output(input), "Parsing 100%");
+    fn carriage_return_collapses_overwrites() {
+        let input = "downloading\u{1b}[K\r\u{1b}[2Kdone";
+        assert_eq!(clean_terminal_output(input), "done");
     }
 
     #[test]
-    fn ansi_progress_bar_reduces_to_final_frame() {
-        // ESC[K (erase) + CR redraw, as emitted by many CLIs.
-        let input =
-            "\u{1b}[K\rload \u{1b}[32m10%\u{1b}[0m\u{1b}[K\rload \u{1b}[32m100%\u{1b}[0m";
-        assert_eq!(clean_terminal_output(input), "load 100%");
+    fn osc_hyperlink_is_removed() {
+        let input = "\u{1b}]8;;https://eg.com\u{1b}\\link\u{1b}]8;;\u{1b}\\";
+        assert_eq!(clean_terminal_output(input), "link");
     }
 
     #[test]
-    fn plain_text_is_unchanged() {
-        let input = "line one\nline two\n";
-        assert_eq!(clean_terminal_output(input), "line one\nline two\n");
+    fn alternat_screen_buffer_clear_survive() {
+        let input = "before\u{1b}[?1049h\u{1b}[2J\u{1b}[?1049lafter";
+        assert_eq!(clean_terminal_output(input), "beforeafter");
     }
 }
 
-/// Strip terminal control noise from captured command output: ANSI escape
-/// sequences (colours, cursor moves, line erases) and carriage-return redraws
-/// (progress bars). The result is the plain text a human would ultimately see.
+/// Strip ANSI escape sequences (CSI, OSC, ESC) and apply carriage-return
+/// overwrite semantics so progress bars collapse to their final frame. The
+/// model sees clean text and we don't burn tokens on terminal control noise.
 fn clean_terminal_output(input: &str) -> String {
-    let stripped = strip_ansi(input);
-    let mut out = String::with_capacity(stripped.len());
-    for (i, line) in stripped.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        if line.contains('\r') {
-            out.push_str(&apply_carriage_returns(line));
-        } else {
-            out.push_str(line);
-        }
+    // Fast path: most output has no escapes or carriage returns.
+    if !input.contains('\u{1b}') && !input.contains('\r') {
+        return input.to_string();
     }
-    out
-}
 
-/// Remove ANSI escape sequences: CSI (`ESC [ … final`), OSC (`ESC ] … BEL/ST`),
-/// and other two-byte `ESC x` sequences.
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek() {
-            Some('[') => {
-                chars.next();
-                // CSI: consume params/intermediates up to a final byte @–~.
-                while let Some(&nc) = chars.peek() {
-                    chars.next();
-                    if ('\u{40}'..='\u{7e}').contains(&nc) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                chars.next();
-                // OSC: consume until BEL or ST (ESC \).
-                while let Some(&nc) = chars.peek() {
-                    if nc == '\u{07}' {
-                        chars.next();
-                        break;
-                    }
-                    if nc == '\u{1b}' {
-                        chars.next();
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                        }
-                        break;
-                    }
-                    chars.next();
-                }
-            }
-            // A lone ESC or a short sequence (charset selection, etc.): drop the
-            // ESC and its single following byte.
-            Some(_) => {
-                chars.next();
-            }
-            None => {}
-        }
-    }
-    out
-}
-
-/// Apply carriage-return semantics within a single line: `\r` moves the write
-/// cursor back to column 0, so later text overwrites earlier text. Collapses a
-/// progress bar's many redraws down to its final frame.
-fn apply_carriage_returns(line: &str) -> String {
+    // Process the input in terminal order: ANSI escape sequences (especially
+    // CSI erase-in-line) and carriage returns are applied line by line against
+    // a virtual buffer, so the final result matches what a real terminal would
+    // display.
+    let mut lines: Vec<String> = Vec::new();
     let mut buf: Vec<char> = Vec::new();
     let mut pos = 0usize;
-    for c in line.chars() {
-        if c == '\r' {
-            pos = 0;
-        } else {
-            if pos < buf.len() {
-                buf[pos] = c;
-            } else {
-                buf.push(c);
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => {
+                lines.push(buf.iter().collect());
+                buf.clear();
+                pos = 0;
             }
-            pos += 1;
+            '\r' => {
+                pos = 0;
+            }
+            '\u{1b}' => match chars.peek().copied() {
+                Some('[') => {
+                    chars.next(); // consume '['
+                    // Collect CSI parameter bytes (digits, semicolons, '?', etc.)
+                    let mut params = String::new();
+                    let final_byte = loop {
+                        match chars.next() {
+                            Some(b) if ('\u{40}'..='\u{7e}').contains(&b) => break b,
+                            Some(b) => {
+                                params.push(b);
+                            }
+                            None => {
+                                // Truncated escape at end of input.
+                                lines.push(buf.iter().collect());
+                                return lines.join("\n");
+                            }
+                        }
+                    };
+                    match final_byte {
+                        'K' => {
+                            // Erase-in-line.
+                            match params.as_str() {
+                                "0" | "" => {
+                                    // Clear from cursor to end.
+                                    buf.truncate(pos);
+                                }
+                                "1" => {
+                                    // Clear from beginning to cursor.
+                                    let keep = buf.len().saturating_sub(pos);
+                                    buf.drain(..pos);
+                                    pos = 0;
+                                    let _ = keep;
+                                }
+                                "2" => {
+                                    // Clear entire line.
+                                    buf.clear();
+                                    pos = 0;
+                                }
+                                _ => {} // unknown, ignore
+                            }
+                        }
+                        'J' => {
+                            // Erase-in-display — ignore for line-based cleanup.
+                        }
+                        _ => {
+                            // Other CSI (colours, cursor movement, etc.) — ignore.
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next(); // consume ']'
+                    // OSC: consume until BEL or ST (ESC \).
+                    loop {
+                        match chars.next() {
+                            Some('\u{07}') => break,
+                            Some('\u{1b}') => {
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
+                                break;
+                            }
+                            None => break,
+                            _ => {}
+                        }
+                    }
+                }
+                Some(_) => {
+                    // Lone ESC + single byte (charset selection, etc.) — drop both.
+                    chars.next();
+                }
+                None => {}
+            },
+            _ => {
+                // Normal character: write at current position.
+                if pos < buf.len() {
+                    buf[pos] = c;
+                } else {
+                    buf.push(c);
+                }
+                pos += 1;
+            }
         }
     }
-    buf.into_iter().collect()
+    // Flush the last line.
+    lines.push(buf.iter().collect());
+
+    lines.join("\n")
 }

@@ -22,22 +22,23 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 impl QuestionPanel {
-    /// The number of rows this panel needs (excluding borders).
+    /// The number of rows this panel needs (including the top border).
     pub fn needed_height(&self) -> u16 {
         let question_lines = (self.question.text.len() as u16 / 40 + 1).max(1);
-        match &self.question.kind {
+        let content = match &self.question.kind {
             QuestionKind::Choice { options, .. } => {
-                // question + options + hint
                 (question_lines + options.len() as u16 + 1).max(3)
             }
             QuestionKind::Text { .. } => {
                 // question + input + hint
                 (question_lines + 2).max(3)
             }
-        }
+        };
+        content + 1 // top border
     }
 
     /// Render the question panel into the given area (bottom of screen).
+    /// TextArea::render handles cursor positioning via the buffer.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::TOP)
@@ -56,19 +57,17 @@ impl QuestionPanel {
                     ])
                     .split(inner);
 
-                // Question text.
                 Paragraph::new(self.question.text.as_str())
                     .style(Style::default().fg(Color::White).bold())
                     .wrap(Wrap { trim: true })
                     .render(chunks[0], buf);
 
-                // Options.
                 let lines: Vec<Line> = options
                     .iter()
                     .enumerate()
                     .map(|(i, opt)| {
                         let is_sel = i == *selected;
-                        let marker = if is_sel { "❯" } else { " " };
+                        let marker = if is_sel { "\u{2771}" } else { " " };
                         let style = if is_sel {
                             Style::default()
                                 .fg(Color::Black)
@@ -85,16 +84,18 @@ impl QuestionPanel {
                     .collect();
                 Paragraph::new(lines).render(chunks[1], buf);
 
-                // Hint.
                 let hint = Line::from(vec![
-                    Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
+                    Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-                    Span::styled(" confirm", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" confirm  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+                    Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
                 ]);
                 Paragraph::new(hint).render(chunks[2], buf);
             }
-            (QuestionKind::Choice { .. }, Mode::Text { input }) => {
+            (QuestionKind::Choice { .. }, Mode::Text { textarea })
+            | (QuestionKind::Text { .. }, Mode::Text { textarea }) => {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -109,46 +110,13 @@ impl QuestionPanel {
                     .wrap(Wrap { trim: true })
                     .render(chunks[0], buf);
 
-                let input_line = Line::from(vec![
-                    Span::styled("  ❯ ", Style::default().fg(Color::Cyan)),
-                    Span::styled(input.clone(), Style::default().fg(Color::White)),
-                    Span::styled("▏", Style::default().fg(Color::Cyan)),
-                ]);
-                Paragraph::new(input_line).render(chunks[1], buf);
+                textarea.render(chunks[1], buf);
 
                 let hint = Line::from(vec![
                     Span::styled("Enter", Style::default().fg(Color::Green).bold()),
                     Span::styled(" submit  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" back", Style::default().fg(Color::DarkGray)),
-                ]);
-                Paragraph::new(hint).render(chunks[2], buf);
-            }
-            (QuestionKind::Text { .. }, Mode::Text { input }) => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(1),
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                    ])
-                    .split(inner);
-
-                Paragraph::new(self.question.text.as_str())
-                    .style(Style::default().fg(Color::White).bold())
-                    .wrap(Wrap { trim: true })
-                    .render(chunks[0], buf);
-
-                let input_line = Line::from(vec![
-                    Span::styled("  ❯ ", Style::default().fg(Color::Cyan)),
-                    Span::styled(input.clone(), Style::default().fg(Color::White)),
-                    Span::styled("▏", Style::default().fg(Color::Cyan)),
-                ]);
-                Paragraph::new(input_line).render(chunks[1], buf);
-
-                let hint = Line::from(vec![
-                    Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-                    Span::styled(" submit", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
                 ]);
                 Paragraph::new(hint).render(chunks[2], buf);
             }

@@ -118,7 +118,7 @@ fn is_foldable(item: &MessageItem) -> bool {
         item,
         MessageItem::Output(OutputItem::Reasoning(_))
             | MessageItem::Output(OutputItem::FunctionCall(_))
-            | MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(_)))
+            | MessageItem::ToolOutput { .. }
     )
 }
 
@@ -570,12 +570,16 @@ impl ConversationPanel {
             )
     }
 
-    /// Appends a tool result as a `function_call_output` input item so it is both
-    /// rendered and sent back to the model on the next request.
-    pub fn add_tool_output(&mut self, output: FunctionCallOutputItemParam) {
-        self.items.push(MessageItem::Input(InputItem::Item(
-            Item::FunctionCallOutput(output),
-        )));
+    /// Appends a tool result so it is both rendered and sent back to the model
+    /// on the next request. The `failed` flag is authoritative (reported by the
+    /// tool via [`crate::tools::run_tool_call`]), stored alongside the output so
+    /// renderers and the classifier never re-parse the text for an `error:`
+    /// prefix.
+    pub fn add_tool_output(&mut self, output: crate::tools::ToolOutput) {
+        self.items.push(MessageItem::ToolOutput {
+            output: output.param,
+            failed: output.failed,
+        });
     }
 
     /// Append text to the stored output of the tool call identified by
@@ -587,7 +591,7 @@ impl ConversationPanel {
     /// affected cache entry is dropped to force a re-render.
     pub fn append_to_tool_output(&mut self, call_id: &str, extra: &str) -> bool {
         for item in self.items.iter_mut() {
-            if let MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) = item {
+            if let MessageItem::ToolOutput { output, .. } = item {
                 if output.call_id == call_id {
                     match &mut output.output {
                         FunctionCallOutput::Text(text) => text.push_str(extra),
@@ -796,7 +800,7 @@ impl ConversationPanel {
         // Recorded function_call_output items, keyed by call id.
         let mut recorded_outputs: HashMap<&str, &FunctionCallOutputItemParam> = HashMap::new();
         for item in &self.items {
-            if let MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) = item {
+            if let MessageItem::ToolOutput { output, .. } = item {
                 recorded_outputs.entry(output.call_id.as_str()).or_insert(output);
             }
         }
@@ -813,7 +817,7 @@ impl ConversationPanel {
             match message_item {
                 // A stored output marks the boundary after an assistant block:
                 // flush that block's outputs here, in call order.
-                MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(_))) => {
+                MessageItem::ToolOutput { .. } => {
                     input_items.append(&mut pending_outputs);
                 }
                 MessageItem::Input(input_item) => {
@@ -930,11 +934,14 @@ mod tests {
                 status: None,
             })
         };
-        let output = |call_id: &str| FunctionCallOutputItemParam {
-            call_id: call_id.into(),
-            output: FunctionCallOutput::Text("ok".into()),
-            id: None,
-            status: None,
+        let output = |call_id: &str| crate::tools::ToolOutput {
+            param: FunctionCallOutputItemParam {
+                call_id: call_id.into(),
+                output: FunctionCallOutput::Text("ok".into()),
+                id: None,
+                status: None,
+            },
+            failed: false,
         };
         let assistant_text = |text: &str| {
             OutputItem::Message(OutputMessage {
@@ -1007,11 +1014,14 @@ mod tests {
                 status: None,
             })
         };
-        let output = |call_id: &str| FunctionCallOutputItemParam {
-            call_id: call_id.into(),
-            output: FunctionCallOutput::Text("ok".into()),
-            id: None,
-            status: None,
+        let output = |call_id: &str| crate::tools::ToolOutput {
+            param: FunctionCallOutputItemParam {
+                call_id: call_id.into(),
+                output: FunctionCallOutput::Text("ok".into()),
+                id: None,
+                status: None,
+            },
+            failed: false,
         };
 
         let mut panel = ConversationPanel::new();

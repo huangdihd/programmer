@@ -42,12 +42,12 @@ pub fn tool() -> Tool {
     )
 }
 
-pub async fn run(_arguments: &str) -> String {
+pub async fn run(_arguments: &str) -> Result<String, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-    match diagnostics::collect(&cwd).await {
+    Ok(match diagnostics::collect(&cwd).await {
         Some(snapshot) => snapshot.render(),
         None => "No diagnostics profile is configured. Run /init or call \
                  configure_diagnostics to set one up."
             .to_string(),
-    }
+    })
 }

@@ -22,22 +22,14 @@ use ratatui::text::{Line, Span, Text};
 use crate::ui::components::messages::assistant::detail_style;
 use crate::ui::markdown_theme::palette;
 
-/// Whether a tool output indicates failure (starts with "error:").
-pub fn is_failure(output_text: &str) -> bool {
-    output_text.trim_start().to_ascii_lowercase().starts_with("error:")
-}
-
 /// Renders a tool call the model made, together with its result once it has
 /// one. Collapsed it is the tool name plus a one-line summary, with the first
-/// line of the result below (`⎿ …`); expanded it shows each argument and the
-/// full result. A caret hints that the block can be clicked to toggle.
-/// 
-/// Successful calls render in green; failed calls (output starts with
-/// "error:") render in red.
+/// line of the result below; expanded it shows each argument and the
+/// full result. Successful calls render in green; failed calls render in red.
 pub struct ToolCallMessage<'a> {
     call: &'a FunctionToolCall,
-    /// The matching `function_call_output`, once the tool has finished.
     output: Option<&'a FunctionCallOutputItemParam>,
+    failed: bool,
     expanded: bool,
 }
 
@@ -46,6 +38,7 @@ impl<'a> ToolCallMessage<'a> {
         Self {
             call,
             output: None,
+            failed: false,
             expanded: false,
         }
     }
@@ -55,33 +48,35 @@ impl<'a> ToolCallMessage<'a> {
         self
     }
 
+    pub fn failed(mut self, failed: bool) -> Self {
+        self.failed = failed;
+        self
+    }
+
     pub fn expanded(mut self, expanded: bool) -> Self {
         self.expanded = expanded;
         self
     }
 
     pub fn into_text(self) -> Text<'static> {
-        let result_text = self.output.map(|output| match &output.output {
-            FunctionCallOutput::Text(text) => text.clone(),
+        let result_text = self.output.map(|o| match &o.output {
+            FunctionCallOutput::Text(t) => t.clone(),
             FunctionCallOutput::Content(_) => "[non-text output]".to_string(),
         });
-        let failed = result_text.as_deref().map(is_failure).unwrap_or(false);
+        let failed = self.failed;
 
         let status_color = if failed { palette::RED } else { palette::GREEN };
-        let status_char = if failed { "✗" } else { "✓" };
+        let status_char = if failed { "\u{2717}" } else { "\u{2713}" };
         let accent = Style::new()
             .fg(status_color)
             .add_modifier(Modifier::BOLD);
         let muted = Style::new().fg(palette::MUTED);
-
         let value = serde_json::from_str::<serde_json::Value>(&self.call.arguments).ok();
 
         if !self.expanded {
-            // Collapsed: the tool name plus a one-line summary, then the first
-            // line of the result.
             let mut spans = vec![
-                Span::styled("▸ ", muted),
-                Span::styled(format!("🔧 {}", self.call.name), accent),
+                Span::styled("\u{25B8} ", muted),
+                Span::styled(format!("\u{1F527} {}", self.call.name), accent),
             ];
             let (summary, multiline) = one_line_summary(value.as_ref(), &self.call.arguments);
             if !summary.is_empty() {
@@ -99,30 +94,27 @@ impl<'a> ToolCallMessage<'a> {
                 let first = result_lines.next().unwrap_or("[no output]");
                 let suffix = if result_lines.next().is_some() { "..." } else { "" };
                 lines.push(Line::from(Span::styled(
-                    format!("  ⎿ {first}{suffix}"),
+                    format!("  \u{23BF} {first}{suffix}"),
                     dim,
                 )));
             } else if !failed {
-                // No result yet (still running): show pending indicator.
-                lines.push(Line::from(Span::styled("  ⎿ …", muted)));
+                lines.push(Line::from(Span::styled("  \u{23BF} \u{2026}", muted)));
             }
             return Text::from(lines);
         }
 
-        // Expanded: header plus every argument and the full result.
         let mut lines = vec![Line::from(vec![
-            Span::styled("▾ ", muted),
-            Span::styled(format!("🔧 {}", self.call.name), accent),
+            Span::styled("\u{25BE} ", muted),
+            Span::styled(format!("\u{1F527} {}", self.call.name), accent),
         ])];
 
         match &value {
             Some(serde_json::Value::Object(map)) => {
-                for (key, value) in map {
-                    push_field(&mut lines, key, &value_text(value), detail_style());
+                for (key, val) in map {
+                    push_field(&mut lines, key, &value_text(val), detail_style());
                 }
             }
             _ => {
-                // Arguments not parseable (e.g. still streaming); show them raw.
                 for line in self.call.arguments.lines() {
                     lines.push(Line::from(Span::styled(
                         format!("  {line}"),
@@ -140,7 +132,7 @@ impl<'a> ToolCallMessage<'a> {
             };
             let mut first = true;
             for line in text.lines() {
-                let prefix = format!("  {} {status_char} ", if first { "⎿" } else { " " });
+                let prefix = format!("  {} {status_char} ", if first { "\u{23BF}" } else { " " });
                 lines.push(Line::from(Span::styled(
                     format!("{prefix}{line}"),
                     result_style,
@@ -148,7 +140,7 @@ impl<'a> ToolCallMessage<'a> {
                 first = false;
             }
             if first {
-                lines.push(Line::from(Span::styled("  ⎿ [no output]", detail_style())));
+                lines.push(Line::from(Span::styled("  \u{23BF} [no output]", detail_style())));
             }
         }
 
@@ -156,10 +148,6 @@ impl<'a> ToolCallMessage<'a> {
     }
 }
 
-/// A one-line summary for the collapsed view: the command or path if present,
-/// otherwise the first non-empty argument value, truncated to a single line.
-/// Returns `(summary, truncated)` where `truncated` is true when the original
-/// value had more than one line.
 fn one_line_summary(value: Option<&serde_json::Value>, raw: &str) -> (String, bool) {
     let truncated = |s: &str| {
         let mut lines = s.lines();
@@ -167,7 +155,6 @@ fn one_line_summary(value: Option<&serde_json::Value>, raw: &str) -> (String, bo
         let has_more = lines.next().is_some();
         (first, has_more)
     };
-
     if let Some(serde_json::Value::Object(map)) = value {
         for key in ["command", "path"] {
             if let Some(text) = map.get(key).and_then(|v| v.as_str()) {
@@ -181,8 +168,6 @@ fn one_line_summary(value: Option<&serde_json::Value>, raw: &str) -> (String, bo
     truncated(raw)
 }
 
-/// Renders one `key: value` argument, keeping multi-line values on their own
-/// indented lines.
 fn push_field(lines: &mut Vec<Line<'static>>, key: &str, value: &str, style: Style) {
     let value_lines: Vec<&str> = value.lines().collect();
     if value_lines.len() <= 1 {
@@ -195,7 +180,6 @@ fn push_field(lines: &mut Vec<Line<'static>>, key: &str, value: &str, style: Sty
     }
 }
 
-/// String values as-is; anything else as its JSON representation.
 fn value_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.clone(),

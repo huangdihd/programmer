@@ -25,7 +25,9 @@ pub fn tool() -> Tool {
     function_tool(
         NAME,
         "Replace an exact substring in a file with new text. `old_string` must \
-         appear exactly once in the file so the edit is unambiguous.",
+         appear exactly once in the file so the edit is unambiguous. \
+         Use `offset` and `limit` to restrict the search to a specific line \
+         range (1-based) when the string appears multiple times.",
         json!({
             "path": {
                 "type": "string",
@@ -38,6 +40,14 @@ pub fn tool() -> Tool {
             "new_string": {
                 "type": "string",
                 "description": "The text to replace it with."
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Optional 1-based line number to start searching from."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Optional number of lines to search within when offset is given."
             }
         }),
         &["path", "old_string", "new_string"],
@@ -49,34 +59,73 @@ struct Args {
     path: String,
     old_string: String,
     new_string: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(error) => return format!("error: invalid arguments: {error}"),
+        Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
     let contents = match tokio::fs::read_to_string(&args.path).await {
         Ok(contents) => contents,
-        Err(error) => return format!("error: could not read {}: {error}", args.path),
+        Err(error) => return Err(format!("error: could not read {}: {error}", args.path)),
     };
 
-    match contents.matches(&args.old_string).count() {
-        0 => return format!("error: old_string not found in {}", args.path),
-        1 => {}
-        n => {
-            return format!(
-                "error: old_string appears {n} times in {}; add more surrounding \
-                 context so it is unique",
-                args.path
-            );
+    // Normalize CRLF → LF so old_string matching works across platforms.
+    let contents = contents.replace("\r\n", "\n");
+    let old_normalized = args.old_string.replace("\r\n", "\n");
+    let matches_count = if let Some(offset) = args.offset {
+        let limit = args.limit.unwrap_or(1);
+        let lines: Vec<&str> = contents.lines().collect();
+        let start = offset.saturating_sub(1); // 1-based → 0-based
+        let end = (start + limit).min(lines.len());
+        if start >= lines.len() {
+            return Err(format!(
+                "error: offset {offset} is past end of {} ({} lines)",
+                args.path,
+                lines.len()
+            ));
         }
+        let region = lines[start..end].join("\n");
+        region.matches(&old_normalized).count()
+    } else {
+        contents.matches(&old_normalized).count()
+    };
+
+    if matches_count == 0 {
+        return Err(if let Some(offset) = args.offset {
+            let limit = args.limit.unwrap_or(1);
+            format!(
+                "error: old_string not found in {} lines {offset}-{}",
+                args.path,
+                offset + limit - 1
+            )
+        } else {
+            format!("error: old_string not found in {}", args.path)
+        });
+    }
+    if matches_count > 1 {
+        if args.offset.is_some() {
+            return Err(format!(
+                "error: old_string appears {matches_count} times in the given range; \
+                 add more surrounding context so it is unique",
+            ));
+        }
+        return Err(format!(
+            "error: old_string appears {matches_count} times in {}; add more surrounding \
+             context so it is unique",
+            args.path
+        ));
     }
 
-    let updated = contents.replacen(&args.old_string, &args.new_string, 1);
+    let updated = contents.replacen(&old_normalized, &args.new_string, 1);
     match tokio::fs::write(&args.path, updated).await {
-        Ok(()) => format!("edited {}", args.path),
-        Err(error) => format!("error: could not write {}: {error}", args.path),
+        Ok(()) => Ok(format!("edited {}", args.path)),
+        Err(error) => Err(format!("error: could not write {}: {error}", args.path)),
     }
 }

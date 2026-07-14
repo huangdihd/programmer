@@ -23,6 +23,8 @@
 pub mod ui;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui_textarea::TextArea;
 
 use crate::tools::ask_user::{Question, QuestionKind};
 use crate::ui::event::AnswerTx;
@@ -36,19 +38,31 @@ pub enum AnswerAction {
     Answer(String),
 }
 
-#[derive(Debug)]
 pub(crate) enum Mode {
     /// Navigating a list of preset choices.
     Choice { selected: usize },
     /// Typing a free-form answer.
-    Text { input: String },
+    Text { textarea: TextArea<'static> },
 }
 
-#[derive(Debug)]
 pub struct QuestionPanel {
     question: Question,
     mode: Mode,
     answer_tx: Option<AnswerTx>,
+}
+
+fn make_textarea() -> TextArea<'static> {
+    let mut ta = TextArea::default();
+    ta.set_style(Style::default().fg(Color::White));
+    ta.set_cursor_line_style(Style::default());
+    ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    ta.set_placeholder_text("Type your answer\u{2026}");
+    ta.set_placeholder_style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    );
+    ta
 }
 
 impl QuestionPanel {
@@ -56,7 +70,7 @@ impl QuestionPanel {
         let mode = match &question.kind {
             QuestionKind::Choice { .. } => Mode::Choice { selected: 0 },
             QuestionKind::Text { .. } => Mode::Text {
-                input: String::new(),
+                textarea: make_textarea(),
             },
         };
         QuestionPanel {
@@ -94,11 +108,11 @@ impl QuestionPanel {
                         }
                         AnswerAction::None
                     }
+                    KeyCode::Esc => AnswerAction::Answer("(cancelled)".to_string()),
                     KeyCode::Enter => {
-                        if Some(*selected) == *other_index {
-                            // Switch to text input mode for "Other…".
+                        if *selected == *other_index {
                             self.mode = Mode::Text {
-                                input: String::new(),
+                                textarea: make_textarea(),
                             };
                             AnswerAction::None
                         } else {
@@ -109,26 +123,16 @@ impl QuestionPanel {
                     _ => AnswerAction::None,
                 }
             }
-            Mode::Text { input } => match key.code {
-                KeyCode::Esc => {
-                    // Go back to choice mode if we're in an "Other…" text input.
-                    if let QuestionKind::Choice { .. } = &self.question.kind {
-                        self.mode = Mode::Choice { selected: 0 };
-                    }
-                    AnswerAction::None
-                }
+            Mode::Text { textarea } => match key.code {
+                KeyCode::Esc => AnswerAction::Answer("(cancelled)".to_string()),
                 KeyCode::Enter => {
-                    AnswerAction::Answer(input.clone())
+                    let text = textarea.lines().join("\n");
+                    AnswerAction::Answer(text)
                 }
-                KeyCode::Backspace => {
-                    input.pop();
+                _ => {
+                    textarea.input(ratatui_textarea::Input::from(key));
                     AnswerAction::None
                 }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    AnswerAction::None
-                }
-                _ => AnswerAction::None,
             },
         }
     }
@@ -142,17 +146,15 @@ impl QuestionPanel {
 
     /// Append pasted text in text-input mode.
     pub fn handle_paste(&mut self, data: &str) {
-        if let Mode::Text { input } = &mut self.mode {
+        if let Mode::Text { textarea } = &mut self.mode {
             let clean: String = data.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-            input.push_str(&clean);
+            textarea.insert_str(&clean);
         }
     }
 }
 
 impl Drop for QuestionPanel {
     fn drop(&mut self) {
-        // If the panel is dropped without answering (shouldn't normally happen),
-        // at least unblock the tool call.
         if let Some(tx) = self.answer_tx.take() {
             tx.send("(cancelled)".to_string());
         }
@@ -162,5 +164,19 @@ impl Drop for QuestionPanel {
 impl AnswerTx {
     pub fn send(self, text: String) {
         let _ = self.0.send(text);
+    }
+}
+
+// TextArea doesn't implement Debug; provide a custom impl.
+impl std::fmt::Debug for QuestionPanel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode_str = match &self.mode {
+            Mode::Choice { selected } => format!("Choice({selected})"),
+            Mode::Text { .. } => "Text".to_string(),
+        };
+        f.debug_struct("QuestionPanel")
+            .field("question", &self.question)
+            .field("mode", &mode_str)
+            .finish()
     }
 }

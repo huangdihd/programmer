@@ -74,21 +74,21 @@ struct Args {
     status: Option<String>,
 }
 
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
-        Err(e) => return format!("error: invalid arguments: {e}"),
+        Err(e) => return Err(format!("error: invalid arguments: {e}")),
     };
 
     let mut list = TodoList::load();
 
-    let result = match args.action.as_str() {
-        "list" => list.render_table(),
+    match args.action.as_str() {
+        "list" => Ok(list.render_table()),
 
         "add" => {
             let title = match args.title {
                 Some(ref t) if !t.trim().is_empty() => t.clone(),
-                _ => return "error: 'title' is required for add".to_string(),
+                _ => return Err("error: 'title' is required for add".to_string()),
             };
             let todo = list.add(title, args.description);
             // Snapshot fields before saving (save needs &mut list).
@@ -97,13 +97,13 @@ pub async fn run(arguments: &str) -> String {
             let has_desc = todo.description.is_some();
             let _ = list.save_to_file();
             let desc_note = if has_desc { " (with description)" } else { "" };
-            format!("created todo {id}: {todo_title}{desc_note}")
+            Ok(format!("created todo {id}: {todo_title}{desc_note}"))
         }
 
         "update" => {
             let id = match args.id {
                 Some(ref i) if !i.trim().is_empty() => i.clone(),
-                _ => return "error: 'id' is required for update".to_string(),
+                _ => return Err("error: 'id' is required for update".to_string()),
             };
             let status = args
                 .status
@@ -115,30 +115,28 @@ pub async fn run(arguments: &str) -> String {
                     let ttitle = todo.title.clone();
                     let tstatus = todo.status.label();
                     let _ = list.save_to_file();
-                    format!("updated todo {tid}: title={ttitle:?} status={tstatus}")
+                    Ok(format!("updated todo {tid}: title={ttitle:?} status={tstatus}"))
                 }
-                Err(e) => e,
+                Err(e) => Err(e),
             }
         }
 
         "delete" => {
             let id = match args.id {
                 Some(ref i) if !i.trim().is_empty() => i.clone(),
-                _ => return "error: 'id' is required for delete".to_string(),
+                _ => return Err("error: 'id' is required for delete".to_string()),
             };
             match list.delete(&id) {
                 Ok(()) => {
                     let _ = list.save_to_file();
-                    format!("deleted todo {id}")
+                    Ok(format!("deleted todo {id}"))
                 }
-                Err(e) => e,
+                Err(e) => Err(e),
             }
         }
 
-        other => format!(
+        other => Err(format!(
             "error: unknown action '{other}' — use list, add, update, or delete"
-        ),
-    };
-
-    result
+        )),
+    }
 }

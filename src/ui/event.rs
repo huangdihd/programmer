@@ -16,9 +16,8 @@
 use crate::response::partial_response::PartialResponse;
 use crate::tools::ask_user::Question;
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{
-    FunctionCallOutputItemParam, FunctionToolCall, ResponseStreamEvent,
-};
+use crate::tools::ToolOutput;
+use async_openai::types::responses::{FunctionToolCall, ResponseStreamEvent};
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
@@ -61,12 +60,12 @@ pub enum AppEvent {
     /// All tool calls from the last response have run; carries their outputs to
     /// be fed back to the model, plus the cancel token so stale completions
     /// from cancelled requests can be ignored.
-    ToolCallsCompleted(Vec<FunctionCallOutputItemParam>, Arc<AtomicBool>),
+    ToolCallsCompleted(Vec<ToolOutput>, Arc<AtomicBool>),
     /// Auto-mode LLM classification finished. Carries the calls cleared to run,
     /// the denial outputs to feed back to the model, and the cancel token.
     ClassificationCompleted {
         allowed: Vec<FunctionToolCall>,
-        denied: Vec<FunctionCallOutputItemParam>,
+        denied: Vec<ToolOutput>,
         cancel_token: Arc<AtomicBool>,
     },
     /// Diagnostics checkers finished after an edit. Carries the fresh snapshot

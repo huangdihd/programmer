@@ -20,7 +20,6 @@ use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use crate::ui::components::messages::assistant::detail_style;
-use crate::ui::components::messages::assistant::tool_call::is_failure;
 use crate::ui::components::messages::assistant_message::EXPANDED_BG;
 use crate::ui::markdown_theme::palette;
 
@@ -32,6 +31,7 @@ const PAD_RIGHT: u16 = 2;
 /// output. A caret hints the line can be clicked to toggle.
 pub struct ToolResultMessage<'a> {
     output: &'a FunctionCallOutputItemParam,
+    failed: bool,
     expanded: bool,
 }
 
@@ -39,8 +39,14 @@ impl<'a> ToolResultMessage<'a> {
     pub fn new(output: &'a FunctionCallOutputItemParam) -> Self {
         Self {
             output,
+            failed: false,
             expanded: false,
         }
+    }
+
+    pub fn failed(mut self, failed: bool) -> Self {
+        self.failed = failed;
+        self
     }
 
     pub fn expanded(mut self, expanded: bool) -> Self {
@@ -53,7 +59,7 @@ impl<'a> ToolResultMessage<'a> {
             FunctionCallOutput::Text(text) => text.clone(),
             FunctionCallOutput::Content(_) => "[non-text output]".to_string(),
         };
-        let failed = is_failure(&text);
+        let failed = self.failed;
         let result_style = if failed {
             Style::new().fg(palette::RED_MUTED)
         } else {
@@ -65,29 +71,27 @@ impl<'a> ToolResultMessage<'a> {
         let block = Block::default().padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 1));
 
         if !self.expanded {
-            // Collapsed: a single (unwrapped) line — the first line of output.
             let first = all.first().copied().unwrap_or("[no output]");
-            let caret = if multiline { "▸ " } else { "" };
+            let caret = if multiline { "\u{25B8} " } else { "" };
             let suffix = if multiline { "..." } else { "" };
-            let line = Line::from(Span::styled(format!("{caret}⎿ {first}{suffix}"), result_style));
+            let line = Line::from(Span::styled(format!("{caret}\u{23BF} {first}{suffix}"), result_style));
             return Paragraph::new(Text::from(line)).block(block);
         }
 
-        // Expanded: the full output.
         let mut lines: Vec<Line<'static>> = all
             .iter()
             .enumerate()
             .map(|(index, line)| {
                 if index == 0 {
-                    let caret = if multiline { "▾ " } else { "" };
-                    Line::from(Span::styled(format!("{caret}⎿ {line}"), result_style))
+                    let caret = if multiline { "\u{25BE} " } else { "" };
+                    Line::from(Span::styled(format!("{caret}\u{23BF} {line}"), result_style))
                 } else {
                     Line::from(Span::styled(format!("  {line}"), result_style))
                 }
             })
             .collect();
         if lines.is_empty() {
-            lines.push(Line::from(Span::styled("⎿ [no output]", result_style)));
+            lines.push(Line::from(Span::styled("\u{23BF} [no output]", result_style)));
         }
 
         Paragraph::new(Text::from(lines))

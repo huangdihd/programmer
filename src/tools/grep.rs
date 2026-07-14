@@ -58,15 +58,15 @@ struct Args {
 /// Maximum total matches to return so a broad search can't blow up the context.
 const MAX_MATCHES: usize = 200;
 
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(error) => return format!("error: invalid arguments: {error}"),
+        Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
     let re = match Regex::new(&args.pattern) {
         Ok(re) => re,
-        Err(error) => return format!("error: invalid regex: {error}"),
+        Err(error) => return Err(format!("error: invalid regex: {error}")),
     };
 
     let root = args.path.clone().unwrap_or_else(|| {
@@ -79,11 +79,11 @@ pub async fn run(arguments: &str) -> String {
     let mut count: usize = 0;
 
     if let Err(error) = search(&root, &re, &args.include, &mut results, &mut count) {
-        return format!("error: {error}");
+        return Err(format!("error: {error}"));
     }
 
     if results.is_empty() {
-        return format!("no matches found for pattern '{}'", args.pattern);
+        return Ok(format!("no matches found for pattern '{}'", args.pattern));
     }
 
     if count >= MAX_MATCHES {
@@ -92,7 +92,7 @@ pub async fn run(arguments: &str) -> String {
         ));
     }
 
-    results.join("\n")
+    Ok(results.join("\n"))
 }
 
 fn search(
@@ -297,14 +297,17 @@ mod tests {
 
         let json_path = dir.to_string_lossy().replace('\\', "\\\\");
 
-        let out = run(&format!(r#"{{"pattern":"hello","path":"{json_path}"}}"#)).await;
+        let out = run(&format!(r#"{{"pattern":"hello","path":"{json_path}"}}"#))
+            .await
+            .expect("grep should succeed");
         assert!(out.contains("a.rs:1:"), "got: {out}");
         assert!(out.contains("b.txt:1:"), "got: {out}");
 
         let out_filtered = run(&format!(
             r#"{{"pattern":"hello","path":"{json_path}","include":"*.rs"}}"#
         ))
-        .await;
+        .await
+        .expect("grep should succeed");
         assert!(out_filtered.contains("a.rs"), "got: {out_filtered}");
         assert!(!out_filtered.contains("b.txt"), "got: {out_filtered}");
 
@@ -321,7 +324,8 @@ mod tests {
         let out = run(&format!(
             r#"{{"pattern":"zzz_nonexistent_xyz","path":"{json_path}"}}"#
         ))
-        .await;
+        .await
+        .expect("grep should succeed with no matches");
         assert!(out.starts_with("no matches found"), "got: {out}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -329,7 +333,9 @@ mod tests {
 
     #[tokio::test]
     async fn grep_rejects_invalid_regex() {
-        let out = run(r#"{"pattern":"[invalid"}"#).await;
+        let out = run(r#"{"pattern":"[invalid"}"#)
+            .await
+            .expect_err("invalid regex should fail");
         assert!(out.starts_with("error: invalid regex"), "got: {out}");
     }
 }

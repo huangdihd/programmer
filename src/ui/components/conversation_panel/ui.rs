@@ -27,7 +27,7 @@ use crate::ui::components::messages::user_message::UserMessage;
 use crate::ui::components::messages::warning_message::WarningMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
-use async_openai::types::responses::{FunctionCallOutputItemParam, InputItem, Item, OutputItem};
+use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem};
 use std::collections::{HashMap, HashSet};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
@@ -42,14 +42,15 @@ fn build_item_paragraph(
     item: &MessageItem,
     content_width: u16,
     expanded: bool,
-    tool_output: Option<&FunctionCallOutputItemParam>,
+    tool_output: Option<(&FunctionCallOutputItemParam, bool)>,
 ) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
     match item {
-        MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) => {
+        MessageItem::ToolOutput { output, failed } => {
             // Only reached for orphan results whose call is missing; results
             // with a call render inside that call's item.
             (
                 ToolResultMessage::new(output)
+                    .failed(*failed)
                     .expanded(expanded)
                     .into_paragraph(),
                 Vec::new(),
@@ -95,10 +96,11 @@ impl Widget for &mut ConversationPanel {
         // Tool calls render together with their result as one message: map each
         // call_id to its result, and collect the call ids so the standalone
         // result items can be hidden (they draw inside their call's entry).
-        let mut outputs_by_call: HashMap<&str, &FunctionCallOutputItemParam> = HashMap::new();
+        let mut outputs_by_call: HashMap<&str, (&FunctionCallOutputItemParam, bool)> =
+            HashMap::new();
         for item in &self.items {
-            if let MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) = item {
-                outputs_by_call.insert(output.call_id.as_str(), output);
+            if let MessageItem::ToolOutput { output, failed } = item {
+                outputs_by_call.insert(output.call_id.as_str(), (output, *failed));
             }
         }
         let call_ids: HashSet<&str> = self
@@ -129,7 +131,7 @@ impl Widget for &mut ConversationPanel {
         for index in 0..self.items.len() {
             let expanded = self.expanded_items.contains(&index);
             let (hidden, tool_output) = match &self.items[index] {
-                MessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) => {
+                MessageItem::ToolOutput { output, .. } => {
                     (call_ids.contains(output.call_id.as_str()), None)
                 }
                 MessageItem::Output(OutputItem::FunctionCall(call)) => (

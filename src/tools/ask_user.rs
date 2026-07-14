@@ -32,15 +32,14 @@ pub struct Question {
 
 #[derive(Debug, Clone)]
 pub enum QuestionKind {
-    /// A list of choices. `other_index` is the position of the "Other…" option, if any.
+    /// A list of choices with an "Other…" option at `other_index` that
+    /// switches to free-form text input.
     Choice {
         options: Vec<String>,
-        other_index: Option<usize>,
+        other_index: usize,
     },
     /// Free-form text input.
-    Text {
-        input: String,
-    },
+    Text,
 }
 
 pub fn tool() -> Tool {
@@ -48,7 +47,8 @@ pub fn tool() -> Tool {
         NAME,
         "Ask the user a question and wait for their response. Use this when you \
          need clarification before proceeding, or when the user should make a \
-         decision. Supports yes/no questions, multiple choice, and free-text input.",
+         decision. Supports yes/no questions, multiple choice, and free-text input. \
+         Every choice list includes an 'Other…' option for free-form answers.",
         json!({
             "question": {
                 "type": "string",
@@ -63,10 +63,6 @@ pub fn tool() -> Tool {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Required for 'multiple_choice': the list of options to present."
-            },
-            "allow_other": {
-                "type": "boolean",
-                "description": "For 'yes_no' and 'multiple_choice': when true, adds an 'Other...' option that lets the user type a free-form response instead."
             }
         }),
         &["question", "kind"],
@@ -79,45 +75,36 @@ struct Args {
     kind: String,
     #[serde(default)]
     options: Vec<String>,
-    #[serde(default)]
-    allow_other: bool,
 }
 
-pub async fn run(arguments: &str, sender: &mpsc::UnboundedSender<Event>) -> String {
+pub async fn run(arguments: &str, sender: &mpsc::UnboundedSender<Event>) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
-        Err(e) => return format!("error: invalid arguments: {e}"),
+        Err(e) => return Err(format!("error: invalid arguments: {e}")),
     };
 
     let question = match args.kind.as_str() {
-        "yes_no" => {
-            let mut options = vec!["Yes".to_string(), "No".to_string()];
-            let other_index = if args.allow_other {
-                options.push("Other…".to_string());
-                Some(2usize)
-            } else {
-                None
-            };
-            Question {
-                text: args.question,
-                kind: QuestionKind::Choice {
-                    options,
-                    other_index,
-                },
-            }
-        }
+        "yes_no" => Question {
+            text: args.question,
+            kind: QuestionKind::Choice {
+                options: vec![
+                    "Yes".to_string(),
+                    "No".to_string(),
+                    "Other\u{2026}".to_string(),
+                ],
+                other_index: 2,
+            },
+        },
         "multiple_choice" => {
             let mut options = args.options;
             if options.is_empty() {
-                return "error: 'options' must be a non-empty array for kind='multiple_choice'".to_string();
+                return Err(
+                    "error: 'options' must be a non-empty array for kind='multiple_choice'"
+                        .to_string(),
+                );
             }
-            let other_index = if args.allow_other {
-                let idx = options.len();
-                options.push("Other…".to_string());
-                Some(idx)
-            } else {
-                None
-            };
+            let other_index = options.len();
+            options.push("Other\u{2026}".to_string());
             Question {
                 text: args.question,
                 kind: QuestionKind::Choice {
@@ -128,11 +115,13 @@ pub async fn run(arguments: &str, sender: &mpsc::UnboundedSender<Event>) -> Stri
         }
         "text" => Question {
             text: args.question,
-            kind: QuestionKind::Text {
-                input: String::new(),
-            },
+            kind: QuestionKind::Text,
         },
-        other => return format!("error: unknown kind '{other}'; valid kinds: yes_no, multiple_choice, text"),
+        other => {
+            return Err(format!(
+                "error: unknown kind '{other}'; valid kinds: yes_no, multiple_choice, text"
+            ))
+        }
     };
 
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
@@ -140,5 +129,5 @@ pub async fn run(arguments: &str, sender: &mpsc::UnboundedSender<Event>) -> Stri
         question,
         answer_tx: AnswerTx(answer_tx),
     }));
-    answer_rx.await.unwrap_or_else(|_| "(no answer)".to_string())
+    Ok(answer_rx.await.unwrap_or_else(|_| "(no answer)".to_string()))
 }

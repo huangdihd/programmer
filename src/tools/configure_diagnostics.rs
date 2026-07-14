@@ -70,30 +70,30 @@ struct Args {
     profile_toml: String,
 }
 
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     run_in(arguments, &cwd).await
 }
 
 /// The tool body, parameterized on the working directory so tests can target a
 /// temp dir instead of writing into the real project.
-async fn run_in(arguments: &str, cwd: &Path) -> String {
+async fn run_in(arguments: &str, cwd: &Path) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(error) => return format!("error: invalid arguments: {error}"),
+        Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
     let profile = match DiagnosticsProfile::from_toml(&args.profile_toml) {
         Ok(p) => p,
-        Err(e) => return format!("error: {e}\nThe profile was NOT saved."),
+        Err(e) => return Err(format!("error: {e}\nThe profile was NOT saved.")),
     };
     if let Err(e) = profile.validate() {
-        return format!("error: {e}\nThe profile was NOT saved.");
+        return Err(format!("error: {e}\nThe profile was NOT saved."));
     }
     if profile.checkers.is_empty() {
-        return "error: the profile has no [[checkers]]. Add at least one, or \
+        return Err("error: the profile has no [[checkers]]. Add at least one, or \
                 skip diagnostics setup entirely."
-            .to_string();
+            .to_string());
     }
 
     // Test-run each checker so a bad command or parser is caught now, not on
@@ -109,21 +109,21 @@ async fn run_in(arguments: &str, cwd: &Path) -> String {
                 ));
             }
             Ok(Err(e)) => {
-                return format!(
+                return Err(format!(
                     "error: checker '{}' failed to run: {e}\nThe profile was NOT \
                      saved — fix the command or parser and try again.",
                     checker.name
-                );
+                ));
             }
             Err(_) => {
-                return format!(
+                return Err(format!(
                     "error: checker '{}' didn't finish within {}s. The command \
                      backend expects a one-shot checker (e.g. `cargo check`, \
                      `tsc --noEmit`), not a watch or dev-server. The profile was \
                      NOT saved.",
                     checker.name,
                     VERIFY_TIMEOUT.as_secs()
-                );
+                ));
             }
         }
     }
@@ -131,23 +131,23 @@ async fn run_in(arguments: &str, cwd: &Path) -> String {
     // Everything ran — persist it.
     let toml = match profile.to_toml() {
         Ok(t) => t,
-        Err(e) => return format!("error: could not serialize profile: {e}"),
+        Err(e) => return Err(format!("error: could not serialize profile: {e}")),
     };
     let path = cwd.join(PROFILE_PATH);
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            return format!("error: could not create {}: {e}", parent.display());
+            return Err(format!("error: could not create {}: {e}", parent.display()));
         }
     }
     if let Err(e) = std::fs::write(&path, toml) {
-        return format!("error: could not write {}: {e}", path.display());
+        return Err(format!("error: could not write {}: {e}", path.display()));
     }
 
-    format!(
+    Ok(format!(
         "Diagnostics profile saved to {PROFILE_PATH} with {} checker(s):\n{}",
         profile.checkers.len(),
         report_lines.join("\n")
-    )
+    ))
 }
 
 #[cfg(all(test, unix))]
@@ -168,7 +168,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_toml_without_writing() {
         let dir = temp_dir("badtoml");
-        let out = run_in(r#"{"profile_toml":"this is not = valid = toml"}"#, &dir).await;
+        let out = run_in(r#"{"profile_toml":"this is not = valid = toml"}"#, &dir)
+            .await
+            .expect_err("invalid toml should fail");
         assert!(out.starts_with("error:"), "got: {out}");
         assert!(out.contains("NOT saved"));
         assert!(!dir.join(PROFILE_PATH).exists());
@@ -182,7 +184,9 @@ mod tests {
             "profile_toml": "[[checkers]]\nname='x'\ncommand='true'\nparser='bogus'\n"
         })
         .to_string();
-        let out = run_in(&args, &dir).await;
+        let out = run_in(&args, &dir)
+            .await
+            .expect_err("unknown parser should fail");
         assert!(out.contains("unknown parser preset"), "got: {out}");
         assert!(!dir.join(PROFILE_PATH).exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -197,7 +201,9 @@ mod tests {
                 "[[checkers]]\nname='noop'\ncommand='true'\nparser='gnu'\nrun_on=['*.rs']\n"
         })
         .to_string();
-        let out = run_in(&args, &dir).await;
+        let out = run_in(&args, &dir)
+            .await
+            .expect("valid profile should be saved");
         assert!(out.contains("saved"), "got: {out}");
         assert!(out.contains("ran ok, parsed 0"), "got: {out}");
         let written = dir.join(PROFILE_PATH);

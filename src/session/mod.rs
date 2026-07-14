@@ -20,7 +20,9 @@
 //! `--resume` (no argument) to pick interactively from saved sessions.
 
 use crate::response::message_item::MessageItem;
-use async_openai::types::responses::{InputItem, OutputItem};
+use async_openai::types::responses::{
+    FunctionCallOutput, FunctionCallOutputItemParam, InputItem, Item, OutputItem,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -33,6 +35,11 @@ use std::path::{Path, PathBuf};
 pub(crate) enum SerializableMessageItem {
     Input(InputItem),
     Output(OutputItem),
+    /// A tool result with its authoritative failure flag.
+    ToolOutput {
+        output: FunctionCallOutputItemParam,
+        failed: bool,
+    },
     OpenAIError { message: String },
     Error(String),
     Warning(String),
@@ -46,6 +53,9 @@ impl From<MessageItem> for SerializableMessageItem {
         match item {
             MessageItem::Input(i) => SerializableMessageItem::Input(i),
             MessageItem::Output(o) => SerializableMessageItem::Output(o),
+            MessageItem::ToolOutput { output, failed } => {
+                SerializableMessageItem::ToolOutput { output, failed }
+            }
             MessageItem::OpenAIError(e) => SerializableMessageItem::OpenAIError {
                 message: e.to_string(),
             },
@@ -64,8 +74,24 @@ impl From<MessageItem> for SerializableMessageItem {
 impl From<SerializableMessageItem> for MessageItem {
     fn from(item: SerializableMessageItem) -> Self {
         match item {
+            // Sessions saved before tool outputs had their own variant stored
+            // them as `function_call_output` input items. Migrate those to the
+            // `ToolOutput` variant so the render path and classifier treat them
+            // uniformly; the failure flag is recomputed once from the text (the
+            // only signal such an old session carries).
+            SerializableMessageItem::Input(InputItem::Item(Item::FunctionCallOutput(output))) => {
+                let failed = matches!(
+                    &output.output,
+                    FunctionCallOutput::Text(t)
+                        if t.trim_start().to_ascii_lowercase().starts_with("error:")
+                );
+                MessageItem::ToolOutput { output, failed }
+            }
             SerializableMessageItem::Input(i) => MessageItem::Input(i),
             SerializableMessageItem::Output(o) => MessageItem::Output(o),
+            SerializableMessageItem::ToolOutput { output, failed } => {
+                MessageItem::ToolOutput { output, failed }
+            }
             SerializableMessageItem::OpenAIError { message } => {
                 MessageItem::Error(format!("(restored) {message}"))
             }

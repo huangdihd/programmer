@@ -53,18 +53,18 @@ struct Args {
     limit: Option<usize>,
 }
 
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(error) => return format!("error: invalid arguments: {error}"),
+        Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
     let contents = match tokio::fs::read_to_string(&args.path).await {
         Ok(contents) => contents,
-        Err(error) => return format!("error: could not read {}: {error}", args.path),
+        Err(error) => return Err(format!("error: could not read {}: {error}", args.path)),
     };
 
-    slice_lines(contents, args.offset, args.limit)
+    Ok(slice_lines(contents, args.offset, args.limit))
 }
 
 fn slice_lines(contents: String, offset: Option<usize>, limit: Option<usize>) -> String {

@@ -148,8 +148,19 @@ fn mcp_function_tool(
 /// was cut short.
 const MAX_OUTPUT_LENGTH: usize = 8000;
 
-/// Executes a single tool call and wraps the result as a `function_call_output`
-/// item ready to be sent back to the model.
+/// A tool call's `function_call_output` together with whether the tool reported
+/// failure. The flag is authoritative — it comes from the tool's own `Result`,
+/// not from parsing the output text — so renderers, the classifier, and session
+/// storage all read the same pre-computed answer instead of sniffing for an
+/// `error:` prefix.
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    pub param: FunctionCallOutputItemParam,
+    pub failed: bool,
+}
+
+/// Executes a single tool call and wraps the result as a [`ToolOutput`] ready to
+/// be sent back to the model and rendered.
 ///
 /// When `mcp` is provided and the tool name starts with `mcp__`, the call is
 /// forwarded to the appropriate MCP server.
@@ -157,8 +168,11 @@ pub(crate) async fn run_tool_call(
     call: &FunctionToolCall,
     sender: &tokio::sync::mpsc::UnboundedSender<crate::ui::event::Event>,
     mcp: Option<&crate::mcp::McpManager>,
-) -> FunctionCallOutputItemParam {
-    let output = if call.name.starts_with("mcp__") {
+) -> ToolOutput {
+    // Every branch yields a `Result<String, String>`: `Ok` is a successful
+    // result, `Err` is a failure. This is the single source of truth for the
+    // `failed` flag below.
+    let result: Result<String, String> = if call.name.starts_with("mcp__") {
         if let Some(mgr) = mcp {
             match mgr
                 .call_tool(
@@ -167,7 +181,7 @@ pub(crate) async fn run_tool_call(
                 )
                 .await
             {
-                Ok(result) => result
+                Ok(result) => Ok(result
                     .content
                     .iter()
                     .map(|c| match c {
@@ -175,11 +189,11 @@ pub(crate) async fn run_tool_call(
                         _ => "[non-text MCP content]".to_string(),
                     })
                     .collect::<Vec<_>>()
-                    .join("\n"),
-                Err(e) => format!("error: MCP tool call failed: {e}"),
+                    .join("\n")),
+                Err(e) => Err(format!("error: MCP tool call failed: {e}")),
             }
         } else {
-            "error: MCP not available (no servers connected)".to_string()
+            Err("error: MCP not available (no servers connected)".to_string())
         }
     } else {
         match call.name.as_str() {
@@ -193,17 +207,24 @@ pub(crate) async fn run_tool_call(
             configure_diagnostics::NAME => configure_diagnostics::run(&call.arguments).await,
             diagnostics::NAME => diagnostics::run(&call.arguments).await,
             todo::NAME => todo::run(&call.arguments).await,
-            other => format!("error: unknown tool '{other}'"),
+            other => Err(format!("error: unknown tool '{other}'")),
         }
     };
 
-    let output = truncate_output(output);
+    let (text, failed) = match result {
+        Ok(text) => (text, false),
+        Err(text) => (text, true),
+    };
+    let text = truncate_output(text);
 
-    FunctionCallOutputItemParam {
-        call_id: call.call_id.clone(),
-        output: FunctionCallOutput::Text(output),
-        id: None,
-        status: None,
+    ToolOutput {
+        param: FunctionCallOutputItemParam {
+            call_id: call.call_id.clone(),
+            output: FunctionCallOutput::Text(text),
+            id: None,
+            status: None,
+        },
+        failed,
     }
 }
 
@@ -275,8 +296,35 @@ mod tests {
 
     #[tokio::test]
     async fn command_runs_and_captures_output() {
-        let out = command::run(r#"{"command":"echo hello"}"#).await;
+        let out = command::run(r#"{"command":"echo hello"}"#)
+            .await
+            .expect("echo should succeed");
         assert!(out.contains("hello"), "unexpected output: {out}");
+    }
+
+    /// `run_tool_call` must set `failed` from the tool's own `Result`, not by
+    /// parsing the output text — the whole point of the authoritative flag.
+    #[tokio::test]
+    async fn run_tool_call_reports_failure_authoritatively() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let call = |name: &str, args: &str| FunctionToolCall {
+            arguments: args.to_string(),
+            call_id: "c1".to_string(),
+            namespace: None,
+            name: name.to_string(),
+            id: None,
+            status: None,
+        };
+
+        // An unknown tool fails.
+        let out = run_tool_call(&call("does_not_exist", "{}"), &tx, None).await;
+        assert!(out.failed, "unknown tool should be marked failed");
+
+        // A command with a non-zero exit fails; a clean one succeeds.
+        let bad = run_tool_call(&call(command::NAME, r#"{"command":"exit 3"}"#), &tx, None).await;
+        assert!(bad.failed, "non-zero exit should be marked failed");
+        let good = run_tool_call(&call(command::NAME, r#"{"command":"exit 0"}"#), &tx, None).await;
+        assert!(!good.failed, "zero exit should not be marked failed");
     }
 
     #[tokio::test]
@@ -290,25 +338,32 @@ mod tests {
         let wrote = write_file::run(&format!(
             r#"{{"path":"{json_path}","content":"alpha\nbeta\n"}}"#
         ))
-        .await;
+        .await
+        .expect("write should succeed");
         assert!(wrote.starts_with("wrote"), "unexpected: {wrote}");
 
-        let read = read_file::run(&format!(r#"{{"path":"{json_path}"}}"#)).await;
+        let read = read_file::run(&format!(r#"{{"path":"{json_path}"}}"#))
+            .await
+            .expect("read should succeed");
         assert_eq!(read, "alpha\nbeta");
 
         let edited = edit_file::run(&format!(
             r#"{{"path":"{json_path}","old_string":"alpha","new_string":"gamma"}}"#
         ))
-        .await;
+        .await
+        .expect("edit should succeed");
         assert_eq!(edited, format!("edited {}", path.to_string_lossy()));
 
-        let read_again = read_file::run(&format!(r#"{{"path":"{json_path}"}}"#)).await;
+        let read_again = read_file::run(&format!(r#"{{"path":"{json_path}"}}"#))
+            .await
+            .expect("read should succeed");
         assert_eq!(read_again, "gamma\nbeta");
 
         let missing = edit_file::run(&format!(
             r#"{{"path":"{json_path}","old_string":"nope","new_string":"x"}}"#
         ))
-        .await;
+        .await
+        .expect_err("edit with missing old_string should fail");
         assert!(
             missing.starts_with("error: old_string not found"),
             "got: {missing}"

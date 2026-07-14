@@ -51,15 +51,15 @@ struct Args {
 
 const MAX_MATCHES: usize = 200;
 
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(error) => return format!("error: invalid arguments: {error}"),
+        Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
     let re = match Regex::new(&args.pattern) {
         Ok(re) => re,
-        Err(error) => return format!("error: invalid regex: {error}"),
+        Err(error) => return Err(format!("error: invalid regex: {error}")),
     };
 
     let root = args.path.clone().unwrap_or_else(|| {
@@ -72,11 +72,11 @@ pub async fn run(arguments: &str) -> String {
     let mut count: usize = 0;
 
     if let Err(error) = walk(&root, &re, &mut results, &mut count) {
-        return format!("error: {error}");
+        return Err(format!("error: {error}"));
     }
 
     if results.is_empty() {
-        return format!("no files matching '{}'", args.pattern);
+        return Ok(format!("no files matching '{}'", args.pattern));
     }
 
     if count >= MAX_MATCHES {
@@ -86,7 +86,7 @@ pub async fn run(arguments: &str) -> String {
         ));
     }
 
-    results.join("\n")
+    Ok(results.join("\n"))
 }
 
 fn walk(
@@ -162,7 +162,8 @@ mod tests {
         let out = run(&format!(
             r#"{{"pattern":"auth_.*\\.rs","path":"{json_path}"}}"#
         ))
-        .await;
+        .await
+        .expect("blob should succeed");
         assert!(out.contains("auth_service.rs"), "got: {out}");
         assert!(out.contains("auth_test.rs"), "got: {out}");
         assert!(!out.contains("main.rs"), "got: {out}");
@@ -181,7 +182,8 @@ mod tests {
         let out = run(&format!(
             r#"{{"pattern":"zzz_nonexistent","path":"{json_path}"}}"#
         ))
-        .await;
+        .await
+        .expect("blob should succeed with no matches");
         assert!(out.starts_with("no files matching"), "got: {out}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -189,7 +191,9 @@ mod tests {
 
     #[tokio::test]
     async fn blob_rejects_invalid_regex() {
-        let out = run(r#"{"pattern":"[invalid"}"#).await;
+        let out = run(r#"{"pattern":"[invalid"}"#)
+            .await
+            .expect_err("invalid regex should fail");
         assert!(out.starts_with("error: invalid regex"), "got: {out}");
     }
 }

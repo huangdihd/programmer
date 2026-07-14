@@ -113,7 +113,8 @@ fn notification(method: &str, params: Value) -> Value {
 
 /// Turn an absolute filesystem path into a `file://` URI.
 pub fn path_to_uri(path: &Path) -> String {
-    let s = path.to_string_lossy();
+    // Normalize Windows backslashes to forward slashes — file URIs always use `/`.
+    let s = path.to_string_lossy().replace('\\', "/");
     if s.starts_with('/') {
         format!("file://{s}")
     } else {
@@ -122,12 +123,13 @@ pub fn path_to_uri(path: &Path) -> String {
 }
 
 /// Turn a `file://` URI back into a path string, percent-decoded and made
-/// relative to `cwd` when it lives inside the workspace.
+/// relative to `cwd` when it lives inside the workspace. Both sides are
+/// normalised to forward slashes before comparison so Windows paths work.
 pub fn uri_to_path(uri: &str, cwd: &Path) -> String {
     let raw = uri.strip_prefix("file://").unwrap_or(uri);
     let decoded = percent_decode(raw);
-    let cwd_str = cwd.to_string_lossy();
-    match decoded.strip_prefix(cwd_str.as_ref()) {
+    let cwd_norm = cwd.to_string_lossy().replace('\\', "/");
+    match decoded.strip_prefix(&cwd_norm) {
         Some(rest) => rest.trim_start_matches('/').to_string(),
         None => decoded,
     }

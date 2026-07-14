@@ -14,19 +14,22 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{InputItem, OutputItem};
+use async_openai::types::responses::{FunctionCallOutputItemParam, InputItem, OutputItem};
 
 #[derive(Debug)]
 pub enum MessageItem {
     Input(InputItem),
     Output(OutputItem),
+    /// A tool result with a pre-computed failure flag — set once in
+    /// `add_tool_output` so renderers and the classifier never parse text.
+    ToolOutput {
+        output: FunctionCallOutputItemParam,
+        failed: bool,
+    },
     OpenAIError(OpenAIError),
     Error(String),
     Warning(String),
     Info(String),
-    /// A visible system-level instruction sent to the model as a user message.
-    /// `label` is displayed in the conversation (e.g. "\u{25B8} \u{521D}\u{59CB}\u{5316}\u{9879}\u{76EE}\u{2026}").
-    /// `text` is the full instruction sent to the model.
     Meta { label: String, text: String },
     Usage(u32, u32), // (input_tokens, output_tokens)
 }
@@ -36,6 +39,10 @@ impl Clone for MessageItem {
         match self {
             MessageItem::Input(i) => MessageItem::Input(i.clone()),
             MessageItem::Output(o) => MessageItem::Output(o.clone()),
+            MessageItem::ToolOutput { output, failed } => MessageItem::ToolOutput {
+                output: output.clone(),
+                failed: *failed,
+            },
             MessageItem::OpenAIError(e) => {
                 MessageItem::Error(format!("(cloned error) {e}"))
             }
