@@ -106,6 +106,52 @@ pub(crate) fn tools(mcp: Option<&crate::mcp::McpManager>) -> Vec<Tool> {
                 mcp_tool.inputSchema,
             ));
         }
+        // Expose MCP resource operations as synthetic tools.
+        // Names like `mcp__<server>__resources_list` / `__resources_read`
+        // are unlikely to collide with real MCP tools.
+        for (_fqn, server_name, _resource) in mgr.all_resources() {
+            let list_fqn = format!("mcp__{}__resources_list", server_name);
+            if !tools.iter().any(|t| tool_name(t) == Some(&list_fqn[..])) {
+                tools.push(resources_list_tool(&list_fqn, &server_name));
+            }
+            let read_fqn = format!("mcp__{}__resources_read", server_name);
+            if !tools.iter().any(|t| tool_name(t) == Some(&read_fqn[..])) {
+                let desc = format!("Read a resource from MCP server '{}'. Call resources_list first to see available URIs, then pass the desired URI.", server_name);
+                tools.push(resources_read_tool(&read_fqn, &desc));
+            }
+        }
+        // Expose MCP prompt operations as synthetic tools.
+        for (_fqn, server_name, _prompt) in mgr.all_prompts() {
+            let list_fqn = format!("mcp__{}__prompts_list", server_name);
+            if !tools.iter().any(|t| tool_name(t) == Some(&list_fqn[..])) {
+                let desc = format!(
+                    "List all prompt templates from MCP server '{server_name}'."
+                );
+                tools.push(mcp_function_tool(&list_fqn, Some(desc), serde_json::json!({ "type": "object", "properties": {} })));
+            }
+            let get_fqn = format!("mcp__{}__prompts_get", server_name);
+            if !tools.iter().any(|t| tool_name(t) == Some(&get_fqn[..])) {
+                let desc = format!(
+                    "Get a prompt template from MCP server '{server_name}'. \
+                     Call prompts_list first to see available prompts, then \
+                     pass the prompt name and any optional arguments."
+                );
+                tools.push(mcp_function_tool(&get_fqn, Some(desc), serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The prompt name (as returned by prompts_list)."
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "description": "Optional prompt arguments (key-value pairs)."
+                        }
+                    },
+                    "required": ["name"]
+                })));
+            }
+        }
     }
 
     tools
@@ -143,6 +189,42 @@ fn mcp_function_tool(
     })
 }
 
+/// Extract the tool name from a [`Tool`] enum. Returns `None` for
+/// non-Function variants (which we don't produce).
+fn tool_name(tool: &Tool) -> Option<&str> {
+    match tool {
+        Tool::Function(f) => Some(&f.name),
+        _ => None,
+    }
+}
+
+/// Synthetic tool: list all resources for an MCP server.
+fn resources_list_tool(fqn: &str, server: &str) -> Tool {
+    mcp_function_tool(
+        fqn,
+        Some(format!("List all resources exposed by MCP server '{server}'.")),
+        serde_json::json!({ "type": "object", "properties": {} }),
+    )
+}
+
+/// Synthetic tool: read a specific MCP resource by URI.
+fn resources_read_tool(fqn: &str, desc: &str) -> Tool {
+    mcp_function_tool(
+        fqn,
+        Some(desc.to_string()),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "uri": {
+                    "type": "string",
+                    "description": "The URI of the resource to read (as returned by resources_list)."
+                }
+            },
+            "required": ["uri"]
+        }),
+    )
+}
+
 /// Maximum characters of tool output kept before truncation. The rest is
 /// discarded and a truncation notice is appended so the model knows the output
 /// was cut short.
@@ -174,23 +256,185 @@ pub(crate) async fn run_tool_call(
     // `failed` flag below.
     let result: Result<String, String> = if call.name.starts_with("mcp__") {
         if let Some(mgr) = mcp {
-            match mgr
-                .call_tool(
-                    &call.name,
-                    serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null),
-                )
-                .await
-            {
-                Ok(result) => Ok(result
-                    .content
+            // Resource operations: dispatch separately from regular tool calls.
+            if call.name.ends_with("__resources_list") {
+                let server = call
+                    .name
+                    .strip_prefix("mcp__")
+                    .and_then(|s| s.strip_suffix("__resources_list"))
+                    .unwrap_or("");
+                let resources = mgr.all_resources();
+                let server_resources: Vec<_> = resources
                     .iter()
-                    .map(|c| match c {
-                        crate::mcp::types::ToolContent::Text { text } => text.clone(),
-                        _ => "[non-text MCP content]".to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")),
-                Err(e) => Err(format!("error: MCP tool call failed: {e}")),
+                    .filter(|(_, s, _)| s == server)
+                    .collect();
+                if server_resources.is_empty() {
+                    Ok(format!(
+                        "No resources available from MCP server '{server}'."
+                    ))
+                } else {
+                    let lines: Vec<String> = server_resources
+                        .iter()
+                        .map(|(_, _, r)| {
+                            format!(
+                                "uri: {}\n  name: {}{}",
+                                r.uri,
+                                r.name,
+                                r.description
+                                    .as_ref()
+                                    .map(|d| format!("\n  description: {d}"))
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .collect();
+                    Ok(lines.join("\n\n"))
+                }
+            } else if call.name.ends_with("__resources_read") {
+                let server = call
+                    .name
+                    .strip_prefix("mcp__")
+                    .and_then(|s| s.strip_suffix("__resources_read"))
+                    .unwrap_or("");
+                #[derive(serde::Deserialize)]
+                struct ReadArgs {
+                    uri: String,
+                }
+                let args: ReadArgs = match serde_json::from_str(&call.arguments) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return ToolOutput {
+                            param: FunctionCallOutputItemParam {
+                                call_id: call.call_id.clone(),
+                                output: FunctionCallOutput::Text(format!(
+                                    "error: invalid arguments: {e}"
+                                )),
+                                id: None,
+                                status: None,
+                            },
+                            failed: true,
+                        }
+                    }
+                };
+                match mgr.read_resource(server, &args.uri).await {
+                    Ok(result) => Ok(result
+                        .contents
+                        .iter()
+                        .map(|c| match c {
+                            crate::mcp::types::ResourceContent::Text {
+                                text, ..
+                            } => text.clone(),
+                            _ => "[non-text resource content]".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")),
+                    Err(e) => Err(format!("error: MCP resource read failed: {e}")),
+                }
+            } else if call.name.ends_with("__prompts_list") {
+                let server = call
+                    .name
+                    .strip_prefix("mcp__")
+                    .and_then(|s| s.strip_suffix("__prompts_list"))
+                    .unwrap_or("");
+                let prompts = mgr.all_prompts();
+                let server_prompts: Vec<_> = prompts
+                    .iter()
+                    .filter(|(_, s, _)| s == server)
+                    .collect();
+                if server_prompts.is_empty() {
+                    Ok(format!(
+                        "No prompts available from MCP server '{server}'."
+                    ))
+                } else {
+                    let lines: Vec<String> = server_prompts
+                        .iter()
+                        .map(|(_, _, p)| {
+                            let mut s = format!("name: {}{}",
+                                p.name,
+                                p.description
+                                    .as_ref()
+                                    .map(|d| format!("\n  description: {d}"))
+                                    .unwrap_or_default());
+                            if let Some(args) = &p.arguments {
+                                s.push_str("\n  arguments:");
+                                for a in args {
+                                    let req = if a.required == Some(true) { " (required)" } else { "" };
+                                    s.push_str(&format!("\n    - {}:{}{}",
+                                        a.name,
+                                        a.description.as_ref().map(|d| format!(" {d}")).unwrap_or_default(),
+                                        req));
+                                }
+                            }
+                            s
+                        })
+                        .collect();
+                    Ok(lines.join("\n\n"))
+                }
+            } else if call.name.ends_with("__prompts_get") {
+                let server = call
+                    .name
+                    .strip_prefix("mcp__")
+                    .and_then(|s| s.strip_suffix("__prompts_get"))
+                    .unwrap_or("");
+                #[derive(serde::Deserialize)]
+                struct PromptGetArgs {
+                    name: String,
+                    #[serde(default)]
+                    arguments: Option<serde_json::Value>,
+                }
+                let args: PromptGetArgs = match serde_json::from_str(&call.arguments) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return ToolOutput {
+                            param: FunctionCallOutputItemParam {
+                                call_id: call.call_id.clone(),
+                                output: FunctionCallOutput::Text(format!(
+                                    "error: invalid arguments: {e}"
+                                )),
+                                id: None,
+                                status: None,
+                            },
+                            failed: true,
+                        }
+                    }
+                };
+                match mgr.get_prompt(server, &args.name, args.arguments).await {
+                    Ok(result) => {
+                        let mut lines = Vec::new();
+                        if let Some(desc) = &result.description {
+                            lines.push(format!("description: {desc}"));
+                        }
+                        for msg in &result.messages {
+                            let role = &msg.role;
+                            let text = match &msg.content {
+                                crate::mcp::types::PromptContent::Text { text } => text.clone(),
+                                _ => "[non-text prompt content]".to_string(),
+                            };
+                            lines.push(format!("[{role}]\n{text}"));
+                        }
+                        Ok(lines.join("\n\n"))
+                    }
+                    Err(e) => Err(format!("error: MCP prompt get failed: {e}")),
+                }
+            } else {
+                match mgr
+                    .call_tool(
+                        &call.name,
+                        serde_json::from_str(&call.arguments)
+                            .unwrap_or(serde_json::Value::Null),
+                    )
+                    .await
+                {
+                    Ok(result) => Ok(result
+                        .content
+                        .iter()
+                        .map(|c| match c {
+                            crate::mcp::types::ToolContent::Text { text } => text.clone(),
+                            _ => "[non-text MCP content]".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")),
+                    Err(e) => Err(format!("error: MCP tool call failed: {e}")),
+                }
             }
         } else {
             Err("error: MCP not available (no servers connected)".to_string())

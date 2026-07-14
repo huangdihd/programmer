@@ -87,7 +87,7 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
 
 /// Parse and execute a slash command. If the command is unknown, fall back
 /// to sending it to the AI model.
-pub(crate) fn execute_command(app: &mut App<'_>, input: &str) {
+pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
     let command = Command::parse(input);
     app.input_panel.completion = None;
     let is_known = command.is_some();
@@ -150,10 +150,8 @@ pub(crate) fn execute_command(app: &mut App<'_>, input: &str) {
             let prev = app.work_mode;
             match arg.trim().to_lowercase().as_str() {
                 "manual" => app.work_mode = WorkMode::Manual,
-                "edits" | "edit" | "allowedits" | "allow" => {
-                    app.work_mode = WorkMode::AllowEdits
-                }
                 "auto" => app.work_mode = WorkMode::Auto,
+                "plan" => app.work_mode = WorkMode::Plan,
                 "yolo" => {
                     if app.config.allow_yolo {
                         app.work_mode = WorkMode::Yolo;
@@ -167,10 +165,10 @@ pub(crate) fn execute_command(app: &mut App<'_>, input: &str) {
                         return;
                     }
                 }
-                "" => app.work_mode = app.work_mode.next(),
+                "" => app.work_mode = app.work_mode.next(app.config.allow_yolo),
                 other => {
                     app.conversation_panel.add_error_string(format!(
-                        "unknown mode '{other}' — use manual, edits, or auto"
+                        "unknown mode '{other}' — use manual, auto, plan, or yolo"
                     ));
                     return;
                 }
@@ -397,6 +395,44 @@ pub(crate) fn execute_command(app: &mut App<'_>, input: &str) {
                 .collect();
             lines.insert(0, "Available commands:".to_string());
             app.conversation_panel.add_info_string(lines.join("\n"));
+            session::save_session(app);
+        }
+        Some(Command::Plan(arg)) => {
+            app.input_panel.clear();
+            match arg.trim().to_lowercase().as_str() {
+                "approve" | "ok" | "go" => {
+                    if app.work_mode == WorkMode::Plan
+                        && app.plan_phase == crate::classifier::PlanPhase::Reviewing
+                    {
+                        // Exit Plan mode into Auto.
+                        app.work_mode = WorkMode::Auto;
+                        app.plan_phase = crate::classifier::PlanPhase::default();
+                        app.plan_execution_mode = None;
+                        app.conversation_panel
+                            .add_info_string("Plan approved — executing with Auto mode.");
+                        let hidden = "The plan was approved by the user. Execute it now using the identified steps.";
+                        session::save_session(app);
+                        start_request_as(app, hidden.to_string(), InputRole::Developer).await;
+                    } else {
+                        app.conversation_panel
+                            .add_info_string("No plan pending approval. Use /mode plan to enter Plan mode.");
+                    }
+                }
+                "cancel" | "abort" => {
+                    app.work_mode = WorkMode::Auto;
+                    app.plan_phase = crate::classifier::PlanPhase::default();
+                    app.plan_execution_mode = None;
+                    app.conversation_panel
+                        .add_info_string("Plan cancelled — returned to Auto mode.");
+                    session::persist_config(app);
+                }
+                _ => {
+                    app.conversation_panel.add_info_string(
+                        "usage: /plan approve — approve current plan and execute\n\
+                         \u{20}      /plan cancel — cancel plan and return to Auto",
+                    );
+                }
+            }
             session::save_session(app);
         }
         None => {

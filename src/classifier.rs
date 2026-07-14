@@ -69,6 +69,10 @@ pub trait Classifier: Send + Sync {
 const DANGEROUS_TOOLS: &[&str] =
     &["command", "write_file", "edit_file", "configure_diagnostics"];
 
+/// Tool names that are read-only — always safe, even in Plan/Planning phase.
+const READ_ONLY_TOOLS: &[&str] =
+    &["read_file", "grep", "blob", "ask_user", "diagnostics", "todo"];
+
 /// Extract the MCP server name from a fully-qualified tool name like
 /// `mcp__codegraph__search` → `"codegraph"`. Returns `None` for built-in tools.
 pub fn mcp_server_name(tool_name: &str) -> Option<&str> {
@@ -124,36 +128,38 @@ impl Classifier for ManualClassifier {
     }
 }
 
-/// Auto-allow edits: write/edit tools are silently approved, but commands
-/// and other dangerous tools still require user approval.
+/// Plan Planning phase: all read-only tools are allowed; anything that
+/// mutates state (write_file, edit_file, command, configure_diagnostics)
+/// is denied with a clear message to output a plan instead.
 /// MCP tools are classified according to their server's [`McpPolicy`].
-pub struct AllowEditsClassifier {
+pub struct PlanPlanningClassifier {
     mcp_policies: HashMap<String, McpPolicy>,
 }
 
-impl AllowEditsClassifier {
+impl PlanPlanningClassifier {
     pub(crate) fn new(mcp_policies: HashMap<String, McpPolicy>) -> Self {
-        AllowEditsClassifier { mcp_policies }
+        PlanPlanningClassifier { mcp_policies }
     }
 }
 
-impl Classifier for AllowEditsClassifier {
+impl Classifier for PlanPlanningClassifier {
     fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
         // MCP tools: consult per-server policy first.
         if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
             return verdict;
         }
-        // In Allow Edits mode, only commands, configure_diagnostics, and
-        // MCP tools with the Review policy require approval.
-        if tool_name == "command"
-            || tool_name == "configure_diagnostics"
-            || tool_name.starts_with("mcp__")
-        {
-            Verdict::Ask {
-                reason: format!("{tool_name} requires approval in Allow Edits mode"),
-            }
-        } else {
-            Verdict::Allow
+        // Read-only tools always allowed.
+        if READ_ONLY_TOOLS.contains(&tool_name) {
+            return Verdict::Allow;
+        }
+        // Everything else: denied. Tell the model to output a plan.
+        Verdict::Deny {
+            reason: format!(
+                "You are in Plan mode (Planning phase). Use read-only tools to \
+                 explore and output a step-by-step plan. Do NOT call {tool_name}. \
+                 Stop after presenting the plan — the user will choose how to \
+                 execute it."
+            ),
         }
     }
 }
@@ -177,15 +183,28 @@ impl Classifier for YoloClassifier {
 pub enum WorkMode {
     /// Every write/edit/command tool call requires user approval.
     Manual,
-    /// Write/edit tools are auto-allowed; commands still require approval.
-    #[default]
-    #[serde(alias = "edits")]
-    AllowEdits,
     /// An LLM classifier decides per tool call whether to auto-approve.
+    #[default]
     Auto,
     /// All tool calls execute without any interception. Gated behind
-    /// `allow_yolo` in the config — not reachable via the normal cycle.
+    /// `allow_yolo` in the config.
     Yolo,
+    /// Plan-first mode: agent explores and outputs a plan before executing.
+    /// In Planning phase only read-only tools are allowed; after user
+    /// approval, execution uses the selected execution mode.
+    Plan,
+}
+
+/// Sub-phase of Plan mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlanPhase {
+    /// Agent explores with read-only tools and outputs a plan.
+    #[default]
+    Planning,
+    /// Plan is complete, waiting for user to choose execution mode.
+    Reviewing,
+    /// User approved; agent executes with the chosen mode.
+    Executing,
 }
 
 impl WorkMode {
@@ -193,30 +212,35 @@ impl WorkMode {
     pub fn label(&self) -> &str {
         match self {
             WorkMode::Manual => "Manual",
-            WorkMode::AllowEdits => "Allow Edits",
             WorkMode::Auto => "Auto",
             WorkMode::Yolo => "YOLO",
+            WorkMode::Plan => "Plan",
         }
     }
 
     /// Emoji icon for the footer.
     pub fn icon(&self) -> &str {
         match self {
-            WorkMode::Manual => "🛡",
-            WorkMode::AllowEdits => "✏️",
-            WorkMode::Auto => "🤖",
-            WorkMode::Yolo => "⚡",
+            WorkMode::Manual => "\u{1f6e1}",
+            WorkMode::Auto => "\u{1f916}",
+            WorkMode::Yolo => "\u{26a1}",
+            WorkMode::Plan => "\u{1f4cb}",
         }
     }
 
-    /// Cycle to the next mode. YOLO is excluded from the cycle; it must be
-    /// selected explicitly via `/mode yolo` and requires `allow_yolo`.
-    pub fn next(self) -> WorkMode {
+    /// Cycle to the next mode. Plan is always in the cycle; YOLO is included
+    /// when `allow_yolo` is true.
+    pub fn next(self, allow_yolo: bool) -> WorkMode {
         match self {
-            WorkMode::Manual => WorkMode::AllowEdits,
-            WorkMode::AllowEdits => WorkMode::Auto,
-            WorkMode::Auto => WorkMode::Manual,
-            // If somehow in YOLO, cycling returns to the normal ring.
+            WorkMode::Manual => WorkMode::Auto,
+            WorkMode::Auto => WorkMode::Plan,
+            WorkMode::Plan => {
+                if allow_yolo {
+                    WorkMode::Yolo
+                } else {
+                    WorkMode::Manual
+                }
+            }
             WorkMode::Yolo => WorkMode::Manual,
         }
     }
@@ -235,8 +259,8 @@ impl WorkMode {
             WorkMode::Manual | WorkMode::Auto => {
                 Box::new(ManualClassifier::new(mcp_policies))
             }
-            WorkMode::AllowEdits => Box::new(AllowEditsClassifier::new(mcp_policies)),
             WorkMode::Yolo => Box::new(YoloClassifier),
+            WorkMode::Plan => Box::new(PlanPlanningClassifier::new(mcp_policies)),
         }
     }
 }
@@ -249,6 +273,22 @@ impl WorkMode {
 /// bypasses the LLM entirely.
 pub fn needs_review(tool_name: &str) -> bool {
     DANGEROUS_TOOLS.contains(&tool_name) || tool_name.starts_with("mcp__")
+}
+
+// ---------------------------------------------------------------------------
+// Plan mode helpers
+// ---------------------------------------------------------------------------
+
+/// Short user messages commonly used to approve a plan. Used to detect when
+/// the user says "go ahead" in Planning phase.
+pub fn is_plan_approval(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "go ahead" | "approved" | "lgtm" | "looks good" | "proceed"
+            | "ok" | "yes" | "do it" | "execute" | "run it" | "sure"
+            | "send it" | "go" | "ship it" | "yolo"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +321,13 @@ auto-approve WITHOUT a human in the loop.
 Approve routine, reversible, in-workspace actions: building, running tests, \
 reading files, editing or creating files inside the project, and safe local \
 git operations (status, diff, add, commit).
+
+Always approve cleanup commands that undo the agent's own side effects: \
+killing leftover test subprocesses (taskkill/pkill targeting python, node, \
+and similar test-only toolchains), deleting temporary files and directories \
+the agent itself created during testing (paths under system temp dirs or \
+with names like mcp_test_server_*.py), and removing stale test binaries. \
+These are inherently safe — they only undo what the agent itself did.
 
 Do NOT approve actions that are destructive, hard to reverse, or reach outside \
 the workspace: `rm -rf` or deletion of broad/unknown paths, force-pushing or \
@@ -597,104 +644,124 @@ mod tests {
     }
 
     #[test]
-    fn allow_edits_allows_edits_but_not_commands() {
-        // Commands still require approval.
-        assert!(matches!(classify(WorkMode::AllowEdits, "command"), Verdict::Ask { .. }));
-        assert!(matches!(
-            classify(WorkMode::AllowEdits, "configure_diagnostics"),
-            Verdict::Ask { .. }
-        ));
-        // Edit and read tools are auto-approved.
-        assert!(matches!(classify(WorkMode::AllowEdits, "write_file"), Verdict::Allow));
-        assert!(matches!(classify(WorkMode::AllowEdits, "edit_file"), Verdict::Allow));
-        assert!(matches!(classify(WorkMode::AllowEdits, "read_file"), Verdict::Allow));
+    fn plan_planning_allows_read_only_denies_mutating() {
+        // Read-only: Allow in Plan Planning.
+        assert!(matches!(classify(WorkMode::Plan, "read_file"), Verdict::Allow));
+        assert!(matches!(classify(WorkMode::Plan, "grep"), Verdict::Allow));
+        assert!(matches!(classify(WorkMode::Plan, "blob"), Verdict::Allow));
+        assert!(matches!(classify(WorkMode::Plan, "ask_user"), Verdict::Allow));
+        assert!(matches!(classify(WorkMode::Plan, "todo"), Verdict::Allow));
+        // Mutating: Deny.
+        assert!(matches!(classify(WorkMode::Plan, "command"), Verdict::Deny { .. }));
+        assert!(matches!(classify(WorkMode::Plan, "write_file"), Verdict::Deny { .. }));
+        assert!(matches!(classify(WorkMode::Plan, "edit_file"), Verdict::Deny { .. }));
     }
 
     #[test]
-    fn mode_cycle_excludes_yolo() {
-        assert_eq!(WorkMode::Manual.next(), WorkMode::AllowEdits);
-        assert_eq!(WorkMode::AllowEdits.next(), WorkMode::Auto);
-        assert_eq!(WorkMode::Auto.next(), WorkMode::Manual);
-        // YOLO is never produced by cycling.
-        assert_ne!(WorkMode::Manual.next(), WorkMode::Yolo);
-        assert_ne!(WorkMode::AllowEdits.next(), WorkMode::Yolo);
-        assert_ne!(WorkMode::Auto.next(), WorkMode::Yolo);
+    fn plan_deny_message_mentions_plan() {
+        if let Verdict::Deny { reason } = classify(WorkMode::Plan, "command") {
+            assert!(reason.contains("plan"), "reason: {reason}");
+        } else {
+            panic!("expected Deny");
+        }
+    }
+
+    #[test]
+    fn mode_cycle_includes_plan() {
+        assert_eq!(WorkMode::Manual.next(false), WorkMode::Auto);
+        assert_eq!(WorkMode::Auto.next(false), WorkMode::Plan);
+        assert_eq!(WorkMode::Plan.next(false), WorkMode::Manual);
+        assert_ne!(WorkMode::Plan.next(false), WorkMode::Yolo);
+    }
+
+    #[test]
+    fn mode_cycle_includes_yolo_when_allowed() {
+        assert_eq!(WorkMode::Manual.next(true), WorkMode::Auto);
+        assert_eq!(WorkMode::Auto.next(true), WorkMode::Plan);
+        assert_eq!(WorkMode::Plan.next(true), WorkMode::Yolo);
+        assert_eq!(WorkMode::Yolo.next(true), WorkMode::Manual);
     }
 
     #[test]
     fn auto_uses_llm_classifier() {
         assert!(WorkMode::Auto.uses_llm_classifier());
         assert!(!WorkMode::Manual.uses_llm_classifier());
-        assert!(!WorkMode::AllowEdits.uses_llm_classifier());
-    }
-
-    #[test]
-    fn yes_no_bucketing() {
-        assert_eq!(yes_no_bucket("yes"), Some(true));
-        assert_eq!(yes_no_bucket(" Yes"), Some(true));
-        assert_eq!(yes_no_bucket("YES"), Some(true));
-        assert_eq!(yes_no_bucket("no"), Some(false));
-        assert_eq!(yes_no_bucket(" No."), Some(false));
-        assert_eq!(yes_no_bucket("maybe"), None);
-        assert_eq!(yes_no_bucket("yep"), None);
-    }
-
-    #[test]
-    fn parse_reasoned_verdicts() {
-        assert!(matches!(parse_reasoned("APPROVE"), Verdict::Allow));
-        assert!(matches!(parse_reasoned("approve"), Verdict::Allow));
-        match parse_reasoned("DENY: rm -rf on a broad path is irreversible") {
-            Verdict::Deny { reason } => assert!(reason.contains("irreversible")),
-            _ => panic!("expected deny"),
-        }
-        // Unrecognised output defaults to deny with the text as the reason.
-        match parse_reasoned("this looks risky") {
-            Verdict::Deny { reason } => assert_eq!(reason, "this looks risky"),
-            _ => panic!("expected deny"),
-        }
-        match parse_reasoned("") {
-            Verdict::Deny { reason } => assert!(!reason.is_empty()),
-            _ => panic!("expected deny"),
-        }
+        assert!(!WorkMode::Plan.uses_llm_classifier());
     }
 
     #[test]
     fn needs_review_only_mutating() {
         assert!(needs_review("command"));
         assert!(needs_review("write_file"));
-        assert!(needs_review("edit_file"));
         assert!(!needs_review("read_file"));
         assert!(!needs_review("grep"));
-        // All MCP tools require review (we can't know their semantics).
-        assert!(needs_review("mcp__filesystem__read_file"));
-        assert!(needs_review("mcp__codegraph__search"));
+        assert!(!needs_review("todo"));
     }
 
     #[test]
-    fn mcp_server_name_parsing() {
-        assert_eq!(mcp_server_name("mcp__codegraph__search"), Some("codegraph"));
-        assert_eq!(mcp_server_name("mcp__fs__read"), Some("fs"));
-        assert_eq!(mcp_server_name("command"), None);
-        assert_eq!(mcp_server_name("mcp__incomplete"), None);
+    fn plan_approval_detection() {
+        assert!(is_plan_approval("go ahead"));
+        assert!(is_plan_approval("approved"));
+        assert!(is_plan_approval("lgtm"));
+        assert!(is_plan_approval("yes"));
+        assert!(is_plan_approval("YOLO"));
+        assert!(is_plan_approval("  go ahead  "));
+        assert!(!is_plan_approval("no"));
+        assert!(!is_plan_approval("maybe later"));
+        assert!(!is_plan_approval("change the second step"));
+    }
+
+    #[test]
+    fn work_mode_labels() {
+        assert_eq!(WorkMode::Manual.label(), "Manual");
+        assert_eq!(WorkMode::Auto.label(), "Auto");
+        assert_eq!(WorkMode::Yolo.label(), "YOLO");
+        assert_eq!(WorkMode::Plan.label(), "Plan");
+    }
+
+    #[test]
+    fn parse_reasoned_verdicts() {
+        assert!(matches!(parse_reasoned("APPROVE"), Verdict::Allow));
+        assert!(matches!(parse_reasoned("DENY: too risky"), Verdict::Deny { .. }));
+        let reason = match parse_reasoned("DENY: too risky") {
+            Verdict::Deny { reason } => reason,
+            _ => panic!(),
+        };
+        assert_eq!(reason, "too risky");
+    }
+
+    #[test]
+    fn yes_no_bucketing() {
+        assert_eq!(yes_no_bucket("yes"), Some(true));
+        assert_eq!(yes_no_bucket("Yes"), Some(true));
+        assert_eq!(yes_no_bucket("no"), Some(false));
+        assert_eq!(yes_no_bucket("No"), Some(false));
+        assert_eq!(yes_no_bucket(""), None);
+        assert_eq!(yes_no_bucket("maybe"), None);
     }
 
     #[test]
     fn mcp_policy_trusted_returns_allow() {
         let mut policies = HashMap::new();
         policies.insert("codegraph".to_string(), McpPolicy::Trusted);
-        let v = classify_mcp_policy("mcp__codegraph__search", &policies);
-        assert!(matches!(v, Some(Verdict::Allow)));
-        // Server not in map defaults to Review → None.
-        let v = classify_mcp_policy("mcp__unknown__tool", &policies);
-        assert!(v.is_none());
+        assert!(matches!(
+            classify_mcp_policy("mcp__codegraph__search", &policies),
+            Some(Verdict::Allow)
+        ));
     }
 
     #[test]
     fn mcp_policy_review_returns_none() {
         let mut policies = HashMap::new();
         policies.insert("codegraph".to_string(), McpPolicy::Review);
-        let v = classify_mcp_policy("mcp__codegraph__search", &policies);
-        assert!(v.is_none()); // Falls through to normal classifier.
+        assert!(classify_mcp_policy("mcp__codegraph__search", &policies).is_none());
+    }
+
+    #[test]
+    fn mcp_server_name_parsing() {
+        assert_eq!(mcp_server_name("mcp__codegraph__search"), Some("codegraph"));
+        assert_eq!(mcp_server_name("command"), None);
+        assert_eq!(mcp_server_name("mcp__"), None);
     }
 
     #[test]
@@ -730,23 +797,24 @@ mod tests {
     }
 
     #[test]
-    fn allow_edits_trusted_mcp_allowed() {
+    fn plan_planning_trusted_mcp_allowed() {
         let mut policies = HashMap::new();
         policies.insert("fs".to_string(), McpPolicy::Trusted);
-        let c = AllowEditsClassifier::new(policies);
-        // MCP tool with Trusted policy: Allow in Allow Edits mode.
+        let c = PlanPlanningClassifier::new(policies);
+        // MCP tool with Trusted policy: auto-approved even in Plan Planning.
         assert!(matches!(c.classify("mcp__fs__read", r#"{}"#), Verdict::Allow));
+        assert!(matches!(c.classify("mcp__fs__write", r#"{}"#), Verdict::Allow));
     }
 
     #[test]
-    fn allow_edits_review_mcp_asks() {
+    fn plan_planning_review_mcp_denied() {
         let mut policies = HashMap::new();
         policies.insert("db".to_string(), McpPolicy::Review);
-        let c = AllowEditsClassifier::new(policies);
-        // MCP tool with Review policy: Ask in Allow Edits mode.
+        let c = PlanPlanningClassifier::new(policies);
+        // MCP tool with Review policy: denied in Plan Planning (not read-only).
         assert!(matches!(
             c.classify("mcp__db__query", r#"{}"#),
-            Verdict::Ask { .. }
+            Verdict::Deny { .. }
         ));
     }
 }

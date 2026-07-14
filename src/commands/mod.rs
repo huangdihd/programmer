@@ -44,6 +44,8 @@ pub enum Command {
     Skill(String),
     /// `/mcp <show|manage>` — list or manage MCP servers.
     Mcp(String),
+    /// `/plan <approve|cancel>` — plan mode control.
+    Plan(String),
 }
 
 impl Command {
@@ -76,6 +78,7 @@ impl Command {
             "todo" | "todos" | "t" => Some(Command::Todo),
             "skill" | "skills" => Some(Command::Skill(args)),
             "mcp" => Some(Command::Mcp(args)),
+            "plan" => Some(Command::Plan(args)),
             _ => None,
         }
     }
@@ -84,7 +87,7 @@ impl Command {
     pub fn all_commands() -> &'static [&'static str] {
         &[
             "model", "new", "providers", "session", "mode", "classifier", "init", "todo", "skill",
-            "mcp", "clear", "quit", "help",
+            "mcp", "plan", "clear", "quit", "help",
         ]
     }
 
@@ -92,9 +95,11 @@ impl Command {
     pub fn descriptions() -> &'static [(&'static str, &'static str)] {
         &[
             ("/model <provider/model>", "Switch to a different model"),
-            ("/mode <manual|edits|auto>", "Set work mode (or cycle with Ctrl+T)"),
+            ("/mode <manual|auto|plan|yolo>", "Set work mode (or cycle with Ctrl+T)"),
             ("/classifier [provider/model]", "Set/show the Auto-mode classifier model"),
             ("/init", "Explore the project, write PROGRAMMER.md, set up diagnostics"),
+            ("/plan approve", "Approve the current plan (Plan mode)"),
+            ("/plan cancel", "Cancel plan and return to Auto mode"),
             ("/skill <name|list|off>", "Activate, list, or clear agent skills"),
             ("/skill manage", "Open the skills management panel"),
             ("/mcp show", "List configured MCP servers and their status"),

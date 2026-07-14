@@ -103,12 +103,22 @@ impl Widget for &mut App<'_> {
             ).len() as u16;
             4 + detail_count + 4 // title + reason + details + options
         };
-        // The bottom row is either a modal (question / approval) or the input.
+        // The bottom row is either a modal (question / approval / plan review) or the input.
         // When it's the input, let it grow with multi-line content.
+        let plan_review_height: u16 = if self.work_mode == crate::classifier::WorkMode::Plan
+            && self.plan_phase == crate::classifier::PlanPhase::Reviewing
+        {
+            let option_count: u16 = if self.config.allow_yolo { 4 } else { 3 };
+            5 + option_count // header + separator + options
+        } else {
+            0
+        };
         let bottom_height = if self.question_panel.is_some() {
             question_height
         } else if !self.approval_queue.is_empty() {
             approval_height
+        } else if plan_review_height > 0 {
+            plan_review_height
         } else {
             self.input_panel.needed_height()
         };
@@ -207,6 +217,77 @@ impl Widget for &mut App<'_> {
                     Block::default()
                         .borders(Borders::TOP)
                         .border_style(Style::default().fg(Color::Yellow)),
+                )
+                .render(chunks[POS_BOTTOM], buf);
+        } else if self.work_mode == crate::classifier::WorkMode::Plan
+            && self.plan_phase == crate::classifier::PlanPhase::Reviewing
+        {
+            let yolo_on = self.config.allow_yolo;
+            let options: &[&str] = if yolo_on {
+                &[
+                    "Execute with Manual  (approve each action)",
+                    "Execute with Auto    (AI reviews each action)",
+                    "Execute with YOLO    (run everything unchecked)",
+                    "Propose changes\u{2026}     (give feedback first)",
+                ]
+            } else {
+                &[
+                    "Execute with Manual  (approve each action)",
+                    "Execute with Auto    (AI reviews each action)",
+                    "Propose changes\u{2026}     (give feedback first)",
+                ]
+            };
+            let sel = self.plan_review_selected;
+            let option_lines: Vec<Line> = options
+                .iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    let marker = if i == sel { "\u{2771}" } else { " " };
+                    let style = if i == sel {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(format!("{marker} {label}"), style),
+                    ])
+                })
+                .collect();
+
+            let mut lines: Vec<Line> = vec![
+                Line::from(vec![
+                    Span::styled(
+                        "\u{1f4cb}  Plan received. Choose how to execute:",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![Span::styled(
+                    "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+            ];
+            lines.extend(option_lines);
+            // Hint line
+            lines.push(Line::from(vec![
+                Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::Green).bold()),
+                Span::styled(" confirm  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+            ]));
+
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .border_style(Style::default().fg(Color::Cyan)),
                 )
                 .render(chunks[POS_BOTTOM], buf);
         } else {

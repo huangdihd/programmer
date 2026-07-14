@@ -17,6 +17,7 @@
 
 use super::App;
 use super::{commands, diagnostics, helpers, session, stream, tools};
+use crate::classifier::WorkMode;
 use crate::commands::CompletionEngine;
 use crate::ui::components::conversation_panel::conversation_panel::{ActivePhase, SelectionEnd};
 use crate::ui::components::provider_panel::PanelAction;
@@ -38,7 +39,7 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
             crossterm::event::Event::Key(key_event)
                 if key_event.kind == KeyEventKind::Press =>
             {
-                handle_key_events(app, key_event)?
+                handle_key_events(app, key_event).await?
             }
             crossterm::event::Event::Paste(data) => handle_paste(app, data),
             crossterm::event::Event::Mouse(_) if app.provider_panel.is_some() => {}
@@ -100,6 +101,17 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
                 let cancel_token = partial_response.cancelled.clone();
                 let calls = helpers::function_calls(&partial_response);
                 if calls.is_empty() {
+                    // Plan mode: if in Planning phase and model stopped without
+                    // making tool calls, it has finished presenting the plan.
+                    if app.work_mode == WorkMode::Plan
+                        && app.plan_phase == crate::classifier::PlanPhase::Planning
+                    {
+                        app.plan_phase = crate::classifier::PlanPhase::Reviewing;
+                        app.conversation_panel.phase = ActivePhase::None;
+                        app.conversation_panel.flush_usage();
+                        session::save_session(app);
+                        return Ok(());
+                    }
                     app.conversation_panel.phase = ActivePhase::None;
                     app.conversation_panel.flush_usage();
                     if let Some(pending_request) =
@@ -202,6 +214,7 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
                 } else {
                     let mcp = crate::mcp::McpManager::from_config(
                         &app.config.mcp_servers,
+                        ".",
                     )
                     .await;
                     for err in &mcp.startup_errors {
@@ -278,6 +291,110 @@ pub(crate) fn handle_approval_key(
             _ => {}
         },
         _ => {}
+    }
+    Ok(())
+}
+
+/// Handle keyboard input in the plan review bar (Plan mode Reviewing phase).
+async fn handle_plan_review_key(
+    app: &mut App<'_>,
+    key_event: KeyEvent,
+) -> color_eyre::Result<()> {
+    let option_count = if app.config.allow_yolo { 4 } else { 3 };
+    match key_event.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.plan_review_selected = app.plan_review_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+            if app.plan_review_selected + 1 < option_count {
+                app.plan_review_selected += 1;
+            }
+        }
+        KeyCode::Esc => {
+            // Cancel review — go back to Planning for revision.
+            app.plan_phase = crate::classifier::PlanPhase::Planning;
+            app.plan_review_selected = 0;
+            app.conversation_panel
+                .add_info_string("Plan review cancelled — you can revise the plan.");
+            session::save_session(app);
+        }
+        KeyCode::Enter => {
+            match app.plan_review_selected {
+                0 => {
+                    // Execute with Manual — exit Plan mode into Manual.
+                    app.work_mode = WorkMode::Manual;
+                    app.plan_phase = crate::classifier::PlanPhase::default();
+                    app.plan_execution_mode = None;
+                    app.plan_review_selected = 0;
+                    app.conversation_panel
+                        .add_info_string("Plan approved — executing with Manual mode.");
+                    let hidden = "The plan was approved by the user. Execute it now using the identified steps. Ask for approval before running commands or destructive edits.";
+                    session::save_session(app);
+                    super::commands::start_request_as(
+                        app,
+                        hidden.to_string(),
+                        async_openai::types::responses::InputRole::Developer,
+                    )
+                    .await;
+                }
+                1 => {
+                    // Execute with Auto — exit Plan mode into Auto.
+                    app.work_mode = WorkMode::Auto;
+                    app.plan_phase = crate::classifier::PlanPhase::default();
+                    app.plan_execution_mode = None;
+                    app.plan_review_selected = 0;
+                    app.conversation_panel
+                        .add_info_string("Plan approved — executing with Auto mode.");
+                    let hidden = "The plan was approved by the user. Execute it now using the identified steps.";
+                    session::save_session(app);
+                    super::commands::start_request_as(
+                        app,
+                        hidden.to_string(),
+                        async_openai::types::responses::InputRole::Developer,
+                    )
+                    .await;
+                }
+                2 => {
+                    if app.config.allow_yolo {
+                        // Execute with YOLO — exit Plan mode into YOLO.
+                        app.work_mode = WorkMode::Yolo;
+                        app.plan_phase = crate::classifier::PlanPhase::default();
+                        app.plan_execution_mode = None;
+                        app.plan_review_selected = 0;
+                        app.conversation_panel
+                            .add_info_string("Plan approved — executing with YOLO mode.");
+                        let hidden = "The plan was approved by the user. Execute it now using the identified steps. You have full autonomy.";
+                        session::save_session(app);
+                        super::commands::start_request_as(
+                            app,
+                            hidden.to_string(),
+                            async_openai::types::responses::InputRole::Developer,
+                        )
+                        .await;
+                    } else {
+                        // Propose changes (3rd option when YOLO is off)
+                        app.plan_phase = crate::classifier::PlanPhase::Planning;
+                        app.plan_review_selected = 0;
+                        app.conversation_panel
+                            .add_info_string("Enter your feedback in the input panel.");
+                        session::save_session(app);
+                    }
+                }
+                3 => {
+                    // Propose changes (4th option when YOLO is on)
+                    app.plan_phase = crate::classifier::PlanPhase::Planning;
+                    app.plan_review_selected = 0;
+                    app.conversation_panel
+                        .add_info_string("Enter your feedback in the input panel.");
+                    session::save_session(app);
+                }
+                _ => {}
+            }
+        }
+        _ => {
+            // Any other key: pass through to input panel for feedback text
+            app.input_panel.input(key_event);
+        }
     }
     Ok(())
 }
@@ -374,7 +491,7 @@ pub(crate) fn is_newline_modifier(modifiers: KeyModifiers) -> bool {
 }
 
 /// Handles the key events and updates the state of [`App`].
-pub(crate) fn handle_key_events(
+pub(crate) async fn handle_key_events(
     app: &mut App<'_>,
     key_event: KeyEvent,
 ) -> color_eyre::Result<()> {
@@ -397,6 +514,13 @@ pub(crate) fn handle_key_events(
         return Ok(());
     }
 
+    // ---- plan review (Plan mode) ----
+    if app.work_mode == WorkMode::Plan
+        && app.plan_phase == crate::classifier::PlanPhase::Reviewing
+    {
+        return handle_plan_review_key(app, key_event).await;
+    }
+
     // ---- todo panel ----
     if let Some(panel) = app.todo_panel.as_mut() {
         match panel.handle_key(key_event) {
@@ -413,7 +537,7 @@ pub(crate) fn handle_key_events(
     if key_event.code == KeyCode::Char('t')
         && key_event.modifiers == KeyModifiers::CONTROL
     {
-        app.work_mode = app.work_mode.next();
+        app.work_mode = app.work_mode.next(app.config.allow_yolo);
         session::persist_config(app);
         return Ok(());
     }
@@ -583,7 +707,7 @@ pub(crate) fn handle_key_events(
         KeyCode::Enter => {
             let text = app.input_panel.get_content();
             if text.starts_with('/') {
-                commands::execute_command(app, &text);
+                commands::execute_command(app, &text).await;
             } else {
                 app.events.send(AppEvent::Start);
             }

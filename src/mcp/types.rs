@@ -38,21 +38,23 @@ pub(crate) struct JsonRpcRequest {
 #[serde(untagged)]
 pub(crate) enum JsonRpcResponse {
     Success {
+        #[allow(dead_code)]
         jsonrpc: String,
         id: u64,
         result: serde_json::Value,
     },
     Error {
+        #[allow(dead_code)]
         jsonrpc: String,
         id: u64,
         error: JsonRpcError,
     },
-    #[serde(skip)]
-    #[allow(dead_code)]
     Notification {
+        #[allow(dead_code)]
         jsonrpc: String,
         method: String,
         #[serde(default)]
+        #[allow(dead_code)]
         params: Option<serde_json::Value>,
     },
 }
@@ -65,21 +67,6 @@ pub(crate) struct JsonRpcError {
     #[allow(dead_code)]
     #[serde(default)]
     pub(crate) data: Option<serde_json::Value>,
-}
-
-impl JsonRpcResponse {
-    /// Extract the result value, or panic with the error message.
-    pub(crate) fn unwrap_result(self) -> serde_json::Value {
-        match self {
-            JsonRpcResponse::Success { result, .. } => result,
-            JsonRpcResponse::Error { error, .. } => {
-                panic!("MCP RPC error: {}", error.message);
-            }
-            JsonRpcResponse::Notification { .. } => {
-                panic!("unexpected notification in response slot");
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +116,9 @@ pub(crate) struct McpServerConfig {
 pub(crate) struct InitializeResult {
     #[allow(dead_code)]
     pub(crate) protocolVersion: String,
+    #[allow(dead_code)]
     pub(crate) capabilities: serde_json::Value,
+    #[allow(dead_code)]
     pub(crate) serverInfo: ServerInfo,
 }
 
@@ -165,13 +154,6 @@ pub(crate) struct McpTool {
 // MCP protocol: tools/call
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-pub(crate) struct CallToolParams {
-    pub(crate) name: String,
-    #[serde(default)]
-    pub(crate) arguments: serde_json::Value,
-}
-
 #[derive(Debug, Deserialize)]
 #[allow(non_snake_case)]
 pub(crate) struct CallToolResult {
@@ -185,6 +167,127 @@ pub(crate) struct CallToolResult {
 #[allow(non_snake_case)]
 #[serde(tag = "type")]
 pub(crate) enum ToolContent {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    #[allow(dead_code)]
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    #[serde(rename = "resource")]
+    #[allow(dead_code)]
+    Resource {
+        #[allow(dead_code)]
+        resource: serde_json::Value,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// MCP protocol: resources/list
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListResourcesResult {
+    pub(crate) resources: Vec<McpResource>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct McpResource {
+    pub(crate) uri: String,
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(rename = "mimeType")]
+    #[serde(default)]
+    pub(crate) mime_type: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// MCP protocol: resources/read
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReadResourceResult {
+    pub(crate) contents: Vec<ResourceContent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(tag = "type")]
+pub(crate) enum ResourceContent {
+    #[serde(rename = "text")]
+    Text {
+        #[allow(dead_code)]
+        uri: String,
+        #[serde(rename = "mimeType")]
+        #[serde(default)]
+        #[allow(dead_code)]
+        mime_type: Option<String>,
+        text: String,
+    },
+    #[serde(rename = "blob")]
+    #[allow(dead_code)]
+    Blob {
+        uri: String,
+        #[serde(rename = "mimeType")]
+        #[serde(default)]
+        #[allow(dead_code)]
+        mime_type: Option<String>,
+        #[allow(dead_code)]
+        blob: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// MCP protocol: prompts/list
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListPromptsResult {
+    pub(crate) prompts: Vec<McpPrompt>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct McpPrompt {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    /// Prompt arguments (template variables).
+    #[serde(default)]
+    pub(crate) arguments: Option<Vec<McpPromptArgument>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct McpPromptArgument {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
+    pub(crate) required: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// MCP protocol: prompts/get
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct GetPromptResult {
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    pub(crate) messages: Vec<PromptMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PromptMessage {
+    pub(crate) role: String,
+    pub(crate) content: PromptContent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub(crate) enum PromptContent {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image")]

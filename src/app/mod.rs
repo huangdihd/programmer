@@ -103,6 +103,12 @@ pub struct App<'a> {
     pub(crate) session_uuid: String,
     /// Session manager for persistence.
     pub(crate) session_mgr: Option<SessionManager>,
+    /// Plan mode sub-phase. Only meaningful when `work_mode == WorkMode::Plan`.
+    pub(crate) plan_phase: crate::classifier::PlanPhase,
+    /// Execution mode selected by the user for the Plan Executing phase.
+    pub(crate) plan_execution_mode: Option<crate::classifier::WorkMode>,
+    /// Which option is highlighted in the plan review bar.
+    pub(crate) plan_review_selected: usize,
 }
 
 impl std::fmt::Debug for App<'_> {
@@ -204,6 +210,9 @@ impl App<'_> {
             skill_registry: crate::skills::SkillRegistry::load(),
             mcp_manager: None,
             session_mgr,
+            plan_phase: crate::classifier::PlanPhase::default(),
+            plan_execution_mode: None,
+            plan_review_selected: 0,
         };
 
         if !saved_activated_skills.is_empty() {
@@ -212,7 +221,7 @@ impl App<'_> {
         }
 
         if !app.config.mcp_servers.is_empty() {
-            let mcp = crate::mcp::McpManager::from_config(&app.config.mcp_servers).await;
+            let mcp = crate::mcp::McpManager::from_config(&app.config.mcp_servers, ".").await;
             for err in &mcp.startup_errors {
                 app.conversation_panel.add_error_string(err.clone());
             }
@@ -270,8 +279,8 @@ impl App<'_> {
         stream::handle_error_events(self, error).await
     }
 
-    pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        events::handle_key_events(self, key_event)
+    pub async fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        events::handle_key_events(self, key_event).await
     }
 
     pub fn tick(&self) {

@@ -17,6 +17,7 @@
 
 use super::App;
 use super::helpers;
+use crate::classifier::{PlanPhase, WorkMode};
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
 use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
@@ -26,6 +27,35 @@ use async_openai::types::responses::{CreateResponse, OutputItem, ResponseStreamE
 use futures::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Build an optional plan-mode system prompt snippet.
+fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
+    if app.work_mode != WorkMode::Plan {
+        return None;
+    }
+    match app.plan_phase {
+        PlanPhase::Planning => Some(PLAN_PLANNING_PROMPT),
+        PlanPhase::Reviewing | PlanPhase::Executing => None,
+    }
+}
+
+const PLAN_PLANNING_PROMPT: &str = "\
+# Plan Mode — Planning Phase
+
+You are in **Plan Mode**. You must NOT make any changes yet.
+
+1. **Explore**: Read files, search the codebase, and understand the problem using
+   read_file, grep, blob, and diagnostics.
+2. **Plan**: Use the `todo` tool to list the steps you intend to take.
+3. **Present**: Output a clear, step-by-step plan:
+   - Which files need changes and what approach
+   - Tradeoffs and edge cases
+   - Proposed implementation order
+4. **Stop**: After presenting the plan, stop your response. Do NOT call
+   write_file, edit_file, command, or configure_diagnostics. The user will
+   choose how to execute the plan.
+
+Your response should end with a complete plan — not with a tool call.";
 
 /// Spawns a streaming response request for the current conversation state.
 pub(crate) fn spawn_stream(app: &mut App<'_>) {
@@ -49,6 +79,7 @@ pub(crate) fn spawn_stream(app: &mut App<'_>) {
     let input_param = app.conversation_panel.get_input_param(
         &app.current_model,
         app.skill_registry.combined_prompt().as_deref(),
+        plan_system_prompt(app),
     );
     let mcp = app.mcp_manager.clone();
     tokio::spawn(async move {
