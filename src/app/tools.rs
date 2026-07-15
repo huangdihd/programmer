@@ -256,132 +256,179 @@ pub(crate) fn build_mcp_policy_map(app: &App<'_>) -> HashMap<String, crate::mcp:
         .collect()
 }
 
-/// Extract ask_user Q&A summaries from conversation items for the classifier.
-/// Each entry is a two-line summary: the question the model asked and the
-/// answer the user gave. Returns empty Vec if no ask_user calls are found.
-fn build_ask_user_qa<'a>(
-    items: &[&'a MessageItem],
-    call_meta: &std::collections::HashMap<&'a str, (&'a str, &'a str)>,
-) -> Vec<String> {
-    let mut qa: Vec<String> = Vec::new();
-    for it in items.iter() {
-        if let MessageItem::ToolOutput { output: fco, .. } = it {
-            if let Some((name, args_json)) = call_meta.get(fco.call_id.as_str()) {
-                if *name == crate::tools::ask_user::NAME {
-                    let question = serde_json::from_str::<serde_json::Value>(args_json)
-                        .ok()
-                        .and_then(|v| v.get("question")?.as_str().map(String::from))
-                        .unwrap_or_else(|| "(parse error)".to_string());
-                    let answer = match &fco.output {
-                        FunctionCallOutput::Text(t) => helpers::truncate_chars(t.trim(), 500),
-                        _ => "(no text)".to_string(),
-                    };
-                    qa.push(format!(
-                        "The model asked the user: \"{}\"\nThe user answered: \"{}\"",
-                        question, answer
-                    ));
-                }
-            }
-        }
-    }
-    qa
+/// Pull readable text out of an assistant's output message (concatenate all
+/// `OutputText` parts, skip refusals).
+fn extract_msg_text(msg: &async_openai::types::responses::OutputMessage) -> String {
+    use async_openai::types::responses::OutputMessageContent;
+    msg.content
+        .iter()
+        .filter_map(|c| match c {
+            OutputMessageContent::OutputText(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Build light and full classifier context strings from the conversation.
+///
+/// `light_context` carries the last few user+assistant exchanges so the fast
+/// yes/no path has enough to understand short replies like "好的".
+///
+/// `full_context` carries the **complete** conversation transcript (every user
+/// message, every assistant message, every tool call with args, every tool
+/// output), skipping only reasoning blocks and internal errors.  Large tool
+/// outputs are truncated to keep the context manageable.
 pub(crate) fn build_classifier_context(app: &App<'_>) -> (String, String) {
-    let mut light = Vec::new();
-    let mut full: Vec<String> = Vec::new();
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let dir = format!("Working directory: {}", cwd.display());
-        light.push(dir.clone());
-        full.push(dir);
-    }
-
     let items: Vec<&MessageItem> = app.conversation_panel.items().collect();
 
-    if let Some(msg) = items.iter().rev().find_map(|it| match it {
-        MessageItem::Input(input) => helpers::extract_input_text(input),
-        _ => None,
-    }) {
-        let user = format!(
-            "User's latest request:\n{}",
-            helpers::truncate_chars(msg.trim(), 800)
-        );
-        light.push(user.clone());
-        full.push(user);
+    // ---- light context ---------------------------------------------------
+    let mut light = Vec::new();
+
+    if let Ok(cwd) = std::env::current_dir() {
+        light.push(format!("Working directory: {}", cwd.display()));
     }
 
-    let assistant_count = items
-        .iter()
-        .rev()
-        .filter(|it| matches!(it, MessageItem::Output(OutputItem::Message(_))))
-        .take(3)
-        .count();
-    if assistant_count > 0 {
-        full.push(format!("Assistant has sent {assistant_count} message(s) this turn."));
+    // Walk backwards collecting the last few user/assistant messages.
+    // Tool calls and tool outputs are omitted from the light path — it only
+    // needs conversational context to anchor a yes/no decision.
+    {
+        let mut recent: Vec<String> = Vec::new();
+        let mut user_count = 0u32;
+        for it in items.iter().rev() {
+            match it {
+                MessageItem::Input(input) => {
+                    if let Some(text) = helpers::extract_input_text(input) {
+                        recent.push(format!(
+                            "[User]\n{}",
+                            helpers::truncate_chars(text.trim(), 600)
+                        ));
+                        user_count += 1;
+                        if user_count >= 3 {
+                            break;
+                        }
+                    }
+                }
+                MessageItem::Output(OutputItem::Message(msg)) => {
+                    let text = extract_msg_text(msg);
+                    if !text.is_empty() {
+                        recent.push(format!(
+                            "[Assistant]\n{}",
+                            helpers::truncate_chars(text.trim(), 600)
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        recent.reverse();
+        light.extend(recent);
     }
 
-    // Collect function-call metadata keyed by call_id: (tool_name, arguments_json).
-    let call_meta: std::collections::HashMap<&str, (&str, &str)> = items
+    // ---- full context ----------------------------------------------------
+    let mut full_ctx: Vec<String> = Vec::new();
+
+    if let Ok(cwd) = std::env::current_dir() {
+        full_ctx.push(format!("Working directory: {}", cwd.display()));
+    }
+
+    // Map call_id → tool name so we can label tool outputs.
+    let call_meta: HashMap<&str, &str> = items
         .iter()
         .filter_map(|it| match it {
             MessageItem::Output(OutputItem::FunctionCall(fc)) => {
-                Some((fc.call_id.as_str(), (fc.name.as_str(), fc.arguments.as_str())))
+                Some((fc.call_id.as_str(), fc.name.as_str()))
             }
             _ => None,
         })
         .collect();
 
-    // Build ask_user Q&A summaries for the classifier.
-    let ask_user_qa = build_ask_user_qa(&items, &call_meta);
-
-    let tool_outcomes: Vec<String> = items
-        .iter()
-        .rev()
-        .filter_map(|it| match it {
-            MessageItem::Output(OutputItem::FunctionCall(fc)) => {
-                Some(format!("  {} — pending", fc.name))
+    for it in &items {
+        match it {
+            MessageItem::Input(input) => {
+                if let Some(text) = helpers::extract_input_text(input) {
+                    full_ctx.push(format!("\n[User]\n{}", text.trim()));
+                }
             }
-            MessageItem::ToolOutput { output: fco, failed, .. } => {
-                let output_text = match &fco.output {
-                    FunctionCallOutput::Text(t) => t.as_str(),
-                    _ => "",
-                };
+            MessageItem::Output(OutputItem::Message(msg)) => {
+                let text = extract_msg_text(msg);
+                if !text.is_empty() {
+                    full_ctx.push(format!("\n[Assistant]\n{}", text.trim()));
+                }
+            }
+            MessageItem::Output(OutputItem::Reasoning(_)) => {
+                // Skip — internal model chatter, not useful for classification.
+            }
+            MessageItem::Output(OutputItem::FunctionCall(call)) => {
+                full_ctx.push(format!(
+                    "\n[Tool call: {}]\n{}",
+                    call.name,
+                    helpers::truncate_chars(&call.arguments, 1000)
+                ));
+            }
+            MessageItem::Output(_) => {
+                // Other output types (file search, web search, etc.) —
+                // not useful for classification, skip.
+            }
+            MessageItem::ToolOutput {
+                output: fco,
+                failed,
+                approval_label,
+            } => {
                 let name = call_meta
                     .get(fco.call_id.as_str())
-                    .map(|(n, _)| *n)
+                    .copied()
                     .unwrap_or(fco.call_id.as_str());
-                let len = output_text.len();
-                let status = if output_text.is_empty() {
-                    "empty"
-                } else if *failed {
-                    "FAILED"
+                let status = if *failed { "FAILED" } else { "ok" };
+                // ask_user: pass the full answer so the classifier knows
+                // what the user explicitly approved/denied.
+                if name == crate::tools::ask_user::NAME {
+                    let text = match &fco.output {
+                        FunctionCallOutput::Text(t) => helpers::truncate_chars(t.trim(), 500),
+                        _ => String::new(),
+                    };
+                    let mut line = format!("\n[Tool output: {name}] ({status})");
+                    if let Some(label) = approval_label {
+                        line.push_str(&format!(" {label}"));
+                    }
+                    if text.is_empty() {
+                        line.push_str("\n(empty)");
+                    } else {
+                        line.push_str(&format!("\n{text}"));
+                    }
+                    full_ctx.push(line);
                 } else {
-                    "ok"
-                };
-                Some(format!("  {name} — {status}, {len} chars"))
+                    // Other tools: only pass status + approval label,
+                    // never the output text (untrusted external content).
+                    let mut line = format!("\n[Tool output: {name}] ({status})");
+                    if let Some(label) = approval_label {
+                        line.push_str(&format!(" {label}"));
+                    }
+                    full_ctx.push(line);
+                }
             }
-            _ => None,
-        })
-        .take(10)
-        .collect();
-
-    // Push ask_user Q&A into both light and full context — it is crucial
-    // for the classifier to know what the user explicitly approved/denied.
-    for qa in &ask_user_qa {
-        light.push(qa.clone());
-        full.push(qa.clone());
+            MessageItem::OpenAIError(e) => {
+                full_ctx.push(format!("\n[Error]\n{}", e));
+            }
+            MessageItem::Error(s) => {
+                full_ctx.push(format!("\n[Error]\n{}", s));
+            }
+            MessageItem::Warning(s) => {
+                full_ctx.push(format!("\n[Warning]\n{}", s));
+            }
+            MessageItem::Info(s) => {
+                full_ctx.push(format!("\n[Info]\n{}", s));
+            }
+            MessageItem::Meta { label, text } => {
+                full_ctx.push(format!("\n[{label}]\n{text}"));
+            }
+            MessageItem::Usage(_, _) => {
+                // Token usage counters — not useful for classification.
+            }
+        }
     }
 
-    if !tool_outcomes.is_empty() {
-        full.push(format!(
-            "Tool calls this turn:\n{}",
-            tool_outcomes.into_iter().rev().collect::<Vec<_>>().join("\n")
-        ));
-    }
-
-    (light.join("\n\n"), full.join("\n\n"))
+    (light.join("\n\n"), full_ctx.join("\n"))
 }
 
 // ---------------------------------------------------------------------------
@@ -443,94 +490,7 @@ fn spawn_run(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use async_openai::types::responses::{FunctionCallOutput, FunctionCallOutputItemParam};
-    use serde_json::json;
-
-    fn make_fc_call(id: &str, name: &str, args: &str) -> MessageItem {
-        MessageItem::Output(OutputItem::FunctionCall(
-            serde_json::from_value(json!({
-                "id": format!("fc_{id}"),
-                "call_id": id,
-                "name": name,
-                "arguments": args,
-                "type": "function_call",
-                "status": "completed",
-            }))
-            .unwrap(),
-        ))
-    }
-
-    fn make_tool_output(call_id: &str, text: &str) -> MessageItem {
-        MessageItem::ToolOutput {
-            output: FunctionCallOutputItemParam {
-                call_id: call_id.to_string(),
-                output: FunctionCallOutput::Text(text.to_string()),
-                id: None,
-                status: None,
-            },
-            failed: false,
-            approval_label: None,
-        }
-    }
-
-    #[test]
-    fn ask_user_qa_included() {
-        let items = vec![
-            make_fc_call(
-                "call_1",
-                "ask_user",
-                &json!({"question": "Can I create a file?", "kind": "yes_no"}).to_string(),
-            ),
-            make_tool_output("call_1", "Yes"),
-        ];
-        let item_refs: Vec<&MessageItem> = items.iter().collect();
-        let call_meta: std::collections::HashMap<&str, (&str, &str)> = item_refs
-            .iter()
-            .filter_map(|it| match it {
-                MessageItem::Output(OutputItem::FunctionCall(fc)) => {
-                    Some((fc.call_id.as_str(), (fc.name.as_str(), fc.arguments.as_str())))
-                }
-                _ => None,
-            })
-            .collect();
-
-        let qa = build_ask_user_qa(&item_refs, &call_meta);
-        assert_eq!(qa.len(), 1);
-        assert!(qa[0].contains("Can I create a file?"));
-        assert!(qa[0].contains("Yes"));
-    }
-
-    #[test]
-    fn ask_user_qa_empty_when_no_ask_user() {
-        let items = vec![
-            make_fc_call("call_1", "command", r#"{"command":"ls"}"#),
-            make_tool_output("call_1", "file1.txt"),
-        ];
-        let item_refs: Vec<&MessageItem> = items.iter().collect();
-        let call_meta: std::collections::HashMap<&str, (&str, &str)> = item_refs
-            .iter()
-            .filter_map(|it| match it {
-                MessageItem::Output(OutputItem::FunctionCall(fc)) => {
-                    Some((fc.call_id.as_str(), (fc.name.as_str(), fc.arguments.as_str())))
-                }
-                _ => None,
-            })
-            .collect();
-
-        let qa = build_ask_user_qa(&item_refs, &call_meta);
-        assert!(qa.is_empty());
-    }
-
-    #[test]
-    fn ask_user_qa_missing_answer_no_panic() {
-        // ToolOutput exists but no matching FunctionCall in call_meta — should not crash.
-        let items = vec![make_tool_output("orphan_call", "orphan answer")];
-        let item_refs: Vec<&MessageItem> = items.iter().collect();
-        let call_meta: std::collections::HashMap<&str, (&str, &str)> =
-            std::collections::HashMap::new();
-
-        let qa = build_ask_user_qa(&item_refs, &call_meta);
-        assert!(qa.is_empty());
-    }
+    // Tests for build_classifier_context require an App instance and are
+    // covered by integration tests (manual mode or Auto mode with a real
+    // conversation).
 }
