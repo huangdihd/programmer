@@ -42,10 +42,10 @@ fn build_item_paragraph(
     item: &MessageItem,
     content_width: u16,
     expanded: bool,
-    tool_output: Option<(&FunctionCallOutputItemParam, bool)>,
+    tool_output: Option<(&FunctionCallOutputItemParam, bool, Option<&str>)>,
 ) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
     match item {
-        MessageItem::ToolOutput { output, failed } => {
+        MessageItem::ToolOutput { output, failed, .. } => {
             // Only reached for orphan results whose call is missing; results
             // with a call render inside that call's item.
             (
@@ -96,11 +96,14 @@ impl Widget for &mut ConversationPanel {
         // Tool calls render together with their result as one message: map each
         // call_id to its result, and collect the call ids so the standalone
         // result items can be hidden (they draw inside their call's entry).
-        let mut outputs_by_call: HashMap<&str, (&FunctionCallOutputItemParam, bool)> =
+        let mut outputs_by_call: HashMap<&str, (&FunctionCallOutputItemParam, bool, Option<&str>)> =
             HashMap::new();
         for item in &self.items {
-            if let MessageItem::ToolOutput { output, failed } = item {
-                outputs_by_call.insert(output.call_id.as_str(), (output, *failed));
+            if let MessageItem::ToolOutput { output, failed, approval_label } = item {
+                outputs_by_call.insert(
+                    output.call_id.as_str(),
+                    (output, *failed, approval_label.as_deref()),
+                );
             }
         }
         let call_ids: HashSet<&str> = self

@@ -25,6 +25,9 @@ pub enum MessageItem {
     ToolOutput {
         output: FunctionCallOutputItemParam,
         failed: bool,
+        /// Human-readable label explaining why this tool call was approved or
+        /// denied (e.g. "approved by Auto mode", "denied in Manual mode by user").
+        approval_label: Option<String>,
     },
     OpenAIError(OpenAIError),
     Error(String),
@@ -39,9 +42,10 @@ impl Clone for MessageItem {
         match self {
             MessageItem::Input(i) => MessageItem::Input(i.clone()),
             MessageItem::Output(o) => MessageItem::Output(o.clone()),
-            MessageItem::ToolOutput { output, failed } => MessageItem::ToolOutput {
+            MessageItem::ToolOutput { output, failed, approval_label } => MessageItem::ToolOutput {
                 output: output.clone(),
                 failed: *failed,
+                approval_label: approval_label.clone(),
             },
             MessageItem::OpenAIError(e) => {
                 MessageItem::Error(format!("(cloned error) {e}"))

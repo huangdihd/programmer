@@ -31,6 +31,9 @@ pub struct ToolCallMessage<'a> {
     output: Option<&'a FunctionCallOutputItemParam>,
     failed: bool,
     expanded: bool,
+    /// Human-readable label explaining why this tool call was approved or
+    /// denied (e.g. "approved by Auto mode", "denied in Manual mode by user").
+    approval_label: Option<&'a str>,
 }
 
 impl<'a> ToolCallMessage<'a> {
@@ -40,6 +43,7 @@ impl<'a> ToolCallMessage<'a> {
             output: None,
             failed: false,
             expanded: false,
+            approval_label: None,
         }
     }
 
@@ -55,6 +59,11 @@ impl<'a> ToolCallMessage<'a> {
 
     pub fn expanded(mut self, expanded: bool) -> Self {
         self.expanded = expanded;
+        self
+    }
+
+    pub fn approval_label(mut self, label: Option<&'a str>) -> Self {
+        self.approval_label = label;
         self
     }
 
@@ -84,6 +93,14 @@ impl<'a> ToolCallMessage<'a> {
                 spans.push(Span::styled(format!("  {summary}{suffix}"), muted));
             }
             let mut lines = vec![Line::from(spans)];
+            // Approval label (collapsed): subtle line below the tool name.
+            if let Some(label) = self.approval_label {
+                let label_style = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
+                lines.push(Line::from(Span::styled(
+                    format!("  {label}"),
+                    label_style,
+                )));
+            }
             if let Some(text) = &result_text {
                 let dim = if failed {
                     Style::new().fg(palette::RED_MUTED)
@@ -122,6 +139,15 @@ impl<'a> ToolCallMessage<'a> {
                     )));
                 }
             }
+        }
+
+        // Approval label (expanded): subtle line below the arguments.
+        if let Some(label) = self.approval_label {
+            let label_style = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
+            lines.push(Line::from(Span::styled(
+                format!("  {label}"),
+                label_style,
+            )));
         }
 
         if let Some(text) = &result_text {

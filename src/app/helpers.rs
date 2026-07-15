@@ -155,6 +155,7 @@ pub(crate) fn classifier_denied_output(
             status: None,
         },
         failed: true,
+        approval_label: Some(format!("\u{274c} denied by classifier — {reason}")),
     }
 }
 

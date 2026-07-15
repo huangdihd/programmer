@@ -46,10 +46,10 @@ pub struct AssistantMessage<'a> {
     expanded: bool,
     /// Monotonic frame counter for animating the "Thinking..." dots.
     frame_count: Option<u64>,
-    /// For function-call items: the matching result and whether the tool
-    /// reported failure, rendered inline so the call and its output appear as a
-    /// single message.
-    tool_output: Option<(&'a FunctionCallOutputItemParam, bool)>,
+    /// For function-call items: the matching result, whether the tool
+    /// reported failure, and an optional approval label — rendered inline so
+    /// the call and its output appear as a single message.
+    tool_output: Option<(&'a FunctionCallOutputItemParam, bool, Option<&'a str>)>,
 }
 
 impl<'a> AssistantMessage<'a> {
@@ -66,7 +66,7 @@ impl<'a> AssistantMessage<'a> {
 
     pub fn tool_output(
         mut self,
-        tool_output: Option<(&'a FunctionCallOutputItemParam, bool)>,
+        tool_output: Option<(&'a FunctionCallOutputItemParam, bool, Option<&'a str>)>,
     ) -> Self {
         self.tool_output = tool_output;
         self
@@ -98,8 +98,13 @@ impl<'a> AssistantMessage<'a> {
             }
             OutputItem::FunctionCall(call) => (
                 ToolCallMessage::new(call)
-                    .output(self.tool_output.map(|(output, _)| output))
-                    .failed(self.tool_output.map(|(_, failed)| failed).unwrap_or(false))
+                    .output(self.tool_output.map(|(output, _, _)| output))
+                    .failed(
+                        self.tool_output
+                            .map(|(_, failed, _)| failed)
+                            .unwrap_or(false),
+                    )
+                    .approval_label(self.tool_output.and_then(|(_, _, label)| label))
                     .expanded(self.expanded)
                     .into_text(),
                 Vec::new(),

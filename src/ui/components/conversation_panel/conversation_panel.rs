@@ -493,6 +493,7 @@ impl ConversationPanel {
         self.items.push(MessageItem::ToolOutput {
             output: output.param,
             failed: output.failed,
+            approval_label: output.approval_label,
         });
     }
 
@@ -860,6 +861,7 @@ mod tests {
                 status: None,
             },
             failed: false,
+            approval_label: None,
         };
         let assistant_text = |text: &str| {
             OutputItem::Message(OutputMessage {
@@ -940,6 +942,7 @@ mod tests {
                 status: None,
             },
             failed: false,
+            approval_label: None,
         };
 
         let mut panel = ConversationPanel::new();

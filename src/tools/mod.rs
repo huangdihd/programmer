@@ -239,6 +239,9 @@ const MAX_OUTPUT_LENGTH: usize = 8000;
 pub struct ToolOutput {
     pub param: FunctionCallOutputItemParam,
     pub failed: bool,
+    /// Human-readable label explaining why this tool call was approved or
+    /// denied (e.g. "approved by Auto mode", "denied in Manual mode by user").
+    pub approval_label: Option<String>,
 }
 
 /// Executes a single tool call and wraps the result as a [`ToolOutput`] ready to
@@ -312,6 +315,7 @@ pub(crate) async fn run_tool_call(
                                 status: None,
                             },
                             failed: true,
+                            approval_label: None,
                         }
                     }
                 };
@@ -394,6 +398,7 @@ pub(crate) async fn run_tool_call(
                                 status: None,
                             },
                             failed: true,
+                            approval_label: None,
                         }
                     }
                 };
@@ -469,6 +474,7 @@ pub(crate) async fn run_tool_call(
             status: None,
         },
         failed,
+        approval_label: None,
     }
 }
 

@@ -424,6 +424,7 @@ fn deny_single_call(app: &mut App<'_>, call: FunctionToolCall, reason: String) {
             status: None,
         },
         failed: true,
+        approval_label: Some(format!("{} denied in Manual mode by user", WorkMode::Manual.icon())),
     };
     app.conversation_panel.add_tool_output(output);
 }
@@ -447,13 +448,7 @@ fn check_approval_done(app: &mut App<'_>) {
         for call in &calls {
             let mut out =
                 crate::tools::run_tool_call(call, &sender, mcp.as_deref()).await;
-            let text = match &out.param.output {
-                FunctionCallOutput::Text(t) => t.clone(),
-                _ => String::new(),
-            };
-            out.param.output = FunctionCallOutput::Text(format!(
-                "[approved by user in Manual mode]\n{text}"
-            ));
+            out.approval_label = Some(format!("{} approved in Manual mode by user", WorkMode::Manual.icon()));
             outputs.push(out);
         }
         let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(

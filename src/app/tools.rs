@@ -118,8 +118,9 @@ pub(crate) fn process_classification_results(
         return;
     }
 
-    let label = app.work_mode.label().to_string();
-    spawn_run(app, allowed, denied, cancel_token, label);
+    let mode_icon = app.work_mode.icon().to_string();
+    let mode_name = app.work_mode.label().to_string();
+    spawn_run(app, allowed, denied, cancel_token, mode_icon, mode_name);
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +343,7 @@ pub(crate) fn build_classifier_context(app: &App<'_>) -> (String, String) {
             MessageItem::Output(OutputItem::FunctionCall(fc)) => {
                 Some(format!("  {} — pending", fc.name))
             }
-            MessageItem::ToolOutput { output: fco, failed } => {
+            MessageItem::ToolOutput { output: fco, failed, .. } => {
                 let output_text = match &fco.output {
                     FunctionCallOutput::Text(t) => t.as_str(),
                     _ => "",
@@ -414,7 +415,8 @@ fn spawn_run(
     allowed: Vec<FunctionToolCall>,
     denied: Vec<crate::tools::ToolOutput>,
     cancel_token: Arc<AtomicBool>,
-    _label: String,
+    mode_icon: String,
+    mode_name: String,
 ) {
     app.conversation_panel.phase = ActivePhase::ToolRunning;
     let sender = app.events.sender.clone();
@@ -425,7 +427,11 @@ fn spawn_run(
             if cancel_token.load(Ordering::Relaxed) {
                 break;
             }
-            let out = crate::tools::run_tool_call(call, &sender, mcp.as_deref()).await;
+            let mut out = crate::tools::run_tool_call(call, &sender, mcp.as_deref()).await;
+            // Only set if the classifier_denied_output path didn't already set one.
+            if out.approval_label.is_none() {
+                out.approval_label = Some(format!("{mode_icon} approved by {mode_name} mode"));
+            }
             outputs.push(out);
         }
         let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
@@ -464,6 +470,7 @@ mod tests {
                 status: None,
             },
             failed: false,
+            approval_label: None,
         }
     }
 

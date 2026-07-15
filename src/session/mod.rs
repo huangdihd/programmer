@@ -39,6 +39,8 @@ pub(crate) enum SerializableMessageItem {
     ToolOutput {
         output: FunctionCallOutputItemParam,
         failed: bool,
+        #[serde(default)]
+        approval_label: Option<String>,
     },
     OpenAIError { message: String },
     Error(String),
@@ -53,8 +55,8 @@ impl From<MessageItem> for SerializableMessageItem {
         match item {
             MessageItem::Input(i) => SerializableMessageItem::Input(i),
             MessageItem::Output(o) => SerializableMessageItem::Output(o),
-            MessageItem::ToolOutput { output, failed } => {
-                SerializableMessageItem::ToolOutput { output, failed }
+            MessageItem::ToolOutput { output, failed, approval_label } => {
+                SerializableMessageItem::ToolOutput { output, failed, approval_label }
             }
             MessageItem::OpenAIError(e) => SerializableMessageItem::OpenAIError {
                 message: e.to_string(),
@@ -85,12 +87,12 @@ impl From<SerializableMessageItem> for MessageItem {
                     FunctionCallOutput::Text(t)
                         if t.trim_start().to_ascii_lowercase().starts_with("error:")
                 );
-                MessageItem::ToolOutput { output, failed }
+                MessageItem::ToolOutput { output, failed, approval_label: None }
             }
             SerializableMessageItem::Input(i) => MessageItem::Input(i),
             SerializableMessageItem::Output(o) => MessageItem::Output(o),
-            SerializableMessageItem::ToolOutput { output, failed } => {
-                MessageItem::ToolOutput { output, failed }
+            SerializableMessageItem::ToolOutput { output, failed, approval_label } => {
+                MessageItem::ToolOutput { output, failed, approval_label }
             }
             SerializableMessageItem::OpenAIError { message } => {
                 MessageItem::Error(format!("(restored) {message}"))
