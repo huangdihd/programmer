@@ -121,8 +121,27 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
                     }
                     session::save_session(app);
                 } else {
-                    tools::run_tool_calls(app, calls, cancel_token).await;
+                    tools::run_tool_calls(app, calls, cancel_token);
                 }
+            }
+            AppEvent::ClassificationCompleted {
+                allowed,
+                denied,
+                ask_queue,
+                cancel_token,
+            } => {
+                if cancel_token.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if !ask_queue.is_empty() {
+                    for output in &denied {
+                        app.conversation_panel.add_tool_output(output.clone());
+                    }
+                    app.approval_queue = ask_queue;
+                    app.conversation_panel.phase = ActivePhase::None;
+                    return Ok(());
+                }
+                tools::process_classification_results(app, allowed, denied, cancel_token);
             }
             AppEvent::ToolCallsCompleted(outputs, cancel_token) => {
                 if cancel_token.load(Ordering::Relaxed) {

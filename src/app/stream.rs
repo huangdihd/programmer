@@ -39,23 +39,7 @@ fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
     }
 }
 
-const PLAN_PLANNING_PROMPT: &str = "\
-# Plan Mode — Planning Phase
-
-You are in **Plan Mode**. You must NOT make any changes yet.
-
-1. **Explore**: Read files, search the codebase, and understand the problem using
-   read_file, grep, blob, and diagnostics.
-2. **Plan**: Use the `todo` tool to list the steps you intend to take.
-3. **Present**: Output a clear, step-by-step plan:
-   - Which files need changes and what approach
-   - Tradeoffs and edge cases
-   - Proposed implementation order
-4. **Stop**: After presenting the plan, stop your response. Do NOT call
-   write_file, edit_file, command, or configure_diagnostics. The user will
-   choose how to execute the plan.
-
-Your response should end with a complete plan — not with a tool call.";
+use crate::prompts::PLAN_PLANNING_PROMPT;
 
 /// Spawns a streaming response request for the current conversation state.
 pub(crate) fn spawn_stream(app: &mut App<'_>) {

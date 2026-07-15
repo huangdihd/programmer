@@ -26,6 +26,7 @@ pub mod commands;
 pub mod config;
 pub mod diagnostics;
 pub mod mcp;
+pub mod prompts;
 pub mod providers;
 pub mod response;
 pub mod session;

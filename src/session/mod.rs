@@ -524,34 +524,7 @@ pub(crate) fn pick_session(
 // ---------------------------------------------------------------------------
 
 fn uuid_v4() -> String {
-    let mut buf = [0u8; 16];
-    // Read from /dev/urandom (Unix/macOS). Fall back to time-based bytes on
-    // other platforms — good enough for a session identifier.
-    #[cfg(unix)]
-    {
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            use std::io::Read;
-            let _ = f.read_exact(&mut buf);
-        }
-    }
-    // If we're on non-unix or /dev/urandom failed, mix in the current time.
-    if buf.iter().all(|b| *b == 0) {
-        let nanos = now_secs_nanos();
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = ((nanos >> (i * 8)) & 0xff) as u8;
-        }
-    }
-    // Set version (4) and variant bits.
-    buf[6] = (buf[6] & 0x0f) | 0x40;
-    buf[8] = (buf[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        buf[0], buf[1], buf[2], buf[3],
-        buf[4], buf[5],
-        buf[6], buf[7],
-        buf[8], buf[9],
-        buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    )
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn now_secs() -> u64 {
@@ -561,12 +534,6 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn now_secs_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-}
 
 fn unix_to_local(secs: u64) -> String {
     let now = now_secs();

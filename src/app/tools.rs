@@ -36,98 +36,83 @@ const MAX_CONCURRENT_CLASSIFICATIONS: usize = 4;
 
 /// Runs the model's requested tool calls in the background, then reports the
 /// outputs back to the event loop via `ToolCallsCompleted`.
-pub(crate) async fn run_tool_calls(
+///
+/// Classification is always done asynchronously via a spawned task for every
+/// mode: Auto mode makes LLM calls in the background; all other modes run
+/// their sync classifier in a spawned task so the event loop is never blocked
+/// and can always process Cancel / UI events.
+pub(crate) fn run_tool_calls(
     app: &mut App<'_>,
     calls: Vec<FunctionToolCall>,
     cancel_token: Arc<AtomicBool>,
 ) {
-    let mcp_policies = build_mcp_policy_map(app);
-
-    // Build one Arc<dyn Classifier> for every mode — the only divergence
-    // between Auto and others is which implementation sits behind the trait.
-    let classifier: Arc<dyn crate::classifier::Classifier> =
-        if app.work_mode == crate::classifier::WorkMode::Auto {
-            let model_str = app
-                .config
-                .classifier_model
-                .clone()
-                .unwrap_or_else(|| app.current_model.clone());
-            let (client, model_name) = match app.provider_manager.resolve(&model_str) {
-                Some((c, m)) => (c.clone(), m),
-                None => {
-                    app.conversation_panel.add_error_string(format!(
-                        "classifier model '{model_str}' not found — set a valid \
-                         classifier_model (or /classifier <provider/model>)"
-                    ));
-                    app.conversation_panel.phase = ActivePhase::None;
-                    return;
-                }
-            };
-            let (light_context, full_context) = build_classifier_context(app);
-            Arc::new(crate::classifier::AutoClassifier::new(
-                mcp_policies,
-                crate::classifier::AutoClassifierParams {
-                    client,
-                    model: model_name,
-                    light_context,
-                    full_context,
-                    no_logprobs: app.classifier_no_logprobs.clone(),
-                },
-            ))
-        } else {
-            app.work_mode.classifier(mcp_policies, None)
-        };
-
     app.conversation_panel.phase = ActivePhase::Classifying;
 
-    // Unified concurrent pipeline for every mode. Sync classifiers are
-    // instant, so `buffered` degenerates to a fast sequential fold.
-    let outcomes: Vec<Option<(FunctionToolCall, crate::classifier::Verdict)>> =
-        futures::stream::iter(calls.into_iter().map(|call| {
-            let classifier = classifier.clone();
-            let ct = &cancel_token;
-            async move {
-                if ct.load(Ordering::Relaxed) {
-                    return None;
-                }
-                let verdict = classifier.classify(&call.name, &call.arguments).await;
-                Some((call, verdict))
-            }
-        }))
-        .buffered(MAX_CONCURRENT_CLASSIFICATIONS)
-        .collect()
-        .await;
+    if app.work_mode.uses_llm_classifier() {
+        spawn_auto_classification(app, calls, cancel_token);
+    } else {
+        spawn_sync_classification(app, calls, cancel_token);
+    }
+}
 
+/// Spawn sync classification for non-Auto modes. The sync classifier runs
+/// in a spawned task and sends its verdicts back via
+/// [`AppEvent::ClassificationCompleted`] just like Auto mode, keeping the
+/// event loop unblocked.
+fn spawn_sync_classification(
+    app: &mut App<'_>,
+    calls: Vec<FunctionToolCall>,
+    cancel_token: Arc<AtomicBool>,
+) {
+    let classifier = app.work_mode.classifier(build_mcp_policy_map(app));
+    let sender = app.events.sender.clone();
+
+    tokio::spawn(async move {
+        if cancel_token.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut allowed: Vec<FunctionToolCall> = Vec::new();
+        let mut denied: Vec<crate::tools::ToolOutput> = Vec::new();
+        let mut ask_queue: Vec<(FunctionToolCall, String)> = Vec::new();
+
+        for call in &calls {
+            if cancel_token.load(Ordering::Relaxed) {
+                return;
+            }
+            match classifier.classify(&call.name, &call.arguments) {
+                crate::classifier::Verdict::Allow => allowed.push(call.clone()),
+                crate::classifier::Verdict::Deny { reason } => {
+                    denied.push(helpers::classifier_denied_output(call, &reason))
+                }
+                crate::classifier::Verdict::Ask { reason } => {
+                    ask_queue.push((call.clone(), reason))
+                }
+            }
+        }
+
+        let _ = sender.send(Event::App(AppEvent::ClassificationCompleted {
+            allowed,
+            denied,
+            ask_queue,
+            cancel_token,
+        }));
+    });
+}
+
+/// Process final classification verdicts: run allowed tools, report denied
+/// outputs back to the model. All classification (sync or LLM) has already
+/// happened in the spawned task; verdicts here are final.
+pub(crate) fn process_classification_results(
+    app: &mut App<'_>,
+    allowed: Vec<FunctionToolCall>,
+    denied: Vec<crate::tools::ToolOutput>,
+    cancel_token: Arc<AtomicBool>,
+) {
     if cancel_token.load(Ordering::Relaxed) {
         app.conversation_panel.phase = ActivePhase::None;
         return;
     }
-
-    let mut allowed: Vec<FunctionToolCall> = Vec::new();
-    let mut queued: Vec<(FunctionToolCall, String)> = Vec::new();
-    let mut denied: Vec<crate::tools::ToolOutput> = Vec::new();
-
-    for (call, verdict) in outcomes.into_iter().flatten() {
-        match verdict {
-            crate::classifier::Verdict::Allow => allowed.push(call),
-            crate::classifier::Verdict::Deny { reason } => {
-                denied.push(helpers::classifier_denied_output(&call, &reason))
-            }
-            crate::classifier::Verdict::Ask { reason } => {
-                queued.push((call, reason))
-            }
-        }
-    }
-
-    if !queued.is_empty() {
-        for output in denied {
-            app.conversation_panel.add_tool_output(output);
-        }
-        app.approval_queue = queued;
-        app.conversation_panel.phase = ActivePhase::None;
-        return;
-    }
-
     if allowed.is_empty() && denied.is_empty() {
         app.conversation_panel.phase = ActivePhase::None;
         return;
@@ -135,6 +120,126 @@ pub(crate) async fn run_tool_calls(
 
     let label = app.work_mode.label().to_string();
     spawn_run(app, allowed, denied, cancel_token, label);
+}
+
+// ---------------------------------------------------------------------------
+// Auto mode: LLM classification
+// ---------------------------------------------------------------------------
+
+/// Auto mode: classify each mutating call with the LLM, then hand the
+/// verdicts back via [`AppEvent::ClassificationCompleted`].
+fn spawn_auto_classification(
+    app: &mut App<'_>,
+    calls: Vec<FunctionToolCall>,
+    cancel_token: Arc<AtomicBool>,
+) {
+    app.conversation_panel.phase = ActivePhase::Classifying;
+
+    let model_str = app
+        .config
+        .classifier_model
+        .clone()
+        .unwrap_or_else(|| app.current_model.clone());
+    let (client, model_name) = match app.provider_manager.resolve(&model_str) {
+        Some((c, m)) => (c.clone(), m),
+        None => {
+            app.conversation_panel.add_error_string(format!(
+                "classifier model '{model_str}' not found — set a valid \
+                 classifier_model (or /classifier <provider/model>)"
+            ));
+            app.conversation_panel.phase = ActivePhase::None;
+            return;
+        }
+    };
+
+    let sender = app.events.sender.clone();
+    let no_lp = app.classifier_no_logprobs.clone();
+    let (light_context, full_context) = build_classifier_context(app);
+    let mcp_policies = build_mcp_policy_map(app);
+
+    tokio::spawn(async move {
+        enum Decision {
+            Allow(FunctionToolCall),
+            Deny(crate::tools::ToolOutput),
+        }
+
+        let decisions: Vec<Option<Decision>> = futures::stream::iter(
+            calls.into_iter().map(|call| {
+                let client = &client;
+                let model_name = &model_name;
+                let no_lp = &no_lp;
+                let light_context = &light_context;
+                let full_context = &full_context;
+                let cancel_token = &cancel_token;
+                let mcp_policies = &mcp_policies;
+                async move {
+                    if cancel_token.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    if let Some(verdict) =
+                        crate::classifier::classify_mcp_policy(&call.name, mcp_policies)
+                    {
+                        return Some(match verdict {
+                            crate::classifier::Verdict::Allow => Decision::Allow(call),
+                            crate::classifier::Verdict::Ask { reason }
+                            | crate::classifier::Verdict::Deny { reason } => {
+                                Decision::Deny(helpers::classifier_denied_output(&call, &reason))
+                            }
+                        });
+                    }
+                    if !crate::classifier::needs_review(&call.name) {
+                        return Some(Decision::Allow(call));
+                    }
+
+                    let try_logprobs = !no_lp.lock().unwrap().contains(model_name);
+                    let outcome = crate::classifier::classify_tool_call(
+                        client,
+                        model_name,
+                        &call.name,
+                        &call.arguments,
+                        light_context,
+                        full_context,
+                        try_logprobs,
+                    )
+                    .await;
+                    if outcome.logprobs_missing {
+                        no_lp.lock().unwrap().insert(model_name.clone());
+                    }
+
+                    Some(match outcome.verdict {
+                        crate::classifier::Verdict::Allow => Decision::Allow(call),
+                        crate::classifier::Verdict::Deny { reason }
+                        | crate::classifier::Verdict::Ask { reason } => {
+                            Decision::Deny(helpers::classifier_denied_output(&call, &reason))
+                        }
+                    })
+                }
+            }),
+        )
+        .buffered(MAX_CONCURRENT_CLASSIFICATIONS)
+        .collect()
+        .await;
+
+        if cancel_token.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut allowed: Vec<FunctionToolCall> = Vec::new();
+        let mut denied: Vec<crate::tools::ToolOutput> = Vec::new();
+        for decision in decisions.into_iter().flatten() {
+            match decision {
+                Decision::Allow(call) => allowed.push(call),
+                Decision::Deny(output) => denied.push(output),
+            }
+        }
+
+        let _ = sender.send(Event::App(AppEvent::ClassificationCompleted {
+            allowed,
+            denied,
+            ask_queue: Vec::new(),
+            cancel_token,
+        }));
+    });
 }
 
 // ---------------------------------------------------------------------------
