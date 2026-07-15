@@ -1947,6 +1947,7 @@ name = "programmer"
 version = "0.2.0"
 dependencies = [
  "async-openai",
+ "async-trait",
  "color-eyre",
  "config",
  "crossterm",
