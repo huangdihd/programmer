@@ -14,7 +14,6 @@ futures = "0.3.32"
 ratatui = "0.30.2"
 ratatui-widgets = { version = "0.3.0", features = ["unstable-rendered-line-info"] }
 tokio = { version = "1.52.3", features = ["full"] }
-async-trait = "0.1.89"
 color-eyre = "0.6.5"
 async-openai = { version = "0.41.1", features = ["responses", "model"] }
 serde = { version = "1.0.228", features = ["derive"] }

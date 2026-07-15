@@ -21,9 +21,7 @@
 //! requires implementing the trait and wiring up a new variant.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::mcp::types::McpPolicy;
@@ -51,9 +49,8 @@ pub enum Verdict {
 ///
 /// Receives the tool name and its raw JSON arguments so future
 /// implementations can inspect the payload (e.g. forbid `rm -rf`).
-#[async_trait]
 pub trait Classifier: Send + Sync {
-    async fn classify(&self, tool_name: &str, arguments: &str) -> Verdict;
+    fn classify(&self, tool_name: &str, arguments: &str) -> Verdict;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,9 +109,8 @@ impl ManualClassifier {
     }
 }
 
-#[async_trait]
 impl Classifier for ManualClassifier {
-    async fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
+    fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
         // MCP tools: consult per-server policy first.
         if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
             return verdict;
@@ -146,9 +142,8 @@ impl PlanPlanningClassifier {
     }
 }
 
-#[async_trait]
 impl Classifier for PlanPlanningClassifier {
-    async fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
+    fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
         // MCP tools: consult per-server policy first.
         if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
             return verdict;
@@ -172,91 +167,9 @@ impl Classifier for PlanPlanningClassifier {
 /// YOLO mode: everything is allowed, no questions asked.
 pub struct YoloClassifier;
 
-#[async_trait]
 impl Classifier for YoloClassifier {
-    async fn classify(&self, _tool_name: &str, _arguments: &str) -> Verdict {
+    fn classify(&self, _tool_name: &str, _arguments: &str) -> Verdict {
         Verdict::Allow
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Auto mode: LLM-based classifier
-// ---------------------------------------------------------------------------
-
-/// Parameters passed to [`AutoClassifier`] by the caller.  Every field is
-/// required; the caller builds this from the app state before constructing
-/// the classifier.
-pub struct AutoClassifierParams {
-    pub client: async_openai::Client<async_openai::config::OpenAIConfig>,
-    pub model: String,
-    pub light_context: String,
-    pub full_context: String,
-    pub no_logprobs: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashSet<String>>,
-    >,
-}
-
-/// Classifier for [`WorkMode::Auto`] that evaluates each tool call with the
-/// configured LLM.  MCP-policy checks and read-only-tool fast-paths are
-/// applied first so only genuinely ambiguous mutating calls reach the model.
-pub struct AutoClassifier {
-    mcp_policies: HashMap<String, McpPolicy>,
-    client: async_openai::Client<async_openai::config::OpenAIConfig>,
-    model: String,
-    light_context: String,
-    full_context: String,
-    no_logprobs: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashSet<String>>,
-    >,
-}
-
-impl AutoClassifier {
-    pub(crate) fn new(
-        mcp_policies: HashMap<String, McpPolicy>,
-        params: AutoClassifierParams,
-    ) -> Self {
-        AutoClassifier {
-            mcp_policies,
-            client: params.client,
-            model: params.model,
-            light_context: params.light_context,
-            full_context: params.full_context,
-            no_logprobs: params.no_logprobs,
-        }
-    }
-}
-
-#[async_trait]
-impl Classifier for AutoClassifier {
-    async fn classify(&self, tool_name: &str, arguments: &str) -> Verdict {
-        // 1. MCP server-level policy.
-        if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
-            return verdict;
-        }
-        // 2. Read-only built-in tools — always safe.
-        if !needs_review(tool_name) {
-            return Verdict::Allow;
-        }
-        // 3. Ask the LLM.
-        let try_logprobs = !self.no_logprobs.lock().unwrap().contains(&self.model);
-        let outcome = classify_tool_call(
-            &self.client,
-            &self.model,
-            tool_name,
-            arguments,
-            &self.light_context,
-            &self.full_context,
-            try_logprobs,
-        )
-        .await;
-        if outcome.logprobs_missing {
-            self.no_logprobs.lock().unwrap().insert(self.model.clone());
-        }
-        // In Auto mode the LLM is the final authority: fold Ask into Deny.
-        match outcome.verdict {
-            Verdict::Allow => Verdict::Allow,
-            Verdict::Deny { reason } | Verdict::Ask { reason } => Verdict::Deny { reason },
-        }
     }
 }
 
@@ -332,24 +245,22 @@ impl WorkMode {
         }
     }
 
-    /// Return the classifier for this mode.
-    ///
-    /// For [`WorkMode::Auto`], `auto_params` must be provided; it carries the
-    /// LLM client, model name, context strings, and logprob-denylist needed by
-    /// [`AutoClassifier`].  For all other modes it is ignored (pass `None`).
-    pub(crate) fn classifier(
-        &self,
-        mcp_policies: HashMap<String, McpPolicy>,
-        auto_params: Option<AutoClassifierParams>,
-    ) -> Arc<dyn Classifier> {
+    /// Whether this mode classifies tool calls with an async LLM call rather
+    /// than the synchronous rule-based [`Classifier`].
+    pub fn uses_llm_classifier(&self) -> bool {
+        matches!(self, WorkMode::Auto)
+    }
+
+    /// Return the synchronous classifier for this mode. Auto has no sync
+    /// classifier (it uses [`classify_tool_call`]); it falls back to asking so
+    /// callers that ignore [`uses_llm_classifier`] stay safe.
+    pub(crate) fn classifier(&self, mcp_policies: HashMap<String, McpPolicy>) -> Box<dyn Classifier> {
         match self {
-            WorkMode::Auto => Arc::new(AutoClassifier::new(
-                mcp_policies,
-                auto_params.expect("AutoClassifierParams required for Auto mode"),
-            )),
-            WorkMode::Manual => Arc::new(ManualClassifier::new(mcp_policies)),
-            WorkMode::Yolo => Arc::new(YoloClassifier),
-            WorkMode::Plan => Arc::new(PlanPlanningClassifier::new(mcp_policies)),
+            WorkMode::Manual | WorkMode::Auto => {
+                Box::new(ManualClassifier::new(mcp_policies))
+            }
+            WorkMode::Yolo => Box::new(YoloClassifier),
+            WorkMode::Plan => Box::new(PlanPlanningClassifier::new(mcp_policies)),
         }
     }
 }
@@ -362,6 +273,22 @@ impl WorkMode {
 /// bypasses the LLM entirely.
 pub fn needs_review(tool_name: &str) -> bool {
     DANGEROUS_TOOLS.contains(&tool_name) || tool_name.starts_with("mcp__")
+}
+
+// ---------------------------------------------------------------------------
+// Plan mode helpers
+// ---------------------------------------------------------------------------
+
+/// Short user messages commonly used to approve a plan. Used to detect when
+/// the user says "go ahead" in Planning phase.
+pub fn is_plan_approval(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "go ahead" | "approved" | "lgtm" | "looks good" | "proceed"
+            | "ok" | "yes" | "do it" | "execute" | "run it" | "sure"
+            | "send it" | "go" | "ship it" | "yolo"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +311,7 @@ const APPROVE_MARGIN: f64 = 0.7;
 /// nothing extra there; a reasoning model gets enough room to finish thinking
 /// before it emits the answer token whose logprobs we read.
 const CLASSIFIER_MAX_TOKENS: u32 = 2048;
+
 /// Instructions shared by every classifier call.
 const CLASSIFIER_INSTRUCTIONS: &str = "\
 You are a security gate for an autonomous coding agent working inside a user's \
@@ -408,28 +336,6 @@ config, piping remote scripts into a shell, network calls to unknown hosts, \
 anything that could exfiltrate secrets or credentials, or commands whose intent \
 is unclear.
 
-=== Concrete examples ===
-Use these as a guide — they are the most common scenarios you will see.
-
-| Scenario | Verdict | Why |
-|---|---|---|
-| User: \"fix the login bug\" → agent wants to `git commit` | Deny | User asked to fix code, not to commit. Only approve commits when the user explicitly asks to commit. |
-| User: \"fix the login bug\" → agent wants to `git push` | Deny | Push is never implied by a fix/modify request. Always deny unless the user explicitly says \"push\". |
-| User: \"refactor the parser\" → agent wants to `git commit -m ...` | Deny | Same — modifying code ≠ committing. The user didn't say to commit. |
-| User: \"plan how to add auth\" → agent wants to `write_file src/auth.rs` | Deny | User asked for a PLAN, not implementation. In planning phase, deny any file creation or mutation — only read-only tools and `todo` are allowed. |
-| User: \"plan how to add auth\" → next turn user says nothing new, agent starts writing code | Deny | User never said \"go ahead\" or \"start\". Planning-only intent persists until the user explicitly says to begin. |
-| User: \"plan how to add auth\" → agent wants `command: cargo build` | Deny | Building is an implementation act, not a planning one. Deny in planning context. |
-| User: \"plan how to add auth\"; then user: \"looks good\" → agent writes code | Deny | \"looks good\" is ambiguous — it could mean \"the plan is well-written\", not \"start executing\". Deny until the user says something unambiguous like \"go ahead\", \"do it\", \"execute\", \"proceed\", \"start\", or \"approved\". |
-| User: \"plan how to add auth\"; then user: \"go ahead\" → agent writes code | Approve | \"go ahead\" is an explicit, unambiguous signal to start. |
-| User: \"plan how to add auth\"; then user: \"ok do it\" → agent writes code | Approve | \"do it\" combined with \"ok\" is unambiguous. |
-| User: \"plan how to add auth\"; then user: \"nice plan\" → agent writes code | Deny | Complimenting the plan ≠ authorizing execution. Same as \"looks good\". |
-| User: \"add dark mode\" → agent wants `write_file src/theme.css` | Approve | Editing/creating project files to implement the user's request is the agent's job. |
-| User: \"add dark mode\" → agent wants `npm publish` | Deny | Publishing is never implied by a feature request. |
-| User: \"delete that sidebar file I told you about\" → agent wants `del sidebar/mod.rs` | Approve | User is explicitly naming a specific file to delete that they're unhappy with. |
-| Agent accidentally created files or edits without user's permission in a previous turn, user is annoyed → agent tries to delete/revert ONLY those files | Approve | Undoing the agent's own wrongly-approved actions is always safe — the agent is cleaning up a mistake, not doing new work. Only approve deletions that exactly match files the agent created/modified without authorization. If the scope is broader or targets pre-existing code, deny. |
-| Agent created `sidebar/mod.rs` without permission → agent wants `rmdir /s /q sidebar` | Approve | Cleaning up exactly what the agent wrongly created. |
-| User is directing an architectural refactoring (e.g. unifying code paths, removing a dead module) → agent wants to delete a function/symbol that was made obsolete by the refactoring | Approve | Removing dead code that the user explicitly asked to eliminate as part of a refactoring session is safe routine cleanup — the function was already replaced and unused. Only approve when the deletion is a direct consequence of a refactoring the user just directed. If the removal scope looks larger than what the user asked for, deny. |
-
 === User override ===
 The \"User's latest request\" in the context may contain explicit per-operation \
 approval or disapproval. Evaluate each instruction literally and per-operation: \
@@ -439,10 +345,6 @@ approval or disapproval. Evaluate each instruction literally and per-operation: 
 - If the user explicitly says NOT to run a specific call, deny it. \
 - Approvals and disapprovals are per-operation: \"do X, don't do Y\" means \
   approve X and deny Y separately. \
--  If the user expressed dissatisfaction with specific files or modifications \
-  that the agent made (especially ones that were wrongly auto-approved), \
-  deleting or reverting ONLY those specific files and modifications is allowed. \
-  This is cleanup, not new work. \
 - Vague statements like \"be careful\" or \"I trust you\" are NOT overrides — \
   only explicit per-operation instructions count.
 
@@ -499,44 +401,44 @@ pub async fn classify_tool_call(
     try_logprobs: bool,
 ) -> ClassifyOutcome {
     if try_logprobs {
-        return match classify_fast(client, model, tool_name, arguments, light_context).await {
+        match classify_fast(client, model, tool_name, arguments, light_context).await {
             Ok(FastResult::Approved) => {
-                ClassifyOutcome {
+                return ClassifyOutcome {
                     verdict: Verdict::Allow,
                     logprobs_missing: false,
-                }
+                };
             }
             Ok(FastResult::Denied) => {
                 // Fast path voted "no" — re-evaluate with full context and
                 // reasoning so the model gets a chance to approve after seeing
                 // the bigger picture, reducing false positives.
-                ClassifyOutcome {
+                return ClassifyOutcome {
                     verdict: classify_reasoned(client, model, tool_name, arguments, full_context)
                         .await,
                     logprobs_missing: false,
-                }
+                };
             }
             Ok(FastResult::Ambiguous) => {
-                ClassifyOutcome {
+                return ClassifyOutcome {
                     verdict: classify_reasoned(client, model, tool_name, arguments, full_context)
                         .await,
                     logprobs_missing: false,
-                }
+                };
             }
             Ok(FastResult::NoLogprobs) => {
-                ClassifyOutcome {
+                return ClassifyOutcome {
                     verdict: classify_reasoned(client, model, tool_name, arguments, full_context)
                         .await,
                     logprobs_missing: true,
-                }
+                };
             }
             Err(e) => {
-                ClassifyOutcome {
+                return ClassifyOutcome {
                     verdict: Verdict::Deny {
                         reason: format!("classifier error: {e}"),
                     },
                     logprobs_missing: false,
-                }
+                };
             }
         }
     }
@@ -723,11 +625,7 @@ mod tests {
     use super::*;
 
     fn classify(mode: WorkMode, name: &str) -> Verdict {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(
-            mode.classifier(HashMap::new(), None)
-                .classify(name, r#"{}"#),
-        )
+        mode.classifier(HashMap::new()).classify(name, r#"{}"#)
     }
 
     #[test]
@@ -785,18 +683,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_uses_async_classifier() {
-        // Auto mode is async (needs AutoClassifierParams at runtime), but the
-        // classifier() factory validates the variant — it panics without params
-        // as Auto, and succeeds with None for Manual/Plan/Yolo.
-        assert!(std::panic::catch_unwind(|| {
-            let _ = WorkMode::Auto.classifier(HashMap::new(), None);
-        })
-        .is_err());
-        // Manual, Plan, Yolo are fine with None.
-        let _ = WorkMode::Manual.classifier(HashMap::new(), None);
-        let _ = WorkMode::Plan.classifier(HashMap::new(), None);
-        let _ = WorkMode::Yolo.classifier(HashMap::new(), None);
+    fn auto_uses_llm_classifier() {
+        assert!(WorkMode::Auto.uses_llm_classifier());
+        assert!(!WorkMode::Manual.uses_llm_classifier());
+        assert!(!WorkMode::Plan.uses_llm_classifier());
     }
 
     #[test]
@@ -806,6 +696,19 @@ mod tests {
         assert!(!needs_review("read_file"));
         assert!(!needs_review("grep"));
         assert!(!needs_review("todo"));
+    }
+
+    #[test]
+    fn plan_approval_detection() {
+        assert!(is_plan_approval("go ahead"));
+        assert!(is_plan_approval("approved"));
+        assert!(is_plan_approval("lgtm"));
+        assert!(is_plan_approval("yes"));
+        assert!(is_plan_approval("YOLO"));
+        assert!(is_plan_approval("  go ahead  "));
+        assert!(!is_plan_approval("no"));
+        assert!(!is_plan_approval("maybe later"));
+        assert!(!is_plan_approval("change the second step"));
     }
 
     #[test]
@@ -875,12 +778,8 @@ mod tests {
         let mut policies = HashMap::new();
         policies.insert("fs".to_string(), McpPolicy::Trusted);
         let c = ManualClassifier::new(policies);
-        let rt = tokio::runtime::Runtime::new().unwrap();
         // MCP tool with Trusted policy: auto-approved even in Manual mode.
-        assert!(matches!(
-            rt.block_on(c.classify("mcp__fs__write", r#"{}"#)),
-            Verdict::Allow
-        ));
+        assert!(matches!(c.classify("mcp__fs__write", r#"{}"#), Verdict::Allow));
     }
 
     #[test]
@@ -888,17 +787,13 @@ mod tests {
         let mut policies = HashMap::new();
         policies.insert("db".to_string(), McpPolicy::Review);
         let c = ManualClassifier::new(policies);
-        let rt = tokio::runtime::Runtime::new().unwrap();
         // MCP tool with Review policy: Ask in Manual mode.
         assert!(matches!(
-            rt.block_on(c.classify("mcp__db__query", r#"{}"#)),
+            c.classify("mcp__db__query", r#"{}"#),
             Verdict::Ask { .. }
         ));
         // Built-in dangerous: still Ask.
-        assert!(matches!(
-            rt.block_on(c.classify("command", r#"{}"#)),
-            Verdict::Ask { .. }
-        ));
+        assert!(matches!(c.classify("command", r#"{}"#), Verdict::Ask { .. }));
     }
 
     #[test]
@@ -906,16 +801,9 @@ mod tests {
         let mut policies = HashMap::new();
         policies.insert("fs".to_string(), McpPolicy::Trusted);
         let c = PlanPlanningClassifier::new(policies);
-        let rt = tokio::runtime::Runtime::new().unwrap();
         // MCP tool with Trusted policy: auto-approved even in Plan Planning.
-        assert!(matches!(
-            rt.block_on(c.classify("mcp__fs__read", r#"{}"#)),
-            Verdict::Allow
-        ));
-        assert!(matches!(
-            rt.block_on(c.classify("mcp__fs__write", r#"{}"#)),
-            Verdict::Allow
-        ));
+        assert!(matches!(c.classify("mcp__fs__read", r#"{}"#), Verdict::Allow));
+        assert!(matches!(c.classify("mcp__fs__write", r#"{}"#), Verdict::Allow));
     }
 
     #[test]
@@ -923,10 +811,9 @@ mod tests {
         let mut policies = HashMap::new();
         policies.insert("db".to_string(), McpPolicy::Review);
         let c = PlanPlanningClassifier::new(policies);
-        let rt = tokio::runtime::Runtime::new().unwrap();
         // MCP tool with Review policy: denied in Plan Planning (not read-only).
         assert!(matches!(
-            rt.block_on(c.classify("mcp__db__query", r#"{}"#)),
+            c.classify("mcp__db__query", r#"{}"#),
             Verdict::Deny { .. }
         ));
     }

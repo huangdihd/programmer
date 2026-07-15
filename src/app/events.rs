@@ -121,8 +121,18 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
                     }
                     session::save_session(app);
                 } else {
-                    tools::run_tool_calls(app, calls, cancel_token).await;
+                    tools::run_tool_calls(app, calls, cancel_token);
                 }
+            }
+            AppEvent::ClassificationCompleted {
+                allowed,
+                denied,
+                cancel_token,
+            } => {
+                if cancel_token.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                tools::process_classification_results(app, allowed, denied, cancel_token);
             }
             AppEvent::ToolCallsCompleted(outputs, cancel_token) => {
                 if cancel_token.load(Ordering::Relaxed) {
