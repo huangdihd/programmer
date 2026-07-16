@@ -19,22 +19,22 @@ use ::config::{Config, Environment, File};
 use app::App;
 use std::path::Path;
 
-pub mod app;
-pub mod classifier;
-pub mod clipboard;
-pub mod commands;
-pub mod config;
-pub mod diagnostics;
-pub mod mcp;
-pub mod prompts;
-pub mod providers;
-pub mod response;
-pub mod session;
-pub mod skills;
-pub mod tasks;
-pub mod terminal;
-pub mod todos;
-pub mod tools;
+mod app;
+mod classifier;
+mod clipboard;
+mod commands;
+mod config;
+mod diagnostics;
+mod mcp;
+mod prompts;
+mod providers;
+mod response;
+mod session;
+mod skills;
+mod tasks;
+mod terminal;
+mod todos;
+mod tools;
 mod ui;
 
 /// Parsed command-line arguments.

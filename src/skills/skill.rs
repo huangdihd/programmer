@@ -29,15 +29,15 @@
 //! Markdown body…
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Where a skill file was loaded from.
 #[derive(Debug, Clone)]
 pub(crate) enum SkillSource {
     /// Project-scoped: `.programmer/skills/<name>/SKILL.md`.
-    Project(PathBuf),
+    Project,
     /// User-global: `~/.config/programmer/skills/<name>/SKILL.md`.
-    Global(PathBuf),
+    Global,
 }
 
 /// A skill loaded from a `SKILL.md` file.
@@ -45,10 +45,6 @@ pub(crate) enum SkillSource {
 pub(crate) struct Skill {
     pub(crate) name: String,
     pub(crate) description: String,
-    /// Arbitrary metadata pulled from the YAML frontmatter (e.g. `author`,
-    /// `version`, `argument-hint`). Stored as a JSON value so skills can carry
-    /// structured hints for the model.
-    pub(crate) metadata: serde_json::Value,
     /// The markdown body (everything after the closing `---` divider).
     pub(crate) body: String,
     /// Where this skill was loaded from.
@@ -67,22 +63,19 @@ impl Skill {
 
         let raw = std::fs::read_to_string(&file).ok()?;
         let (front, body) = split_frontmatter(&raw)?;
-        let (name, description, metadata) = parse_frontmatter(&front)?;
+        let (name, description) = parse_frontmatter(front)?;
 
         Some(Skill {
             name,
             description,
-            metadata,
             body: body.to_string(),
-            source: SkillSource::Project(file),
+            source: SkillSource::Project,
         })
     }
 
     /// Re-tag the source as global.
     pub(crate) fn with_global_source(mut self) -> Self {
-        if let SkillSource::Project(p) = self.source {
-            self.source = SkillSource::Global(p);
-        }
+        self.source = SkillSource::Global;
         self
     }
 
@@ -117,17 +110,17 @@ fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
     Some((front, body))
 }
 
-/// Parse YAML frontmatter into (name, description, metadata).
-/// The name is required; everything else is optional.
-fn parse_frontmatter(front: &str) -> Option<(String, String, serde_json::Value)> {
+/// Parse YAML frontmatter into (name, description). The name is required.
+/// Other keys — including nested `metadata:` blocks — are skipped; only the
+/// fields the app actually uses are kept.
+fn parse_frontmatter(front: &str) -> Option<(String, String)> {
     let mut name: Option<String> = None;
     let mut description = String::new();
-    let mut meta = serde_json::Map::new();
     let mut in_metadata = false;
     let mut metadata_indent = 0usize;
 
     for line in front.lines() {
-        // Handle nested metadata block.
+        // Skip over nested metadata block lines.
         if in_metadata {
             let trimmed = line.trim_start();
             let indent = line.len() - trimmed.len();
@@ -136,11 +129,6 @@ fn parse_frontmatter(front: &str) -> Option<(String, String, serde_json::Value)>
                 // as a regular top-level key.
                 in_metadata = false;
             } else {
-                // Simple nested key: "  author: vercel"
-                if let Some((k, v)) = trimmed.split_once(':') {
-                    let v = v.trim().trim_matches('"');
-                    meta.insert(k.trim().to_string(), serde_json::Value::String(v.to_string()));
-                }
                 continue;
             }
         }
@@ -162,15 +150,13 @@ fn parse_frontmatter(front: &str) -> Option<(String, String, serde_json::Value)>
                     in_metadata = true;
                     metadata_indent = line.len() - line.trim_start().len();
                 }
-                _ => {
-                    meta.insert(key.to_string(), serde_json::Value::String(val.to_string()));
-                }
+                _ => {}
             }
         }
     }
 
     let name = name?;
-    Some((name, description, serde_json::Value::Object(meta)))
+    Some((name, description))
 }
 
 #[cfg(test)]
@@ -184,23 +170,20 @@ mod tests {
         assert!(front.contains("name: test-skill"));
         assert_eq!(body, "\n# Body\nSome body text.");
 
-        let (name, desc, meta) = parse_frontmatter(front).unwrap();
+        let (name, desc) = parse_frontmatter(front).unwrap();
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test skill");
-        assert!(meta.as_object().unwrap().is_empty());
     }
 
     #[test]
-    fn parse_with_metadata() {
+    fn parse_skips_metadata_block_without_derailing() {
+        // A nested metadata block (and unknown keys after it) must not break
+        // parsing of the fields we care about.
         let raw = "---\nname: advanced\ndescription: An advanced skill\nmetadata:\n  author: vercel\n  version: \"1.0.0\"\nlicense: MIT\n---\n\n# Advanced\nBody here.";
         let (front, _body) = split_frontmatter(raw).unwrap();
-        let (name, desc, meta) = parse_frontmatter(front).unwrap();
+        let (name, desc) = parse_frontmatter(front).unwrap();
         assert_eq!(name, "advanced");
         assert_eq!(desc, "An advanced skill");
-        let obj = meta.as_object().unwrap();
-        assert_eq!(obj["author"], "vercel");
-        assert_eq!(obj["version"], "1.0.0");
-        assert_eq!(obj["license"], "MIT");
     }
 
     #[test]
@@ -220,9 +203,8 @@ mod tests {
         let skill = Skill {
             name: "test".into(),
             description: "a test".into(),
-            metadata: serde_json::Value::Object(Default::default()),
             body: "Do the thing.".into(),
-            source: SkillSource::Project(PathBuf::from(".")),
+            source: SkillSource::Project,
         };
         let prompt = skill.to_prompt();
         assert!(prompt.contains("## Skill: test"));

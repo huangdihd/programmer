@@ -119,8 +119,6 @@ pub struct App<'a> {
     pub(crate) session_mgr: Option<SessionManager>,
     /// Plan mode sub-phase. Only meaningful when `work_mode == WorkMode::Plan`.
     pub(crate) plan_phase: crate::classifier::PlanPhase,
-    /// Execution mode selected by the user for the Plan Executing phase.
-    pub(crate) plan_execution_mode: Option<crate::classifier::WorkMode>,
     /// Which option is highlighted in the plan review bar.
     pub(crate) plan_review_selected: usize,
 }
@@ -229,7 +227,6 @@ impl App<'_> {
             mcp_manager: None,
             session_mgr,
             plan_phase: crate::classifier::PlanPhase::default(),
-            plan_execution_mode: None,
             plan_review_selected: 0,
         };
 

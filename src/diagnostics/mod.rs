@@ -27,7 +27,7 @@ mod parse;
 mod profile;
 mod runner;
 
-pub use lsp::{shutdown_all as shutdown_lsp, status as lsp_status, LspStatus};
+pub use lsp::{shutdown_all as shutdown_lsp, status as lsp_status};
 pub use parse::{parse_output, Parser};
 pub use profile::{Checker, CheckerKind, DiagnosticsProfile, PROFILE_PATH};
 pub use runner::run_checker;
@@ -122,15 +122,6 @@ impl DiagnosticDiff {
     /// No change either way.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty()
-    }
-
-    /// How many of the *added* diagnostics are errors (the number that most
-    /// matters when deciding whether an edit made things worse).
-    pub fn added_errors(&self) -> usize {
-        self.added
-            .iter()
-            .filter(|d| d.severity == Severity::Error)
-            .count()
     }
 
     /// A short, token-cheap summary for the model: counts plus each newly
@@ -308,7 +299,6 @@ mod tests {
         let d = diff(&old, &new);
         assert_eq!(d.added, vec![diag("c.rs", 3, Severity::Error, "new one")]);
         assert_eq!(d.removed, vec![diag("a.rs", 1, Severity::Error, "boom")]);
-        assert_eq!(d.added_errors(), 1);
         assert!(!d.is_empty());
     }
 

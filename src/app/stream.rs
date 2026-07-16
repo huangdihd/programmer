@@ -35,7 +35,7 @@ fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
     }
     match app.plan_phase {
         PlanPhase::Planning => Some(PLAN_PLANNING_PROMPT),
-        PlanPhase::Reviewing | PlanPhase::Executing => None,
+        PlanPhase::Reviewing => None,
     }
 }
 
@@ -179,12 +179,3 @@ pub(crate) async fn handle_error_events(app: &mut App<'_>, error: OpenAIError) {
     }
 }
 
-/// Cancel the current stream and clear the receiving state.
-#[allow(dead_code)]
-pub(crate) fn cancel_stream(app: &mut App<'_>) {
-    if let Some(receiving) = &app.conversation_panel.receiving_response {
-        receiving.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    app.conversation_panel.abort_receiving();
-    app.conversation_panel.phase = ActivePhase::None;
-}

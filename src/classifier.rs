@@ -209,7 +209,9 @@ pub enum WorkMode {
     Plan,
 }
 
-/// Sub-phase of Plan mode.
+/// Sub-phase of Plan mode. Approving a plan exits Plan mode entirely (the
+/// work mode switches to the chosen execution mode), so there is no
+/// "executing" phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlanPhase {
     /// Agent explores with read-only tools and outputs a plan.
@@ -217,8 +219,6 @@ pub enum PlanPhase {
     Planning,
     /// Plan is complete, waiting for user to choose execution mode.
     Reviewing,
-    /// User approved; agent executes with the chosen mode.
-    Executing,
 }
 
 impl WorkMode {
@@ -287,22 +287,6 @@ impl WorkMode {
 /// bypasses the LLM entirely.
 pub fn needs_review(tool_name: &str, arguments: &str) -> bool {
     is_mutating(tool_name, arguments) || tool_name.starts_with("mcp__")
-}
-
-// ---------------------------------------------------------------------------
-// Plan mode helpers
-// ---------------------------------------------------------------------------
-
-/// Short user messages commonly used to approve a plan. Used to detect when
-/// the user says "go ahead" in Planning phase.
-pub fn is_plan_approval(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "go ahead" | "approved" | "lgtm" | "looks good" | "proceed"
-            | "ok" | "yes" | "do it" | "execute" | "run it" | "sure"
-            | "send it" | "go" | "ship it" | "yolo"
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -696,19 +680,6 @@ mod tests {
         assert!(!needs_review("task", list));
         assert!(!needs_review("task", output));
         assert!(!needs_review("task", wait));
-    }
-
-    #[test]
-    fn plan_approval_detection() {
-        assert!(is_plan_approval("go ahead"));
-        assert!(is_plan_approval("approved"));
-        assert!(is_plan_approval("lgtm"));
-        assert!(is_plan_approval("yes"));
-        assert!(is_plan_approval("YOLO"));
-        assert!(is_plan_approval("  go ahead  "));
-        assert!(!is_plan_approval("no"));
-        assert!(!is_plan_approval("maybe later"));
-        assert!(!is_plan_approval("change the second step"));
     }
 
     #[test]

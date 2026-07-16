@@ -407,7 +407,6 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
                         // Exit Plan mode into Auto.
                         app.work_mode = WorkMode::Auto;
                         app.plan_phase = crate::classifier::PlanPhase::default();
-                        app.plan_execution_mode = None;
                         app.conversation_panel
                             .add_info_string("Plan approved — executing with Auto mode.");
                         let hidden = "The plan was approved by the user. Execute it now using the identified steps.";
@@ -421,7 +420,6 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
                 "cancel" | "abort" => {
                     app.work_mode = WorkMode::Auto;
                     app.plan_phase = crate::classifier::PlanPhase::default();
-                    app.plan_execution_mode = None;
                     app.conversation_panel
                         .add_info_string("Plan cancelled — returned to Auto mode.");
                     session::persist_config(app);

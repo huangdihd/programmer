@@ -24,7 +24,7 @@ use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, InputItem, Item, OutputItem,
 };
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Serializable mirror
@@ -279,11 +279,6 @@ impl SessionManager {
     /// Path to a specific session file.
     fn session_path(&self, uuid: &str) -> PathBuf {
         self.sessions_dir.join(format!("{uuid}.json"))
-    }
-
-    /// The sessions directory.
-    pub(crate) fn dir(&self) -> &Path {
-        &self.sessions_dir
     }
 }
 

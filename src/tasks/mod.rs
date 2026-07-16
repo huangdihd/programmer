@@ -122,12 +122,6 @@ pub fn snapshot(id: u64) -> Option<TaskSnapshot> {
     reg.iter().find(|e| e.id == id).map(snapshot_entry)
 }
 
-/// Number of currently running tasks.
-pub fn running_count() -> usize {
-    let reg = registry().lock().unwrap();
-    reg.iter().filter(|e| e.status == TaskStatus::Running).count()
-}
-
 /// Spawn `command` through the platform shell as a background task and return
 /// its id immediately. Output is captured incrementally; completion is
 /// recorded by a detached reader task.

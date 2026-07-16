@@ -49,14 +49,6 @@ pub(crate) enum JsonRpcResponse {
         id: u64,
         error: JsonRpcError,
     },
-    Notification {
-        #[allow(dead_code)]
-        jsonrpc: String,
-        method: String,
-        #[serde(default)]
-        #[allow(dead_code)]
-        params: Option<serde_json::Value>,
-    },
 }
 
 #[derive(Debug, Deserialize)]

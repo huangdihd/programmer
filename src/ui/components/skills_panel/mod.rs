@@ -203,8 +203,8 @@ impl SkillsPanel {
 /// A short label for where a skill was loaded from.
 fn source_label(source: &SkillSource) -> String {
     match source {
-        SkillSource::Project(_) => "project".to_string(),
-        SkillSource::Global(_) => "global".to_string(),
+        SkillSource::Project => "project".to_string(),
+        SkillSource::Global => "global".to_string(),
     }
 }
 

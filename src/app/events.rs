@@ -405,7 +405,6 @@ async fn handle_plan_review_key(
                     // Execute with Manual — exit Plan mode into Manual.
                     app.work_mode = WorkMode::Manual;
                     app.plan_phase = crate::classifier::PlanPhase::default();
-                    app.plan_execution_mode = None;
                     app.plan_review_selected = 0;
                     app.conversation_panel
                         .add_info_string("Plan approved — executing with Manual mode.");
@@ -422,7 +421,6 @@ async fn handle_plan_review_key(
                     // Execute with Auto — exit Plan mode into Auto.
                     app.work_mode = WorkMode::Auto;
                     app.plan_phase = crate::classifier::PlanPhase::default();
-                    app.plan_execution_mode = None;
                     app.plan_review_selected = 0;
                     app.conversation_panel
                         .add_info_string("Plan approved — executing with Auto mode.");
@@ -440,7 +438,6 @@ async fn handle_plan_review_key(
                         // Execute with YOLO — exit Plan mode into YOLO.
                         app.work_mode = WorkMode::Yolo;
                         app.plan_phase = crate::classifier::PlanPhase::default();
-                        app.plan_execution_mode = None;
                         app.plan_review_selected = 0;
                         app.conversation_panel
                             .add_info_string("Plan approved — executing with YOLO mode.");

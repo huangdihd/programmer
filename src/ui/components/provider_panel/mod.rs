@@ -52,9 +52,6 @@ struct ModelCompletion {
     selected: usize,
     /// Scroll offset for the popup (items scrolled off the top).
     scroll_offset: usize,
-    /// The typed prefix that was used to filter.
-    #[allow(dead_code)]
-    prefix: String,
 }
 
 #[derive(Debug, Default)]
@@ -415,7 +412,6 @@ impl ProviderPanel {
             candidates,
             selected: 0,
             scroll_offset: 0,
-            prefix: prefix.to_string(),
         })
     }
 
