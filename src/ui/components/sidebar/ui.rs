@@ -345,7 +345,7 @@ impl Sidebar {
         &self,
         lines: &mut Vec<Line<'static>>,
         targets: &mut Vec<ClickTarget>,
-        _width: u16,
+        width: u16,
         mcp_manager: Option<&McpManager>,
     ) {
         let Some(mgr) = mcp_manager else {
@@ -391,19 +391,31 @@ impl Sidebar {
             count += 1;
         }
 
+        // Wrap each startup error across as many lines as it needs so the full
+        // message is readable, rather than clipping it to a single line.
+        let msg_max = (width.saturating_sub(4)) as usize; // "  ✗ " / "    " indent
         for err in &mgr.startup_errors {
             if count >= VISIBLE_PER_SECTION {
                 break;
             }
-            let msg = truncate_to_width(err, 50);
-            let line = Line::from(vec![
-                Span::raw("  "),
-                Span::styled("✗", Style::default().fg(Color::Red)),
-                Span::raw(" "),
-                Span::styled(msg, Style::default().fg(Color::Yellow)),
-            ]);
-            lines.push(line);
-            targets.push(ClickTarget::None);
+            let chunks = wrap_to_width(err, msg_max);
+            for (i, chunk) in chunks.iter().enumerate() {
+                let line = if i == 0 {
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("✗", Style::default().fg(Color::Red)),
+                        Span::raw(" "),
+                        Span::styled(chunk.clone(), Style::default().fg(Color::Yellow)),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(chunk.clone(), Style::default().fg(Color::Yellow)),
+                    ])
+                };
+                lines.push(line);
+                targets.push(ClickTarget::None);
+            }
             count += 1;
         }
 
