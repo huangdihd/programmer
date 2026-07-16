@@ -87,6 +87,12 @@ impl McpClient {
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
 
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("cannot spawn MCP server '{command}': {e}"))?;

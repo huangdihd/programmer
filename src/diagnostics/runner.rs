@@ -40,10 +40,24 @@ pub async fn run_checker(checker: &Checker, cwd: &Path) -> Result<Vec<Diagnostic
     let parser = checker.resolve_parser()?;
 
     let (program, flag) = crate::tools::shell();
-    let output = tokio::process::Command::new(program)
-        .arg(flag)
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.arg(flag)
         .arg(&checker.command)
         .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+
+    // On Windows, give the child its own (windowless) console so it doesn't
+    // reset the parent console's input mode, which would disable mouse capture.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd
         .output()
         .await
         .map_err(|e| format!("checker '{}': failed to run: {e}", checker.name))?;

@@ -221,14 +221,22 @@ impl LspServer {
     /// Spawn the server and complete the `initialize` handshake.
     async fn start(checker: &Checker, cwd: &Path) -> Result<LspServer, String> {
         let (program, flag) = crate::tools::shell();
-        let mut child = tokio::process::Command::new(program)
-            .arg(flag)
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.arg(flag)
             .arg(&checker.command)
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("checker '{}': failed to start LSP server: {e}", checker.name))?;
 
