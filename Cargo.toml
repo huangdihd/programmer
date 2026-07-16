@@ -28,6 +28,7 @@ regex = "1.12.2"
 uuid = { version = "1", features = ["v4"] }
 unicode-width = "0.2"
 ratatui-markdown = { git = "https://github.com/huangdihd/ratatui-markdown", version = "0.3.6", features = ["highlight-lang-all"] }
+which = "8.0.5"
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]

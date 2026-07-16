@@ -77,8 +77,14 @@ impl McpClient {
         env: &std::collections::HashMap<String, String>,
         workspace_root: &str,
     ) -> Result<Self, String> {
-        let mut cmd = Command::new(command);
-        cmd.args(args);
+        // Resolve `.cmd`/`.bat`/`.ps1` shims (npm global installs, PS Gallery
+        // scripts) on Windows so a bare name like `codegraph` is found; the
+        // `.ps1` case comes back as a `powershell.exe -File …` invocation
+        // whose prefix args must precede the server's own. A no-op elsewhere.
+        let (program, mut argv) = crate::tools::resolve_program(command);
+        argv.extend(args.iter().cloned());
+        let mut cmd = Command::new(&program);
+        cmd.args(&argv);
         for (k, v) in env {
             cmd.env(k, v);
         }

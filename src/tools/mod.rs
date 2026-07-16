@@ -40,6 +40,64 @@ pub fn shell() -> (&'static str, &'static str) {
     }
 }
 
+/// Resolve a program name into a concrete invocation: the executable to spawn
+/// plus any arguments that must precede the caller's own.
+///
+/// On Windows, npm/pnpm/yarn global installs create `.cmd` and `.ps1` shims
+/// rather than `.exe`s. `Command::new("codegraph")` ultimately calls
+/// `CreateProcess`, which resolves a bare name only against `.exe` — so the
+/// shim is never found and the spawn fails with "program not found" even
+/// though `codegraph` is on `PATH`. Resolution order here:
+///
+/// 1. An explicit `.ps1` is wrapped in a `powershell.exe -File` invocation —
+///    `CreateProcess` cannot start PowerShell scripts and std does not
+///    special-case them.
+/// 2. Otherwise resolve via the `which` crate (`PATH × PATHEXT`, what
+///    `cmd.exe` itself would find); a `.cmd`/`.bat` hit comes back as a full
+///    path and std then runs it via `cmd.exe` automatically.
+/// 3. If that misses, look for `<name>.ps1` on `PATH` — `.PS1` is not in
+///    `PATHEXT`, but PowerShell Gallery's `Install-Script` and hand-written
+///    script dirs ship bare `.ps1` files with no `.cmd` companion — and wrap
+///    it in PowerShell.
+///
+/// On non-Windows the name is returned unchanged with no extra arguments
+/// (`execvp` handles `PATH` and shebangs natively).
+pub fn resolve_program(program: &str) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        /// `.ps1` cannot be spawned directly; run it under the PowerShell
+        /// host. `-ExecutionPolicy Bypass` scopes to this one process only.
+        fn ps_wrap(script: String) -> (String, Vec<String>) {
+            (
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    script,
+                ],
+            )
+        }
+
+        if program.to_ascii_lowercase().ends_with(".ps1") {
+            // Resolve a bare script name to its PATH location if possible;
+            // `-File` alone only looks in the current directory.
+            let script = which::which(program)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| program.to_string());
+            return ps_wrap(script);
+        }
+        if let Ok(found) = which::which(program) {
+            return (found.to_string_lossy().into_owned(), Vec::new());
+        }
+        if let Ok(found) = which::which(format!("{program}.ps1")) {
+            return ps_wrap(found.to_string_lossy().into_owned());
+        }
+    }
+    (program.to_string(), Vec::new())
+}
+
 /// A short description of the runtime environment, appended to the system prompt
 /// so the model knows which OS/shell/working directory it is operating in.
 pub fn environment_info() -> String {
@@ -282,6 +340,33 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn resolve_program_finds_exe_on_path() {
+        let (program, prefix) = resolve_program("cmd");
+        assert!(
+            program.to_ascii_lowercase().ends_with("cmd.exe"),
+            "got: {program}"
+        );
+        assert!(prefix.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn resolve_program_wraps_explicit_ps1() {
+        let (program, prefix) = resolve_program(r"C:\scripts\deploy.ps1");
+        assert_eq!(program, "powershell.exe");
+        assert_eq!(prefix.last().map(String::as_str), Some(r"C:\scripts\deploy.ps1"));
+        assert!(prefix.contains(&"-File".to_string()));
+    }
+
+    #[test]
+    fn resolve_program_passes_unknown_through() {
+        let (program, prefix) = resolve_program("definitely_not_a_real_tool_xyz");
+        assert_eq!(program, "definitely_not_a_real_tool_xyz");
+        assert!(prefix.is_empty());
     }
 }
 
