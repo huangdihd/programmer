@@ -395,6 +395,7 @@ impl Widget for &mut App<'_> {
                     self.lsp_configured,
                     self.mcp_manager.as_deref(),
                     &self.todo_list,
+                    &crate::tasks::snapshot_all(),
                 );
         } else {
             self.sidebar_area = None;

@@ -29,6 +29,7 @@ pub enum SidebarSection {
     Diagnostics,
     Mcp,
     Todos,
+    Tasks,
 }
 
 /// Per-section UI state.
@@ -75,6 +76,10 @@ impl Sidebar {
             },
             SectionState {
                 key: SidebarSection::Todos,
+                collapsed: false,
+            },
+            SectionState {
+                key: SidebarSection::Tasks,
                 collapsed: false,
             },
             SectionState {

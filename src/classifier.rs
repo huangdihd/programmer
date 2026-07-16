@@ -73,6 +73,16 @@ const DANGEROUS_TOOLS: &[&str] =
 const READ_ONLY_TOOLS: &[&str] =
     &["read_file", "grep", "blob", "ask_user", "diagnostics", "todo"];
 
+/// The `task` tool is action-dependent: `create` runs an arbitrary command and
+/// `kill` terminates a process (gated like `command`), while `list`/`output`/
+/// `wait` only observe existing tasks and are safe everywhere.
+fn is_mutating(tool_name: &str, arguments: &str) -> bool {
+    if tool_name == crate::tools::task::NAME {
+        return crate::tools::task::action_is_mutating(arguments);
+    }
+    DANGEROUS_TOOLS.contains(&tool_name)
+}
+
 /// Extract the MCP server name from a fully-qualified tool name like
 /// `mcp__codegraph__search` → `"codegraph"`. Returns `None` for built-in tools.
 pub fn mcp_server_name(tool_name: &str) -> Option<&str> {
@@ -110,7 +120,7 @@ impl ManualClassifier {
 }
 
 impl Classifier for ManualClassifier {
-    fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
+    fn classify(&self, tool_name: &str, arguments: &str) -> Verdict {
         // MCP tools: consult per-server policy first.
         if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
             return verdict;
@@ -118,7 +128,7 @@ impl Classifier for ManualClassifier {
         // Built-in tools: ask for dangerous, allow for safe.
         // Unknown MCP tools (not in any server's policy map) are treated as
         // dangerous — we can't know their semantics.
-        if DANGEROUS_TOOLS.contains(&tool_name) || tool_name.starts_with("mcp__") {
+        if is_mutating(tool_name, arguments) || tool_name.starts_with("mcp__") {
             Verdict::Ask {
                 reason: format!("{tool_name} requires approval in Manual mode"),
             }
@@ -143,13 +153,17 @@ impl PlanPlanningClassifier {
 }
 
 impl Classifier for PlanPlanningClassifier {
-    fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
+    fn classify(&self, tool_name: &str, arguments: &str) -> Verdict {
         // MCP tools: consult per-server policy first.
         if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
             return verdict;
         }
-        // Read-only tools always allowed.
-        if READ_ONLY_TOOLS.contains(&tool_name) {
+        // Read-only tools always allowed, including the task tool's
+        // observing actions (list/output/wait).
+        if READ_ONLY_TOOLS.contains(&tool_name)
+            || (tool_name == crate::tools::task::NAME
+                && !is_mutating(tool_name, arguments))
+        {
             return Verdict::Allow;
         }
         // Everything else: denied. Tell the model to output a plan.
@@ -271,8 +285,8 @@ impl WorkMode {
 /// semantics at compile time), but their server's [`McpPolicy`] is checked
 /// first in [`spawn_auto_classification`] — a [`McpPolicy::Trusted`] server
 /// bypasses the LLM entirely.
-pub fn needs_review(tool_name: &str) -> bool {
-    DANGEROUS_TOOLS.contains(&tool_name) || tool_name.starts_with("mcp__")
+pub fn needs_review(tool_name: &str, arguments: &str) -> bool {
+    is_mutating(tool_name, arguments) || tool_name.starts_with("mcp__")
 }
 
 // ---------------------------------------------------------------------------
@@ -646,11 +660,42 @@ mod tests {
 
     #[test]
     fn needs_review_only_mutating() {
-        assert!(needs_review("command"));
-        assert!(needs_review("write_file"));
-        assert!(!needs_review("read_file"));
-        assert!(!needs_review("grep"));
-        assert!(!needs_review("todo"));
+        assert!(needs_review("command", "{}"));
+        assert!(needs_review("write_file", "{}"));
+        assert!(!needs_review("read_file", "{}"));
+        assert!(!needs_review("grep", "{}"));
+        assert!(!needs_review("todo", "{}"));
+    }
+
+    #[test]
+    fn task_tool_is_classified_by_action() {
+        let create = r#"{"action":"create","command":"cargo watch"}"#;
+        let kill = r#"{"action":"kill","id":1}"#;
+        let list = r#"{"action":"list"}"#;
+        let output = r#"{"action":"output","id":1}"#;
+        let wait = r#"{"action":"wait","id":1}"#;
+
+        // Manual: mutating actions ask, observing actions pass.
+        let manual = WorkMode::Manual.classifier(HashMap::new());
+        assert!(matches!(manual.classify("task", create), Verdict::Ask { .. }));
+        assert!(matches!(manual.classify("task", kill), Verdict::Ask { .. }));
+        assert!(matches!(manual.classify("task", list), Verdict::Allow));
+        assert!(matches!(manual.classify("task", output), Verdict::Allow));
+        assert!(matches!(manual.classify("task", wait), Verdict::Allow));
+
+        // Plan Planning: mutating actions denied, observing actions pass.
+        let plan = WorkMode::Plan.classifier(HashMap::new());
+        assert!(matches!(plan.classify("task", create), Verdict::Deny { .. }));
+        assert!(matches!(plan.classify("task", kill), Verdict::Deny { .. }));
+        assert!(matches!(plan.classify("task", list), Verdict::Allow));
+        assert!(matches!(plan.classify("task", output), Verdict::Allow));
+
+        // Auto's pre-filter mirrors the same split.
+        assert!(needs_review("task", create));
+        assert!(needs_review("task", kill));
+        assert!(!needs_review("task", list));
+        assert!(!needs_review("task", output));
+        assert!(!needs_review("task", wait));
     }
 
     #[test]

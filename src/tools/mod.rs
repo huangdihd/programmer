@@ -21,6 +21,7 @@ pub mod diagnostics;
 pub mod edit_file;
 pub mod grep;
 pub mod read_file;
+pub mod task;
 pub mod todo;
 pub mod write_file;
 
@@ -96,6 +97,7 @@ pub(crate) fn tools(mcp: Option<&crate::mcp::McpManager>) -> Vec<Tool> {
         configure_diagnostics::tool(),
         diagnostics::tool(),
         todo::tool(),
+        task::tool(),
     ];
 
     if let Some(mgr) = mcp {
@@ -456,6 +458,7 @@ pub(crate) async fn run_tool_call(
             configure_diagnostics::NAME => configure_diagnostics::run(&call.arguments).await,
             diagnostics::NAME => diagnostics::run(&call.arguments).await,
             todo::NAME => todo::run(&call.arguments).await,
+            task::NAME => task::run(&call.arguments).await,
             other => Err(format!("error: unknown tool '{other}'")),
         }
     };

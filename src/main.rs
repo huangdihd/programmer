@@ -31,6 +31,7 @@ pub mod providers;
 pub mod response;
 pub mod session;
 pub mod skills;
+pub mod tasks;
 pub mod terminal;
 pub mod todos;
 pub mod tools;

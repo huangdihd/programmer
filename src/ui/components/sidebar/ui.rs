@@ -16,6 +16,7 @@
 use super::{ClickTarget, Sidebar, SidebarSection};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::mcp::McpManager;
+use crate::tasks::{TaskSnapshot, TaskStatus};
 use crate::todos::{TodoList, TodoStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -40,6 +41,7 @@ impl Sidebar {
         lsp_configured: bool,
         mcp_manager: Option<&McpManager>,
         todo_list: &TodoList,
+        tasks: &[TaskSnapshot],
     ) {
         let block = Block::default()
             .borders(Borders::LEFT)
@@ -59,6 +61,7 @@ impl Sidebar {
             lsp_configured,
             mcp_manager,
             todo_list,
+            tasks,
         );
 
         // Clamp scroll.
@@ -126,13 +129,14 @@ impl Sidebar {
         lsp_configured: bool,
         mcp_manager: Option<&McpManager>,
         todo_list: &TodoList,
+        tasks: &[TaskSnapshot],
     ) -> (Vec<Line<'static>>, Vec<ClickTarget>) {
         let mut lines: Vec<Line> = Vec::new();
         let mut targets: Vec<ClickTarget> = Vec::new();
 
         for (idx, section) in self.sections.iter().enumerate() {
             // Title line.
-            let title = self.section_title(section, diagnostics, lsp_configured, mcp_manager, todo_list);
+            let title = self.section_title(section, diagnostics, lsp_configured, mcp_manager, todo_list, tasks);
             let title_line = self.make_title_line(&title, section.key, section.collapsed);
             lines.push(title_line);
             targets.push(ClickTarget::Section(section.key));
@@ -153,6 +157,9 @@ impl Sidebar {
                     }
                     SidebarSection::Todos => {
                         self.render_todos(&mut lines, &mut targets, width, todo_list);
+                    }
+                    SidebarSection::Tasks => {
+                        self.render_tasks(&mut lines, &mut targets, width, tasks);
                     }
                 }
             }
@@ -179,8 +186,20 @@ impl Sidebar {
         lsp_configured: bool,
         mcp_manager: Option<&McpManager>,
         todo_list: &TodoList,
+        tasks: &[TaskSnapshot],
     ) -> String {
         match section.key {
+            SidebarSection::Tasks => {
+                if tasks.is_empty() {
+                    "Tasks".to_string()
+                } else {
+                    let running = tasks
+                        .iter()
+                        .filter(|t| t.status == TaskStatus::Running)
+                        .count();
+                    format!("Tasks ({running} running, {} total)", tasks.len())
+                }
+            }
             SidebarSection::Diagnostics => {
                 if !lsp_configured && diagnostics.is_empty() {
                     "Diagnostics".to_string()
@@ -235,6 +254,7 @@ impl Sidebar {
             SidebarSection::Diagnostics => Color::Red,
             SidebarSection::Mcp => Color::Magenta,
             SidebarSection::Todos => Color::Yellow,
+            SidebarSection::Tasks => Color::Cyan,
         };
 
         let style = Style::default()
@@ -449,6 +469,76 @@ impl Sidebar {
             }
         }
     }
+
+    fn render_tasks(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        targets: &mut Vec<ClickTarget>,
+        width: u16,
+        tasks: &[TaskSnapshot],
+    ) {
+        if tasks.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No background tasks",
+                Style::default().fg(Color::DarkGray),
+            )));
+            targets.push(ClickTarget::None);
+            return;
+        }
+
+        for task in tasks {
+            let (icon, color) = match task.status {
+                TaskStatus::Running => ("▶", Color::Yellow),
+                TaskStatus::Completed => ("✓", Color::Green),
+                TaskStatus::Failed => ("✗", Color::Red),
+                TaskStatus::Killed => ("⊘", Color::DarkGray),
+            };
+
+            let elapsed = format_elapsed(task.elapsed);
+            let title_style = Style::default().fg(Color::White);
+            let cont_style = Style::default().fg(Color::DarkGray);
+
+            let prefix_spans: Vec<Span<'static>> = vec![
+                Span::raw("  "),
+                Span::styled(
+                    icon.to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" #{} ", task.id),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            let prefix_width = spans_width(&prefix_spans);
+
+            let line_count_before = lines.len();
+            wrapped_item(
+                lines,
+                prefix_spans,
+                &format!("{} ({elapsed})", task.name),
+                width,
+                prefix_width,
+                CONT_INDENT,
+                title_style,
+                cont_style,
+            );
+            for _ in 0..(lines.len() - line_count_before) {
+                targets.push(ClickTarget::None);
+            }
+        }
+    }
+}
+
+/// Compact human-readable duration: `42s`, `3m12s`, `1h04m`.
+fn format_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 // -- helpers --
@@ -557,5 +647,67 @@ pub(crate) fn todo_status_order(s: &TodoStatus) -> u8 {
         TodoStatus::InProgress => 1,
         TodoStatus::Completed => 2,
         TodoStatus::Cancelled => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::TaskSnapshot;
+    use std::time::Duration;
+
+    fn buffer_text(buf: &Buffer) -> String {
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn tasks_section_renders_above_diagnostics() {
+        let mut sidebar = Sidebar::new();
+        let area = Rect::new(0, 0, 32, 40);
+        let mut buf = Buffer::empty(area);
+        let tasks = vec![TaskSnapshot {
+            id: 7,
+            name: "cargo watch 构建监听".to_string(),
+            command: "cargo watch".to_string(),
+            status: crate::tasks::TaskStatus::Running,
+            exit_code: None,
+            elapsed: Duration::from_secs(75),
+            output: String::new(),
+        }];
+
+        sidebar.render(
+            area,
+            &mut buf,
+            &[],
+            false,
+            None,
+            &crate::todos::TodoList::default(),
+            &tasks,
+        );
+
+        let text = buffer_text(&buf);
+        assert!(text.contains("Tasks (1 running, 1 total)"), "got:\n{text}");
+        assert!(text.contains("#7"), "got:\n{text}");
+        assert!(text.contains("1m15s"), "got:\n{text}");
+        let tasks_pos = text.find("Tasks").expect("tasks section");
+        let diag_pos = text.find("Diagnostics").expect("diagnostics section");
+        assert!(
+            tasks_pos < diag_pos,
+            "Tasks must render above Diagnostics"
+        );
+    }
+
+    #[test]
+    fn elapsed_formatting() {
+        assert_eq!(format_elapsed(Duration::from_secs(42)), "42s");
+        assert_eq!(format_elapsed(Duration::from_secs(192)), "3m12s");
+        assert_eq!(format_elapsed(Duration::from_secs(3840)), "1h04m");
     }
 }

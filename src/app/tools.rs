@@ -188,7 +188,7 @@ fn spawn_auto_classification(
                             }
                         });
                     }
-                    if !crate::classifier::needs_review(&call.name) {
+                    if !crate::classifier::needs_review(&call.name, &call.arguments) {
                         return Some(Decision::Allow(call));
                     }
 

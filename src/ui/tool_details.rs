@@ -40,6 +40,28 @@ pub(crate) fn format_tool_details(tool_name: &str, arguments: &str) -> Vec<Strin
             }
             lines
         }
+        "task" => {
+            let mut lines = Vec::new();
+            if let Some(action) = v.get("action").and_then(|a| a.as_str()) {
+                lines.push(format!("action: {action}"));
+            }
+            if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                lines.push(format!("  command: {cmd}"));
+            }
+            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                lines.push(format!("  name: {name}"));
+            }
+            if let Some(dir) = v.get("dir").and_then(|d| d.as_str()) {
+                lines.push(format!("  dir: {dir}"));
+            }
+            if let Some(id) = v.get("id") {
+                lines.push(format!("  task id: {id}"));
+            }
+            if lines.is_empty() {
+                lines.push(arguments.to_string());
+            }
+            lines
+        }
         "write_file" => {
             let mut lines = Vec::new();
             if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
