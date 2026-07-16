@@ -67,11 +67,11 @@ pub trait Classifier: Send + Sync {
 /// A [`McpPolicy::Trusted`] tool is allowed immediately; a [`McpPolicy::Review`]
 /// tool falls through to the normal classifier.
 const DANGEROUS_TOOLS: &[&str] =
-    &["command", "write_file", "edit_file", "configure_diagnostics", "todo"];
+    &["command", "write_file", "edit_file", "configure_diagnostics"];
 
 /// Tool names that are read-only — always safe, even in Plan/Planning phase.
 const READ_ONLY_TOOLS: &[&str] =
-    &["read_file", "grep", "blob", "ask_user", "diagnostics"];
+    &["read_file", "grep", "blob", "ask_user", "diagnostics", "todo"];
 
 /// Extract the MCP server name from a fully-qualified tool name like
 /// `mcp__codegraph__search` → `"codegraph"`. Returns `None` for built-in tools.
@@ -594,7 +594,6 @@ mod tests {
     fn manual_asks_for_dangerous() {
         assert!(matches!(classify(WorkMode::Manual, "command"), Verdict::Ask { .. }));
         assert!(matches!(classify(WorkMode::Manual, "write_file"), Verdict::Ask { .. }));
-        assert!(matches!(classify(WorkMode::Manual, "todo"), Verdict::Ask { .. }));
         assert!(matches!(classify(WorkMode::Manual, "read_file"), Verdict::Allow));
         assert!(matches!(classify(WorkMode::Manual, "grep"), Verdict::Allow));
     }
@@ -606,11 +605,11 @@ mod tests {
         assert!(matches!(classify(WorkMode::Plan, "grep"), Verdict::Allow));
         assert!(matches!(classify(WorkMode::Plan, "blob"), Verdict::Allow));
         assert!(matches!(classify(WorkMode::Plan, "ask_user"), Verdict::Allow));
+        assert!(matches!(classify(WorkMode::Plan, "todo"), Verdict::Allow));
         // Mutating: Deny.
         assert!(matches!(classify(WorkMode::Plan, "command"), Verdict::Deny { .. }));
         assert!(matches!(classify(WorkMode::Plan, "write_file"), Verdict::Deny { .. }));
         assert!(matches!(classify(WorkMode::Plan, "edit_file"), Verdict::Deny { .. }));
-        assert!(matches!(classify(WorkMode::Plan, "todo"), Verdict::Deny { .. }));
     }
 
     #[test]
@@ -651,7 +650,7 @@ mod tests {
         assert!(needs_review("write_file"));
         assert!(!needs_review("read_file"));
         assert!(!needs_review("grep"));
-        assert!(needs_review("todo"));
+        assert!(!needs_review("todo"));
     }
 
     #[test]
