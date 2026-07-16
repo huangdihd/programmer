@@ -48,37 +48,80 @@ impl ProviderManager {
     ///
     /// For each provider whose `models` field is `None`, we call the
     /// `/models` endpoint to auto-discover available models at startup.
+    /// Wrapped in a global timeout so startup never hangs on network.
     pub async fn new(config: &ProgrammerConfig) -> Self {
-        let mut clients = HashMap::new();
+        let mut clients: HashMap<String, Client<OpenAIConfig>> = HashMap::new();
         let mut models: HashMap<String, Vec<String>> = HashMap::new();
         let mut startup_errors = Vec::new();
 
-        // Discover models for all providers concurrently so a slow/unreachable
-        // provider doesn't stack its timeout on top of the others.
-        let fetches = config.providers.iter().map(|(name, provider_config)| {
+        // Build clients synchronously — always instant.
+        for (name, provider_config) in &config.providers {
             let openai_config = OpenAIConfig::default()
                 .with_api_base(&provider_config.base_url)
                 .with_api_key(&provider_config.api_key);
-            let client = Client::with_config(openai_config);
-            async move {
-                let result = match &provider_config.models {
-                    Some(manual) => Ok(manual.clone()),
-                    None => Self::fetch_models(&client, name).await,
-                };
-                (name.clone(), client, result)
+            clients.insert(name.clone(), Client::with_config(openai_config));
+            if let Some(manual) = &provider_config.models {
+                models.insert(name.clone(), manual.clone());
+            } else {
+                models.insert(name.clone(), Vec::new());
             }
+        }
+
+        // Fetch models concurrently, but with a hard cap so startup is
+        // never blocked indefinitely (some DNS / TCP stacks on Windows
+        // can bypass tokio::time::timeout).
+        const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+        let fetches = config.providers.iter().filter_map(|(name, pc)| {
+            if pc.models.is_some() {
+                return None; // already populated above
+            }
+            let client = clients.get(name).unwrap().clone();
+            let name = name.clone();
+            Some(tokio::spawn(async move {
+                match tokio::time::timeout(MODEL_FETCH_TIMEOUT, client.models().list()).await {
+                    Ok(Ok(resp)) => {
+                        let list = resp.data.into_iter().map(|m| m.id).collect();
+                        (name, Ok(list))
+                    }
+                    Ok(Err(e)) => {
+                        let msg = format!(
+                            "failed to fetch models for provider '{name}': {e} \
+                             (provider still works, but /model completion won't list its models)"
+                        );
+                        (name, Err(msg))
+                    }
+                    Err(_) => {
+                        let msg = format!(
+                            "timed out fetching models for provider '{name}' after \
+                             {}s — check your network \
+                             (provider still works, but /model completion won't list its models)",
+                            MODEL_FETCH_TIMEOUT.as_secs()
+                        );
+                        (name, Err(msg))
+                    }
+                }
+            }))
         });
 
-        for (name, client, result) in futures::future::join_all(fetches).await {
-            let model_list = match result {
-                Ok(list) => list,
-                Err(message) => {
-                    startup_errors.push(message);
-                    Vec::new()
+        match tokio::time::timeout(STARTUP_TIMEOUT, futures::future::join_all(fetches)).await {
+            Ok(results) => {
+                for result in results {
+                    match result {
+                        Ok((name, Ok(list))) => {
+                            models.insert(name, list);
+                        }
+                        Ok((_, Err(msg))) => startup_errors.push(msg),
+                        Err(_) => {} // task panicked; nothing to report
+                    }
                 }
-            };
-            models.insert(name.clone(), model_list);
-            clients.insert(name, client);
+            }
+            Err(_) => {
+                startup_errors.push(
+                    "model discovery timed out — providers work, \
+                     but /model completion may be incomplete"
+                        .to_string(),
+                );
+            }
         }
 
         ProviderManager {
@@ -87,29 +130,6 @@ impl ProviderManager {
             configs: config.providers.clone(),
             default_provider: config.default_provider.clone(),
             startup_errors,
-        }
-    }
-
-    /// Try to fetch the model list from the provider's `/models` endpoint,
-    /// bounded by [`MODEL_FETCH_TIMEOUT`]. On failure, returns the error
-    /// message to surface in the UI (the provider still works, just without
-    /// model completion support).
-    async fn fetch_models(
-        client: &Client<OpenAIConfig>,
-        name: &str,
-    ) -> Result<Vec<String>, String> {
-        match tokio::time::timeout(MODEL_FETCH_TIMEOUT, client.models().list()).await {
-            Ok(Ok(response)) => Ok(response.data.into_iter().map(|m| m.id).collect()),
-            Ok(Err(e)) => Err(format!(
-                "failed to fetch models for provider '{name}': {e} \
-                 (provider still works, but /model completion won't list its models)"
-            )),
-            Err(_) => Err(format!(
-                "timed out fetching models for provider '{name}' after \
-                 {}s — check your network \
-                 (provider still works, but /model completion won't list its models)",
-                MODEL_FETCH_TIMEOUT.as_secs()
-            )),
         }
     }
 
@@ -210,6 +230,7 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(manager.startup_errors.len(), 1);
+        assert!(manager.models_for("offline").is_empty());
         assert_eq!(manager.default_model(), "offline/default");
     }
 }
