@@ -47,6 +47,9 @@ pub(crate) fn run_tool_calls(
     cancel_token: Arc<AtomicBool>,
 ) {
     app.conversation_panel.phase = ActivePhase::Classifying;
+    // Keep the token reachable from the event loop so Esc can cancel the
+    // classification/tool phases (the stream that owned it is finished).
+    app.active_cancel_token = Some(cancel_token.clone());
 
     if app.work_mode.uses_llm_classifier() {
         spawn_auto_classification(app, calls, cancel_token);

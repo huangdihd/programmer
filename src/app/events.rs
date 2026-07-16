@@ -136,6 +136,11 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
                 if let Some(partial) = &app.conversation_panel.receiving_response {
                     partial.cancelled.store(true, Ordering::Relaxed);
                 }
+                // Also stop the post-stream pipeline (classifying / running
+                // tools) — its token outlives `receiving_response`.
+                if let Some(token) = app.active_cancel_token.take() {
+                    token.store(true, Ordering::Relaxed);
+                }
                 app.conversation_panel.abort_receiving();
                 app.conversation_panel.phase = ActivePhase::None;
                 app.conversation_panel.flush_usage();

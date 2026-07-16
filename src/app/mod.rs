@@ -106,6 +106,11 @@ pub struct App<'a> {
     pub(crate) lsp_configured: bool,
     /// Tracks whether the current mouse-drag started in the sidebar area.
     pub(crate) sidebar_click_active: bool,
+    /// Cancel token of the current post-stream pipeline (classification and
+    /// tool execution). The stream's own token lives in `receiving_response`,
+    /// which is already gone by the time classification runs — this keeps Esc
+    /// working through those later phases.
+    pub(crate) active_cancel_token: Option<Arc<AtomicBool>>,
     /// True while the stream task is backing off between connection retries.
     pub(crate) stream_retrying: Arc<AtomicBool>,
     /// Session UUID.
@@ -217,6 +222,7 @@ impl App<'_> {
             mutating_turns: 0,
             lsp_configured: helpers::lsp_checker_configured(),
             sidebar_click_active: false,
+            active_cancel_token: None,
             stream_retrying: Arc::new(AtomicBool::new(false)),
             session_uuid,
             skill_registry: crate::skills::SkillRegistry::load(),
