@@ -61,6 +61,9 @@ impl StatusState {
 #[derive(Debug)]
 pub struct StatusBar {
     pub status: StatusState,
+    /// Extra context appended after the label, e.g. live MCP progress
+    /// ("codegraph: 67% step 2"). Cleared by the owner when stale.
+    pub detail: Option<String>,
     /// When the current busy phase began.
     busy_start: Option<Instant>,
 }
@@ -69,6 +72,7 @@ impl StatusBar {
     pub fn new() -> Self {
         Self {
             status: StatusState::Idle,
+            detail: None,
             busy_start: None,
         }
     }

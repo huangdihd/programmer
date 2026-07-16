@@ -17,6 +17,7 @@ use super::status_bar::{StatusBar, StatusState};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 const DIM: Color = Color::DarkGray;
@@ -55,8 +56,16 @@ impl Widget for &StatusBar {
             }
         }
 
-        ratatui::widgets::Paragraph::new(text)
-            .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
-            .render(area, buf);
+        let mut spans = vec![Span::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )];
+        if let Some(detail) = &self.detail {
+            spans.push(Span::styled(
+                format!("· {detail} "),
+                Style::default().fg(DIM),
+            ));
+        }
+        ratatui::widgets::Paragraph::new(Line::from(spans)).render(area, buf);
     }
 }

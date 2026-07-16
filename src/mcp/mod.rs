@@ -198,9 +198,16 @@ impl McpManager {
         self.servers.get(server_name).map(|s| s.stderr_snapshot())
     }
 
-    /// All in-flight progress reports from a server, keyed by progress token.
-    pub(crate) fn server_progress_all(&self, server_name: &str) -> Option<HashMap<String, client::ProgressInfo>> {
-        self.servers.get(server_name).map(|s| s.progress_snapshot())
+    /// The first in-flight progress report across all servers, for the
+    /// footer status bar. Progress state is cleared when its call finishes,
+    /// so `Some` means a call is actively reporting.
+    pub(crate) fn active_progress(&self) -> Option<(String, client::ProgressInfo)> {
+        for (name, s) in &self.servers {
+            if let Some(info) = s.progress_snapshot().into_values().next() {
+                return Some((name.clone(), info));
+            }
+        }
+        None
     }
 
     // -- resource / prompt access --
@@ -621,22 +628,21 @@ while True:
             async {
                 for _ in 0..200 {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    if let Some(snap) = mgr.server_progress_all("a") {
-                        if let Some(info) = snap.get("p1") {
-                            return Some(info.clone());
-                        }
+                    if let Some((server, info)) = mgr.active_progress() {
+                        return Some((server, info));
                     }
                 }
                 None
             }
         );
         call_result.unwrap();
-        let info = observed.expect("progress visible while the call runs");
+        let (server, info) = observed.expect("progress visible while the call runs");
+        assert_eq!(server, "a");
         assert_eq!(info.total, Some(3.0));
         assert!(info.progress >= 1.0);
         assert!(info.message.as_deref().unwrap_or("").starts_with("step"));
-        // Finished call leaves no stale progress for the sidebar to show.
-        assert!(mgr.server_progress_all("a").unwrap().is_empty());
+        // Finished call leaves no stale progress for the footer to show.
+        assert!(mgr.active_progress().is_none());
 
         // --- Roots ---
         // roots_probe sends roots/list to client, reads response.

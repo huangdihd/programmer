@@ -324,6 +324,26 @@ impl Widget for &mut App<'_> {
         // Resolve the single status the footer should show, then let the
         // status bar track its own busy timer.
         self.footer.status.set(self.resolve_status());
+        // Live MCP progress rides along as status detail while a call runs
+        // (progress state is cleared when the call finishes).
+        self.footer.status.detail = self
+            .mcp_manager
+            .as_deref()
+            .and_then(|m| m.active_progress())
+            .map(|(server, info)| {
+                let pct = info
+                    .total
+                    .filter(|t| *t > 0.0)
+                    .map(|t| format!("{:.0}% ", (info.progress / t * 100.0).min(100.0)))
+                    .unwrap_or_default();
+                let msg = info.message.unwrap_or_default();
+                let text = format!("{server}: {pct}{msg}");
+                let mut trimmed: String = text.trim_end().chars().take(60).collect();
+                if trimmed.chars().count() == 60 {
+                    trimmed.push('…');
+                }
+                trimmed
+            });
         self.footer.work_mode = self.work_mode;
         self.footer.current_model = self.current_model.clone();
         self.footer.lsp_configured = self.lsp_configured;
