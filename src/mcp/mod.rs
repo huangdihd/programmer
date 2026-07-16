@@ -78,16 +78,8 @@ impl McpServer {
         }
     }
 
-    fn take_stderr_lines(&self) -> Vec<String> {
-        self.client.take_stderr_lines()
-    }
-
-    fn take_cancelled(&self) -> Option<u64> {
-        self.client.take_cancelled()
-    }
-
-    fn take_progress(&self, token: &str) -> Option<client::ProgressInfo> {
-        self.client.take_progress(token)
+    fn stderr_snapshot(&self) -> Vec<String> {
+        self.client.stderr_snapshot()
     }
 
     fn progress_snapshot(&self) -> HashMap<String, client::ProgressInfo> {
@@ -201,18 +193,12 @@ impl McpManager {
         out
     }
 
+    /// The most recent stderr lines from a server (non-destructive).
     pub(crate) fn server_stderr(&self, server_name: &str) -> Option<Vec<String>> {
-        self.servers.get(server_name).map(|s| s.take_stderr_lines())
+        self.servers.get(server_name).map(|s| s.stderr_snapshot())
     }
 
-    pub(crate) fn server_cancelled(&self, server_name: &str) -> Option<u64> {
-        self.servers.get(server_name).and_then(|s| s.take_cancelled())
-    }
-
-    pub(crate) fn server_progress(&self, server_name: &str, token: &str) -> Option<client::ProgressInfo> {
-        self.servers.get(server_name).and_then(|s| s.take_progress(token))
-    }
-
+    /// All in-flight progress reports from a server, keyed by progress token.
     pub(crate) fn server_progress_all(&self, server_name: &str) -> Option<HashMap<String, client::ProgressInfo>> {
         self.servers.get(server_name).map(|s| s.progress_snapshot())
     }
@@ -257,11 +243,29 @@ impl McpManager {
         let s = self.servers.get(server_name)
             .ok_or_else(|| format!("MCP server '{server_name}' not found"))?;
 
+        // Attach a progress token so servers that support
+        // `notifications/progress` can report progress; the sidebar shows it
+        // while the call runs.
+        static PROGRESS_SEQ: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let token = format!(
+            "call-{}",
+            PROGRESS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let raw = s.client.call_with_timeout(
             "tools/call",
-            Some(serde_json::json!({"name": tool_name, "arguments": arguments})),
+            Some(serde_json::json!({
+                "name": tool_name,
+                "arguments": arguments,
+                "_meta": { "progressToken": token },
+            })),
             TOOL_CALL_TIMEOUT_SECS,
-        ).await?;
+        ).await;
+        // The call is over either way — drop progress state so the UI never
+        // shows stale progress (also covers servers that report under a
+        // token of their own instead of the one we attached).
+        s.client.clear_progress();
+        let raw = raw?;
 
         s.refresh_if_stale().await;
         s.refresh_resources_if_stale().await;
@@ -545,10 +549,12 @@ while True:
         let mgr = McpManager::from_config(&[cfg], ".").await;
         let lines = mgr.server_stderr("s").unwrap();
         assert!(lines.iter().any(|l| l.contains("start")));
-        assert!(mgr.server_stderr("s").unwrap().is_empty());
+        // Snapshots are non-destructive — the UI polls this every frame.
+        assert!(mgr.server_stderr("s").unwrap().iter().any(|l| l.contains("start")));
         mgr.call_tool("mcp__s__e", serde_json::json!({"msg":"hi"})).await.unwrap();
         let l2 = mgr.server_stderr("s").unwrap();
         assert!(l2.iter().any(|l| l.contains("echo: hi")));
+        assert!(l2.iter().any(|l| l.contains("start")), "older lines are kept");
     }
 
     // --- Cancellation + Progress + Roots test ---
@@ -608,13 +614,29 @@ while True:
         assert!(mgr.startup_errors.is_empty());
 
         // --- Progress ---
-        // Call long_task — server sends 3 progress notifications.
-        mgr.call_tool("mcp__a__long_task", serde_json::json!({"token":"p1"})).await.unwrap();
-        let snap = mgr.server_progress_all("a").unwrap();
-        assert!(snap.contains_key("p1"), "progress not tracked: {snap:?}");
-        let info = snap.get("p1").unwrap();
+        // long_task sends 3 progress notifications while it runs. Progress is
+        // observable during the call and cleared once it completes.
+        let (call_result, observed) = tokio::join!(
+            mgr.call_tool("mcp__a__long_task", serde_json::json!({"token":"p1"})),
+            async {
+                for _ in 0..200 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    if let Some(snap) = mgr.server_progress_all("a") {
+                        if let Some(info) = snap.get("p1") {
+                            return Some(info.clone());
+                        }
+                    }
+                }
+                None
+            }
+        );
+        call_result.unwrap();
+        let info = observed.expect("progress visible while the call runs");
         assert_eq!(info.total, Some(3.0));
-        assert_eq!(info.progress, 3.0);
+        assert!(info.progress >= 1.0);
+        assert!(info.message.as_deref().unwrap_or("").starts_with("step"));
+        // Finished call leaves no stale progress for the sidebar to show.
+        assert!(mgr.server_progress_all("a").unwrap().is_empty());
 
         // --- Roots ---
         // roots_probe sends roots/list to client, reads response.

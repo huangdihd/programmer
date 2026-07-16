@@ -334,17 +334,14 @@ impl McpClient {
         self.prompts_list_changed.swap(false, Ordering::Relaxed)
     }
 
-    // --- cancellation ---
-
-    pub(crate) fn take_cancelled(&self) -> Option<u64> {
-        self.cancelled_id.lock().unwrap().take()
-    }
-
     // --- progress ---
 
-    /// Snapshot and clear progress for a given token.
-    pub(crate) fn take_progress(&self, token: &str) -> Option<ProgressInfo> {
-        self.progress.lock().unwrap().remove(token)
+    /// Drop all tracked progress. Called when a tool call finishes so the UI
+    /// never shows stale progress — this covers servers that report under
+    /// their own token instead of the one we attached (tool calls are
+    /// sequential, so there is nothing else in flight to clobber).
+    pub(crate) fn clear_progress(&self) {
+        self.progress.lock().unwrap().clear();
     }
 
     /// All currently tracked progress tokens and their info (non-destructive).
@@ -354,9 +351,10 @@ impl McpClient {
 
     // --- stderr ---
 
-    pub(crate) fn take_stderr_lines(&self) -> Vec<String> {
-        let mut guard = self.stderr_buf.lock().unwrap();
-        guard.drain(..).collect()
+    /// The most recent stderr lines from the server (non-destructive), for
+    /// display in the MCP panel.
+    pub(crate) fn stderr_snapshot(&self) -> Vec<String> {
+        self.stderr_buf.lock().unwrap().iter().cloned().collect()
     }
 
     // --- notification sender ---

@@ -290,14 +290,31 @@ impl McpPanel {
         buf: &mut Buffer,
     ) {
         Clear.render(area, buf);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        // In list mode, connected servers get a stderr log pane for the
+        // selected entry (useful when a server misbehaves).
+        let show_logs = matches!(self.mode, Mode::List)
+            && !config.mcp_servers.is_empty()
+            && mcp.is_some()
+            && area.height > 16;
+        let constraints: Vec<Constraint> = if show_logs {
+            vec![
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(8),
+                Constraint::Length(2),
+            ]
+        } else {
+            vec![
                 Constraint::Length(2),
                 Constraint::Min(3),
                 Constraint::Length(2),
-            ])
+            ]
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
             .split(area);
+        let bottom = chunks[chunks.len() - 1];
 
         // -- Title --
         Paragraph::new(Line::from(vec![
@@ -395,6 +412,47 @@ impl McpPanel {
             ratatui::widgets::StatefulWidget::render(list, chunks[1], buf, &mut list_state);
         }
 
+        // -- Selected server's recent stderr --
+        if show_logs {
+            let selected_name = config
+                .mcp_servers
+                .get(self.selected.min(config.mcp_servers.len() - 1))
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            let stderr = mcp
+                .and_then(|m| m.server_stderr(&selected_name))
+                .unwrap_or_default();
+            let log_area = chunks[2];
+            let visible = log_area.height.saturating_sub(2) as usize;
+            let log_lines: Vec<Line> = if stderr.is_empty() {
+                vec![Line::from(Span::styled(
+                    "  (no stderr output)",
+                    Style::default().fg(Color::DarkGray).italic(),
+                ))]
+            } else {
+                stderr
+                    .iter()
+                    .rev()
+                    .take(visible.max(1))
+                    .rev()
+                    .map(|l| {
+                        Line::from(Span::styled(
+                            truncate(l, (area.width.saturating_sub(4) as usize).max(8)),
+                            Style::default().fg(Color::Gray),
+                        ))
+                    })
+                    .collect()
+            };
+            Paragraph::new(log_lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(format!(" {selected_name} · stderr ")),
+                )
+                .render(log_area, buf);
+        }
+
         // -- Bottom bar: help, confirmation, or form --
         match &self.mode {
             Mode::List => {
@@ -410,7 +468,7 @@ impl McpPanel {
                     Span::styled("q/Esc", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" close", Style::default().fg(Color::Gray)),
                 ]);
-                Paragraph::new(help).render(chunks[2], buf);
+                Paragraph::new(help).render(bottom, buf);
             }
             Mode::ConfirmDelete(name) => {
                 let confirm = Line::from(vec![
@@ -423,7 +481,7 @@ impl McpPanel {
                     Span::styled("n", Style::default().fg(Color::Red).bold()),
                     Span::styled(" cancel", Style::default().fg(Color::Gray)),
                 ]);
-                Paragraph::new(confirm).render(chunks[2], buf);
+                Paragraph::new(confirm).render(bottom, buf);
             }
             Mode::Form(form) => {
                 let title = if form.original.is_some() {

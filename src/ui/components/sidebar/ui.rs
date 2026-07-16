@@ -344,7 +344,7 @@ impl Sidebar {
         &self,
         lines: &mut Vec<Line<'static>>,
         targets: &mut Vec<ClickTarget>,
-        _width: u16,
+        width: u16,
         mcp_manager: Option<&McpManager>,
     ) {
         let Some(mgr) = mcp_manager else {
@@ -379,7 +379,7 @@ impl Sidebar {
                 Span::raw("  "),
                 Span::styled("●", Style::default().fg(Color::Green)),
                 Span::raw(" "),
-                Span::styled(server, Style::default().fg(Color::White)),
+                Span::styled(server.clone(), Style::default().fg(Color::White)),
                 Span::styled(
                     format!(" ({tool_n} tools)"),
                     Style::default().fg(Color::DarkGray),
@@ -388,6 +388,24 @@ impl Sidebar {
             lines.push(line);
             targets.push(ClickTarget::None);
             count += 1;
+
+            // Live progress reported by this server for in-flight tool calls
+            // (notifications/progress).
+            let progress = mgr.server_progress_all(&server).unwrap_or_default();
+            for info in progress.values() {
+                let pct = info
+                    .total
+                    .filter(|t| *t > 0.0)
+                    .map(|t| format!("{:.0}% ", (info.progress / t * 100.0).min(100.0)))
+                    .unwrap_or_default();
+                let msg = info.message.clone().unwrap_or_else(|| "working…".to_string());
+                let text = truncate_msg(&format!("⟳ {pct}{msg}"), width.saturating_sub(6) as usize);
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(text, Style::default().fg(Color::Yellow)),
+                ]));
+                targets.push(ClickTarget::None);
+            }
         }
 
         for err in &mgr.startup_errors {
