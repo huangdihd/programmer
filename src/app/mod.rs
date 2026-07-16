@@ -33,6 +33,7 @@ use crate::ui::components::conversation_panel::conversation_panel::ConversationP
 use crate::ui::components::footer::footer::Footer;
 use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::components::provider_panel::ProviderPanel;
+use crate::ui::components::sidebar::Sidebar;
 use crate::ui::components::skills_panel::SkillsPanel;
 use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::question_panel::QuestionPanel;
@@ -44,6 +45,7 @@ use async_openai::types::responses::{
 };
 use crossterm::event::KeyEvent;
 use ratatui::DefaultTerminal;
+use ratatui::layout::Rect;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -72,6 +74,11 @@ pub struct App<'a> {
     pub question_panel: Option<QuestionPanel>,
     /// Todo-list panel shown with `/todo`.
     pub todo_panel: Option<TodoPanel>,
+    /// Right-hand sidebar panel (toggled with Ctrl+B).
+    pub sidebar: Option<Sidebar>,
+    /// The sidebar's screen area from the last render, used to route mouse
+    /// scroll events to the correct panel.
+    pub sidebar_area: Option<Rect>,
     /// In-memory todo list synced with the global todos file and the session.
     pub todo_list: crate::todos::TodoList,
     /// Loaded agent skills, with activation state.
@@ -97,6 +104,8 @@ pub struct App<'a> {
     pub(crate) mutating_turns: usize,
     /// Whether the project's diagnostics profile declares an LSP checker.
     pub(crate) lsp_configured: bool,
+    /// Tracks whether the current mouse-drag started in the sidebar area.
+    pub(crate) sidebar_click_active: bool,
     /// True while the stream task is backing off between connection retries.
     pub(crate) stream_retrying: Arc<AtomicBool>,
     /// Session UUID.
@@ -188,6 +197,8 @@ impl App<'_> {
             mcp_panel: None,
             question_panel: None,
             todo_panel: None,
+            sidebar: Some(Sidebar::new()),
+            sidebar_area: None,
             todo_list: {
                 let list = crate::todos::TodoList {
                     todos: saved_todos,
@@ -205,6 +216,7 @@ impl App<'_> {
             diagnostics_baseline: None,
             mutating_turns: 0,
             lsp_configured: helpers::lsp_checker_configured(),
+            sidebar_click_active: false,
             stream_retrying: Arc::new(AtomicBool::new(false)),
             session_uuid,
             skill_registry: crate::skills::SkillRegistry::load(),
@@ -243,9 +255,13 @@ impl App<'_> {
         mut self,
         mut terminal: DefaultTerminal,
     ) -> (color_eyre::Result<()>, String) {
+        // Kick off diagnostics baseline seeding on startup.
+        crate::app::diagnostics::maybe_seed_diagnostics_baseline(&mut self);
+
         let result = async {
             while self.running {
                 terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+
                 let event = self.events.next().await?;
                 self.handle_event(event).await?;
                 while self.running {

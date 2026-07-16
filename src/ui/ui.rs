@@ -17,6 +17,7 @@ use crate::app::App;
 use crate::ui::components::completion_popup::CompletionPopup;
 use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
 use crate::ui::components::logo::Logo;
+use crate::ui::components::sidebar::Sidebar;
 use crate::ui::components::status_bar::status_bar::StatusState;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -56,78 +57,18 @@ impl App<'_> {
             },
         }
     }
-}
 
-impl Widget for &mut App<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        // The provider management panel is modal and replaces the whole UI.
-        if let Some(panel) = &self.provider_panel {
-            panel.render(&self.config, &self.provider_manager, area, buf);
-            return;
-        }
-        // The skills management panel is modal and replaces the whole UI.
-        if let Some(panel) = &self.skills_panel {
-            panel.render(&self.skill_registry, area, buf);
-            return;
-        }
-        // The MCP management panel is modal and replaces the whole UI.
-        if let Some(panel) = &self.mcp_panel {
-            panel.render(&self.config, self.mcp_manager.as_deref(), area, buf);
-            return;
-        }
-
-        // Resolve the single status the footer should show, then let the
-        // status bar track its own busy timer.
-        self.footer.status.set(self.resolve_status());
-        self.footer.work_mode = self.work_mode;
-        self.footer.current_model = self.current_model.clone();
-        self.footer.lsp_configured = self.lsp_configured;
-        self.footer.active_skills = self
-            .skill_registry
-            .activated_names()
-            .join(",");
-
-        // When the model is asking a question or waiting for approval,
-        // the bottom area grows; the conversation panel shrinks.
-        let question_height: u16 = self
-            .question_panel
-            .as_ref()
-            .map(|q| q.needed_height())
-            .unwrap_or(3);
-        let approval_height: u16 = if self.approval_queue.is_empty() {
-            3
-        } else {
-            let detail_count = crate::ui::tool_details::format_tool_details(
-                &self.approval_queue[0].0.name,
-                &self.approval_queue[0].0.arguments,
-            ).len() as u16;
-            4 + detail_count + 4 // title + reason + details + options
-        };
-        // The bottom row is either a modal (question / approval / plan review) or the input.
-        // When it's the input, let it grow with multi-line content.
-        let plan_review_height: u16 = if self.work_mode == crate::classifier::WorkMode::Plan
-            && self.plan_phase == crate::classifier::PlanPhase::Reviewing
-        {
-            let option_count: u16 = if self.config.allow_yolo { 4 } else { 3 };
-            5 + option_count // header + separator + options
-        } else {
-            0
-        };
-        let bottom_height = if self.question_panel.is_some() {
-            question_height
-        } else if !self.approval_queue.is_empty() {
-            approval_height
-        } else if plan_review_height > 0 {
-            plan_review_height
-        } else {
-            self.input_panel.needed_height()
-        };
-
-        // Show a compact todo bar when there are items and the full modal
-        // isn't open.
-        let has_todo_bar = !self.todo_list.todos.is_empty() && self.todo_panel.is_none();
-        let todo_bar_height: u16 = if has_todo_bar { 1 } else { 0 };
-
+    /// Render the main vertical layout area (logo, conversation, todo bar,
+    /// input, footer, overlays). Called either full-screen or in the left
+    /// portion when the sidebar is open.
+    fn render_main(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        has_todo_bar: bool,
+        todo_bar_height: u16,
+        bottom_height: u16,
+    ) {
         // Named indices into the constraint array so they don't drift when
         // rows are added or removed.
         const POS_LOGO: usize = 0;
@@ -358,6 +299,106 @@ impl Widget for &mut App<'_> {
                 }
             }
             panel.render(panel_area, buf);
+        }
+    }
+}
+
+impl Widget for &mut App<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        // The provider management panel is modal and replaces the whole UI.
+        if let Some(panel) = &self.provider_panel {
+            panel.render(&self.config, &self.provider_manager, area, buf);
+            return;
+        }
+        // The skills management panel is modal and replaces the whole UI.
+        if let Some(panel) = &self.skills_panel {
+            panel.render(&self.skill_registry, area, buf);
+            return;
+        }
+        // The MCP management panel is modal and replaces the whole UI.
+        if let Some(panel) = &self.mcp_panel {
+            panel.render(&self.config, self.mcp_manager.as_deref(), area, buf);
+            return;
+        }
+
+        // Resolve the single status the footer should show, then let the
+        // status bar track its own busy timer.
+        self.footer.status.set(self.resolve_status());
+        self.footer.work_mode = self.work_mode;
+        self.footer.current_model = self.current_model.clone();
+        self.footer.lsp_configured = self.lsp_configured;
+        self.footer.active_skills = self
+            .skill_registry
+            .activated_names()
+            .join(",");
+
+        // When the model is asking a question or waiting for approval,
+        // the bottom area grows; the conversation panel shrinks.
+        let question_height: u16 = self
+            .question_panel
+            .as_ref()
+            .map(|q| q.needed_height())
+            .unwrap_or(3);
+        let approval_height: u16 = if self.approval_queue.is_empty() {
+            3
+        } else {
+            let detail_count = crate::ui::tool_details::format_tool_details(
+                &self.approval_queue[0].0.name,
+                &self.approval_queue[0].0.arguments,
+            ).len() as u16;
+            4 + detail_count + 4 // title + reason + details + options
+        };
+        // The bottom row is either a modal (question / approval / plan review) or the input.
+        // When it's the input, let it grow with multi-line content.
+        let plan_review_height: u16 = if self.work_mode == crate::classifier::WorkMode::Plan
+            && self.plan_phase == crate::classifier::PlanPhase::Reviewing
+        {
+            let option_count: u16 = if self.config.allow_yolo { 4 } else { 3 };
+            5 + option_count // header + separator + options
+        } else {
+            0
+        };
+        let bottom_height = if self.question_panel.is_some() {
+            question_height
+        } else if !self.approval_queue.is_empty() {
+            approval_height
+        } else if plan_review_height > 0 {
+            plan_review_height
+        } else {
+            self.input_panel.needed_height()
+        };
+
+        // Show a compact todo bar when there are items and the full modal
+        // isn't open.
+        let has_todo_bar = !self.todo_list.todos.is_empty() && self.todo_panel.is_none();
+        let todo_bar_height: u16 = if has_todo_bar { 1 } else { 0 };
+
+        // ---- sidebar: conditionally split the screen horizontally ----
+        if self.sidebar.is_some() {
+            let sidebar_width = Sidebar::needed_width().min(area.width / 3);
+            let horiz = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(10),               // main area
+                    Constraint::Length(sidebar_width), // sidebar
+                ])
+                .split(area);
+            self.sidebar_area = Some(horiz[1]);
+
+            self.render_main(horiz[0], buf, has_todo_bar, todo_bar_height, bottom_height);
+
+            self.sidebar.as_mut().unwrap()
+                .render(
+                    horiz[1],
+                    buf,
+                    self.diagnostics_baseline.as_deref().unwrap_or(&[]),
+                    self.lsp_configured,
+                    self.mcp_manager.as_deref(),
+                    &self.todo_list,
+                );
+        } else {
+            self.sidebar_area = None;
+            self.render_main(area, buf, has_todo_bar, todo_bar_height, bottom_height);
         }
     }
 }

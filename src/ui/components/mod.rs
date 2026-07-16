@@ -22,6 +22,7 @@ pub mod messages;
 pub mod mcp_panel;
 pub mod provider_panel;
 pub mod question_panel;
+pub mod sidebar;
 pub mod skills_panel;
 pub mod status_bar;
 pub mod todo_panel;

@@ -22,6 +22,7 @@ use crate::commands::CompletionEngine;
 use crate::ui::components::conversation_panel::conversation_panel::{ActivePhase, SelectionEnd};
 use crate::ui::components::provider_panel::PanelAction;
 use crate::ui::components::question_panel::QuestionPanel;
+use crate::ui::components::sidebar::ClickTarget;
 use crate::ui::event::{AppEvent, Event};
 use async_openai::types::responses::{FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
@@ -36,6 +37,13 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
     match event {
         Event::Tick => app.tick(),
         Event::Crossterm(event) => match event {
+            crossterm::event::Event::FocusGained => {
+                // Restore mouse capture explicitly on focus regain.
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::event::EnableMouseCapture
+                );
+            }
             crossterm::event::Event::Key(key_event)
                 if key_event.kind == KeyEventKind::Press =>
             {
@@ -44,15 +52,64 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
             crossterm::event::Event::Paste(data) => handle_paste(app, data),
             crossterm::event::Event::Mouse(_) if app.provider_panel.is_some() => {}
             crossterm::event::Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollDown => app.conversation_panel.scroll_down(),
-                MouseEventKind::ScrollUp => app.conversation_panel.scroll_up(),
-                MouseEventKind::Down(MouseButton::Left) => app
-                    .conversation_panel
-                    .selection_begin(mouse.column, mouse.row),
-                MouseEventKind::Drag(MouseButton::Left) => app
-                    .conversation_panel
-                    .selection_drag(mouse.column, mouse.row),
+                MouseEventKind::ScrollDown => {
+                    if app.sidebar_area.map_or(false, |a| mouse.column >= a.x) {
+                        if let Some(ref mut s) = app.sidebar { s.scroll_down(); }
+                    } else {
+                        app.conversation_panel.scroll_down();
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if app.sidebar_area.map_or(false, |a| mouse.column >= a.x) {
+                        if let Some(ref mut s) = app.sidebar { s.scroll_up(); }
+                    } else {
+                        app.conversation_panel.scroll_up();
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // If click is in the sidebar, track it and don't start selection.
+                    app.sidebar_click_active = app.sidebar.is_some()
+                        && app.sidebar_area.as_ref().map_or(false, |area| {
+                            mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                                && mouse.row >= area.y
+                                && mouse.row < area.y + area.height
+                        });
+                    if app.sidebar_click_active {
+                        return Ok(());
+                    }
+                    app.conversation_panel
+                        .selection_begin(mouse.column, mouse.row)
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if app.sidebar_click_active {
+                        return Ok(());
+                    }
+                    app.conversation_panel
+                        .selection_drag(mouse.column, mouse.row)
+                }
                 MouseEventKind::Up(MouseButton::Left) => {
+                    if app.sidebar_click_active {
+                        app.sidebar_click_active = false;
+                        // Only act if the release is still in the sidebar.
+                        if let Some(ref sidebar) = app.sidebar {
+                            if let Some(ref area) = app.sidebar_area {
+                                if mouse.column > area.x
+                                    && mouse.column < area.x + area.width
+                                    && mouse.row >= area.y
+                                    && mouse.row < area.y + area.height
+                                {
+                                    let line_idx = (mouse.row - area.y) as usize;
+                                    if line_idx < sidebar.click_map.len() {
+                                        let target =
+                                            sidebar.click_map[line_idx].clone();
+                                        handle_sidebar_click(app, &target);
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
                     match app
                         .conversation_panel
                         .selection_end(mouse.column, mouse.row)
@@ -155,6 +212,7 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
                 }
                 app.todo_list = crate::todos::TodoList::load();
                 session::save_session(app);
+                // Restore mouse capture — external commands disable it.
                 let _ = crossterm::execute!(
                     std::io::stdout(),
                     crossterm::event::EnableMouseCapture
@@ -184,9 +242,18 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
                 }
                 diagnostics::apply_diagnostics(app, snapshot, reminder_due);
                 session::save_session(app);
+                // Restore mouse capture — diagnostic runners may reset console
+                // modes on Windows.
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::event::EnableMouseCapture
+                );
                 stream::spawn_stream(app);
             }
-            AppEvent::Start => commands::send_message(app).await,
+            AppEvent::Start => {
+                diagnostics::maybe_seed_diagnostics_baseline(app);
+                commands::send_message(app).await;
+            }
             AppEvent::StartInit => {
                 app.conversation_panel.add_meta(
                     "\u{25B8} Initializing project\u{2026}",
@@ -537,6 +604,32 @@ pub(crate) async fn handle_key_events(
         return Ok(());
     }
 
+    // ---- sidebar keyboard (when focused) ----
+    if app.sidebar.as_ref().map_or(false, |s| s.has_focus) {
+        if key_event.code == KeyCode::Esc {
+            if let Some(ref mut s) = app.sidebar {
+                s.has_focus = false;
+            }
+            return Ok(());
+        }
+        if let Some(ref mut s) = app.sidebar {
+            s.handle_key(key_event);
+        }
+        return Ok(());
+    }
+
+    // ---- Ctrl+B: toggle sidebar ----
+    if key_event.code == KeyCode::Char('b')
+        && key_event.modifiers == KeyModifiers::CONTROL
+    {
+        if app.sidebar.is_some() {
+            app.sidebar = None;
+        } else {
+            app.sidebar = Some(crate::ui::components::sidebar::Sidebar::new());
+        }
+        return Ok(());
+    }
+
     // ---- Ctrl+T: cycle work mode ----
     if key_event.code == KeyCode::Char('t')
         && key_event.modifiers == KeyModifiers::CONTROL
@@ -722,6 +815,36 @@ pub(crate) async fn handle_key_events(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar click handling
+// ---------------------------------------------------------------------------
+
+fn handle_sidebar_click(app: &mut App<'_>, target: &ClickTarget) {
+    match target {
+        ClickTarget::Section(key) => {
+            if let Some(ref mut s) = app.sidebar {
+                s.toggle_section(*key);
+            }
+        }
+        ClickTarget::TodoItem(idx) => {
+            let mut sorted: Vec<&crate::todos::Todo> =
+                app.todo_list.todos.iter().collect();
+            sorted.sort_by_key(|t| {
+                crate::ui::components::sidebar::ui::todo_status_order(&t.status)
+            });
+            if let Some(todo) = sorted.get(*idx) {
+                let id = todo.id.clone();
+                let _ = app.todo_list.toggle_status(&id);
+                let _ = app.todo_list.save_to_file();
+            }
+        }
+        ClickTarget::Diagnostic(_idx) => {
+            // Could jump to file location in the future.
+        }
+        ClickTarget::None => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
