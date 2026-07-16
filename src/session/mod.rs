@@ -155,6 +155,10 @@ pub(crate) struct Session {
     /// Names of activated skills, restored on resume.
     #[serde(default)]
     pub(crate) activated_skills: Vec<String>,
+    /// Background tasks carried with the session. Tasks recorded as running
+    /// are restored as killed — their processes died with the old instance.
+    #[serde(default)]
+    pub(crate) tasks: Vec<crate::tasks::PersistedTask>,
 }
 
 pub(crate) struct SessionManager {
@@ -216,6 +220,7 @@ impl SessionManager {
             classifier_model: None,
             todos: Vec::new(),
             activated_skills: Vec::new(),
+            tasks: Vec::new(),
         }
     }
 

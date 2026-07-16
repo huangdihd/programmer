@@ -21,6 +21,7 @@
 //! the sidebar. State lives in a process-global registry because tools only
 //! receive their JSON arguments — there is no `App` handle in the tool path.
 
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -28,6 +29,11 @@ use std::time::{Duration, Instant};
 /// Cap on the output buffer kept per task. When exceeded, the oldest half is
 /// dropped so the tail (usually the interesting part) is always available.
 const MAX_TASK_OUTPUT: usize = 200_000;
+
+/// Cap on the output persisted per task in the session file.
+const MAX_PERSISTED_OUTPUT: usize = 10_000;
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Lifecycle state of one background task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +92,7 @@ fn registry() -> &'static Mutex<Vec<TaskEntry>> {
 }
 
 fn next_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 fn snapshot_entry(e: &TaskEntry) -> TaskSnapshot {
@@ -264,6 +269,88 @@ pub async fn wait(id: u64, timeout: Duration) -> Result<(TaskSnapshot, bool), St
     }
 }
 
+// ---------------------------------------------------------------------------
+// Session persistence
+// ---------------------------------------------------------------------------
+
+/// Serialized form of one task, carried in the session file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedTask {
+    pub id: u64,
+    pub name: String,
+    pub command: String,
+    /// [`TaskStatus::label`] string ("running", "completed", …).
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub elapsed_secs: u64,
+    /// Tail of the captured output.
+    pub output: String,
+}
+
+/// Snapshot every task for session storage, oldest first.
+pub fn persist_all() -> Vec<PersistedTask> {
+    let reg = registry().lock().unwrap();
+    reg.iter()
+        .map(|e| {
+            let output = if e.output.chars().count() > MAX_PERSISTED_OUTPUT {
+                let skip = e.output.chars().count() - MAX_PERSISTED_OUTPUT;
+                e.output.chars().skip(skip).collect()
+            } else {
+                e.output.clone()
+            };
+            PersistedTask {
+                id: e.id,
+                name: e.name.clone(),
+                command: e.command.clone(),
+                status: e.status.label().to_string(),
+                exit_code: e.exit_code,
+                elapsed_secs: e
+                    .finished
+                    .map(|f| f - e.started)
+                    .unwrap_or_else(|| e.started.elapsed())
+                    .as_secs(),
+                output,
+            }
+        })
+        .collect()
+}
+
+/// Restore tasks saved in a session. Tasks that were still running when the
+/// session was saved come back as [`TaskStatus::Killed`] — their processes
+/// died with the previous instance. New task ids continue above the restored
+/// ones.
+pub fn restore(saved: &[PersistedTask]) {
+    let mut reg = registry().lock().unwrap();
+    let now = Instant::now();
+    for t in saved {
+        if reg.iter().any(|e| e.id == t.id) {
+            continue;
+        }
+        let status = match t.status.as_str() {
+            "completed" => TaskStatus::Completed,
+            "failed" => TaskStatus::Failed,
+            // "running" becomes Killed: the child died with the old process.
+            _ => TaskStatus::Killed,
+        };
+        let started = now
+            .checked_sub(Duration::from_secs(t.elapsed_secs))
+            .unwrap_or(now);
+        reg.push(TaskEntry {
+            id: t.id,
+            name: t.name.clone(),
+            command: t.command.clone(),
+            status,
+            exit_code: t.exit_code,
+            started,
+            finished: Some(now),
+            output: t.output.clone(),
+            kill: None,
+        });
+    }
+    let max_id = reg.iter().map(|e| e.id).max().unwrap_or(0);
+    NEXT_ID.fetch_max(max_id + 1, Ordering::Relaxed);
+}
+
 fn append_output(id: u64, chunk: &str) {
     let mut reg = registry().lock().unwrap();
     if let Some(entry) = reg.iter_mut().find(|e| e.id == id) {
@@ -325,6 +412,57 @@ mod tests {
         assert_eq!(snap.status, TaskStatus::Killed);
         // A second kill reports the task as finished.
         assert!(kill(id).is_err());
+    }
+
+    #[test]
+    fn restore_marks_running_tasks_as_killed_and_bumps_ids() {
+        // Ids far above anything the other tests allocate, so the shared
+        // global registry doesn't collide.
+        let saved = vec![
+            PersistedTask {
+                id: 900_001,
+                name: "dev server".to_string(),
+                command: "npm run dev".to_string(),
+                status: "running".to_string(),
+                exit_code: None,
+                elapsed_secs: 90,
+                output: "listening on :3000".to_string(),
+            },
+            PersistedTask {
+                id: 900_002,
+                name: "build".to_string(),
+                command: "cargo build".to_string(),
+                status: "completed".to_string(),
+                exit_code: Some(0),
+                elapsed_secs: 30,
+                output: String::new(),
+            },
+        ];
+        restore(&saved);
+
+        let running = snapshot(900_001).expect("restored task");
+        assert_eq!(running.status, TaskStatus::Killed, "running → killed on restore");
+        assert_eq!(running.elapsed.as_secs(), 90);
+        assert!(running.output.contains("listening"));
+
+        let done = snapshot(900_002).expect("restored task");
+        assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(done.exit_code, Some(0));
+
+        // New ids continue above the restored ones.
+        assert!(next_id() > 900_002);
+
+        // Restoring again must not duplicate entries.
+        restore(&saved);
+        let dupes = snapshot_all()
+            .iter()
+            .filter(|t| t.id == 900_001)
+            .count();
+        assert_eq!(dupes, 1);
+
+        // Round trip: the restored tasks serialize back out.
+        let persisted = persist_all();
+        assert!(persisted.iter().any(|t| t.id == 900_001 && t.status == "killed"));
     }
 
     #[tokio::test]

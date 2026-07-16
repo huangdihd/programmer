@@ -44,6 +44,7 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     session.classifier_model = app.config.classifier_model.clone();
     session.todos = app.todo_list.todos.clone();
     session.activated_skills = app.skill_registry.activated_names().to_vec();
+    session.tasks = crate::tasks::persist_all();
     if let Err(e) = mgr.save(&mut session) {
         app.conversation_panel
             .add_error_string(format!("session save: {e}"));

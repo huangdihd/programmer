@@ -107,6 +107,7 @@ fn resolve_session(
             Some(session) => {
                 let history = session.history.clone();
                 let todos = session.todos.clone();
+                tasks::restore(&session.tasks);
                 let items = SessionManager::into_items(session);
                 (uuid, items, history, todos)
             }
@@ -125,6 +126,7 @@ fn resolve_session(
                         Some(session) => {
                             let history = session.history.clone();
                             let todos = session.todos.clone();
+                            tasks::restore(&session.tasks);
                             let items = SessionManager::into_items(session);
                             (uuid, items, history, todos)
                         }
