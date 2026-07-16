@@ -51,6 +51,8 @@ pub enum ClickTarget {
     /// A diagnostic entry; the usize is the index into the sorted diagnostics
     /// slice.
     Diagnostic(usize),
+    /// A background task header; click toggles its output view.
+    Task(u64),
 }
 
 /// The sidebar panel itself.
@@ -65,6 +67,8 @@ pub struct Sidebar {
     /// Click map built by the last render: for each rendered line (after
     /// scrolling), what is clickable there.
     pub click_map: Vec<ClickTarget>,
+    /// Ids of background tasks whose output is expanded.
+    expanded_tasks: std::collections::HashSet<u64>,
 }
 
 impl Sidebar {
@@ -92,6 +96,7 @@ impl Sidebar {
             scroll_offset: 0,
             has_focus: false,
             click_map: Vec::new(),
+            expanded_tasks: std::collections::HashSet::new(),
         }
     }
 
@@ -110,6 +115,18 @@ impl Sidebar {
         if let Some(s) = self.sections.iter_mut().find(|s| s.key == section) {
             s.collapsed = !s.collapsed;
         }
+    }
+
+    /// Toggle a background task's output view.
+    pub fn toggle_task(&mut self, id: u64) {
+        if !self.expanded_tasks.remove(&id) {
+            self.expanded_tasks.insert(id);
+        }
+    }
+
+    /// Whether a task's output view is expanded.
+    pub(crate) fn task_expanded(&self, id: u64) -> bool {
+        self.expanded_tasks.contains(&id)
     }
 
     // -- scrolling --

@@ -121,6 +121,11 @@ fn handle_sidebar_click(app: &mut App<'_>, target: &ClickTarget) {
                 let _ = app.todo_list.save_to_file();
             }
         }
+        ClickTarget::Task(id) => {
+            if let Some(ref mut s) = app.sidebar {
+                s.toggle_task(*id);
+            }
+        }
         ClickTarget::Diagnostic(_idx) => {
             // Could jump to file location in the future.
         }

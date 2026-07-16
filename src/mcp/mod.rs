@@ -554,14 +554,26 @@ while True:
         let scr = write_temp_script("stderr", STDERR_SERVER);
         let cfg = McpServerConfig { name: "s".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), auto_approve: McpPolicy::Trusted };
         let mgr = McpManager::from_config(&[cfg], ".").await;
-        let lines = mgr.server_stderr("s").unwrap();
-        assert!(lines.iter().any(|l| l.contains("start")));
+        // stderr is drained by a background task, so poll briefly instead of
+        // asserting on the instantaneous snapshot.
+        let wait_for_line = |mgr: &McpManager, needle: &'static str| {
+            let lines = mgr.server_stderr("s").unwrap();
+            lines.iter().any(|l| l.contains(needle))
+        };
+        for _ in 0..200 {
+            if wait_for_line(&mgr, "start") { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(wait_for_line(&mgr, "start"));
         // Snapshots are non-destructive — the UI polls this every frame.
-        assert!(mgr.server_stderr("s").unwrap().iter().any(|l| l.contains("start")));
+        assert!(wait_for_line(&mgr, "start"));
         mgr.call_tool("mcp__s__e", serde_json::json!({"msg":"hi"})).await.unwrap();
-        let l2 = mgr.server_stderr("s").unwrap();
-        assert!(l2.iter().any(|l| l.contains("echo: hi")));
-        assert!(l2.iter().any(|l| l.contains("start")), "older lines are kept");
+        for _ in 0..200 {
+            if wait_for_line(&mgr, "echo: hi") { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(wait_for_line(&mgr, "echo: hi"));
+        assert!(wait_for_line(&mgr, "start"), "older lines are kept");
     }
 
     // --- Cancellation + Progress + Roots test ---

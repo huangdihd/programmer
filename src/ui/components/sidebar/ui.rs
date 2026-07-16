@@ -495,6 +495,8 @@ impl Sidebar {
                 TaskStatus::Killed => ("⊘", Color::DarkGray),
             };
 
+            let expanded = self.task_expanded(task.id);
+            let arrow = if expanded { "▾" } else { "▸" };
             let elapsed = format_duration_secs(task.elapsed);
             let title_style = Style::default().fg(Color::White);
             let cont_style = Style::default().fg(Color::DarkGray);
@@ -506,12 +508,13 @@ impl Sidebar {
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!(" #{} ", task.id),
+                    format!(" {arrow} #{} ", task.id),
                     Style::default().fg(Color::DarkGray),
                 ),
             ];
             let prefix_width = spans_width(&prefix_spans);
 
+            // Header line(s): clickable to toggle the output view.
             let line_count_before = lines.len();
             wrapped_item(
                 lines,
@@ -524,8 +527,65 @@ impl Sidebar {
                 cont_style,
             );
             for _ in 0..(lines.len() - line_count_before) {
-                targets.push(ClickTarget::None);
+                targets.push(ClickTarget::Task(task.id));
             }
+
+            if expanded {
+                self.render_task_output(lines, targets, width, task);
+            }
+        }
+    }
+
+    /// The expanded output view under a task header: exit code (when
+    /// finished) and the last few output lines.
+    fn render_task_output(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        targets: &mut Vec<ClickTarget>,
+        width: u16,
+        task: &TaskSnapshot,
+    ) {
+        const OUTPUT_TAIL_LINES: usize = 10;
+        let dim = Style::default().fg(Color::DarkGray);
+        let text_style = Style::default().fg(Color::Gray);
+        let budget = (width.saturating_sub(6) as usize).max(8);
+
+        if let Some(code) = task.exit_code {
+            lines.push(Line::from(Span::styled(
+                format!("     exit {code}"),
+                dim,
+            )));
+            targets.push(ClickTarget::None);
+        }
+
+        let tail: Vec<&str> = task
+            .output
+            .lines()
+            .rev()
+            .take(OUTPUT_TAIL_LINES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if tail.is_empty() {
+            lines.push(Line::from(Span::styled("     (no output)", dim)));
+            targets.push(ClickTarget::None);
+            return;
+        }
+        let total = task.output.lines().count();
+        if total > tail.len() {
+            lines.push(Line::from(Span::styled(
+                format!("     … {} earlier lines", total - tail.len()),
+                dim,
+            )));
+            targets.push(ClickTarget::None);
+        }
+        for out_line in tail {
+            lines.push(Line::from(vec![
+                Span::raw("     "),
+                Span::styled(truncate_to_width(out_line, budget), text_style),
+            ]));
+            targets.push(ClickTarget::None);
         }
     }
 }
@@ -637,4 +697,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn expanded_task_shows_output_tail_and_exit_code() {
+        let mut sidebar = Sidebar::new();
+        sidebar.toggle_task(3);
+        let area = Rect::new(0, 0, 32, 40);
+        let mut buf = Buffer::empty(area);
+        let output: String = (1..=13)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let tasks = vec![TaskSnapshot {
+            id: 3,
+            name: "build".to_string(),
+            command: "cargo build".to_string(),
+            status: crate::tasks::TaskStatus::Failed,
+            exit_code: Some(101),
+            elapsed: Duration::from_secs(9),
+            output,
+        }];
+
+        sidebar.render(
+            area,
+            &mut buf,
+            &[],
+            false,
+            None,
+            &crate::todos::TodoList::default(),
+            &tasks,
+        );
+
+        let text = buffer_text(&buf);
+        assert!(text.contains("exit 101"), "got:\n{text}");
+        // Only the last 10 lines show, with an earlier-lines marker.
+        assert!(text.contains("3 earlier lines"), "got:\n{text}");
+        assert!(text.contains("line 13"), "got:\n{text}");
+        assert!(!text.contains("line 2 "), "got:\n{text}");
+
+        // Collapsing hides the output again.
+        sidebar.toggle_task(3);
+        let mut buf2 = Buffer::empty(area);
+        sidebar.render(
+            area,
+            &mut buf2,
+            &[],
+            false,
+            None,
+            &crate::todos::TodoList::default(),
+            &tasks,
+        );
+        assert!(!buffer_text(&buf2).contains("exit 101"));
+    }
 }
