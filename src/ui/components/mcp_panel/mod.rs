@@ -23,6 +23,7 @@
 use crate::config::programmer_config::ProgrammerConfig;
 use crate::mcp::McpManager;
 use crate::mcp::types::{McpPolicy, McpServerConfig};
+use crate::ui::components::panel_search::{PanelSearch, SearchKey};
 use crate::ui::text::truncate_to_width;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
@@ -67,6 +68,7 @@ enum Mode {
 pub struct McpPanel {
     mode: Mode,
     selected: usize,
+    search: PanelSearch,
 }
 
 impl McpPanel {
@@ -74,12 +76,22 @@ impl McpPanel {
         McpPanel {
             mode: Mode::List,
             selected: 0,
+            search: PanelSearch::default(),
         }
     }
 
-    /// Server names in a stable display order (config order).
-    fn names(config: &ProgrammerConfig) -> Vec<String> {
-        config.mcp_servers.iter().map(|s| s.name.clone()).collect()
+    /// Server names passing the current search filter (name or command line),
+    /// in a stable display order (config order).
+    fn filtered_names(&self, config: &ProgrammerConfig) -> Vec<String> {
+        config
+            .mcp_servers
+            .iter()
+            .filter(|s| {
+                let cmdline = format!("{} {}", s.command, s.args.join(" "));
+                self.search.matches(&[s.name.as_str(), cmdline.as_str()])
+            })
+            .map(|s| s.name.clone())
+            .collect()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, config: &mut ProgrammerConfig) -> PanelAction {
@@ -99,7 +111,13 @@ impl McpPanel {
     }
 
     fn handle_list_key(&mut self, key: KeyEvent, config: &mut ProgrammerConfig) -> PanelAction {
-        let names = Self::names(config);
+        if let SearchKey::Consumed { changed } = self.search.handle_key(key) {
+            if changed {
+                self.selected = 0;
+            }
+            return PanelAction::None;
+        }
+        let names = self.filtered_names(config);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return PanelAction::Close,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -291,10 +309,18 @@ impl McpPanel {
         buf: &mut Buffer,
     ) {
         Clear.render(area, buf);
+        let filtered: Vec<&McpServerConfig> = config
+            .mcp_servers
+            .iter()
+            .filter(|s| {
+                let cmdline = format!("{} {}", s.command, s.args.join(" "));
+                self.search.matches(&[s.name.as_str(), cmdline.as_str()])
+            })
+            .collect();
         // In list mode, connected servers get a stderr log pane for the
         // selected entry (useful when a server misbehaves).
         let show_logs = matches!(self.mode, Mode::List)
-            && !config.mcp_servers.is_empty()
+            && !filtered.is_empty()
             && mcp.is_some()
             && area.height > 16;
         let constraints: Vec<Constraint> = if show_logs {
@@ -327,29 +353,43 @@ impl McpPanel {
         ]))
         .render(chunks[0], buf);
 
+        let mut list_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        if let Some(title) = self
+            .search
+            .block_title(filtered.len(), config.mcp_servers.len())
+        {
+            list_block = list_block.title(title);
+        }
+
         // -- Server list --
-        if config.mcp_servers.is_empty() {
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  No MCP servers configured. Press 'a' to add one.",
-                    Style::default().fg(Color::Gray),
-                )),
-                Line::from(Span::styled(
-                    "  Example — filesystem: command 'npx', \
-                     args '-y @modelcontextprotocol/server-filesystem /path'",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .render(chunks[1], buf);
+        if filtered.is_empty() {
+            let message = if config.mcp_servers.is_empty() {
+                vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  No MCP servers configured. Press 'a' to add one.",
+                        Style::default().fg(Color::Gray),
+                    )),
+                    Line::from(Span::styled(
+                        "  Example — filesystem: command 'npx', \
+                         args '-y @modelcontextprotocol/server-filesystem /path'",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ]
+            } else {
+                vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  No MCP servers match the search.",
+                        Style::default().fg(Color::Gray),
+                    )),
+                ]
+            };
+            Paragraph::new(message).block(list_block).render(chunks[1], buf);
         } else {
-            let items: Vec<ListItem> = config
-                .mcp_servers
+            let items: Vec<ListItem> = filtered
                 .iter()
                 .map(|s| {
                     // Runtime status: connected + tool count, if the manager is up.
@@ -396,11 +436,7 @@ impl McpPanel {
                 })
                 .collect();
             let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray)),
-                )
+                .block(list_block)
                 .highlight_style(
                     Style::default()
                         .fg(Color::Black)
@@ -409,15 +445,14 @@ impl McpPanel {
                 )
                 .highlight_symbol("❯ ");
             let mut list_state = ListState::default();
-            list_state.select(Some(self.selected.min(config.mcp_servers.len() - 1)));
+            list_state.select(Some(self.selected.min(filtered.len() - 1)));
             ratatui::widgets::StatefulWidget::render(list, chunks[1], buf, &mut list_state);
         }
 
         // -- Selected server's recent stderr --
         if show_logs {
-            let selected_name = config
-                .mcp_servers
-                .get(self.selected.min(config.mcp_servers.len() - 1))
+            let selected_name = filtered
+                .get(self.selected.min(filtered.len() - 1))
                 .map(|s| s.name.clone())
                 .unwrap_or_default();
             let stderr = mcp
@@ -457,19 +492,22 @@ impl McpPanel {
         // -- Bottom bar: help, confirmation, or form --
         match &self.mode {
             Mode::List => {
-                let help = Line::from(vec![
+                let mut help = vec![
                     Span::styled(" ↑↓", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" navigate  ", Style::default().fg(Color::Gray)),
                     Span::styled("a", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" add  ", Style::default().fg(Color::Gray)),
                     Span::styled("e", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" edit  ", Style::default().fg(Color::Gray)),
+                ];
+                help.extend(PanelSearch::help_spans());
+                help.extend([
                     Span::styled("d", Style::default().fg(Color::Red).bold()),
                     Span::styled(" delete  ", Style::default().fg(Color::Gray)),
                     Span::styled("q/Esc", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" close", Style::default().fg(Color::Gray)),
                 ]);
-                Paragraph::new(help).render(bottom, buf);
+                Paragraph::new(Line::from(help)).render(bottom, buf);
             }
             Mode::ConfirmDelete(name) => {
                 let confirm = Line::from(vec![

@@ -23,6 +23,7 @@
 use crate::config::programmer_config::{ProgrammerConfig, ProviderConfig};
 use crate::providers::ProviderManager;
 use crate::ui::components::completion_popup::CompletionPopup;
+use crate::ui::components::panel_search::{PanelSearch, SearchKey};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -83,6 +84,7 @@ enum Mode {
 pub struct ProviderPanel {
     mode: Mode,
     selected: usize,
+    search: PanelSearch,
 }
 
 impl ProviderPanel {
@@ -90,6 +92,7 @@ impl ProviderPanel {
         ProviderPanel {
             mode: Mode::List,
             selected: 0,
+            search: PanelSearch::default(),
         }
     }
 
@@ -98,6 +101,21 @@ impl ProviderPanel {
         let mut names: Vec<String> = config.providers.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Provider names passing the current search filter (name or base_url).
+    fn filtered_names(&self, config: &ProgrammerConfig) -> Vec<String> {
+        Self::sorted_names(config)
+            .into_iter()
+            .filter(|name| {
+                let base_url = config
+                    .providers
+                    .get(name)
+                    .map(|p| p.base_url.clone())
+                    .unwrap_or_default();
+                self.search.matches(&[name.as_str(), base_url.as_str()])
+            })
+            .collect()
     }
 
     /// Handle a key event, possibly mutating `config`.
@@ -130,7 +148,13 @@ impl ProviderPanel {
         config: &mut ProgrammerConfig,
         _pm: &ProviderManager,
     ) -> PanelAction {
-        let names = Self::sorted_names(config);
+        if let SearchKey::Consumed { changed } = self.search.handle_key(key) {
+            if changed {
+                self.selected = 0;
+            }
+            return PanelAction::None;
+        }
+        let names = self.filtered_names(config);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return PanelAction::Close,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -488,15 +512,23 @@ impl ProviderPanel {
             .split(area);
 
         // -- Title --
-        let names = Self::sorted_names(config);
+        let total = config.providers.len();
+        let names = self.filtered_names(config);
         Paragraph::new(Line::from(vec![
             Span::styled("🔌  Providers", Style::default().fg(Color::Cyan).bold()),
             Span::styled(
-                format!("  ({} configured)", names.len()),
+                format!("  ({total} configured)"),
                 Style::default().fg(Color::Gray).italic(),
             ),
         ]))
         .render(chunks[0], buf);
+
+        let mut list_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        if let Some(title) = self.search.block_title(names.len(), total) {
+            list_block = list_block.title(title);
+        }
 
         // -- Provider list --
         let items: Vec<ListItem> = names
@@ -535,29 +567,37 @@ impl ProviderPanel {
                 ListItem::new(vec![Line::from(first), second])
             })
             .collect();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("❯ ");
-        let mut list_state = ListState::default();
-        if !names.is_empty() {
-            list_state.select(Some(self.selected.min(names.len() - 1)));
+        if names.is_empty() && self.search.is_filtering() {
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  No providers match the search.",
+                    Style::default().fg(Color::Gray),
+                )),
+            ])
+            .block(list_block)
+            .render(chunks[1], buf);
+        } else {
+            let list = List::new(items)
+                .block(list_block)
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("❯ ");
+            let mut list_state = ListState::default();
+            if !names.is_empty() {
+                list_state.select(Some(self.selected.min(names.len() - 1)));
+            }
+            ratatui::widgets::StatefulWidget::render(list, chunks[1], buf, &mut list_state);
         }
-        ratatui::widgets::StatefulWidget::render(list, chunks[1], buf, &mut list_state);
 
         // -- Bottom bar: help, confirmation, add/edit form, or model list --
         match &self.mode {
             Mode::List => {
-                let help = Line::from(vec![
+                let mut help = vec![
                     Span::styled(" ↑↓", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" navigate  ", Style::default().fg(Color::Gray)),
                     Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
@@ -568,12 +608,15 @@ impl ProviderPanel {
                     Span::styled(" edit  ", Style::default().fg(Color::Gray)),
                     Span::styled("m", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" models  ", Style::default().fg(Color::Gray)),
+                ];
+                help.extend(PanelSearch::help_spans());
+                help.extend([
                     Span::styled("d", Style::default().fg(Color::Red).bold()),
                     Span::styled(" delete  ", Style::default().fg(Color::Gray)),
                     Span::styled("q/Esc", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" close", Style::default().fg(Color::Gray)),
                 ]);
-                Paragraph::new(help).render(chunks[2], buf);
+                Paragraph::new(Line::from(help)).render(chunks[2], buf);
             }
             Mode::ConfirmDelete(name) => {
                 let confirm = Line::from(vec![

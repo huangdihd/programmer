@@ -20,6 +20,7 @@ pub mod input_panel;
 pub mod logo;
 pub mod messages;
 pub mod mcp_panel;
+pub mod panel_search;
 pub mod provider_panel;
 pub mod question_panel;
 pub mod sidebar;
