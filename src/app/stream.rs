@@ -25,8 +25,7 @@ use crate::ui::event::{AppEvent, Event};
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{CreateResponse, OutputItem, ResponseStreamEvent};
 use futures::StreamExt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 /// Build an optional plan-mode system prompt snippet.
 fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
@@ -43,7 +42,9 @@ use crate::prompts::PLAN_PLANNING_PROMPT;
 
 /// Spawns a streaming response request for the current conversation state.
 pub(crate) fn spawn_stream(app: &mut App<'_>) {
-    let cancel_token = Arc::new(AtomicBool::new(false));
+    // Derive this stream segment's token from the turn's root token so Esc
+    // (which cancels the root) stops it, even across tool-loop continuations.
+    let cancel_token = app.cancel.active.child();
     app.conversation_panel.live_expanded_items.clear();
     app.conversation_panel.phase = ActivePhase::None;
     app.conversation_panel.receiving_response =
@@ -58,7 +59,7 @@ pub(crate) fn spawn_stream(app: &mut App<'_>) {
         }
     };
     let sender = app.events.sender.clone();
-    let retrying = app.stream_retrying.clone();
+    let retrying = app.cancel.stream_retrying.clone();
     retrying.store(false, Ordering::Relaxed);
     let input_param = app.conversation_panel.get_input_param(
         &app.current_model,
@@ -73,13 +74,14 @@ pub(crate) fn spawn_stream(app: &mut App<'_>) {
         request.model = Option::from(model_name);
         request.tools = Some(crate::tools::tools(mcp.as_deref()));
 
-        const MAX_RETRIES: u32 = 10;
         let mut attempt: u32 = 0;
         let stream = loop {
             match client.responses().create_stream(request.clone()).await {
                 Ok(stream) => break Ok(stream),
-                Err(e) if helpers::is_retryable(&e) && attempt < MAX_RETRIES => {
-                    if cancel_token.load(Ordering::Relaxed) {
+                Err(e) if helpers::is_retryable(&e)
+                    && attempt < crate::consts::MAX_STREAM_RETRIES =>
+                {
+                    if cancel_token.is_cancelled() {
                         retrying.store(false, Ordering::Relaxed);
                         return;
                     }
@@ -94,7 +96,7 @@ pub(crate) fn spawn_stream(app: &mut App<'_>) {
         match stream {
             Ok(mut response_stream) => {
                 while let Some(response_stream_event) = response_stream.next().await {
-                    if cancel_token.load(Ordering::Relaxed) {
+                    if cancel_token.is_cancelled() {
                         return;
                     }
                     match response_stream_event {
@@ -110,7 +112,7 @@ pub(crate) fn spawn_stream(app: &mut App<'_>) {
                 }
             }
             Err(openai_error) => {
-                if !cancel_token.load(Ordering::Relaxed) {
+                if !cancel_token.is_cancelled() {
                     let _ =
                         sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
                 }
@@ -146,7 +148,7 @@ pub(crate) async fn handle_chunk_events(
             .expanded_items
             .insert(base_index + live_idx);
     }
-    let cancelled = partial_response.cancelled.load(Ordering::Relaxed);
+    let cancelled = partial_response.cancelled.is_cancelled();
     let usage = partial_response.usage;
     app.conversation_panel.items.extend(
         partial_response

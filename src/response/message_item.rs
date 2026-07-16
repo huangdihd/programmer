@@ -15,6 +15,7 @@
 
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{FunctionCallOutputItemParam, InputItem, OutputItem};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum MessageItem {
@@ -29,7 +30,10 @@ pub enum MessageItem {
         /// denied (e.g. "approved by Auto mode", "denied in Manual mode by user").
         approval_label: Option<String>,
     },
-    OpenAIError(OpenAIError),
+    /// A streaming/API error. Held behind an [`Arc`] because [`OpenAIError`] is
+    /// not itself `Clone`; the `Arc` lets [`MessageItem::clone`] preserve the
+    /// original error losslessly instead of degrading it to a string.
+    OpenAIError(Arc<OpenAIError>),
     Error(String),
     Warning(String),
     Info(String),
@@ -47,9 +51,7 @@ impl Clone for MessageItem {
                 failed: *failed,
                 approval_label: approval_label.clone(),
             },
-            MessageItem::OpenAIError(e) => {
-                MessageItem::Error(format!("(cloned error) {e}"))
-            }
+            MessageItem::OpenAIError(e) => MessageItem::OpenAIError(e.clone()),
             MessageItem::Error(s) => MessageItem::Error(s.clone()),
             MessageItem::Warning(s) => MessageItem::Warning(s.clone()),
             MessageItem::Info(s) => MessageItem::Info(s.clone()),

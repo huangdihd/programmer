@@ -556,7 +556,8 @@ impl ConversationPanel {
                 }
             }
         }
-        self.items.push(MessageItem::OpenAIError(openai_error));
+        self.items
+            .push(MessageItem::OpenAIError(std::sync::Arc::new(openai_error)));
         self.stick_to_bottom = true;
     }
 
@@ -637,7 +638,7 @@ impl ConversationPanel {
             for &live_idx in &self.live_expanded_items {
                 self.expanded_items.insert(base_index + live_idx);
             }
-            let cancelled = partial.cancelled.load(std::sync::atomic::Ordering::Relaxed);
+            let cancelled = partial.cancelled.is_cancelled();
             let items: Vec<OutputItem> = if cancelled {
                 // When the user cancelled, drop all function calls so they
                 // aren't shown and won't execute.
@@ -799,10 +800,9 @@ impl ConversationPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancel::CancellationToken;
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     fn user_message(text: &str) -> ApiMessageItem {
         ApiMessageItem::Input(InputMessage {
@@ -979,7 +979,7 @@ mod tests {
     #[test]
     fn abort_receiving_clears_busy_state() {
         let mut panel = ConversationPanel::new();
-        panel.receiving_response = Some(PartialResponse::new(Arc::new(AtomicBool::new(false))));
+        panel.receiving_response = Some(PartialResponse::new(CancellationToken::new()));
         assert!(panel.is_busy(), "receiving a response is busy");
 
         panel.abort_receiving();

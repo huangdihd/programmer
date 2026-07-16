@@ -26,6 +26,7 @@ pub mod task;
 pub mod todo;
 pub mod write_file;
 
+use crate::consts::MAX_OUTPUT_LENGTH;
 use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, Tool,
 };
@@ -107,11 +108,6 @@ pub(crate) fn tools(mcp: Option<&crate::mcp::McpManager>) -> Vec<Tool> {
 
     tools
 }
-
-/// Maximum characters of tool output kept before truncation. The rest is
-/// discarded and a truncation notice is appended so the model knows the output
-/// was cut short.
-const MAX_OUTPUT_LENGTH: usize = 8000;
 
 /// A tool call's `function_call_output` together with whether the tool reported
 /// failure. The flag is authoritative — it comes from the tool's own `Result`,

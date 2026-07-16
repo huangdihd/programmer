@@ -20,10 +20,12 @@ use app::App;
 use std::path::Path;
 
 mod app;
+mod cancel;
 mod classifier;
 mod clipboard;
 mod commands;
 mod config;
+mod consts;
 mod diagnostics;
 mod mcp;
 mod prompts;

@@ -18,16 +18,38 @@
 use super::App;
 use crate::response::message_item::MessageItem;
 use crate::session::SessionManager;
+use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
 
 use super::helpers;
 
+/// Mark the session as needing a save. Cheap: the actual disk write is deferred
+/// to the next idle tick (see [`flush_if_dirty`]), so many state changes across
+/// a single turn collapse into one save when the turn finishes.
+pub(crate) fn mark_dirty(app: &mut App<'_>) {
+    app.session.dirty = true;
+}
+
+/// If the session is dirty and no turn is in flight, persist it and clear the
+/// flag. Called from the tick handler, this debounces saves to turn boundaries:
+/// while a response is streaming or tools are running the app is never idle, so
+/// nothing is written until everything settles.
+pub(crate) fn flush_if_dirty(app: &mut App<'_>) {
+    if app.session.dirty
+        && app.conversation_panel.receiving_response.is_none()
+        && app.conversation_panel.phase == ActivePhase::None
+    {
+        save_session(app);
+    }
+}
+
 /// Persist the current conversation to the session file.
 pub(crate) fn save_session(app: &mut App<'_>) {
-    let Some(mgr) = &app.session_mgr else { return };
+    app.session.dirty = false;
+    let Some(mgr) = &app.session.mgr else { return };
     let items: Vec<MessageItem> = app.conversation_panel.items().cloned().collect();
-    let mut session = mgr.load(&app.session_uuid).unwrap_or_else(|| {
+    let mut session = mgr.load(&app.session.uuid).unwrap_or_else(|| {
         let mut s = mgr.create();
-        s.uuid = app.session_uuid.clone();
+        s.uuid = app.session.uuid.clone();
         s
     });
     // Capture first user message for the picker preview.
@@ -78,9 +100,9 @@ pub(crate) fn persist_config(app: &mut App<'_>) {
 
 /// Delete the session file and start a fresh session with a new UUID.
 pub(crate) fn delete_session(app: &mut App<'_>) {
-    if let Some(mgr) = &app.session_mgr {
-        let _ = mgr.delete(&app.session_uuid);
+    if let Some(mgr) = &app.session.mgr {
+        let _ = mgr.delete(&app.session.uuid);
         let new_session = mgr.create();
-        app.session_uuid = new_session.uuid;
+        app.session.uuid = new_session.uuid;
     }
 }

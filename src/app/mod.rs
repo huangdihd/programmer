@@ -24,6 +24,7 @@ pub(crate) mod session;
 pub(crate) mod stream;
 pub(crate) mod tools;
 
+use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
 use crate::config::programmer_config::ProgrammerConfig;
 use crate::providers::ProviderManager;
@@ -48,6 +49,56 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+
+/// Pending tool-call approvals in Manual mode and the state of the in-progress
+/// approval UI.
+#[derive(Default)]
+pub(crate) struct ApprovalState {
+    /// Pending tool-call approvals: (call, reason).
+    pub(crate) queue: Vec<(FunctionToolCall, String)>,
+    /// Calls the user has approved so far (waiting for all to be decided).
+    pub(crate) approved: Vec<FunctionToolCall>,
+    /// Which option is highlighted in the approval UI
+    /// (0=approve, 1=deny, 2=approve all, 3=deny all).
+    pub(crate) selected: usize,
+}
+
+/// Diagnostics baseline and the edit-turn counter behind PROGRAMMER.md reminders.
+pub(crate) struct DiagnosticsState {
+    /// The last full diagnostics snapshot, used to diff after each edit so the
+    /// model is told which problems it introduced vs. resolved.
+    pub(crate) baseline: Option<Vec<crate::diagnostics::Diagnostic>>,
+    /// Count of turns that edited files, driving the periodic reminder to keep
+    /// `PROGRAMMER.md` up to date.
+    pub(crate) mutating_turns: usize,
+    /// Whether the project's diagnostics profile declares an LSP checker.
+    pub(crate) lsp_configured: bool,
+}
+
+/// Cancellation-related tokens for the current request lifecycle.
+pub(crate) struct CancelState {
+    /// The current turn's root cancel token. Every phase (stream,
+    /// classification, tool execution, diagnostics) runs against a child
+    /// derived from it, so cancelling this one token stops whichever phase is
+    /// in flight — including the post-stream pipeline whose own stream token is
+    /// already gone by the time it runs.
+    pub(crate) active: CancellationToken,
+    /// True while the stream task is backing off between connection retries.
+    pub(crate) stream_retrying: Arc<AtomicBool>,
+}
+
+/// Session identity, persistence handle, and the deferred-save dirty flag.
+pub(crate) struct SessionState {
+    /// Session UUID.
+    pub(crate) uuid: String,
+    /// Session manager for persistence.
+    pub(crate) mgr: Option<SessionManager>,
+    /// Set when session state changed and needs persisting. The actual disk
+    /// write is deferred to the next idle tick (see [`session::flush_if_dirty`])
+    /// so a burst of changes within a turn collapses into a single save at turn
+    /// end instead of writing after every event.
+    pub(crate) dirty: bool,
+}
 
 /// Application.
 pub struct App<'a> {
@@ -87,36 +138,19 @@ pub struct App<'a> {
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     /// Current safety/work mode.
     pub work_mode: WorkMode,
-    /// Pending tool-call approvals in Manual mode: (call, reason).
-    pub(crate) approval_queue: Vec<(FunctionToolCall, String)>,
-    /// Calls the user has approved so far (waiting for all to be decided).
-    pub(crate) approved_calls: Vec<FunctionToolCall>,
-    /// Which option is highlighted in the approval UI (0=approve,1=deny,2=approve all,3=deny all).
-    pub(crate) approval_selected: usize,
+    /// Manual-mode tool-call approval queue and UI state.
+    pub(crate) approval: ApprovalState,
     /// Classifier models discovered not to support logprobs, so Auto mode skips
     /// the single-token fast path and goes straight to the merged reasoned call.
     pub(crate) classifier_no_logprobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    /// The last full diagnostics snapshot, used to diff after each edit so the
-    /// model is told which problems it introduced vs. resolved.
-    pub(crate) diagnostics_baseline: Option<Vec<crate::diagnostics::Diagnostic>>,
-    /// Count of turns that edited files, driving the periodic reminder to keep
-    /// `PROGRAMMER.md` up to date.
-    pub(crate) mutating_turns: usize,
-    /// Whether the project's diagnostics profile declares an LSP checker.
-    pub(crate) lsp_configured: bool,
+    /// Diagnostics baseline and edit-turn bookkeeping.
+    pub(crate) diag: DiagnosticsState,
     /// Tracks whether the current mouse-drag started in the sidebar area.
     pub(crate) sidebar_click_active: bool,
-    /// Cancel token of the current post-stream pipeline (classification and
-    /// tool execution). The stream's own token lives in `receiving_response`,
-    /// which is already gone by the time classification runs — this keeps Esc
-    /// working through those later phases.
-    pub(crate) active_cancel_token: Option<Arc<AtomicBool>>,
-    /// True while the stream task is backing off between connection retries.
-    pub(crate) stream_retrying: Arc<AtomicBool>,
-    /// Session UUID.
-    pub(crate) session_uuid: String,
-    /// Session manager for persistence.
-    pub(crate) session_mgr: Option<SessionManager>,
+    /// Cancellation tokens for the current request lifecycle.
+    pub(crate) cancel: CancelState,
+    /// Session identity, persistence handle, and deferred-save flag.
+    pub(crate) session: SessionState,
     /// Plan mode sub-phase. Only meaningful when `work_mode == WorkMode::Plan`.
     pub(crate) plan_phase: crate::classifier::PlanPhase,
     /// Which option is highlighted in the plan review bar.
@@ -210,22 +244,27 @@ impl App<'_> {
                 list
             },
             work_mode,
-            approval_queue: Vec::new(),
-            approved_calls: Vec::new(),
-            approval_selected: 0,
+            approval: ApprovalState::default(),
             classifier_no_logprobs: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
-            diagnostics_baseline: None,
-            mutating_turns: 0,
-            lsp_configured: helpers::lsp_checker_configured(),
+            diag: DiagnosticsState {
+                baseline: None,
+                mutating_turns: 0,
+                lsp_configured: helpers::lsp_checker_configured(),
+            },
             sidebar_click_active: false,
-            active_cancel_token: None,
-            stream_retrying: Arc::new(AtomicBool::new(false)),
-            session_uuid,
+            cancel: CancelState {
+                active: CancellationToken::new(),
+                stream_retrying: Arc::new(AtomicBool::new(false)),
+            },
+            session: SessionState {
+                uuid: session_uuid,
+                mgr: session_mgr,
+                dirty: false,
+            },
             skill_registry: crate::skills::SkillRegistry::load(),
             mcp_manager: None,
-            session_mgr,
             plan_phase: crate::classifier::PlanPhase::default(),
             plan_review_selected: 0,
         };
@@ -278,7 +317,7 @@ impl App<'_> {
         }
         .await;
         crate::diagnostics::shutdown_lsp().await;
-        let uuid = self.session_uuid.clone();
+        let uuid = self.session.uuid.clone();
         (result, uuid)
     }
 
@@ -302,7 +341,7 @@ impl App<'_> {
         events::handle_key_events(self, key_event).await
     }
 
-    pub fn tick(&self) {
+    pub fn tick(&mut self) {
         events::tick(self)
     }
 

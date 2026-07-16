@@ -20,8 +20,7 @@ use super::App;
 use super::helpers;
 use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
 use crate::ui::event::{AppEvent, Event};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use crate::cancel::CancellationToken;
 
 /// Deliver post-edit feedback (a diagnostics summary and/or a reminder).
 pub(crate) fn emit_post_edit_feedback(app: &mut App<'_>, text: String) {
@@ -46,13 +45,13 @@ pub(crate) fn emit_post_edit_feedback(app: &mut App<'_>, text: String) {
 pub(crate) fn continue_with_diagnostics(
     app: &mut App<'_>,
     edited_files: bool,
-    cancel_token: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
 ) -> bool {
     if !edited_files {
         return false;
     }
-    app.mutating_turns += 1;
-    let reminder_due = app.mutating_turns % helpers::OVERVIEW_REMINDER_EVERY == 0
+    app.diag.mutating_turns += 1;
+    let reminder_due = app.diag.mutating_turns % crate::consts::OVERVIEW_REMINDER_EVERY == 0
         && std::path::Path::new("PROGRAMMER.md").exists();
 
     if std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
@@ -62,22 +61,22 @@ pub(crate) fn continue_with_diagnostics(
 
     if reminder_due {
         emit_post_edit_feedback(app, helpers::overview_reminder());
-        super::session::save_session(app);
+        super::session::mark_dirty(app);
     }
     false
 }
 
 /// Forget the diagnostics baseline and edit counter.
 pub(crate) fn reset_diagnostics_state(app: &mut App<'_>) {
-    app.diagnostics_baseline = None;
-    app.mutating_turns = 0;
+    app.diag.baseline = None;
+    app.diag.mutating_turns = 0;
 }
 
 /// Spawn the diagnostics checkers in the background.
 pub(crate) fn spawn_diagnostics(
     app: &mut App<'_>,
     reminder_due: bool,
-    cancel_token: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
 ) {
     app.conversation_panel.phase = ActivePhase::Checking;
     let sender = app.events.sender.clone();
@@ -97,7 +96,7 @@ pub(crate) fn spawn_diagnostics(
 /// On the first turn of a session with a diagnostics profile, run the
 /// checkers once in the background to establish a baseline.
 pub(crate) fn maybe_seed_diagnostics_baseline(app: &mut App<'_>) {
-    if app.diagnostics_baseline.is_some() {
+    if app.diag.baseline.is_some() {
         return;
     }
     if !std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
@@ -112,7 +111,7 @@ pub(crate) fn maybe_seed_diagnostics_baseline(app: &mut App<'_>) {
             snapshot,
             reminder_due: false,
             seed: true,
-            cancel_token: Arc::new(AtomicBool::new(false)),
+            cancel_token: CancellationToken::new(),
         }));
     });
 }
@@ -126,7 +125,7 @@ pub(crate) fn apply_diagnostics(
 ) {
     let mut parts: Vec<String> = Vec::new();
 
-    match &app.diagnostics_baseline {
+    match &app.diag.baseline {
         Some(old) => {
             let d = crate::diagnostics::diff(old, &snapshot.diagnostics);
             if let Some(summary) = d.summary() {
@@ -147,7 +146,7 @@ pub(crate) fn apply_diagnostics(
     for e in &snapshot.errors {
         parts.push(format!("Diagnostics checker error: {e}"));
     }
-    app.diagnostics_baseline = Some(snapshot.diagnostics);
+    app.diag.baseline = Some(snapshot.diagnostics);
 
     if reminder_due {
         parts.push(helpers::overview_reminder());

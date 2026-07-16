@@ -78,6 +78,9 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
     app.conversation_panel.reset_accumulated_usage();
     diagnostics::maybe_seed_diagnostics_baseline(app);
     session::save_session(app);
+    // Fresh turn: start from an un-cancelled root token so a prior turn's Esc
+    // doesn't carry over to this one.
+    app.cancel.active = crate::cancel::CancellationToken::new();
     stream::spawn_stream(app);
 }
 
@@ -111,9 +114,9 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
             session::save_session(app);
             app.conversation_panel.clear_messages();
             diagnostics::reset_diagnostics_state(app);
-            if let Some(mgr) = &app.session_mgr {
+            if let Some(mgr) = &app.session.mgr {
                 let new_session = mgr.create();
-                app.session_uuid = new_session.uuid;
+                app.session.uuid = new_session.uuid;
             }
             app.todo_list = crate::todos::TodoList::default();
             crate::todos::TodoList::clear_file();

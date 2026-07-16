@@ -21,13 +21,11 @@ use async_openai::types::responses::{FunctionToolCall, ResponseStreamEvent};
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use crate::cancel::CancellationToken;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// The frequency at which tick events are emitted.
-const TICK_FPS: f64 = 30.0;
+use crate::consts::TICK_FPS;
 
 /// Representation of all possible events.
 #[derive(Debug)]
@@ -60,7 +58,7 @@ pub enum AppEvent {
     /// All tool calls from the last response have run; carries their outputs to
     /// be fed back to the model, plus the cancel token so stale completions
     /// from cancelled requests can be ignored.
-    ToolCallsCompleted(Vec<ToolOutput>, Arc<AtomicBool>),
+    ToolCallsCompleted(Vec<ToolOutput>, CancellationToken),
     /// Auto-mode LLM classification finished. Carries the calls cleared to run,
     /// the denial outputs to feed back to the model, the cancel token, and any
     /// `Ask`-verdict calls that must be queued for user approval.
@@ -68,7 +66,7 @@ pub enum AppEvent {
         allowed: Vec<FunctionToolCall>,
         denied: Vec<ToolOutput>,
         ask_queue: Vec<(FunctionToolCall, String)>,
-        cancel_token: Arc<AtomicBool>,
+        cancel_token: CancellationToken,
     },
     /// Diagnostics checkers finished after an edit. Carries the fresh snapshot
     /// to diff against the baseline, whether a PROGRAMMER.md update reminder is
@@ -80,7 +78,7 @@ pub enum AppEvent {
         /// run: record the snapshot as the baseline without injecting feedback
         /// or continuing a turn.
         seed: bool,
-        cancel_token: Arc<AtomicBool>,
+        cancel_token: CancellationToken,
     },
     /// Cancel the current in-flight request (streaming or tool calls).
     Cancel,

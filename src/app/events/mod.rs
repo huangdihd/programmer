@@ -23,13 +23,16 @@ pub(crate) use keys::handle_key_events;
 
 use super::App;
 use super::{commands, diagnostics, helpers, session, stream, tools};
+use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
 use crate::commands::CompletionEngine;
+use crate::response::partial_response::PartialResponse;
 use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
 use crate::ui::components::question_panel::QuestionPanel;
 use crate::ui::event::{AppEvent, Event};
+use async_openai::error::OpenAIError;
+use async_openai::types::responses::FunctionToolCall;
 use crossterm::event::KeyEventKind;
-use std::sync::atomic::Ordering;
 
 // ---------------------------------------------------------------------------
 // Main event handler
@@ -38,211 +41,266 @@ use std::sync::atomic::Ordering;
 pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre::Result<()> {
     match event {
         Event::Tick => app.tick(),
-        Event::Crossterm(event) => match event {
-            crossterm::event::Event::FocusGained => {
-                // Restore mouse capture explicitly on focus regain.
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::event::EnableMouseCapture
-                );
-            }
-            crossterm::event::Event::Key(key_event)
-                if key_event.kind == KeyEventKind::Press =>
-            {
-                handle_key_events(app, key_event).await?
-            }
-            crossterm::event::Event::Paste(data) => keys::handle_paste(app, data),
-            crossterm::event::Event::Mouse(_) if app.provider_panel.is_some() => {}
-            crossterm::event::Event::Mouse(mouse) => mouse::handle_mouse(app, mouse),
-            _ => {}
-        },
-        Event::App(app_event) => match app_event {
-            AppEvent::Cancel => {
-                if let Some(partial) = &app.conversation_panel.receiving_response {
-                    partial.cancelled.store(true, Ordering::Relaxed);
-                }
-                // Also stop the post-stream pipeline (classifying / running
-                // tools) — its token outlives `receiving_response`.
-                if let Some(token) = app.active_cancel_token.take() {
-                    token.store(true, Ordering::Relaxed);
-                }
-                app.conversation_panel.abort_receiving();
-                app.conversation_panel.phase = ActivePhase::None;
-                app.conversation_panel.flush_usage();
-                app.conversation_panel
-                    .add_info_string("Request cancelled by user.".to_string());
-                session::save_session(app);
-                if let Some(pending_request) = app.conversation_panel.pending_message.take() {
-                    commands::start_request(app, pending_request).await;
-                }
-            }
-            AppEvent::ChunkReceived(chunk) => stream::handle_chunk_events(app, chunk).await,
-            AppEvent::OpenAIErrorReceived(error) => {
-                stream::handle_error_events(app, error).await;
-                session::save_session(app);
-            }
-            AppEvent::ResponseFinished(partial_response) => {
-                if partial_response.cancelled.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                let cancel_token = partial_response.cancelled.clone();
-                let calls = helpers::function_calls(&partial_response);
-                if calls.is_empty() {
-                    // Plan mode: if in Planning phase and model stopped without
-                    // making tool calls, it has finished presenting the plan.
-                    if app.work_mode == WorkMode::Plan
-                        && app.plan_phase == crate::classifier::PlanPhase::Planning
-                    {
-                        app.plan_phase = crate::classifier::PlanPhase::Reviewing;
-                        app.conversation_panel.phase = ActivePhase::None;
-                        app.conversation_panel.flush_usage();
-                        session::save_session(app);
-                        return Ok(());
-                    }
-                    app.conversation_panel.phase = ActivePhase::None;
-                    app.conversation_panel.flush_usage();
-                    if let Some(pending_request) =
-                        app.conversation_panel.pending_message.take()
-                    {
-                        commands::start_request(app, pending_request).await
-                    }
-                    session::save_session(app);
-                } else {
-                    tools::run_tool_calls(app, calls, cancel_token);
-                }
-            }
-            AppEvent::ClassificationCompleted {
-                allowed,
-                denied,
-                ask_queue,
-                cancel_token,
-            } => {
-                if cancel_token.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                if !ask_queue.is_empty() {
-                    for output in &denied {
-                        app.conversation_panel.add_tool_output(output.clone());
-                    }
-                    app.approval_queue = ask_queue;
-                    app.conversation_panel.phase = ActivePhase::None;
-                    return Ok(());
-                }
-                tools::process_classification_results(app, allowed, denied, cancel_token);
-            }
-            AppEvent::ToolCallsCompleted(outputs, cancel_token) => {
-                if cancel_token.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                app.conversation_panel.phase = ActivePhase::None;
-                app.lsp_configured = helpers::lsp_checker_configured();
-                let edited_files = tools::batch_edited_files(app, &outputs);
-                for output in outputs {
-                    app.conversation_panel.add_tool_output(output);
-                }
-                app.todo_list = crate::todos::TodoList::load();
-                session::save_session(app);
-                // Restore mouse capture — external commands disable it.
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::event::EnableMouseCapture
-                );
-                if !diagnostics::continue_with_diagnostics(
-                    app,
-                    edited_files,
-                    cancel_token.clone(),
-                ) {
-                    stream::spawn_stream(app);
-                }
-            }
-            AppEvent::DiagnosticsCompleted {
-                snapshot,
-                reminder_due,
-                seed,
-                cancel_token,
-            } => {
-                if cancel_token.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                if seed {
-                    if app.diagnostics_baseline.is_none() {
-                        app.diagnostics_baseline = Some(snapshot.diagnostics);
-                    }
-                    return Ok(());
-                }
-                diagnostics::apply_diagnostics(app, snapshot, reminder_due);
-                session::save_session(app);
-                // Restore mouse capture — diagnostic runners may reset console
-                // modes on Windows.
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::event::EnableMouseCapture
-                );
-                stream::spawn_stream(app);
-            }
-            AppEvent::Start => {
-                diagnostics::maybe_seed_diagnostics_baseline(app);
-                commands::send_message(app).await;
-            }
-            AppEvent::StartInit => {
-                app.conversation_panel.add_meta(
-                    "\u{25B8} Initializing project\u{2026}",
-                    helpers::init_prompt(),
-                );
-                app.conversation_panel.reset_accumulated_usage();
-                diagnostics::maybe_seed_diagnostics_baseline(app);
-                session::save_session(app);
-                stream::spawn_stream(app);
-            }
-            AppEvent::Quit => app.quit(),
-            AppEvent::ProvidersChanged => {
-                app.provider_manager = crate::providers::ProviderManager::new(&app.config).await;
-                for msg in &app.provider_manager.startup_errors {
-                    app.conversation_panel.add_error_string(msg.clone());
-                }
-                if app
-                    .provider_manager
-                    .resolve(&app.current_model)
-                    .is_none()
-                {
-                    app.current_model = app.provider_manager.default_model();
-                    app.conversation_panel.add_info_string(format!(
-                        "current model reset to: {}",
-                        app.current_model
-                    ));
-                }
-            }
-            AppEvent::McpChanged => {
-                if app.config.mcp_servers.is_empty() {
-                    app.mcp_manager = None;
-                    app.conversation_panel
-                        .add_info_string("MCP servers cleared.".to_string());
-                } else {
-                    let mcp = crate::mcp::McpManager::from_config(
-                        &app.config.mcp_servers,
-                        ".",
-                    )
-                    .await;
-                    for err in &mcp.startup_errors {
-                        app.conversation_panel.add_error_string(err.clone());
-                    }
-                    app.conversation_panel.add_info_string(format!(
-                        "MCP reloaded: {} server(s), {} tool(s) available",
-                        mcp.server_count(),
-                        mcp.all_tools().len(),
-                    ));
-                    app.mcp_manager = Some(std::sync::Arc::new(mcp));
-                }
-            }
-            AppEvent::QuestionPrompt {
-                question,
-                answer_tx,
-            } => {
-                app.question_panel = Some(QuestionPanel::new(question, answer_tx));
-            }
-        },
+        Event::Crossterm(event) => handle_crossterm(app, event).await?,
+        Event::App(app_event) => handle_app_event(app, app_event).await,
     }
     Ok(())
+}
+
+/// Route a terminal event to the focus, keyboard, paste, and mouse handlers.
+async fn handle_crossterm(
+    app: &mut App<'_>,
+    event: crossterm::event::Event,
+) -> color_eyre::Result<()> {
+    match event {
+        crossterm::event::Event::FocusGained => {
+            // Restore mouse capture explicitly on focus regain.
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::EnableMouseCapture
+            );
+        }
+        crossterm::event::Event::Key(key_event)
+            if key_event.kind == KeyEventKind::Press =>
+        {
+            handle_key_events(app, key_event).await?
+        }
+        crossterm::event::Event::Paste(data) => keys::handle_paste(app, data),
+        crossterm::event::Event::Mouse(_) if app.provider_panel.is_some() => {}
+        crossterm::event::Event::Mouse(mouse) => mouse::handle_mouse(app, mouse),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Dispatch an [`AppEvent`] to its handler. Each variant's logic lives in a
+/// dedicated `handle_*` function below; this only routes.
+async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
+    match app_event {
+        AppEvent::Cancel => handle_cancel(app).await,
+        AppEvent::ChunkReceived(chunk) => stream::handle_chunk_events(app, chunk).await,
+        AppEvent::OpenAIErrorReceived(error) => handle_openai_error(app, error).await,
+        AppEvent::ResponseFinished(partial_response) => {
+            handle_response_finished(app, partial_response).await
+        }
+        AppEvent::ClassificationCompleted {
+            allowed,
+            denied,
+            ask_queue,
+            cancel_token,
+        } => handle_classification_completed(app, allowed, denied, ask_queue, cancel_token),
+        AppEvent::ToolCallsCompleted(outputs, cancel_token) => {
+            handle_tool_calls_completed(app, outputs, cancel_token)
+        }
+        AppEvent::DiagnosticsCompleted {
+            snapshot,
+            reminder_due,
+            seed,
+            cancel_token,
+        } => handle_diagnostics_completed(app, snapshot, reminder_due, seed, cancel_token),
+        AppEvent::Start => {
+            diagnostics::maybe_seed_diagnostics_baseline(app);
+            commands::send_message(app).await;
+        }
+        AppEvent::StartInit => handle_start_init(app),
+        AppEvent::Quit => app.quit(),
+        AppEvent::ProvidersChanged => handle_providers_changed(app).await,
+        AppEvent::McpChanged => handle_mcp_changed(app).await,
+        AppEvent::QuestionPrompt {
+            question,
+            answer_tx,
+        } => {
+            app.question_panel = Some(QuestionPanel::new(question, answer_tx));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-variant AppEvent handlers
+// ---------------------------------------------------------------------------
+
+/// Cancel: stop the in-flight stream and post-stream pipeline, then start any
+/// queued follow-up request.
+async fn handle_cancel(app: &mut App<'_>) {
+    // Cancel the turn's root token; every phase (the in-flight stream and the
+    // post-stream classify/tool pipeline) runs against a child of it, so this
+    // one call stops whichever is currently running.
+    app.cancel.active.cancel();
+    app.conversation_panel.abort_receiving();
+    app.conversation_panel.phase = ActivePhase::None;
+    app.conversation_panel.flush_usage();
+    app.conversation_panel
+        .add_info_string("Request cancelled by user.".to_string());
+    session::mark_dirty(app);
+    if let Some(pending_request) = app.conversation_panel.pending_message.take() {
+        commands::start_request(app, pending_request).await;
+    }
+}
+
+/// A streaming error ended the turn: surface it and mark the session dirty.
+async fn handle_openai_error(app: &mut App<'_>, error: OpenAIError) {
+    stream::handle_error_events(app, error).await;
+    session::mark_dirty(app);
+}
+
+/// A response finished: run any tool calls it requested, otherwise close out
+/// the turn (handling plan mode and any queued follow-up request).
+async fn handle_response_finished(app: &mut App<'_>, partial_response: PartialResponse) {
+    if partial_response.cancelled.is_cancelled() {
+        return;
+    }
+    let cancel_token = partial_response.cancelled.clone();
+    let calls = helpers::function_calls(&partial_response);
+    if calls.is_empty() {
+        // Plan mode: if in Planning phase and model stopped without making
+        // tool calls, it has finished presenting the plan.
+        if app.work_mode == WorkMode::Plan
+            && app.plan_phase == crate::classifier::PlanPhase::Planning
+        {
+            app.plan_phase = crate::classifier::PlanPhase::Reviewing;
+            app.conversation_panel.phase = ActivePhase::None;
+            app.conversation_panel.flush_usage();
+            session::mark_dirty(app);
+            return;
+        }
+        app.conversation_panel.phase = ActivePhase::None;
+        app.conversation_panel.flush_usage();
+        if let Some(pending_request) = app.conversation_panel.pending_message.take() {
+            commands::start_request(app, pending_request).await
+        }
+        session::mark_dirty(app);
+    } else {
+        tools::run_tool_calls(app, calls, cancel_token);
+    }
+}
+
+/// Classification finished: surface any denials that need approval, otherwise
+/// run the allowed calls.
+fn handle_classification_completed(
+    app: &mut App<'_>,
+    allowed: Vec<FunctionToolCall>,
+    denied: Vec<crate::tools::ToolOutput>,
+    ask_queue: Vec<(FunctionToolCall, String)>,
+    cancel_token: CancellationToken,
+) {
+    if cancel_token.is_cancelled() {
+        return;
+    }
+    if !ask_queue.is_empty() {
+        for output in &denied {
+            app.conversation_panel.add_tool_output(output.clone());
+        }
+        app.approval.queue = ask_queue;
+        app.conversation_panel.phase = ActivePhase::None;
+        return;
+    }
+    tools::process_classification_results(app, allowed, denied, cancel_token);
+}
+
+/// All tool calls ran: record their outputs, then either run diagnostics or
+/// resume the stream.
+fn handle_tool_calls_completed(
+    app: &mut App<'_>,
+    outputs: Vec<crate::tools::ToolOutput>,
+    cancel_token: CancellationToken,
+) {
+    if cancel_token.is_cancelled() {
+        return;
+    }
+    app.conversation_panel.phase = ActivePhase::None;
+    app.diag.lsp_configured = helpers::lsp_checker_configured();
+    let edited_files = tools::batch_edited_files(app, &outputs);
+    for output in outputs {
+        app.conversation_panel.add_tool_output(output);
+    }
+    app.todo_list = crate::todos::TodoList::load();
+    session::mark_dirty(app);
+    // Restore mouse capture — external commands disable it.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture
+    );
+    if !diagnostics::continue_with_diagnostics(app, edited_files, cancel_token.clone()) {
+        stream::spawn_stream(app);
+    }
+}
+
+/// Diagnostics finished: seed the baseline, or apply the diff and resume the
+/// stream.
+fn handle_diagnostics_completed(
+    app: &mut App<'_>,
+    snapshot: crate::diagnostics::Snapshot,
+    reminder_due: bool,
+    seed: bool,
+    cancel_token: CancellationToken,
+) {
+    if cancel_token.is_cancelled() {
+        return;
+    }
+    if seed {
+        if app.diag.baseline.is_none() {
+            app.diag.baseline = Some(snapshot.diagnostics);
+        }
+        return;
+    }
+    diagnostics::apply_diagnostics(app, snapshot, reminder_due);
+    session::mark_dirty(app);
+    // Restore mouse capture — diagnostic runners may reset console modes on
+    // Windows.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture
+    );
+    stream::spawn_stream(app);
+}
+
+/// `/init`: seed the init prompt and kick off the first stream.
+fn handle_start_init(app: &mut App<'_>) {
+    app.conversation_panel.add_meta(
+        "\u{25B8} Initializing project\u{2026}",
+        helpers::init_prompt(),
+    );
+    app.conversation_panel.reset_accumulated_usage();
+    diagnostics::maybe_seed_diagnostics_baseline(app);
+    session::mark_dirty(app);
+    // Fresh turn: start from an un-cancelled root token.
+    app.cancel.active = CancellationToken::new();
+    stream::spawn_stream(app);
+}
+
+/// Providers changed: rebuild the manager and reset the model if it vanished.
+async fn handle_providers_changed(app: &mut App<'_>) {
+    app.provider_manager = crate::providers::ProviderManager::new(&app.config).await;
+    for msg in &app.provider_manager.startup_errors {
+        app.conversation_panel.add_error_string(msg.clone());
+    }
+    if app.provider_manager.resolve(&app.current_model).is_none() {
+        app.current_model = app.provider_manager.default_model();
+        app.conversation_panel.add_info_string(format!(
+            "current model reset to: {}",
+            app.current_model
+        ));
+    }
+}
+
+/// MCP config changed: reload the servers (or clear them).
+async fn handle_mcp_changed(app: &mut App<'_>) {
+    if app.config.mcp_servers.is_empty() {
+        app.mcp_manager = None;
+        app.conversation_panel
+            .add_info_string("MCP servers cleared.".to_string());
+    } else {
+        let mcp = crate::mcp::McpManager::from_config(&app.config.mcp_servers, ".").await;
+        for err in &mcp.startup_errors {
+            app.conversation_panel.add_error_string(err.clone());
+        }
+        app.conversation_panel.add_info_string(format!(
+            "MCP reloaded: {} server(s), {} tool(s) available",
+            mcp.server_count(),
+            mcp.all_tools().len(),
+        ));
+        app.mcp_manager = Some(std::sync::Arc::new(mcp));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +308,13 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
 // ---------------------------------------------------------------------------
 
 /// Handles the tick event of the terminal.
-pub(crate) fn tick(_app: &App<'_>) {}
+///
+/// Ticks fire at [`crate::consts::TICK_FPS`] to drive animation redraws; we
+/// piggy-back on them to flush a dirty session once the current turn has gone
+/// idle, debouncing saves to turn boundaries.
+pub(crate) fn tick(app: &mut App<'_>) {
+    session::flush_if_dirty(app);
+}
 
 /// Recompute tab-completion candidates from the current input text.
 pub(crate) fn update_completions(app: &mut App<'_>) {

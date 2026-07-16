@@ -26,8 +26,6 @@ use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 /// Handles the key events and updates the state of [`App`].
 pub(crate) async fn handle_key_events(
@@ -35,7 +33,7 @@ pub(crate) async fn handle_key_events(
     key_event: KeyEvent,
 ) -> color_eyre::Result<()> {
     // ---- tool-call approval (Manual mode) ----
-    if !app.approval_queue.is_empty() {
+    if !app.approval.queue.is_empty() {
         return handle_approval_key(app, key_event);
     }
     // ---- question panel ----
@@ -324,42 +322,42 @@ fn handle_approval_key(
 ) -> color_eyre::Result<()> {
     match key_event.code {
         KeyCode::Up | KeyCode::Char('k') => {
-            app.approval_selected = app.approval_selected.saturating_sub(1);
+            app.approval.selected = app.approval.selected.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-            if app.approval_selected + 1 < 4 {
-                app.approval_selected += 1;
+            if app.approval.selected + 1 < 4 {
+                app.approval.selected += 1;
             }
         }
-        KeyCode::Enter => match app.approval_selected {
+        KeyCode::Enter => match app.approval.selected {
             0 => {
-                if let Some((call, _)) = app.approval_queue.drain(..1).next() {
-                    app.approved_calls.push(call);
+                if let Some((call, _)) = app.approval.queue.drain(..1).next() {
+                    app.approval.approved.push(call);
                 }
-                app.approval_selected = 0;
+                app.approval.selected = 0;
                 check_approval_done(app);
             }
             1 => {
-                let denied = app.approval_queue.drain(..1).next();
+                let denied = app.approval.queue.drain(..1).next();
                 if let Some((call, reason)) = denied {
                     deny_single_call(app, call, reason);
                 }
-                app.approval_selected = 0;
+                app.approval.selected = 0;
                 check_approval_done(app);
             }
             2 => {
                 let approved: Vec<FunctionToolCall> =
-                    app.approval_queue.drain(..).map(|(c, _)| c).collect();
-                app.approved_calls.extend(approved);
-                app.approval_selected = 0;
+                    app.approval.queue.drain(..).map(|(c, _)| c).collect();
+                app.approval.approved.extend(approved);
+                app.approval.selected = 0;
                 check_approval_done(app);
             }
             3 => {
-                let all = std::mem::take(&mut app.approval_queue);
+                let all = std::mem::take(&mut app.approval.queue);
                 for (call, reason) in all {
                     deny_single_call(app, call, reason);
                 }
-                app.approval_selected = 0;
+                app.approval.selected = 0;
                 check_approval_done(app);
             }
             _ => {}
@@ -392,17 +390,17 @@ fn deny_single_call(app: &mut App<'_>, call: FunctionToolCall, reason: String) {
 
 /// If the approval queue is empty, run the approved calls and continue.
 fn check_approval_done(app: &mut App<'_>) {
-    if !app.approval_queue.is_empty() {
+    if !app.approval.queue.is_empty() {
         return;
     }
-    let calls = std::mem::take(&mut app.approved_calls);
+    let calls = std::mem::take(&mut app.approval.approved);
     if calls.is_empty() {
         stream::spawn_stream(app);
         return;
     }
 
     let sender = app.events.sender.clone();
-    let cancel_token = Arc::new(AtomicBool::new(false));
+    let cancel_token = app.cancel.active.child();
     let mcp = app.mcp_manager.clone();
     tokio::spawn(async move {
         let mut outputs = Vec::new();

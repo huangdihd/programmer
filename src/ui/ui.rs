@@ -32,7 +32,7 @@ impl App<'_> {
         if self.question_panel.is_some() {
             return StatusState::WaitingAnswer;
         }
-        if !self.approval_queue.is_empty() {
+        if !self.approval.queue.is_empty() {
             return StatusState::WaitingApproval;
         }
         let cp = &self.conversation_panel;
@@ -46,7 +46,7 @@ impl App<'_> {
                 // Request in flight but nothing has streamed back yet: either
                 // still connecting, or backing off between retries.
                 Some(partial) if !partial.started() => {
-                    if self.stream_retrying.load(std::sync::atomic::Ordering::Relaxed) {
+                    if self.cancel.stream_retrying.load(std::sync::atomic::Ordering::Relaxed) {
                         StatusState::Retrying
                     } else {
                         StatusState::Connecting
@@ -113,14 +113,14 @@ impl App<'_> {
 
         if let Some(panel) = &self.question_panel {
             panel.render(chunks[POS_BOTTOM], buf);
-        } else if !self.approval_queue.is_empty() {
-            let current = self.approved_calls.len() + 1;
-            let total = self.approved_calls.len() + self.approval_queue.len();
-            let (call, reason) = &self.approval_queue[0];
+        } else if !self.approval.queue.is_empty() {
+            let current = self.approval.approved.len() + 1;
+            let total = self.approval.approved.len() + self.approval.queue.len();
+            let (call, reason) = &self.approval.queue[0];
             let detail_lines = crate::ui::tool_details::format_tool_details(&call.name, &call.arguments);
 
             let labels = ["Approve", "Deny", "Approve all", "Deny all"];
-            let sel = self.approval_selected;
+            let sel = self.approval.selected;
             let option_lines: Vec<Line> = labels.iter().enumerate().map(|(i, label)| {
                 let marker = if i == sel { "❯" } else { " " };
                 let style = if i == sel {
@@ -346,7 +346,7 @@ impl Widget for &mut App<'_> {
             });
         self.footer.work_mode = self.work_mode;
         self.footer.current_model = self.current_model.clone();
-        self.footer.lsp_configured = self.lsp_configured;
+        self.footer.lsp_configured = self.diag.lsp_configured;
         self.footer.active_skills = self
             .skill_registry
             .activated_names()
@@ -359,12 +359,12 @@ impl Widget for &mut App<'_> {
             .as_ref()
             .map(|q| q.needed_height())
             .unwrap_or(3);
-        let approval_height: u16 = if self.approval_queue.is_empty() {
+        let approval_height: u16 = if self.approval.queue.is_empty() {
             3
         } else {
             let detail_count = crate::ui::tool_details::format_tool_details(
-                &self.approval_queue[0].0.name,
-                &self.approval_queue[0].0.arguments,
+                &self.approval.queue[0].0.name,
+                &self.approval.queue[0].0.arguments,
             ).len() as u16;
             4 + detail_count + 4 // title + reason + details + options
         };
@@ -380,7 +380,7 @@ impl Widget for &mut App<'_> {
         };
         let bottom_height = if self.question_panel.is_some() {
             question_height
-        } else if !self.approval_queue.is_empty() {
+        } else if !self.approval.queue.is_empty() {
             approval_height
         } else if plan_review_height > 0 {
             plan_review_height
@@ -411,8 +411,8 @@ impl Widget for &mut App<'_> {
                 .render(
                     horiz[1],
                     buf,
-                    self.diagnostics_baseline.as_deref().unwrap_or(&[]),
-                    self.lsp_configured,
+                    self.diag.baseline.as_deref().unwrap_or(&[]),
+                    self.diag.lsp_configured,
                     self.mcp_manager.as_deref(),
                     &self.todo_list,
                     &crate::tasks::snapshot_all(),

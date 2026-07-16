@@ -76,9 +76,6 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
 // PROJECT.md overview reminder
 // ---------------------------------------------------------------------------
 
-/// How many file-editing turns pass between reminders to refresh PROGRAMMER.md.
-pub(crate) const OVERVIEW_REMINDER_EVERY: usize = 5;
-
 /// Whether the project's diagnostics profile declares at least one LSP checker.
 pub(crate) fn lsp_checker_configured() -> bool {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
