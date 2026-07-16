@@ -36,6 +36,44 @@ use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui_widgets::paragraph::Paragraph;
 use tui_scrollview::ScrollView;
 
+/// Rough height estimate for an item, used to avoid expensive markdown rendering
+/// for items far from the viewport. Returns a u16 line count.
+fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
+    let w = width.max(40) as usize;
+    match item {
+        MessageItem::Input(input) => {
+            let text = crate::app::helpers::extract_input_text(input).unwrap_or_default();
+            rough_line_count(&text, w)
+        }
+        MessageItem::Output(output) => match output {
+            OutputItem::Reasoning(_) => 3, // rough
+            OutputItem::Message(_) => 4,
+            OutputItem::FunctionCall(_) => 2,
+            _ => 1,
+        },
+        MessageItem::ToolOutput { output, .. } => {
+            match &output.output {
+                async_openai::types::responses::FunctionCallOutput::Text(t) =>
+                    rough_line_count(t, w).min(20),
+                _ => 1,
+            }
+        }
+        MessageItem::OpenAIError(_) | MessageItem::Error(_)
+        | MessageItem::Warning(_) | MessageItem::Info(_) => 1,
+        MessageItem::Meta { .. } => 1,
+        MessageItem::Usage(_, _) => 1,
+    }
+}
+
+/// Rough line count: chars / width, plus explicit newlines.
+fn rough_line_count(text: &str, width: usize) -> u16 {
+    let lines: u16 = text.lines().count() as u16;
+    let wrapped: u16 = text.lines()
+        .map(|l| (l.chars().count().max(1) / width.max(1)).max(1) as u16)
+        .sum();
+    lines.max(wrapped).max(1)
+}
+
 /// Builds the paragraph for a finished history item. Called at most once per
 /// item (the result is cached in [`ConversationPanel::render_cache`]).
 fn build_item_paragraph(
@@ -125,12 +163,66 @@ impl Widget for &mut ConversationPanel {
         if cache.width != content_width {
             cache.width = content_width;
             cache.entries.clear();
-            // Selection coordinates are relative to the old layout.
             self.selection = None;
         }
         if cache.entries.len() > self.items.len() {
             cache.entries.truncate(self.items.len());
         }
+
+        // First pass: compute estimated heights for every item without
+        // fully rendering them, so we can figure out which ones are visible.
+        let mut est_heights: Vec<u16> = Vec::with_capacity(self.items.len());
+        for index in 0..self.items.len() {
+            let h = if matches!(&self.items[index], MessageItem::ToolOutput { output, .. }
+                if call_ids.contains(output.call_id.as_str()))
+            {
+                0 // hidden inside its call's entry
+            } else {
+                estimate_item_height(&self.items[index], content_width)
+            };
+            est_heights.push(h);
+        }
+
+        // With stick_to_bottom, the viewport covers roughly `area.height`
+        // lines above the bottom. Build items within ~4 screenfuls; the
+        // rest stay as cheap estimates until the user scrolls near them.
+        let viewport_lines = area.height.max(20) as u32 * 4;
+        let mut accum: u32 = 0;
+        let mut build_from = self.items.len();
+        for i in (0..self.items.len()).rev() {
+            accum += est_heights[i] as u32;
+            build_from = i;
+            if accum >= viewport_lines {
+                break;
+            }
+        }
+
+        // When the user has scrolled away from the bottom, also build the
+        // items overlapping the scroll window (plus a margin in both
+        // directions), so scrolling up never lands on a blank placeholder.
+        // Positions come from the cached heights (real for built entries,
+        // estimates for lazy ones) — good enough to pick candidates, and
+        // self-correcting as entries get built on subsequent frames.
+        let mut in_window = vec![false; self.items.len()];
+        if !stick_to_bottom {
+            let offset_y = self.scroll_view_state.offset().y as u32;
+            let win_top = offset_y.saturating_sub(viewport_lines);
+            let win_bottom = offset_y + area.height as u32 + viewport_lines;
+            let mut y = welcome_height as u32;
+            for i in 0..self.items.len() {
+                let h = cache
+                    .entries
+                    .get(i)
+                    .filter(|e| !e.lazy)
+                    .map(|e| e.height)
+                    .unwrap_or(est_heights[i]) as u32;
+                if y < win_bottom && y + h > win_top {
+                    in_window[i] = true;
+                }
+                y += h;
+            }
+        }
+
         for index in 0..self.items.len() {
             let expanded = self.expanded_items.contains(&index);
             let (hidden, tool_output) = match &self.items[index] {
@@ -144,22 +236,33 @@ impl Widget for &mut ConversationPanel {
                 _ => (false, None),
             };
             let has_output = tool_output.is_some();
+            let in_viewport = index >= build_from || in_window[index];
             let needs_build = cache
                 .entries
                 .get(index)
                 .map_or(true, |entry| {
-                    entry.expanded != expanded || entry.has_output != has_output
+                    entry.expanded != expanded
+                        || entry.has_output != has_output
+                        || (entry.lazy && in_viewport)
                 });
             if needs_build {
                 let entry = if hidden {
-                    // The result renders inside its call's entry; keep a
-                    // zero-height placeholder so indices stay aligned.
                     CachedParagraph {
                         paragraph: Paragraph::new(""),
                         height: 0,
                         expanded,
                         has_output,
                         copy_buttons: Vec::new(),
+                        lazy: false,
+                    }
+                } else if !in_viewport {
+                    CachedParagraph {
+                        paragraph: Paragraph::new(""),
+                        height: est_heights[index],
+                        expanded,
+                        has_output,
+                        copy_buttons: Vec::new(),
+                        lazy: true,
                     }
                 } else {
                     let (paragraph, copy_buttons) = build_item_paragraph(
@@ -175,6 +278,7 @@ impl Widget for &mut ConversationPanel {
                         expanded,
                         has_output,
                         copy_buttons,
+                        lazy: false,
                     }
                 };
                 if index < cache.entries.len() {

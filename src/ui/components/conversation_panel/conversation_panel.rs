@@ -141,6 +141,9 @@ pub(crate) struct CachedParagraph {
     /// Clickable copy hotspots for the item's code blocks, relative to the
     /// paragraph's top-left corner.
     pub copy_buttons: Vec<CodeCopyButton>,
+    /// True when this entry's paragraph was skipped (only height estimated)
+    /// to avoid expensive markdown rendering of far-offscreen items.
+    pub lazy: bool,
 }
 
 /// A mouse text selection over the conversation, in scroll-buffer coordinates
