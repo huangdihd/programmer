@@ -14,24 +14,25 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use async_openai::types::responses::Tool;
-use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::function_tool;
+use super::grep::simple_glob_match;
 
 pub const NAME: &str = "blob";
 
 pub fn tool() -> Tool {
     function_tool(
         NAME,
-        "Find files by name using a regex pattern. Walks the directory tree and \
-         returns every file whose name matches the pattern. Useful for locating \
-         files when you know (part of) the filename but not the path.",
+        "Find files by name using a glob pattern (e.g. '*.rs', 'auth_*.{rs,toml}'). \
+         Walks the directory tree and returns every file whose name matches. \
+         Useful for locating files when you know (part of) the filename but \
+         not the path.",
         json!({
             "pattern": {
                 "type": "string",
-                "description": "The regex pattern to match against filenames (Rust regex syntax)."
+                "description": "Glob pattern matched against file names (not paths): `*` matches any run of characters, `{a,b}` matches alternatives. A leading `**/` is accepted and ignored."
             },
             "path": {
                 "type": "string",
@@ -57,10 +58,12 @@ pub async fn run(arguments: &str) -> Result<String, String> {
         Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
-    let re = match Regex::new(&args.pattern) {
-        Ok(re) => re,
-        Err(error) => return Err(format!("error: invalid regex: {error}")),
-    };
+    // Matching is against file names only, so a `**/` path prefix (a common
+    // way to write "at any depth") is redundant — accept and drop it.
+    let pattern = args.pattern.strip_prefix("**/").unwrap_or(&args.pattern);
+    if pattern.is_empty() {
+        return Err("error: empty pattern".to_string());
+    }
 
     let root = args.path.clone().unwrap_or_else(|| {
         std::env::current_dir()
@@ -71,7 +74,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
     let mut results = Vec::new();
     let mut count: usize = 0;
 
-    if let Err(error) = walk(&root, &re, &mut results, &mut count) {
+    if let Err(error) = walk(&root, pattern, &mut results, &mut count) {
         return Err(format!("error: {error}"));
     }
 
@@ -91,14 +94,14 @@ pub async fn run(arguments: &str) -> Result<String, String> {
 
 fn walk(
     root: &str,
-    re: &Regex,
+    pattern: &str,
     results: &mut Vec<String>,
     count: &mut usize,
 ) -> Result<(), String> {
     let metadata = std::fs::metadata(root).map_err(|e| format!("cannot access {root}: {e}"))?;
 
     if metadata.is_file() {
-        check_file(root, re, results, count);
+        check_file(root, pattern, results, count);
         return Ok(());
     }
 
@@ -122,22 +125,22 @@ fn walk(
                     continue;
                 }
             }
-            if walk(&path_str, re, results, count).is_err() {
+            if walk(&path_str, pattern, results, count).is_err() {
                 continue;
             }
         } else if path.is_file() {
-            check_file(&path_str, re, results, count);
+            check_file(&path_str, pattern, results, count);
         }
     }
     Ok(())
 }
 
-fn check_file(path: &str, re: &Regex, results: &mut Vec<String>, count: &mut usize) {
+fn check_file(path: &str, pattern: &str, results: &mut Vec<String>, count: &mut usize) {
     let file_name = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    if re.is_match(file_name) {
+    if simple_glob_match(pattern, file_name) {
         results.push(path.to_string());
         *count += 1;
     }
@@ -160,7 +163,7 @@ mod tests {
         let json_path = dir.to_string_lossy().replace('\\', "\\\\");
 
         let out = run(&format!(
-            r#"{{"pattern":"auth_.*\\.rs","path":"{json_path}"}}"#
+            r#"{{"pattern":"auth_*.rs","path":"{json_path}"}}"#
         ))
         .await
         .expect("blob should succeed");
@@ -168,6 +171,19 @@ mod tests {
         assert!(out.contains("auth_test.rs"), "got: {out}");
         assert!(!out.contains("main.rs"), "got: {out}");
         assert!(!out.contains("config.toml"), "got: {out}");
+
+        // The most common first attempt: a plain `*.ext` glob must work.
+        let star = run(&format!(r#"{{"pattern":"*.rs","path":"{json_path}"}}"#))
+            .await
+            .expect("glob should succeed");
+        assert!(star.contains("main.rs"), "got: {star}");
+        assert!(!star.contains("config.toml"), "got: {star}");
+
+        // A `**/` prefix is tolerated and matches at any depth.
+        let deep = run(&format!(r#"{{"pattern":"**/*.toml","path":"{json_path}"}}"#))
+            .await
+            .expect("**/ prefix should succeed");
+        assert!(deep.contains("config.toml"), "got: {deep}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -190,10 +206,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_rejects_invalid_regex() {
-        let out = run(r#"{"pattern":"[invalid"}"#)
+    async fn blob_rejects_empty_pattern() {
+        let out = run(r#"{"pattern":""}"#)
             .await
-            .expect_err("invalid regex should fail");
-        assert!(out.starts_with("error: invalid regex"), "got: {out}");
+            .expect_err("empty pattern should fail");
+        assert!(out.starts_with("error: empty pattern"), "got: {out}");
     }
 }

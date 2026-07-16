@@ -191,7 +191,8 @@ fn should_skip_file(file_name: &str, include: &Option<String>) -> bool {
 }
 
 /// Simple glob matching that supports `*` wildcards and `{a,b}` alternation.
-fn simple_glob_match(pattern: &str, name: &str) -> bool {
+/// Shared with the `blob` tool, which matches file names by glob.
+pub(crate) fn simple_glob_match(pattern: &str, name: &str) -> bool {
     // Handle {a,b} alternation by trying each alternative.
     if let Some(start) = pattern.find('{') {
         if let Some(end) = pattern[start..].find('}') {
