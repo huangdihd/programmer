@@ -15,6 +15,7 @@
 
 use super::{AddMode, TodoPanel};
 use crate::todos::TodoStatus;
+use crate::ui::text::truncate_to_width;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -96,7 +97,7 @@ impl TodoPanel {
             };
 
             let marker = if is_selected { "❯" } else { " " };
-            let title = truncate_visually(&todo.title, 50);
+            let title = truncate_to_width(&todo.title, 50);
 
             let line_style = if is_selected {
                 highlight_style
@@ -236,21 +237,3 @@ impl TodoPanel {
     }
 }
 
-/// Truncate a string to `max` visible columns, accounting for CJK-wide chars.
-fn truncate_visually(s: &str, max: usize) -> String {
-    let mut width = 0usize;
-    let mut end = 0usize;
-    for (i, c) in s.char_indices() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
-        if width + w > max {
-            break;
-        }
-        width += w;
-        end = i + c.len_utf8();
-    }
-    if end < s.len() {
-        format!("{}…", &s[..end])
-    } else {
-        s.to_string()
-    }
-}

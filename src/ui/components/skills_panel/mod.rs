@@ -208,14 +208,10 @@ fn source_label(source: &SkillSource) -> String {
     }
 }
 
-/// Truncate a description to `max` chars for single-line display.
+/// Flatten whitespace and truncate a description for single-line display.
 fn truncate(s: &str, max: usize) -> String {
     let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        format!("{}…", flat.chars().take(max - 1).collect::<String>())
-    }
+    crate::ui::text::truncate_to_width(&flat, max)
 }
 
 #[cfg(test)]

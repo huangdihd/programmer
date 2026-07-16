@@ -23,6 +23,7 @@
 use crate::config::programmer_config::ProgrammerConfig;
 use crate::mcp::McpManager;
 use crate::mcp::types::{McpPolicy, McpServerConfig};
+use crate::ui::text::truncate_to_width;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -388,7 +389,7 @@ impl McpPanel {
                         format!("{} {}", s.command, s.args.join(" "))
                     };
                     let second = Line::from(Span::styled(
-                        format!("  {}", truncate(&cmdline, 90)),
+                        format!("  {}", truncate_to_width(&cmdline, 90)),
                         Style::default().fg(Color::Gray),
                     ));
                     ListItem::new(vec![first, second])
@@ -437,7 +438,7 @@ impl McpPanel {
                     .rev()
                     .map(|l| {
                         Line::from(Span::styled(
-                            truncate(l, (area.width.saturating_sub(4) as usize).max(8)),
+                            truncate_to_width(l, (area.width.saturating_sub(4) as usize).max(8)),
                             Style::default().fg(Color::Gray),
                         ))
                     })
@@ -561,13 +562,6 @@ impl McpPanel {
 }
 
 /// Truncate a command line for single-line display.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max - 1).collect::<String>())
-    }
-}
 
 #[cfg(test)]
 mod tests {

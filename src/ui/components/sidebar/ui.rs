@@ -18,6 +18,7 @@ use crate::diagnostics::{Diagnostic, Severity};
 use crate::mcp::McpManager;
 use crate::tasks::{TaskSnapshot, TaskStatus};
 use crate::todos::{TodoList, TodoStatus};
+use crate::ui::text::{format_duration_secs, truncate_to_width, wrap_to_width};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -329,7 +330,7 @@ impl Sidebar {
             targets.push(ClickTarget::Diagnostic(i));
 
             // Line 2+: "    message text" wrapped
-            let msg_chunks = wrap_text(&d.message, msg_max);
+            let msg_chunks = wrap_to_width(&d.message, msg_max);
             for chunk in &msg_chunks {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
@@ -394,7 +395,7 @@ impl Sidebar {
             if count >= VISIBLE_PER_SECTION {
                 break;
             }
-            let msg = truncate_msg(err, 50);
+            let msg = truncate_to_width(err, 50);
             let line = Line::from(vec![
                 Span::raw("  "),
                 Span::styled("✗", Style::default().fg(Color::Red)),
@@ -494,7 +495,7 @@ impl Sidebar {
                 TaskStatus::Killed => ("⊘", Color::DarkGray),
             };
 
-            let elapsed = format_elapsed(task.elapsed);
+            let elapsed = format_duration_secs(task.elapsed);
             let title_style = Style::default().fg(Color::White);
             let cont_style = Style::default().fg(Color::DarkGray);
 
@@ -529,17 +530,6 @@ impl Sidebar {
     }
 }
 
-/// Compact human-readable duration: `42s`, `3m12s`, `1h04m`.
-fn format_elapsed(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
 
 // -- helpers --
 
@@ -562,7 +552,7 @@ fn wrapped_item(
     }
 
     let msg_max = (max_width - prefix_width) as usize;
-    let chunks = wrap_text(message, msg_max);
+    let chunks = wrap_to_width(message, msg_max);
 
     for (i, chunk) in chunks.iter().enumerate() {
         if i == 0 {
@@ -578,66 +568,9 @@ fn wrapped_item(
     }
 }
 
-/// Split `text` into chunks ≤ `max_chars` display columns (CJK chars count
-/// as 2), breaking at spaces when possible.
-fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
-    if max_chars == 0 {
-        return vec![text.to_string()];
-    }
-    let mut chunks = Vec::new();
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        let fit = byte_index_at_width(remaining, max_chars);
-        if fit == remaining.len() {
-            chunks.push(remaining.to_string());
-            break;
-        }
-        let mut break_at = fit;
-        if let Some(pos) = remaining[..fit].rfind(' ') {
-            break_at = pos;
-        }
-        if break_at == 0 {
-            // No usable break point and the first char alone exceeds the
-            // budget (e.g. a wide char with max_chars == 1): take it anyway.
-            break_at = remaining
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| i)
-                .unwrap_or(remaining.len());
-        }
-        chunks.push(remaining[..break_at].to_string());
-        remaining = remaining[break_at..].trim_start();
-    }
-    chunks
-}
-
-/// Largest byte index in `s` such that `s[..index]` is ≤ `max` display
-/// columns wide. Always a char boundary.
-fn byte_index_at_width(s: &str, max: usize) -> usize {
-    let mut width = 0usize;
-    for (i, c) in s.char_indices() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
-        if width + w > max {
-            return i;
-        }
-        width += w;
-    }
-    s.len()
-}
-
 /// Total display width of a slice of spans.
 fn spans_width(spans: &[Span<'_>]) -> u16 {
     spans.iter().map(|s| s.width() as u16).sum()
-}
-
-/// Truncate a string to `max` display columns, appending "…" if cut.
-fn truncate_msg(s: &str, max: usize) -> String {
-    let end = byte_index_at_width(s, max);
-    if end == s.len() {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..end])
-    }
 }
 
 /// Ordering key for TodoStatus (Pending < InProgress < Completed < Cancelled).
@@ -704,10 +637,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn elapsed_formatting() {
-        assert_eq!(format_elapsed(Duration::from_secs(42)), "42s");
-        assert_eq!(format_elapsed(Duration::from_secs(192)), "3m12s");
-        assert_eq!(format_elapsed(Duration::from_secs(3840)), "1h04m");
-    }
 }

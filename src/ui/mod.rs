@@ -17,5 +17,6 @@ pub mod components;
 pub mod event;
 pub mod markdown_code_block;
 pub mod markdown_theme;
+pub mod text;
 pub mod tool_details;
 pub mod ui;
