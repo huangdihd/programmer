@@ -50,18 +50,24 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     }
 }
 
-/// Write the current config back to `config.toml`.
+/// Write the current config back to `config.toml` atomically.
 pub(crate) fn persist_config(app: &mut App<'_>) {
     let Some(config_dir) = dirs::config_dir() else {
         app.conversation_panel
             .add_error_string("cannot locate the config directory");
         return;
     };
-    let path = config_dir.join("programmer").join("config.toml");
+    let dir = config_dir.join("programmer");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("config.toml");
     let result = toml::to_string(&app.config)
         .map_err(|e| format!("serialize config: {e}"))
         .and_then(|s| {
-            std::fs::write(&path, s).map_err(|e| format!("write {}: {e}", path.display()))
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &s)
+                .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+            std::fs::rename(&tmp, &path)
+                .map_err(|e| format!("rename to {}: {e}", path.display()))
         });
     if let Err(e) = result {
         app.conversation_panel

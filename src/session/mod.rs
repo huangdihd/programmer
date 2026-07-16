@@ -220,20 +220,34 @@ impl SessionManager {
     }
 
     /// Load a session by UUID. Returns `None` if not found or unreadable.
+    /// An unparseable file is set aside as `<uuid>.json.corrupt` — not
+    /// deleted, since a parse failure can also mean a schema mismatch with
+    /// another version of the program, and the data may still be recoverable.
     pub(crate) fn load(&self, uuid: &str) -> Option<Session> {
         let path = self.session_path(uuid);
         let bytes = std::fs::read(&path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        match serde_json::from_slice(&bytes) {
+            Ok(session) => Some(session),
+            Err(_) => {
+                let quarantine = path.with_extension("json.corrupt");
+                let _ = std::fs::rename(&path, &quarantine);
+                None
+            }
+        }
     }
 
-    /// Save a session to its file.
+    /// Save a session to its file atomically: write to a temp file first,
+    /// then rename, so a crash mid-write never leaves a truncated file.
     pub(crate) fn save(&self, session: &mut Session) -> Result<(), String> {
         session.updated_at = now_secs();
         self.ensure_dir()?;
         let path = self.session_path(&session.uuid);
         let json = serde_json::to_string_pretty(session)
             .map_err(|e| format!("serialize: {e}"))?;
-        std::fs::write(&path, &json).map_err(|e| format!("write: {e}"))?;
+        // Atomic write: tmp → rename.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
         Ok(())
     }
 
