@@ -137,6 +137,7 @@ mod tests {
             command: "npx".into(),
             args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
             env: std::collections::HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
+            url: None,
             auto_approve: Default::default(),
         });
 

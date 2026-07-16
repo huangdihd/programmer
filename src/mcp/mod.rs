@@ -19,11 +19,14 @@
 //! via `initialize` + `tools/list`, and routes `tools/call` requests.
 
 pub mod client;
+pub mod http_client;
 pub mod types;
 
 use client::McpClient;
+use http_client::McpHttpClient;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 use types::{CallToolResult, McpServerConfig, McpTool};
 
 /// Timeout for MCP handshake calls (initialize, tools/list).
@@ -31,9 +34,91 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 /// Timeout for MCP tool calls.
 const TOOL_CALL_TIMEOUT_SECS: u64 = 120;
 
+/// A server connection over either transport. Delegates the small surface
+/// the manager needs; the JSON-RPC semantics are identical on both sides.
+enum McpConn {
+    Stdio(McpClient),
+    Http(McpHttpClient),
+}
+
+impl McpConn {
+    async fn call_with_timeout(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value, String> {
+        match self {
+            McpConn::Stdio(c) => c.call_with_timeout(method, params, timeout_secs).await,
+            McpConn::Http(c) => {
+                tokio::time::timeout(Duration::from_secs(timeout_secs), c.call(method, params))
+                    .await
+                    .map_err(|_| {
+                        format!("MCP call to '{method}' timed out after {timeout_secs}s")
+                    })?
+            }
+        }
+    }
+
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        match self {
+            McpConn::Stdio(c) => c.send_notification(method, params).await,
+            McpConn::Http(c) => c.send_notification(method, params).await,
+        }
+    }
+
+    fn take_tools_list_changed(&self) -> bool {
+        match self {
+            McpConn::Stdio(c) => c.take_tools_list_changed(),
+            McpConn::Http(c) => c.take_tools_list_changed(),
+        }
+    }
+    fn take_resources_list_changed(&self) -> bool {
+        match self {
+            McpConn::Stdio(c) => c.take_resources_list_changed(),
+            McpConn::Http(c) => c.take_resources_list_changed(),
+        }
+    }
+    fn take_resources_updated(&self) -> bool {
+        match self {
+            McpConn::Stdio(c) => c.take_resources_updated(),
+            McpConn::Http(c) => c.take_resources_updated(),
+        }
+    }
+    fn take_prompts_list_changed(&self) -> bool {
+        match self {
+            McpConn::Stdio(c) => c.take_prompts_list_changed(),
+            McpConn::Http(c) => c.take_prompts_list_changed(),
+        }
+    }
+
+    fn clear_progress(&self) {
+        match self {
+            McpConn::Stdio(c) => c.clear_progress(),
+            McpConn::Http(c) => c.clear_progress(),
+        }
+    }
+    fn progress_snapshot(&self) -> HashMap<String, client::ProgressInfo> {
+        match self {
+            McpConn::Stdio(c) => c.progress_snapshot(),
+            McpConn::Http(c) => c.progress_snapshot(),
+        }
+    }
+    fn stderr_snapshot(&self) -> Vec<String> {
+        match self {
+            McpConn::Stdio(c) => c.stderr_snapshot(),
+            McpConn::Http(c) => c.stderr_snapshot(),
+        }
+    }
+}
+
 /// Tracks a connected MCP server and its discovered tools, resources, prompts.
 struct McpServer {
-    client: McpClient,
+    client: McpConn,
     tools: Mutex<Vec<McpTool>>,
     resources: Mutex<Vec<types::McpResource>>,
     prompts: Mutex<Vec<types::McpPrompt>>,
@@ -112,7 +197,19 @@ impl McpManager {
     }
 
     async fn connect_one(cfg: &McpServerConfig, workspace_root: &str) -> Result<McpServer, String> {
-        let client = McpClient::spawn(&cfg.command, &cfg.args, &cfg.env, workspace_root)?;
+        let client = match &cfg.url {
+            // Remote server: Streamable HTTP; `env` doubles as extra headers.
+            Some(url) => McpConn::Http(McpHttpClient::new(url, &cfg.env)?),
+            None if cfg.command.trim().is_empty() => {
+                return Err("no command or url configured".to_string());
+            }
+            None => McpConn::Stdio(McpClient::spawn(
+                &cfg.command,
+                &cfg.args,
+                &cfg.env,
+                workspace_root,
+            )?),
+        };
 
         // Step 1: initialize — declare roots capability.
         let init_params = serde_json::json!({
@@ -303,6 +400,195 @@ mod tests {
     #[test]
     fn parse_fqn_partial() { assert_eq!(parse_fqn("mcp__filesystem"), None); }
 
+    #[test]
+    fn server_config_without_url_deserializes() {
+        // Configs written before HTTP support have no `url` key.
+        let cfg: McpServerConfig = toml::from_str(
+            "name = \"old\"\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\n",
+        )
+        .expect("old config must still parse");
+        assert!(cfg.url.is_none());
+        assert_eq!(cfg.command, "npx");
+    }
+
+    // ---------------------------------------------------------------------
+    // Streamable HTTP transport, against a hand-rolled mock server
+    // ---------------------------------------------------------------------
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Minimal HTTP MCP server: JSON reply to `initialize` (issuing a session
+    /// id), 202 to notifications, an SSE-framed reply to `tools/list`, and a
+    /// session-checked JSON reply to `tools/call`.
+    async fn spawn_mock_http_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Serve requests on this connection until the client
+                    // closes it — reqwest pools and reuses connections, so a
+                    // one-shot server would race its pool.
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        while let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+                            let content_length = headers
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            let body_start = pos + 4;
+                            if buf.len() < body_start + content_length {
+                                break; // body incomplete — read more first.
+                            }
+                            let body = String::from_utf8_lossy(
+                                &buf[body_start..body_start + content_length],
+                            )
+                            .to_string();
+                            buf.drain(..body_start + content_length);
+                            let response = mock_route(&headers, &body);
+                            if sock.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                        let n = match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/mcp"), handle)
+    }
+
+    fn http_json(extra_headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn mock_route(headers: &str, body: &str) -> String {
+        let req: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let id = req.get("id").and_then(|v| v.as_u64());
+
+        // Notification (no id): accept.
+        let Some(id) = id else {
+            return "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n".to_string();
+        };
+
+        let reply = |result: serde_json::Value| {
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
+        };
+        let error = |msg: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32000, "message": msg},
+            })
+            .to_string()
+        };
+
+        match method {
+            "initialize" => http_json(
+                "Mcp-Session-Id: sess-1\r\n",
+                &reply(serde_json::json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "serverInfo": {"name": "mock-http", "version": "0"},
+                })),
+            ),
+            // tools/list answers over SSE to exercise the stream path.
+            "tools/list" => {
+                let msg = reply(serde_json::json!({
+                    "tools": [{"name": "echo", "inputSchema": {"type": "object"}}],
+                }));
+                let body = format!(": keep-alive comment\n\ndata: {msg}\n\n");
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+            }
+            // The session issued at initialize must be echoed back.
+            "tools/call" => {
+                if headers.to_ascii_lowercase().contains("mcp-session-id: sess-1") {
+                    http_json(
+                        "",
+                        &reply(serde_json::json!({
+                            "content": [{"type": "text", "text": "echoed"}],
+                        })),
+                    )
+                } else {
+                    http_json("", &error("missing session id"))
+                }
+            }
+            _ => http_json("", &error("method not found")),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_http_transport_handshake_and_tool_call() {
+        let (url, _server) = spawn_mock_http_server().await;
+        let cfg = McpServerConfig {
+            name: "mock".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            url: Some(url),
+            auto_approve: Default::default(),
+        };
+        let mgr = McpManager::from_config(&[cfg], ".").await;
+        assert!(
+            mgr.startup_errors.is_empty(),
+            "startup errors: {:?}",
+            mgr.startup_errors
+        );
+
+        let tools = mgr.all_tools();
+        assert_eq!(tools.len(), 1, "one tool discovered via SSE tools/list");
+        assert_eq!(tools[0].0, "mcp__mock__echo");
+
+        let result = mgr
+            .call_tool("mcp__mock__echo", serde_json::json!({"msg": "hi"}))
+            .await
+            .expect("tools/call over HTTP");
+        assert!(
+            matches!(&result.content[0], types::ToolContent::Text { text } if text == "echoed"),
+            "session id must have been echoed for the call to succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_http_url_only_config_requires_no_command() {
+        // A config with a URL and no command must not try to spawn anything.
+        let cfg = McpServerConfig {
+            name: "nocmd".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            url: None,
+            auto_approve: Default::default(),
+        };
+        let mgr = McpManager::from_config(&[cfg], ".").await;
+        assert_eq!(mgr.startup_errors.len(), 1);
+        assert!(
+            mgr.startup_errors[0].contains("no command or url"),
+            "got: {:?}",
+            mgr.startup_errors
+        );
+    }
+
     fn python_exe() -> Option<String> {
         for c in &["python3", "python"] {
             if std::process::Command::new(c).arg("--version")
@@ -417,7 +703,7 @@ while True:
         use types::McpPolicy;
         let py = match python_exe() { Some(p) => p, None => return };
         let scr = write_temp_script("notify", NOTIFY_SERVER);
-        let cfg = McpServerConfig { name: "t".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig { name: "t".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
         let mgr = McpManager::from_config(&[cfg], ".").await;
         assert!(mgr.startup_errors.is_empty(), "startup: {:?}", mgr.startup_errors);
         let v1: Vec<_> = mgr.all_tools().iter().map(|(n,_)| n.clone()).collect();
@@ -466,7 +752,7 @@ while True:
         use types::McpPolicy;
         let py = match python_exe() { Some(p) => p, None => return };
         let scr = write_temp_script("resource", RESOURCE_SERVER);
-        let cfg = McpServerConfig { name: "r".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig { name: "r".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
         let mgr = McpManager::from_config(&[cfg], ".").await;
         assert!(mgr.startup_errors.is_empty());
         let res: Vec<_> = mgr.all_resources().iter().map(|(f,_,_)| f.clone()).collect();
@@ -509,7 +795,7 @@ while True:
         use types::McpPolicy;
         let py = match python_exe() { Some(p) => p, None => return };
         let scr = write_temp_script("prompt", PROMPT_SERVER);
-        let cfg = McpServerConfig { name: "p".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig { name: "p".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
         let mgr = McpManager::from_config(&[cfg], ".").await;
         assert!(mgr.startup_errors.is_empty());
         let ps: Vec<_> = mgr.all_prompts().iter().map(|(f,_,_)| f.clone()).collect();
@@ -552,7 +838,7 @@ while True:
         use types::McpPolicy;
         let py = match python_exe() { Some(p) => p, None => return };
         let scr = write_temp_script("stderr", STDERR_SERVER);
-        let cfg = McpServerConfig { name: "s".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig { name: "s".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
         let mgr = McpManager::from_config(&[cfg], ".").await;
         // stderr is drained by a background task, so poll briefly instead of
         // asserting on the instantaneous snapshot.
@@ -628,7 +914,7 @@ while True:
         use types::McpPolicy;
         let py = match python_exe() { Some(p) => p, None => return };
         let scr = write_temp_script("advanced", ADVANCED_SERVER);
-        let cfg = McpServerConfig { name: "a".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig { name: "a".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
         let mgr = McpManager::from_config(&[cfg], ".").await;
         assert!(mgr.startup_errors.is_empty());
 

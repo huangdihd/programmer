@@ -85,14 +85,23 @@ pub(crate) enum McpPolicy {
 pub(crate) struct McpServerConfig {
     /// Human-readable name for this server (e.g. "filesystem").
     pub(crate) name: String,
-    /// The command to spawn (e.g. "npx", "python", "node").
+    /// The command to spawn (e.g. "npx", "python", "node"). Ignored (and may
+    /// be empty) when `url` is set.
+    #[serde(default)]
     pub(crate) command: String,
-    /// Arguments passed to the command.
+    /// Arguments passed to the command (stdio transport only).
     #[serde(default)]
     pub(crate) args: Vec<String>,
-    /// Environment variables injected into the child process.
+    /// stdio transport: environment variables injected into the child
+    /// process. HTTP transport: extra request headers (e.g.
+    /// `Authorization=Bearer xyz`).
     #[serde(default)]
     pub(crate) env: std::collections::HashMap<String, String>,
+    /// URL of a remote server (MCP Streamable HTTP transport, e.g.
+    /// `https://mcp.exa.ai/mcp`). When set, the server is reached over HTTP
+    /// and `command`/`args` are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
     /// Per-server tool-approval policy. Defaults to `auto` (defer to the
     /// current work mode's classifier).
     #[serde(default)]

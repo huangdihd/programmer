@@ -44,15 +44,23 @@ pub enum PanelAction {
 }
 
 /// Editable form fields, in focus order.
-const FORM_LABELS: [&str; 5] =
-    ["name", "command", "args (space-separated)", "env (K=V K=V)", "policy (trusted|review)"];
+const FORM_LABELS: [&str; 6] = [
+    "name",
+    "command (stdio)",
+    "url (remote http server)",
+    "args (space-separated)",
+    "env K=V (http: headers)",
+    "policy (trusted|review)",
+];
+/// Index of the policy field, which toggles instead of taking text.
+const POLICY_FIELD: usize = 5;
 
 #[derive(Debug, Default)]
 struct Form {
     /// `Some(original_name)` when editing an existing server.
     original: Option<String>,
-    /// name, command, args, env, policy.
-    fields: [String; 5],
+    /// name, command, url, args, env, policy.
+    fields: [String; 6],
     focus: usize,
     error: Option<String>,
 }
@@ -80,16 +88,23 @@ impl McpPanel {
         }
     }
 
-    /// Server names passing the current search filter (name or command line),
-    /// in a stable display order (config order).
+    /// One-line invocation summary for a server: its URL for remote servers,
+    /// otherwise the command line.
+    fn cmdline(s: &McpServerConfig) -> String {
+        match &s.url {
+            Some(url) => url.clone(),
+            None if s.args.is_empty() => s.command.clone(),
+            None => format!("{} {}", s.command, s.args.join(" ")),
+        }
+    }
+
+    /// Server names passing the current search filter (name, command line, or
+    /// URL), in a stable display order (config order).
     fn filtered_names(&self, config: &ProgrammerConfig) -> Vec<String> {
         config
             .mcp_servers
             .iter()
-            .filter(|s| {
-                let cmdline = format!("{} {}", s.command, s.args.join(" "));
-                self.search.matches(&[s.name.as_str(), cmdline.as_str()])
-            })
+            .filter(|s| self.search.matches(&[s.name.as_str(), &Self::cmdline(s)]))
             .map(|s| s.name.clone())
             .collect()
     }
@@ -143,6 +158,7 @@ impl McpPanel {
                             fields: [
                                 cfg.name.clone(),
                                 cfg.command.clone(),
+                                cfg.url.clone().unwrap_or_default(),
                                 cfg.args.join(" "),
                                 cfg.env
                                     .iter()
@@ -192,9 +208,9 @@ impl McpPanel {
         let Mode::Form(form) = &mut self.mode else {
             return PanelAction::None;
         };
-        // Policy field (index 4) toggles with Left/Right; other keys are
-        // ignored while it's focused (it's not a free-text field).
-        if form.focus == 4 {
+        // The policy field toggles with Space/Enter; other keys are ignored
+        // while it's focused (it's not a free-text field).
+        if form.focus == POLICY_FIELD {
             match key.code {
                 KeyCode::Esc => {
                     self.mode = Mode::List;
@@ -203,15 +219,16 @@ impl McpPanel {
                     form.focus = 0; // wrap to first field
                 }
                 KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
-                    form.focus = FORM_LABELS.len() - 2; // prev field
+                    form.focus = POLICY_FIELD - 1; // prev field
                 }
                 KeyCode::Char(' ') | KeyCode::Enter => {
                     // Toggle: trusted ↔ review
-                    form.fields[4] = if form.fields[4].trim() == "review" {
-                        "trusted".to_string()
-                    } else {
-                        "review".to_string()
-                    };
+                    form.fields[POLICY_FIELD] =
+                        if form.fields[POLICY_FIELD].trim() == "review" {
+                            "trusted".to_string()
+                        } else {
+                            "review".to_string()
+                        };
                 }
                 _ => {}
             }
@@ -249,12 +266,17 @@ impl McpPanel {
         };
         let name = form.fields[0].trim().to_string();
         let command = form.fields[1].trim().to_string();
+        let url = form.fields[2].trim().to_string();
         if name.is_empty() {
             form.error = Some("name is required".to_string());
             return PanelAction::None;
         }
-        if command.is_empty() {
-            form.error = Some("command is required".to_string());
+        if command.is_empty() && url.is_empty() {
+            form.error = Some("either command (stdio) or url (http) is required".to_string());
+            return PanelAction::None;
+        }
+        if !url.is_empty() && !(url.starts_with("http://") || url.starts_with("https://")) {
+            form.error = Some("url must start with http:// or https://".to_string());
             return PanelAction::None;
         }
         // A rename/add must not collide with a different existing server.
@@ -267,15 +289,15 @@ impl McpPanel {
             return PanelAction::None;
         }
 
-        let args: Vec<String> = form.fields[2]
+        let args: Vec<String> = form.fields[3]
             .split_whitespace()
             .map(|s| s.to_string())
             .collect();
-        let env: std::collections::HashMap<String, String> = form.fields[3]
+        let env: std::collections::HashMap<String, String> = form.fields[4]
             .split_whitespace()
             .filter_map(|pair| pair.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
             .collect();
-        let auto_approve = match form.fields[4].trim() {
+        let auto_approve = match form.fields[POLICY_FIELD].trim() {
             "review" => McpPolicy::Review,
             _ => McpPolicy::Trusted,
         };
@@ -285,6 +307,7 @@ impl McpPanel {
             command,
             args,
             env,
+            url: (!url.is_empty()).then_some(url),
             auto_approve,
         };
 
@@ -312,10 +335,7 @@ impl McpPanel {
         let filtered: Vec<&McpServerConfig> = config
             .mcp_servers
             .iter()
-            .filter(|s| {
-                let cmdline = format!("{} {}", s.command, s.args.join(" "));
-                self.search.matches(&[s.name.as_str(), cmdline.as_str()])
-            })
+            .filter(|s| self.search.matches(&[s.name.as_str(), &Self::cmdline(s)]))
             .collect();
         // In list mode, connected servers get a stderr log pane for the
         // selected entry (useful when a server misbehaves).
@@ -423,13 +443,8 @@ impl McpPanel {
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]);
-                    let cmdline = if s.args.is_empty() {
-                        s.command.clone()
-                    } else {
-                        format!("{} {}", s.command, s.args.join(" "))
-                    };
                     let second = Line::from(Span::styled(
-                        format!("  {}", truncate_to_width(&cmdline, 90)),
+                        format!("  {}", truncate_to_width(&Self::cmdline(s), 90)),
                         Style::default().fg(Color::Gray),
                     ));
                     ListItem::new(vec![first, second])
@@ -626,6 +641,7 @@ mod tests {
         for c in "npx".chars() {
             panel.handle_key(ch(c), &mut config);
         }
+        panel.handle_key(key(KeyCode::Tab), &mut config); // url (left empty)
         panel.handle_key(key(KeyCode::Tab), &mut config);
         // args
         for c in "-y server".chars() {
@@ -636,6 +652,42 @@ mod tests {
         assert_eq!(config.mcp_servers[0].name, "fs");
         assert_eq!(config.mcp_servers[0].command, "npx");
         assert_eq!(config.mcp_servers[0].args, vec!["-y", "server"]);
+        assert!(config.mcp_servers[0].url.is_none());
+    }
+
+    #[test]
+    fn add_http_server_via_form_url_only() {
+        let mut panel = McpPanel::new();
+        let mut config = ProgrammerConfig::default();
+        panel.handle_key(ch('a'), &mut config);
+        for c in "exa".chars() {
+            panel.handle_key(ch(c), &mut config);
+        }
+        panel.handle_key(key(KeyCode::Tab), &mut config); // command (left empty)
+        panel.handle_key(key(KeyCode::Tab), &mut config); // url
+        for c in "https://mcp.exa.ai/mcp".chars() {
+            panel.handle_key(ch(c), &mut config);
+        }
+        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::Saved);
+        assert_eq!(config.mcp_servers[0].url.as_deref(), Some("https://mcp.exa.ai/mcp"));
+        assert!(config.mcp_servers[0].command.is_empty());
+    }
+
+    #[test]
+    fn form_rejects_non_http_url() {
+        let mut panel = McpPanel::new();
+        let mut config = ProgrammerConfig::default();
+        panel.handle_key(ch('a'), &mut config);
+        for c in "bad".chars() {
+            panel.handle_key(ch(c), &mut config);
+        }
+        panel.handle_key(key(KeyCode::Tab), &mut config); // command
+        panel.handle_key(key(KeyCode::Tab), &mut config); // url
+        for c in "ftp://x".chars() {
+            panel.handle_key(ch(c), &mut config);
+        }
+        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::None);
+        assert!(config.mcp_servers.is_empty());
     }
 
     #[test]
@@ -656,6 +708,7 @@ mod tests {
             command: "npx".into(),
             args: vec![],
             env: Default::default(),
+            url: None,
             auto_approve: Default::default(),
         });
         panel.handle_key(ch('d'), &mut config);
@@ -671,6 +724,7 @@ mod tests {
         for c in "srv".chars() { panel.handle_key(ch(c), &mut config); }
         panel.handle_key(key(KeyCode::Tab), &mut config);
         for c in "cmd".chars() { panel.handle_key(ch(c), &mut config); }
+        panel.handle_key(key(KeyCode::Tab), &mut config); // url
         panel.handle_key(key(KeyCode::Tab), &mut config); // args
         panel.handle_key(key(KeyCode::Tab), &mut config); // env
         for c in "API_KEY=secret".chars() { panel.handle_key(ch(c), &mut config); }
@@ -688,6 +742,7 @@ mod tests {
         panel.handle_key(key(KeyCode::Tab), &mut config);
         // command
         for c in "cmd".chars() { panel.handle_key(ch(c), &mut config); }
+        panel.handle_key(key(KeyCode::Tab), &mut config); // url
         panel.handle_key(key(KeyCode::Tab), &mut config); // args
         panel.handle_key(key(KeyCode::Tab), &mut config); // env
         panel.handle_key(key(KeyCode::Tab), &mut config); // policy (default: trusted)
