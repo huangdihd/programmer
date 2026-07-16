@@ -1,0 +1,33 @@
+- multimodal support
+- ~~http mcp~~
+- edit_file tool diff-style message
+- lint
+- remote control(?)
+- fix /init
+- interactive background task terminal(?)
+- installation script(publish to cargo?)
+- ~~multi-provider support~~
+- ~~session persistence~~
+- ~~network retry logic~~
+- ~~per-turn token usage~~
+- ~~clipboard support~~
+- ~~tab completion~~
+- ~~provider management panel~~
+- ~~model browser~~
+- ~~ask_user tool~~
+- ~~manual mode classifier (approval UI)~~
+- ~~auto mode (LLM-based classifier)~~
+- ~~work mode cycling (Ctrl+T)~~
+- ~~diagnostics system~~
+- ~~LSP diagnostics~~
+- ~~MCP client (stdio)~~
+- ~~agent skills system~~
+- ~~todo list subsystem~~
+- ~~plan mode~~
+- ~~right-hand sidebar~~
+- ~~background task system~~
+- ~~fetch tool~~
+- ~~lazy-render conversation items~~
+- ~~MCP progress in UI~~
+- ~~atomic file writes~~
+- ~~incremental search in panels~~
