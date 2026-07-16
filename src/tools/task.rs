@@ -41,15 +41,19 @@ pub fn tool() -> Tool {
          `create` (start a command in the background, returns its task id), \
          `list` (all tasks with status and runtime), \
          `output` (a task's current status and captured output), \
+         `write` (send a line of input to a running task's stdin; set eof to \
+         close stdin — do this when the task reads input to end-of-stream), \
          `wait` (block until a task finishes or the timeout elapses), \
          `kill` (terminate a running task). \
+         Tasks start with stdin open, so a command that reads input will wait \
+         for `write`/eof rather than seeing an empty stream. \
          Prefer the `command` tool for anything that finishes quickly — use \
          background tasks only when the command should outlive the current step.",
         json!({
             "action": {
                 "type": "string",
                 "description": "The action to perform.",
-                "enum": ["create", "list", "output", "wait", "kill"]
+                "enum": ["create", "list", "output", "write", "wait", "kill"]
             },
             "command": {
                 "type": "string",
@@ -65,7 +69,15 @@ pub fn tool() -> Tool {
             },
             "id": {
                 "type": "integer",
-                "description": "The task id (required for output, wait, and kill)."
+                "description": "The task id (required for output, write, wait, and kill)."
+            },
+            "input": {
+                "type": "string",
+                "description": "write only: text to send to the task's stdin. A trailing newline is appended automatically if missing."
+            },
+            "eof": {
+                "type": "boolean",
+                "description": "write only: close the task's stdin after writing (may be used alone, without input, to just signal end of input)."
             },
             "timeout": {
                 "type": "integer",
@@ -92,21 +104,26 @@ struct Args {
     #[serde(default)]
     id: Option<u64>,
     #[serde(default)]
+    input: Option<String>,
+    #[serde(default)]
+    eof: Option<bool>,
+    #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
     tail: Option<usize>,
 }
 
-/// Which task actions mutate state (start/stop processes). Used by the
-/// classifier: `create` runs an arbitrary command and `kill` terminates one,
-/// so they are gated like the `command` tool; the rest are read-only.
+/// Which task actions mutate state (start/stop processes or drive them). Used
+/// by the classifier: `create` runs an arbitrary command, `kill` terminates
+/// one, and `write` feeds input that can confirm destructive prompts, so they
+/// are gated like the `command` tool; the rest are read-only.
 pub fn action_is_mutating(arguments: &str) -> bool {
     #[derive(Deserialize)]
     struct ActionOnly {
         action: String,
     }
     match serde_json::from_str::<ActionOnly>(arguments) {
-        Ok(a) => matches!(a.action.as_str(), "create" | "kill"),
+        Ok(a) => matches!(a.action.as_str(), "create" | "kill" | "write"),
         // Unparseable arguments: assume the worst.
         Err(_) => true,
     }
@@ -148,6 +165,35 @@ pub async fn run(arguments: &str) -> Result<String, String> {
             Ok(render_full(&snap, args.tail.unwrap_or(DEFAULT_TAIL_CHARS)))
         }
 
+        "write" => {
+            let id = require_id(args.id, "write")?;
+            let eof = args.eof.unwrap_or(false);
+            let mut input = args.input.unwrap_or_default();
+            if input.is_empty() && !eof {
+                return Err(
+                    "error: 'input' (or eof=true) is required for write".to_string()
+                );
+            }
+            // Line-based contract: prompts read whole lines, so make sure the
+            // input is terminated.
+            if !input.is_empty() && !input.ends_with('\n') {
+                input.push('\n');
+            }
+            tasks::write_stdin(id, &input, eof)?;
+            let mut msg = if input.is_empty() {
+                format!("closed stdin of task {id}")
+            } else {
+                format!("sent input to task {id}")
+            };
+            if eof && !input.is_empty() {
+                msg.push_str(" and closed its stdin");
+            }
+            msg.push_str(&format!(
+                "\nCheck the task's reaction with action=output id={id}."
+            ));
+            Ok(msg)
+        }
+
         "wait" => {
             let id = require_id(args.id, "wait")?;
             let timeout = args
@@ -173,7 +219,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
         }
 
         other => Err(format!(
-            "error: unknown action '{other}' — use create, list, output, wait, or kill"
+            "error: unknown action '{other}' — use create, list, output, write, wait, or kill"
         )),
     }
 }
@@ -226,9 +272,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_and_kill_are_mutating_but_views_are_not() {
+    fn create_kill_write_are_mutating_but_views_are_not() {
         assert!(action_is_mutating(r#"{"action":"create","command":"x"}"#));
         assert!(action_is_mutating(r#"{"action":"kill","id":1}"#));
+        assert!(action_is_mutating(r#"{"action":"write","id":1,"input":"y"}"#));
         assert!(!action_is_mutating(r#"{"action":"list"}"#));
         assert!(!action_is_mutating(r#"{"action":"output","id":1}"#));
         assert!(!action_is_mutating(r#"{"action":"wait","id":1}"#));

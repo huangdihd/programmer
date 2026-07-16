@@ -72,6 +72,9 @@ struct TaskEntry {
     output: String,
     /// Signals the reader task to kill the child. `None` once finished.
     kill: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Feeds chunks to the child's stdin via the writer task. Dropping it
+    /// (the `eof` action, or task finish) closes the pipe, delivering EOF.
+    stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// Read-only copy of a task's state for rendering and tool output.
@@ -138,7 +141,7 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
-    cmd.stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -157,6 +160,25 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
 
     let id = next_id();
     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Stdin writer: owns the child's stdin and drains a channel into it, so
+    // `write_stdin` stays synchronous (no lock held across an await). When the
+    // channel closes — `eof`, task finish, or a write error — stdin drops and
+    // the child sees EOF.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let child_stdin = child.stdin.take();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let Some(mut stdin) = child_stdin else { return };
+        while let Some(chunk) = stdin_rx.recv().await {
+            if stdin.write_all(chunk.as_bytes()).await.is_err()
+                || stdin.flush().await.is_err()
+            {
+                break;
+            }
+        }
+    });
+
     {
         let mut reg = registry().lock().unwrap();
         reg.push(TaskEntry {
@@ -172,6 +194,7 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
             finished: None,
             output: String::new(),
             kill: Some(kill_tx),
+            stdin_tx: Some(stdin_tx),
         });
     }
 
@@ -225,6 +248,37 @@ where
             Ok(n) => append_output(id, &String::from_utf8_lossy(&buf[..n])),
         }
     }
+}
+
+/// Send input to a running task's stdin. With `eof`, close stdin after the
+/// write (an empty `text` with `eof` just closes it), delivering EOF to the
+/// child. Errors if the id is unknown, the task finished, or stdin was
+/// already closed.
+pub fn write_stdin(id: u64, text: &str, eof: bool) -> Result<(), String> {
+    let mut reg = registry().lock().unwrap();
+    let entry = reg
+        .iter_mut()
+        .find(|e| e.id == id)
+        .ok_or_else(|| format!("error: no task with id {id}"))?;
+    if entry.status != TaskStatus::Running {
+        return Err(format!(
+            "error: task {id} already finished ({})",
+            entry.status.label()
+        ));
+    }
+    let Some(tx) = entry.stdin_tx.as_ref() else {
+        return Err(format!("error: task {id} stdin is already closed"));
+    };
+    if !text.is_empty() {
+        tx.send(text.to_string())
+            .map_err(|_| format!("error: task {id} stdin is already closed"))?;
+    }
+    if eof {
+        // Dropping the sender closes the channel; the writer task flushes any
+        // queued chunks first, then drops stdin → EOF.
+        entry.stdin_tx = None;
+    }
+    Ok(())
 }
 
 /// Request termination of a running task. Returns an error if the id is
@@ -339,6 +393,7 @@ pub fn restore(saved: &[PersistedTask]) {
             finished: Some(now),
             output: t.output.clone(),
             kill: None,
+            stdin_tx: None,
         });
     }
     let max_id = reg.iter().map(|e| e.id).max().unwrap_or(0);
@@ -367,6 +422,7 @@ fn finish(id: u64, status: TaskStatus, exit_code: Option<i32>) {
         entry.exit_code = exit_code;
         entry.finished = Some(Instant::now());
         entry.kill = None;
+        entry.stdin_tx = None;
     }
 }
 
@@ -457,6 +513,25 @@ mod tests {
         // Round trip: the restored tasks serialize back out.
         let persisted = persist_all();
         assert!(persisted.iter().any(|t| t.id == 900_001 && t.status == "killed"));
+    }
+
+    #[tokio::test]
+    async fn write_feeds_stdin_and_eof_closes_it() {
+        // Both commands echo stdin lines back and exit on EOF.
+        let cmd = if cfg!(windows) { "findstr ." } else { "cat" };
+        let id = spawn(cmd, None, None).expect("spawn");
+        write_stdin(id, "hello-stdin\n", false).expect("write while running");
+        write_stdin(id, "", true).expect("eof closes stdin");
+        let (snap, still_running) = wait(id, Duration::from_secs(10)).await.expect("wait");
+        assert!(!still_running, "EOF should end the reader");
+        assert!(
+            snap.output.contains("hello-stdin"),
+            "output: {}",
+            snap.output
+        );
+        // Writes after finish are rejected.
+        let err = write_stdin(id, "late\n", false).expect_err("finished task");
+        assert!(err.contains("finished"), "got: {err}");
     }
 
     #[tokio::test]
