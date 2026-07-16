@@ -471,6 +471,7 @@ fn is_parallel_safe(name: &str) -> bool {
         crate::tools::read_file::NAME
             | crate::tools::grep::NAME
             | crate::tools::blob::NAME
+            | crate::tools::fetch::NAME
     )
 }
 

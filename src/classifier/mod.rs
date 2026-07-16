@@ -70,8 +70,17 @@ const DANGEROUS_TOOLS: &[&str] =
     &["command", "write_file", "edit_file", "configure_diagnostics"];
 
 /// Tool names that are read-only — always safe, even in Plan/Planning phase.
-const READ_ONLY_TOOLS: &[&str] =
-    &["read_file", "grep", "blob", "ask_user", "diagnostics", "todo"];
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "grep",
+    "blob",
+    // `fetch` refuses private/internal addresses itself, so it is safe to
+    // classify as read-only despite touching the network.
+    "fetch",
+    "ask_user",
+    "diagnostics",
+    "todo",
+];
 
 /// The `task` tool is action-dependent: `create` runs an arbitrary command and
 /// `kill` terminates a process (gated like `command`), while `list`/`output`/

@@ -29,6 +29,15 @@ uuid = { version = "1", features = ["v4"] }
 unicode-width = "0.2"
 ratatui-markdown = { git = "https://github.com/huangdihd/ratatui-markdown", version = "0.3.6", features = ["highlight-lang-all"] }
 which = "8.0.5"
+html2text = "0.17.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+
+# Dependencies (dozens of tree-sitter grammars, aws-lc-sys, …) carry enough
+# debug info to blow past the MSVC PDB size limit (LNK1140). Strip debuginfo
+# from deps only — our own crate stays fully debuggable — which also speeds
+# up builds considerably.
+[profile.dev.package."*"]
+debug = false
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]

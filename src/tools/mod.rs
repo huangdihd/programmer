@@ -19,6 +19,7 @@ pub mod command;
 pub mod configure_diagnostics;
 pub mod diagnostics;
 pub mod edit_file;
+pub mod fetch;
 pub mod grep;
 pub(crate) mod mcp_bridge;
 pub mod read_file;
@@ -153,6 +154,7 @@ pub(crate) fn tools(mcp: Option<&crate::mcp::McpManager>) -> Vec<Tool> {
         edit_file::tool(),
         grep::tool(),
         blob::tool(),
+        fetch::tool(),
         ask_user::tool(),
         configure_diagnostics::tool(),
         diagnostics::tool(),
@@ -204,6 +206,7 @@ pub(crate) async fn run_tool_call(
             edit_file::NAME => edit_file::run(&call.arguments).await,
             grep::NAME => grep::run(&call.arguments).await,
             blob::NAME => blob::run(&call.arguments).await,
+            fetch::NAME => fetch::run(&call.arguments).await,
             ask_user::NAME => ask_user::run(&call.arguments, sender).await,
             configure_diagnostics::NAME => configure_diagnostics::run(&call.arguments).await,
             diagnostics::NAME => diagnostics::run(&call.arguments).await,
