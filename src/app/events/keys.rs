@@ -276,6 +276,8 @@ pub(crate) async fn handle_key_events(
             let text = app.input_panel.get_content();
             if text.starts_with('/') {
                 commands::execute_command(app, &text).await;
+            } else if text.starts_with('!') {
+                commands::run_bang_command(app, &text);
             } else {
                 app.events.send(AppEvent::Start);
             }

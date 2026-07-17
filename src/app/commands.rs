@@ -87,6 +87,30 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
     stream::spawn_stream(app);
 }
 
+/// Run a `!command` from the input: spawn it as an interactive PTY task and
+/// open the terminal panel focused on it, so the user drives it right away.
+pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
+    use crate::ui::components::terminal_panel::TerminalPane;
+
+    let command = input.strip_prefix('!').unwrap_or(input).trim().to_string();
+    if command.is_empty() {
+        app.input_panel.clear();
+        return;
+    }
+    app.input_panel.push_history(input.to_string());
+    app.input_panel.clear();
+
+    match crate::tasks::spawn_interactive(&command, None, Some(&command), 24, 80) {
+        Ok(id) => {
+            let mut pane = TerminalPane::new(id, command);
+            // Grab input immediately — the user typed `!` to interact.
+            pane.grabbed = true;
+            app.terminal_pane = Some(pane);
+        }
+        Err(e) => app.conversation_panel.add_error_string(e),
+    }
+}
+
 /// Open the interactive terminal panel for a task. With no argument, opens the
 /// sole interactive task; with an id, opens that task if it is interactive.
 fn open_terminal(app: &mut App<'_>, arg: &str) {

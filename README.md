@@ -206,6 +206,7 @@ programmer
 | `Ctrl+T` | Cycle work mode (Manual → AllowEdits → Auto) |
 | `Ctrl+C` / `Ctrl+Q` | Quit |
 | Mouse scroll | Scroll conversation history |
+| `!<command>` + `Enter` | Run a command interactively in a terminal panel (Ctrl+O releases input) |
 
 ### Slash commands
 

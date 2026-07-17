@@ -1,4 +1,5 @@
 - multimodal support
+- Jump to bottom button
 - ~~http mcp~~
 - ~~edit_file tool diff-style message~~
 - lint
@@ -9,7 +10,7 @@
 - git cooperator signature
 - ~~expose local tools as a MCP server~~
 - ~~@ to quote file~~
-- ! to run a command interactively in the app(?)
+- ~~! to run a command interactively in the app~~
 - ~~multi-provider support~~
 - ~~session persistence~~
 - ~~network retry logic~~
