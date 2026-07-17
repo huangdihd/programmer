@@ -252,16 +252,24 @@ impl Sidebar {
                 if !lsp_configured && diagnostics.is_empty() {
                     "Diagnostics".to_string()
                 } else {
+                    // Compact counts (only non-zero) so the title fits the
+                    // narrow sidebar: e.g. "Diagnostics (2E 5W 12L)".
                     let count = |s| diagnostics.iter().filter(|d| d.severity == s).count();
-                    let errs = count(Severity::Error);
-                    let warns = count(Severity::Warning);
-                    let lints = count(Severity::Lint);
-                    let mut title = format!("Diagnostics ({errs} err, {warns} warn");
-                    if lints > 0 {
-                        title.push_str(&format!(", {lints} lint"));
+                    let mut parts = Vec::new();
+                    for (n, letter) in [
+                        (count(Severity::Error), 'E'),
+                        (count(Severity::Warning), 'W'),
+                        (count(Severity::Lint), 'L'),
+                    ] {
+                        if n > 0 {
+                            parts.push(format!("{n}{letter}"));
+                        }
                     }
-                    title.push(')');
-                    title
+                    if parts.is_empty() {
+                        "Diagnostics".to_string()
+                    } else {
+                        format!("Diagnostics ({})", parts.join(" "))
+                    }
                 }
             }
             SidebarSection::Mcp => {
