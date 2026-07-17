@@ -1,11 +1,13 @@
 - multimodal support
 - ~~http mcp~~
-- edit_file tool diff-style message
+- ~~edit_file tool diff-style message~~
 - lint
 - remote control(?)
 - ~~fix /init~~
 - interactive background task terminal(?)
 - installation script(publish to cargo?)
+- @ to quote file
+- ! to run a command interactively in the app(?)
 - ~~multi-provider support~~
 - ~~session persistence~~
 - ~~network retry logic~~

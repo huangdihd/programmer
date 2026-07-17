@@ -85,13 +85,23 @@ pub(crate) fn format_tool_details(tool_name: &str, arguments: &str) -> Vec<Strin
             if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
                 lines.push(format!("path: {path}"));
             }
-            if let Some(old) = v.get("old_string").and_then(|o| o.as_str()) {
-                let preview: String = old.chars().take(80).collect();
-                lines.push(format!("old: {preview}"));
-            }
-            if let Some(new) = v.get("new_string").and_then(|n| n.as_str()) {
-                let preview: String = new.chars().take(80).collect();
-                lines.push(format!("new: {preview}"));
+            let old = v.get("old_string").and_then(|o| o.as_str());
+            let new = v.get("new_string").and_then(|n| n.as_str());
+            if let (Some(old), Some(new)) = (old, new) {
+                // Show the change as a compact unified diff (up to 6 lines each
+                // side) so the approval prompt reveals what actually changes.
+                for line in old.lines().take(6) {
+                    lines.push(format!("- {line}"));
+                }
+                if old.lines().count() > 6 {
+                    lines.push("- …".to_string());
+                }
+                for line in new.lines().take(6) {
+                    lines.push(format!("+ {line}"));
+                }
+                if new.lines().count() > 6 {
+                    lines.push("+ …".to_string());
+                }
             }
             if lines.is_empty() {
                 lines.push(arguments.to_string());

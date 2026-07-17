@@ -18,6 +18,7 @@ use async_openai::types::responses::{
 };
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
+use unicode_width::UnicodeWidthStr;
 
 use crate::ui::components::messages::assistant::detail_style;
 use crate::ui::markdown_theme::palette;
@@ -126,6 +127,29 @@ impl<'a> ToolCallMessage<'a> {
         ])];
 
         match &value {
+            // `edit_file` renders its old_string → new_string change as a
+            // colored unified diff instead of two opaque text fields.
+            Some(serde_json::Value::Object(map))
+                if self.call.name == "edit_file"
+                    && map.get("old_string").and_then(|v| v.as_str()).is_some()
+                    && map.get("new_string").and_then(|v| v.as_str()).is_some() =>
+            {
+                if let Some(path) = map.get("path").and_then(|v| v.as_str()) {
+                    push_field(&mut lines, "path", path, detail_style());
+                }
+                let old = map.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+                let new = map.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+                // `offset` (1-based) hints where the search began; use it as the
+                // base line number when present, otherwise number from 1.
+                let base = map
+                    .get("offset")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n.max(1) as usize)
+                    .unwrap_or(1);
+                for line in diff_lines(old, new, base) {
+                    lines.push(line);
+                }
+            }
             Some(serde_json::Value::Object(map)) => {
                 for (key, val) in map {
                     push_field(&mut lines, key, &value_text(val), detail_style());
@@ -194,6 +218,167 @@ fn one_line_summary(value: Option<&serde_json::Value>, raw: &str) -> (String, bo
     truncated(raw)
 }
 
+/// One row of a line diff.
+enum DiffOp {
+    /// Unchanged line, present in both sides at (old index, new index).
+    Equal(usize, usize),
+    /// Line removed from the old side (old index).
+    Delete(usize),
+    /// Line added on the new side (new index).
+    Insert(usize),
+}
+
+/// Number of unchanged context lines kept on each side of a change; longer
+/// unchanged runs are collapsed into a single `⋯` separator.
+const DIFF_CONTEXT: usize = 3;
+
+/// Compute a line-level diff via longest-common-subsequence backtracking.
+/// Equal lines are matched so an unchanged line inside the replaced region is
+/// not reported as a delete+insert pair.
+fn diff_ops(old: &[&str], new: &[&str]) -> Vec<DiffOp> {
+    let (n, m) = (old.len(), new.len());
+    // dp[i][j] = LCS length of old[i..] and new[j..].
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if old[i] == new[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if old[i] == new[j] {
+            ops.push(DiffOp::Equal(i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            ops.push(DiffOp::Delete(i));
+            i += 1;
+        } else {
+            ops.push(DiffOp::Insert(j));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(DiffOp::Delete(i));
+        i += 1;
+    }
+    while j < m {
+        ops.push(DiffOp::Insert(j));
+        j += 1;
+    }
+    ops
+}
+
+/// Render a line-based unified diff between `old` and `new`, starting line
+/// numbering at `base`. Each row carries a two-column gutter (old line / new
+/// line). Unchanged lines near a change are dimmed context (far ones are
+/// collapsed to `⋯`); removed lines are red on a dark-red block and added
+/// lines are green on a dark-green block.
+fn diff_lines(old: &str, new: &str, base: usize) -> Vec<Line<'static>> {
+    let old_lines: Vec<&str> = old.split('\n').collect();
+    let new_lines: Vec<&str> = new.split('\n').collect();
+    let ops = diff_ops(&old_lines, &new_lines);
+
+    // Keep an Equal op only when it sits within DIFF_CONTEXT ops of a change;
+    // stretches of unchanged lines further away are collapsed.
+    let is_change = |op: &DiffOp| !matches!(op, DiffOp::Equal(..));
+    let keep: Vec<bool> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| {
+            if is_change(op) {
+                return true;
+            }
+            let lo = idx.saturating_sub(DIFF_CONTEXT);
+            ops[lo..=(idx + DIFF_CONTEXT).min(ops.len() - 1)]
+                .iter()
+                .any(is_change)
+        })
+        .collect();
+
+    use ratatui::style::Color;
+    let gutter_style = Style::new().fg(palette::FAINT);
+    let context = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
+    let removed = Style::new()
+        .fg(palette::RED)
+        .bg(Color::Rgb(0x3a, 0x22, 0x28));
+    let added = Style::new()
+        .fg(palette::GREEN)
+        .bg(Color::Rgb(0x25, 0x33, 0x1d));
+
+    // Width of each line-number column, sized to the largest number shown.
+    let max_no = base + old_lines.len().max(new_lines.len());
+    let num_w = max_no.to_string().len();
+
+    // Pad content (marker + text) to a common width so the colored backgrounds
+    // form even blocks regardless of line length.
+    let content_w = ops
+        .iter()
+        .zip(&keep)
+        .filter(|&(_, &k)| k)
+        .map(|(op, _)| {
+            let text = match *op {
+                DiffOp::Equal(i, _) => old_lines[i],
+                DiffOp::Delete(i) => old_lines[i],
+                DiffOp::Insert(j) => new_lines[j],
+            };
+            UnicodeWidthStr::width(text) + 2 // + "- " / "+ " / "  "
+        })
+        .max()
+        .unwrap_or(0);
+    let pad_to = |s: &str, w: usize| {
+        let extra = w.saturating_sub(UnicodeWidthStr::width(s));
+        format!("{s}{}", " ".repeat(extra))
+    };
+    // Single right-aligned line-number column so every number sits in the same
+    // vertical stripe; the -/+/space marker tells which side the line is from.
+    let gutter = |n: Option<usize>| {
+        let text = match n {
+            Some(n) => format!("  {n:>num_w$} "),
+            None => format!("  {} ", " ".repeat(num_w)),
+        };
+        Span::styled(text, gutter_style)
+    };
+
+    let mut lines = Vec::new();
+    let mut pending_gap = false; // a collapsed run precedes the next kept row
+    for (idx, op) in ops.iter().enumerate() {
+        if !keep[idx] {
+            pending_gap = true;
+            continue;
+        }
+        // Emit a single separator for any run of collapsed lines, but not
+        // before the very first rendered row.
+        if pending_gap && !lines.is_empty() {
+            lines.push(Line::from(vec![
+                gutter(None),
+                Span::styled("  \u{22EF}", context),
+            ]));
+        }
+        pending_gap = false;
+        match *op {
+            DiffOp::Equal(i, _) => lines.push(Line::from(vec![
+                gutter(Some(base + i)),
+                Span::styled(pad_to(&format!("  {}", old_lines[i]), content_w), context),
+            ])),
+            DiffOp::Delete(i) => lines.push(Line::from(vec![
+                gutter(Some(base + i)),
+                Span::styled(pad_to(&format!("- {}", old_lines[i]), content_w), removed),
+            ])),
+            DiffOp::Insert(j) => lines.push(Line::from(vec![
+                gutter(Some(base + j)),
+                Span::styled(pad_to(&format!("+ {}", new_lines[j]), content_w), added),
+            ])),
+        }
+    }
+    lines
+}
+
 fn push_field(lines: &mut Vec<Line<'static>>, key: &str, value: &str, style: Style) {
     let value_lines: Vec<&str> = value.lines().collect();
     if value_lines.len() <= 1 {
@@ -210,5 +395,64 @@ fn value_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_ops_keeps_unchanged_middle_line() {
+        // Only the first and last lines change; the middle line is identical
+        // and must be reported as Equal, not Delete+Insert.
+        let old = ["a", "keep", "b"];
+        let new = ["A", "keep", "B"];
+        let ops = diff_ops(&old, &new);
+        let equals = ops
+            .iter()
+            .filter(|op| matches!(op, DiffOp::Equal(..)))
+            .count();
+        assert_eq!(equals, 1, "the shared middle line should match");
+    }
+
+    fn plain(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn diff_lines_keeps_context_between_separate_hunks() {
+        // Two changes far apart: the big unchanged middle collapses to a single
+        // `⋯`, but a few unchanged lines survive on each side of each change.
+        let old: Vec<String> = (0..30).map(|i| format!("line{i}")).collect();
+        let mut new_v = old.clone();
+        new_v[2] = "CHANGED_A".into();
+        new_v[27] = "CHANGED_B".into();
+        let rendered = plain(&diff_lines(&old.join("\n"), &new_v.join("\n"), 1));
+        let sep = rendered.iter().filter(|l| l.contains('\u{22EF}')).count();
+        assert_eq!(sep, 1, "exactly one collapse separator");
+        assert!(rendered.iter().any(|l| l.contains("CHANGED_A")));
+        assert!(rendered.iter().any(|l| l.contains("CHANGED_B")));
+        // Context preserved on the inner side of each hunk...
+        assert!(rendered.iter().any(|l| l.contains("line5")), "context after hunk A");
+        assert!(rendered.iter().any(|l| l.contains("line24")), "context before hunk B");
+        // ...while the distant middle is hidden.
+        assert!(!rendered.iter().any(|l| l.contains("line15")), "middle hidden");
+    }
+
+    #[test]
+    fn diff_lines_collapses_distant_context() {
+        // A long unchanged head with a single trailing change should collapse
+        // the far context into one separator row.
+        let old = (0..20).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let mut new_v: Vec<String> = (0..20).map(|i| i.to_string()).collect();
+        *new_v.last_mut().unwrap() = "changed".into();
+        let new = new_v.join("\n");
+        let rendered = diff_lines(&old, &new, 1);
+        // Far fewer than 20 rows survive once distant context is collapsed.
+        assert!(rendered.len() < 12, "distant context should collapse, got {}", rendered.len());
     }
 }
