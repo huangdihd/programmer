@@ -198,22 +198,11 @@ pub(crate) async fn run_tool_call(
     // `failed` flag below.
     let result: Result<String, String> = if call.name.starts_with("mcp__") {
         mcp_bridge::run_mcp_call(call, mcp).await
+    } else if call.name == ask_user::NAME {
+        // ask_user needs the UI channel, so it isn't part of run_local_tool.
+        ask_user::run(&call.arguments, sender).await
     } else {
-        match call.name.as_str() {
-            command::NAME => command::run(&call.arguments).await,
-            read_file::NAME => read_file::run(&call.arguments).await,
-            write_file::NAME => write_file::run(&call.arguments).await,
-            edit_file::NAME => edit_file::run(&call.arguments).await,
-            grep::NAME => grep::run(&call.arguments).await,
-            blob::NAME => blob::run(&call.arguments).await,
-            fetch::NAME => fetch::run(&call.arguments).await,
-            ask_user::NAME => ask_user::run(&call.arguments, sender).await,
-            configure_diagnostics::NAME => configure_diagnostics::run(&call.arguments).await,
-            diagnostics::NAME => diagnostics::run(&call.arguments).await,
-            todo::NAME => todo::run(&call.arguments).await,
-            task::NAME => task::run(&call.arguments).await,
-            other => Err(format!("error: unknown tool '{other}'")),
-        }
+        run_local_tool(&call.name, &call.arguments).await
     };
 
     let (text, failed) = match result {
@@ -232,6 +221,42 @@ pub(crate) async fn run_tool_call(
         failed,
         approval_label: None,
     }
+}
+
+/// Dispatch a local (non-MCP, non-`ask_user`) tool by name. Shared by the
+/// agent loop and the MCP server so both run tools the same way.
+pub(crate) async fn run_local_tool(name: &str, arguments: &str) -> Result<String, String> {
+    match name {
+        command::NAME => command::run(arguments).await,
+        read_file::NAME => read_file::run(arguments).await,
+        write_file::NAME => write_file::run(arguments).await,
+        edit_file::NAME => edit_file::run(arguments).await,
+        grep::NAME => grep::run(arguments).await,
+        blob::NAME => blob::run(arguments).await,
+        fetch::NAME => fetch::run(arguments).await,
+        configure_diagnostics::NAME => configure_diagnostics::run(arguments).await,
+        diagnostics::NAME => diagnostics::run(arguments).await,
+        todo::NAME => todo::run(arguments).await,
+        task::NAME => task::run(arguments).await,
+        other => Err(format!("error: unknown tool '{other}'")),
+    }
+}
+
+/// The local tools exposed when running as an MCP server (`--mcp-server`).
+/// Excludes `ask_user` (needs the interactive UI) and MCP passthrough tools.
+pub(crate) fn mcp_server_tools() -> Vec<Tool> {
+    vec![
+        command::tool(),
+        read_file::tool(),
+        write_file::tool(),
+        edit_file::tool(),
+        grep::tool(),
+        blob::tool(),
+        fetch::tool(),
+        diagnostics::tool(),
+        todo::tool(),
+        task::tool(),
+    ]
 }
 
 /// Truncates `output` to at most [`MAX_OUTPUT_LENGTH`] characters. When the

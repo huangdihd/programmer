@@ -20,6 +20,7 @@
 
 pub mod client;
 pub mod http_client;
+pub mod server;
 pub mod types;
 
 use client::McpClient;

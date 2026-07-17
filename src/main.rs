@@ -45,6 +45,7 @@ struct Args {
     help: bool,
     session: bool,
     providers: bool,
+    mcp_server: bool,
 }
 
 const HELP_TEXT: &str = "\
@@ -57,6 +58,8 @@ Options:
                     session management panel to pick one
   --session         Open the session management panel
   --providers       Open the provider management panel on startup
+  --mcp-server      Run as an MCP server on stdio, exposing programmer's local
+                    tools to any MCP client (no TUI)
   -h, --help        Show this help and exit";
 
 fn parse_args() -> Args {
@@ -66,6 +69,7 @@ fn parse_args() -> Args {
         help: false,
         session: false,
         providers: false,
+        mcp_server: false,
     };
     let mut i = 1;
     while i < args.len() {
@@ -80,6 +84,7 @@ fn parse_args() -> Args {
             }
             "--session" => parsed.session = true,
             "--providers" => parsed.providers = true,
+            "--mcp-server" | "--serve-mcp" => parsed.mcp_server = true,
             "-h" | "--help" => parsed.help = true,
             _ => {}
         }
@@ -212,6 +217,12 @@ async fn main() -> color_eyre::Result<()> {
 
     if args.help {
         println!("{HELP_TEXT}");
+        return Ok(());
+    }
+
+    // MCP server mode: no TUI, stdout is reserved for the JSON-RPC protocol.
+    if args.mcp_server {
+        mcp::server::run_stdio_server().await?;
         return Ok(());
     }
 

@@ -257,6 +257,30 @@ Open with `/providers manage` or the `--providers` flag.
 | `Enter` | Save provider |
 | `Esc` | Cancel |
 
+### As an MCP server
+
+`programmer` can also run as an [MCP](https://modelcontextprotocol.io) server,
+exposing its own local tools (`command`, `read_file`, `write_file`,
+`edit_file`, `grep`, `blob`, `fetch`, `diagnostics`, `todo`, `task`) to any MCP
+client — another agent, Claude Desktop, etc. It speaks JSON-RPC 2.0 over stdio;
+`ask_user` is not exposed (it needs the interactive UI).
+
+```sh
+programmer --mcp-server
+```
+
+Register it with a client by pointing at the binary, e.g.:
+
+```json
+{
+  "mcpServers": {
+    "programmer": { "command": "programmer", "args": ["--mcp-server"] }
+  }
+}
+```
+
+The tools run in the server process's working directory.
+
 ### Session management
 
 Sessions are saved to `~/.config/programmer/sessions/<uuid>.json`.

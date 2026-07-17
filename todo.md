@@ -7,7 +7,7 @@
 - ~~interactive background task terminal~~
 - installation script(publish to cargo?)
 - git cooperator signature
-- expose local tools as a MCP server
+- ~~expose local tools as a MCP server~~
 - ~~@ to quote file~~
 - ! to run a command interactively in the app(?)
 - ~~multi-provider support~~
