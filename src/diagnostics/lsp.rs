@@ -676,6 +676,7 @@ mod tests {
             parser: "gnu".into(),
             pattern: None,
             run_on: vec!["*.c".into()],
+            lint: false,
         }
     }
 

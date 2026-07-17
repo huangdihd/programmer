@@ -71,6 +71,12 @@ pub struct Checker {
     /// edit". Consumed by the auto-run loop in a later phase.
     #[serde(default)]
     pub run_on: Vec<String>,
+    /// When true this checker is a linter (clippy/eslint/ruff/…): its findings
+    /// are shown as the lower-ranked [`crate::diagnostics::Severity::Lint`]
+    /// tier (JetBrains-style weak warnings) instead of compiler warnings, so
+    /// they sit alongside — but visibly below — real errors and warnings.
+    #[serde(default)]
+    pub lint: bool,
 }
 
 impl DiagnosticsProfile {
@@ -287,6 +293,7 @@ mod tests {
                 parser: "rustc-json".into(),
                 pattern: None,
                 run_on: vec!["*.rs".into()],
+            lint: false,
             }],
         };
         let text = profile.to_toml().unwrap();
@@ -302,6 +309,7 @@ mod tests {
             parser: "gnu".into(),
             pattern: None,
             run_on: vec!["*.rs".into(), "src/**/*.ts".into()],
+            lint: false,
         };
         assert!(c.applies_to("src/main.rs"));
         assert!(c.applies_to("main.rs"));
@@ -319,6 +327,7 @@ mod tests {
             parser: "gnu".into(),
             pattern: None,
             run_on: vec![],
+            lint: false,
         };
         assert!(c.applies_to("anything.xyz"));
     }

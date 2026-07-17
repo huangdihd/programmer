@@ -45,6 +45,10 @@ use std::path::Path;
 pub enum Severity {
     Error,
     Warning,
+    /// A linter finding (clippy/eslint/…), ranked below a compiler warning —
+    /// the equivalent of a JetBrains "weak warning". Only produced by checkers
+    /// marked `lint = true`; see [`crate::diagnostics::profile::Checker`].
+    Lint,
     Info,
 }
 
@@ -65,7 +69,18 @@ impl Severity {
         match self {
             Severity::Error => "error",
             Severity::Warning => "warning",
+            Severity::Lint => "lint",
             Severity::Info => "info",
+        }
+    }
+
+    /// Downgrade a parsed severity to the lint tier for a `lint = true` checker:
+    /// warnings/notes become lints, but genuine errors (e.g. `#[deny]` clippy
+    /// lints) stay errors.
+    pub fn as_lint(self) -> Severity {
+        match self {
+            Severity::Error => Severity::Error,
+            _ => Severity::Lint,
         }
     }
 }
@@ -284,6 +299,21 @@ mod tests {
         assert_eq!(Severity::parse("warn"), Severity::Warning);
         assert_eq!(Severity::parse("note"), Severity::Info);
         assert_eq!(Severity::parse("whatever"), Severity::Info);
+    }
+
+    #[test]
+    fn lint_downgrade_keeps_errors() {
+        // A lint checker's warnings/notes become lints; errors stay errors.
+        assert_eq!(Severity::Warning.as_lint(), Severity::Lint);
+        assert_eq!(Severity::Info.as_lint(), Severity::Lint);
+        assert_eq!(Severity::Error.as_lint(), Severity::Error);
+    }
+
+    #[test]
+    fn lint_ranks_below_warning_above_info() {
+        // Ord drives sort order (most-severe first): Error < Warning < Lint < Info.
+        assert!(Severity::Warning < Severity::Lint);
+        assert!(Severity::Lint < Severity::Info);
     }
 
     #[test]

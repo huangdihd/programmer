@@ -2,7 +2,7 @@
 - ~~Jump to bottom button~~
 - ~~http mcp~~
 - ~~edit_file tool diff-style message~~
-- lint
+- ~~lint~~
 - remote control(?)
 - ~~fix /init~~
 - ~~interactive background task terminal~~

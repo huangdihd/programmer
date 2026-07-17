@@ -251,12 +251,16 @@ impl Sidebar {
                 if !lsp_configured && diagnostics.is_empty() {
                     "Diagnostics".to_string()
                 } else {
-                    let errs = diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-                    let warns = diagnostics
-                        .iter()
-                        .filter(|d| d.severity == Severity::Warning)
-                        .count();
-                    format!("Diagnostics ({errs} err, {warns} warn)")
+                    let count = |s| diagnostics.iter().filter(|d| d.severity == s).count();
+                    let errs = count(Severity::Error);
+                    let warns = count(Severity::Warning);
+                    let lints = count(Severity::Lint);
+                    let mut title = format!("Diagnostics ({errs} err, {warns} warn");
+                    if lints > 0 {
+                        title.push_str(&format!(", {lints} lint"));
+                    }
+                    title.push(')');
+                    title
                 }
             }
             SidebarSection::Mcp => {
@@ -346,6 +350,7 @@ impl Sidebar {
             let (severity_icon, severity_color) = match d.severity {
                 Severity::Error => ("E", Color::Red),
                 Severity::Warning => ("W", Color::Yellow),
+                Severity::Lint => ("L", Color::DarkGray),
                 Severity::Info => ("I", Color::Blue),
             };
 

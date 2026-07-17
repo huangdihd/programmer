@@ -32,7 +32,7 @@ use super::{parse_output, Checker, CheckerKind, Diagnostic};
 /// non-empty list.
 pub async fn run_checker(checker: &Checker, cwd: &Path) -> Result<Vec<Diagnostic>, String> {
     if checker.kind == CheckerKind::Lsp {
-        return super::lsp::collect_lsp(checker, cwd).await;
+        return Ok(apply_lint(checker, super::lsp::collect_lsp(checker, cwd).await?));
     }
 
     // Resolve the parser before spawning so a broken profile fails fast without
@@ -72,7 +72,17 @@ pub async fn run_checker(checker: &Checker, cwd: &Path) -> Result<Vec<Diagnostic
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
     }
 
-    Ok(parse_output(&parser, &combined))
+    Ok(apply_lint(checker, parse_output(&parser, &combined)))
+}
+
+/// Downgrade a lint checker's non-error findings to the [`Severity::Lint`] tier.
+fn apply_lint(checker: &Checker, mut diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    if checker.lint {
+        for diag in &mut diags {
+            diag.severity = diag.severity.as_lint();
+        }
+    }
+    diags
 }
 
 #[cfg(all(test, unix))]
@@ -88,6 +98,7 @@ mod tests {
             parser: parser.into(),
             pattern: None,
             run_on: vec![],
+            lint: false,
         }
     }
 

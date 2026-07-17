@@ -216,6 +216,7 @@ mod tests {
             providers,
             classifier_model: None,
             allow_yolo: false,
+            git_coauthor: None,
             mcp_servers: Vec::new(),
             model: None,
             base_url: None,

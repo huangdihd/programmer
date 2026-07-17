@@ -128,6 +128,13 @@ pub(crate) fn init_prompt() -> String {
      can't find a suitable checker, note that in PROGRAMMER.md and skip this \
      step.\n\
      \n\
+     4. If the project has a linter distinct from its compiler (Rust → \
+     `cargo clippy --message-format=json`; JS/TS → eslint; Python → ruff; Go → \
+     golangci-lint; etc.), add it as an additional checker with `lint = true`. \
+     Its findings then show as a lower \"lint\" tier alongside — but below — real \
+     errors and warnings, IDE-style. Pick whatever the project actually uses; \
+     skip if there's no separate linter.\n\
+     \n\
      When done, briefly summarize what you set up."
         .to_string()
 }

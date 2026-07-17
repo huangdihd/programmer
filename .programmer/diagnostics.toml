@@ -4,3 +4,11 @@ kind = "command"
 command = "cargo check --message-format=json"
 parser = "rustc-json"
 run_on = ["*.rs"]
+
+[[checkers]]
+name = "clippy"
+kind = "command"
+command = "cargo clippy --message-format=json"
+parser = "rustc-json"
+run_on = ["*.rs"]
+lint = true

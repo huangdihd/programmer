@@ -47,7 +47,9 @@ pub fn tool() -> Tool {
          presets `rustc-json`, `tsc`, `gnu`, or the literal `regex`); optional \
          `pattern` (required when parser is `regex`; a regex with named groups \
          `file`, `line`, `col`, `severity`, `code`, `message`); and optional \
-         `run_on` (file globs whose edits trigger this checker; empty = always).\n\n\
+         `run_on` (file globs whose edits trigger this checker; empty = always); \
+         and optional `lint = true` to mark a linter (clippy/eslint/ruff/…) so \
+         its findings show as a lower \"lint\" tier below real errors/warnings.\n\n\
          For `kind = \"command\"` (default): `command` is a one-shot shell \
          command — NOT a watch/dev-server — and `parser` handles its output. \
          For `kind = \"lsp\"`: `command` launches a language server over stdio \
