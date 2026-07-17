@@ -135,7 +135,32 @@ impl Sidebar {
         let mut lines: Vec<Line> = Vec::new();
         let mut targets: Vec<ClickTarget> = Vec::new();
 
-        for (idx, section) in self.sections.iter().enumerate() {
+        let mut rendered_any = false;
+        for section in self.sections.iter() {
+            // Skip sections with nothing to show (e.g. no todos, no tasks, no
+            // MCP servers, no diagnostics configured) so the sidebar only lists
+            // what's actually present.
+            if !self.section_has_content(
+                section.key,
+                diagnostics,
+                lsp_configured,
+                mcp_manager,
+                todo_list,
+                tasks,
+            ) {
+                continue;
+            }
+
+            // Separator before every visible section except the first.
+            if rendered_any {
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(width as usize),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                targets.push(ClickTarget::None);
+            }
+            rendered_any = true;
+
             // Title line.
             let title = self.section_title(section, diagnostics, lsp_configured, mcp_manager, todo_list, tasks);
             let title_line = self.make_title_line(&title, section.key, section.collapsed);
@@ -164,18 +189,39 @@ impl Sidebar {
                     }
                 }
             }
+        }
 
-            // Separator between sections (not after the last one).
-            if idx + 1 < self.sections.len() {
-                lines.push(Line::from(Span::styled(
-                    "─".repeat(width as usize),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                targets.push(ClickTarget::None);
-            }
+        if !rendered_any {
+            lines.push(Line::from(Span::styled(
+                "  nothing to show yet",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+            targets.push(ClickTarget::None);
         }
 
         (lines, targets)
+    }
+
+    /// Whether a section has anything worth showing. Empty sections are hidden
+    /// entirely (title included) to keep the sidebar uncluttered.
+    fn section_has_content(
+        &self,
+        key: SidebarSection,
+        diagnostics: &[Diagnostic],
+        lsp_configured: bool,
+        mcp_manager: Option<&McpManager>,
+        todo_list: &TodoList,
+        tasks: &[TaskSnapshot],
+    ) -> bool {
+        match key {
+            // Show when diagnostics exist or a live LSP is configured.
+            SidebarSection::Diagnostics => lsp_configured || !diagnostics.is_empty(),
+            SidebarSection::Mcp => mcp_manager.map(|m| m.server_count() > 0).unwrap_or(false),
+            SidebarSection::Todos => !todo_list.todos.is_empty(),
+            SidebarSection::Tasks => !tasks.is_empty(),
+        }
     }
 
     // -- section title helpers --
