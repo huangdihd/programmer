@@ -31,6 +31,10 @@ ratatui-markdown = { git = "https://github.com/huangdihd/ratatui-markdown", vers
 which = "8.0.5"
 html2text = "0.17.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+# Interactive PTY tasks: portable-pty (WezTerm) spawns children in a real
+# pseudo-terminal cross-platform; vt100 parses their output into a screen grid.
+portable-pty = "0.9"
+vt100 = "0.15"
 
 # Dependencies (dozens of tree-sitter grammars, aws-lc-sys, …) carry enough
 # debug info to blow past the MSVC PDB size limit (LNK1140). Strip debuginfo

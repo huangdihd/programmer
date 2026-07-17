@@ -22,9 +22,15 @@
 //! receive their JSON arguments — there is no `App` handle in the tool path.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+/// Scrollback lines vt100 retains behind the visible screen.
+const PTY_SCROLLBACK: usize = 1000;
 
 /// Cap on the output buffer kept per task. When exceeded, the oldest half is
 /// dropped so the tail (usually the interesting part) is always available.
@@ -58,6 +64,25 @@ impl TaskStatus {
     }
 }
 
+/// Interactive-task state: a child running in a real PTY, its output parsed
+/// into a vt100 screen grid. Present only for tasks created interactively;
+/// pipe-based tasks leave this `None` and use `kill`/`stdin_tx` instead.
+struct PtyState {
+    /// Writes bytes (keystrokes, mouse sequences) to the child.
+    writer: Box<dyn Write + Send>,
+    /// The screen grid, fed by a background reader thread.
+    parser: Arc<Mutex<vt100::Parser>>,
+    /// Kept for `resize`.
+    master: Box<dyn MasterPty + Send>,
+    /// Terminates the child (the waiter thread records the exit).
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Set by [`kill`] so the waiter records `Killed` instead of the signal
+    /// exit `Failed`.
+    killed: Arc<AtomicBool>,
+    rows: u16,
+    cols: u16,
+}
+
 /// One background task's bookkeeping entry.
 struct TaskEntry {
     id: u64,
@@ -68,13 +93,31 @@ struct TaskEntry {
     exit_code: Option<i32>,
     started: Instant,
     finished: Option<Instant>,
-    /// Combined stdout+stderr, capped at [`MAX_TASK_OUTPUT`].
+    /// Combined stdout+stderr, capped at [`MAX_TASK_OUTPUT`]. Empty for
+    /// interactive tasks, whose output lives in the vt100 screen instead.
     output: String,
     /// Signals the reader task to kill the child. `None` once finished.
     kill: Option<tokio::sync::oneshot::Sender<()>>,
     /// Feeds chunks to the child's stdin via the writer task. Dropping it
     /// (the `eof` action, or task finish) closes the pipe, delivering EOF.
     stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Interactive PTY state; `None` for pipe-based tasks.
+    pty: Option<PtyState>,
+}
+
+/// A read-only view of an interactive task's screen, for the agent and the UI.
+#[derive(Debug, Clone)]
+pub struct ScreenSnapshot {
+    /// The visible screen as plain text (no colors/attributes).
+    pub text: String,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    /// The child is on its alternate screen (full-screen TUI like vim/htop).
+    pub alt: bool,
+    /// The child has enabled mouse reporting, so mouse events can be forwarded.
+    pub mouse: bool,
+    pub rows: u16,
+    pub cols: u16,
 }
 
 /// Read-only copy of a task's state for rendering and tool output.
@@ -109,7 +152,20 @@ fn snapshot_entry(e: &TaskEntry) -> TaskSnapshot {
             .finished
             .map(|f| f - e.started)
             .unwrap_or_else(|| e.started.elapsed()),
-        output: e.output.clone(),
+        output: entry_output(e),
+    }
+}
+
+/// The task's output text: the captured pipe buffer, or — for interactive
+/// tasks — the current vt100 screen contents.
+fn entry_output(e: &TaskEntry) -> String {
+    match &e.pty {
+        Some(pty) => pty
+            .parser
+            .lock()
+            .map(|p| p.screen().contents())
+            .unwrap_or_default(),
+        None => e.output.clone(),
     }
 }
 
@@ -195,6 +251,7 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
             output: String::new(),
             kill: Some(kill_tx),
             stdin_tx: Some(stdin_tx),
+            pty: None,
         });
     }
 
@@ -232,6 +289,256 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
     });
 
     Ok(id)
+}
+
+/// Spawn `command` in a real PTY as an interactive background task. Its output
+/// is parsed into a vt100 screen grid (readable via [`screen_snapshot`]) and it
+/// is driven with byte input via [`write_bytes`] rather than line-based stdin.
+pub fn spawn_interactive(
+    command: &str,
+    dir: Option<&str>,
+    name: Option<&str>,
+    rows: u16,
+    cols: u16,
+) -> Result<u64, String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("error: failed to open pty: {e}"))?;
+
+    // Run the command through the host shell, matching the `command`/`task`
+    // tools so shell syntax works.
+    let (program, flag) = crate::tools::shell();
+    let mut cmd = CommandBuilder::new(program);
+    cmd.arg(flag);
+    cmd.arg(command);
+    if let Some(dir) = dir {
+        cmd.cwd(dir);
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("error: failed to spawn task: {e}"))?;
+    // The parent doesn't need the slave once the child owns it.
+    drop(pair.slave);
+
+    let killer = child.clone_killer();
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("error: failed to read pty: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("error: failed to write pty: {e}"))?;
+    let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, PTY_SCROLLBACK)));
+    let killed = Arc::new(AtomicBool::new(false));
+
+    let id = next_id();
+
+    // Reader thread: pump PTY output into the vt100 parser until EOF. Blocking
+    // reads keep this off the async runtime.
+    {
+        let parser = Arc::clone(&parser);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut p) = parser.lock() {
+                            p.process(&buf[..n]);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Waiter thread: record the exit status when the child finishes.
+    {
+        let killed = Arc::clone(&killed);
+        std::thread::spawn(move || {
+            let (status, code) = match child.wait() {
+                _ if killed.load(Ordering::Relaxed) => (TaskStatus::Killed, None),
+                Ok(exit) => {
+                    let code = exit.exit_code() as i32;
+                    if exit.success() {
+                        (TaskStatus::Completed, Some(code))
+                    } else {
+                        (TaskStatus::Failed, Some(code))
+                    }
+                }
+                Err(_) => (TaskStatus::Failed, None),
+            };
+            finish(id, status, code);
+        });
+    }
+
+    {
+        let mut reg = registry().lock().unwrap();
+        reg.push(TaskEntry {
+            id,
+            name: name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or(command)
+                .to_string(),
+            command: command.to_string(),
+            status: TaskStatus::Running,
+            exit_code: None,
+            started: Instant::now(),
+            finished: None,
+            output: String::new(),
+            kill: None,
+            stdin_tx: None,
+            pty: Some(PtyState {
+                writer,
+                parser,
+                master: pair.master,
+                killer,
+                killed,
+                rows,
+                cols,
+            }),
+        });
+    }
+
+    Ok(id)
+}
+
+/// Whether a task is interactive (runs in a PTY).
+pub fn is_interactive(id: u64) -> bool {
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.id == id)
+        .map(|e| e.pty.is_some())
+        .unwrap_or(false)
+}
+
+/// Write raw bytes (keystrokes, mouse sequences) to an interactive task's PTY.
+pub fn write_bytes(id: u64, bytes: &[u8]) -> Result<(), String> {
+    let mut reg = registry().lock().unwrap();
+    let entry = reg
+        .iter_mut()
+        .find(|e| e.id == id)
+        .ok_or_else(|| format!("error: no task with id {id}"))?;
+    let status = entry.status;
+    let Some(pty) = entry.pty.as_mut() else {
+        return Err(format!(
+            "error: task {id} is not interactive; use write/eof for stdin"
+        ));
+    };
+    if status != TaskStatus::Running {
+        return Err(format!("error: task {id} already finished ({})", status.label()));
+    }
+    pty.writer
+        .write_all(bytes)
+        .and_then(|()| pty.writer.flush())
+        .map_err(|e| format!("error: failed to send input to task {id}: {e}"))
+}
+
+/// Snapshot an interactive task's current screen.
+pub fn screen_snapshot(id: u64) -> Result<ScreenSnapshot, String> {
+    let reg = registry().lock().unwrap();
+    let entry = reg
+        .iter()
+        .find(|e| e.id == id)
+        .ok_or_else(|| format!("error: no task with id {id}"))?;
+    let pty = entry
+        .pty
+        .as_ref()
+        .ok_or_else(|| format!("error: task {id} is not interactive"))?;
+    let parser = pty.parser.lock().unwrap();
+    let screen = parser.screen();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    Ok(ScreenSnapshot {
+        text: screen.contents(),
+        cursor_row,
+        cursor_col,
+        alt: screen.alternate_screen(),
+        mouse: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+        rows: pty.rows,
+        cols: pty.cols,
+    })
+}
+
+/// Resize an interactive task's PTY and screen grid.
+pub fn resize(id: u64, rows: u16, cols: u16) -> Result<(), String> {
+    let mut reg = registry().lock().unwrap();
+    let entry = reg
+        .iter_mut()
+        .find(|e| e.id == id)
+        .ok_or_else(|| format!("error: no task with id {id}"))?;
+    let pty = entry
+        .pty
+        .as_mut()
+        .ok_or_else(|| format!("error: task {id} is not interactive"))?;
+    pty.master
+        .resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("error: failed to resize task {id}: {e}"))?;
+    pty.parser.lock().unwrap().set_size(rows, cols);
+    pty.rows = rows;
+    pty.cols = cols;
+    Ok(())
+}
+
+/// Translate a named key into the bytes a terminal sends for it. Returns `None`
+/// for unknown names. Shared by the `task keys` action and (later) the UI's
+/// keyboard forwarding. `ctrl-<letter>` / `c-<letter>` map to control bytes.
+pub fn key_to_bytes(name: &str) -> Option<Vec<u8>> {
+    let n = name.trim().to_ascii_lowercase();
+    let bytes: Vec<u8> = match n.as_str() {
+        "enter" | "return" => vec![b'\r'],
+        "tab" => vec![b'\t'],
+        "escape" | "esc" => vec![0x1b],
+        "backspace" | "bs" => vec![0x7f],
+        "space" => vec![b' '],
+        "up" => vec![0x1b, b'[', b'A'],
+        "down" => vec![0x1b, b'[', b'B'],
+        "right" => vec![0x1b, b'[', b'C'],
+        "left" => vec![0x1b, b'[', b'D'],
+        "home" => vec![0x1b, b'[', b'H'],
+        "end" => vec![0x1b, b'[', b'F'],
+        "pageup" | "pgup" => vec![0x1b, b'[', b'5', b'~'],
+        "pagedown" | "pgdn" => vec![0x1b, b'[', b'6', b'~'],
+        "delete" | "del" => vec![0x1b, b'[', b'3', b'~'],
+        "insert" | "ins" => vec![0x1b, b'[', b'2', b'~'],
+        "f1" => vec![0x1b, b'O', b'P'],
+        "f2" => vec![0x1b, b'O', b'Q'],
+        "f3" => vec![0x1b, b'O', b'R'],
+        "f4" => vec![0x1b, b'O', b'S'],
+        "f5" => vec![0x1b, b'[', b'1', b'5', b'~'],
+        "f6" => vec![0x1b, b'[', b'1', b'7', b'~'],
+        "f7" => vec![0x1b, b'[', b'1', b'8', b'~'],
+        "f8" => vec![0x1b, b'[', b'1', b'9', b'~'],
+        "f9" => vec![0x1b, b'[', b'2', b'0', b'~'],
+        "f10" => vec![0x1b, b'[', b'2', b'1', b'~'],
+        "f11" => vec![0x1b, b'[', b'2', b'3', b'~'],
+        "f12" => vec![0x1b, b'[', b'2', b'4', b'~'],
+        _ => {
+            let rest = n.strip_prefix("ctrl-").or_else(|| n.strip_prefix("c-"))?;
+            let [ch] = rest.as_bytes() else { return None };
+            if !ch.is_ascii_alphabetic() {
+                return None;
+            }
+            // Ctrl+A..Ctrl+Z → 0x01..0x1a.
+            vec![ch.to_ascii_lowercase() - b'a' + 1]
+        }
+    };
+    Some(bytes)
 }
 
 /// Read a child pipe to EOF, appending chunks to the task's output buffer.
@@ -289,6 +596,22 @@ pub fn kill(id: u64) -> Result<(), String> {
         .iter_mut()
         .find(|e| e.id == id)
         .ok_or_else(|| format!("error: no task with id {id}"))?;
+    // Interactive tasks are killed through the PTY child killer; the waiter
+    // thread records the exit.
+    let status = entry.status;
+    if let Some(pty) = entry.pty.as_mut() {
+        if status != TaskStatus::Running {
+            return Err(format!(
+                "error: task {id} already finished ({})",
+                status.label()
+            ));
+        }
+        pty.killed.store(true, Ordering::Relaxed);
+        return pty
+            .killer
+            .kill()
+            .map_err(|e| format!("error: failed to kill task {id}: {e}"));
+    }
     match entry.kill.take() {
         Some(tx) => {
             let _ = tx.send(());
@@ -340,11 +663,12 @@ pub fn persist_all() -> Vec<PersistedTask> {
     let reg = registry().lock().unwrap();
     reg.iter()
         .map(|e| {
-            let output = if e.output.chars().count() > MAX_PERSISTED_OUTPUT {
-                let skip = e.output.chars().count() - MAX_PERSISTED_OUTPUT;
-                e.output.chars().skip(skip).collect()
+            let full = entry_output(e);
+            let output = if full.chars().count() > MAX_PERSISTED_OUTPUT {
+                let skip = full.chars().count() - MAX_PERSISTED_OUTPUT;
+                full.chars().skip(skip).collect()
             } else {
-                e.output.clone()
+                full
             };
             PersistedTask {
                 id: e.id,
@@ -394,6 +718,7 @@ pub fn restore(saved: &[PersistedTask]) {
             output: t.output.clone(),
             kill: None,
             stdin_tx: None,
+            pty: None,
         });
     }
     let max_id = reg.iter().map(|e| e.id).max().unwrap_or(0);
@@ -532,6 +857,48 @@ mod tests {
         // Writes after finish are rejected.
         let err = write_stdin(id, "late\n", false).expect_err("finished task");
         assert!(err.contains("finished"), "got: {err}");
+    }
+
+    #[test]
+    fn key_to_bytes_maps_named_and_ctrl_keys() {
+        assert_eq!(key_to_bytes("enter"), Some(vec![b'\r']));
+        assert_eq!(key_to_bytes("Up"), Some(vec![0x1b, b'[', b'A']));
+        assert_eq!(key_to_bytes("ctrl-c"), Some(vec![0x03]));
+        assert_eq!(key_to_bytes("c-u"), Some(vec![0x15]));
+        assert_eq!(key_to_bytes("f1"), Some(vec![0x1b, b'O', b'P']));
+        assert!(key_to_bytes("nonsense").is_none());
+        assert!(key_to_bytes("ctrl-1").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_pty_takes_input_and_reads_screen() {
+        // `cat` echoes what we type; drive it through the PTY and read it back.
+        let id = spawn_interactive("cat", None, Some("cat"), 24, 80).expect("spawn");
+        assert!(is_interactive(id));
+        write_bytes(id, b"pty-echo-123\r").expect("write bytes");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let snap = screen_snapshot(id).expect("screen");
+        assert!(snap.text.contains("pty-echo-123"), "screen: {}", snap.text);
+        assert!(!snap.alt, "cat should not use the alternate screen");
+
+        // Pipe-only helpers reject interactive tasks.
+        assert!(write_stdin(id, "x\n", false).is_err());
+
+        kill(id).expect("kill running interactive task");
+        let (snap, still) = wait(id, Duration::from_secs(10)).await.expect("wait");
+        assert!(!still);
+        assert_eq!(snap.status, TaskStatus::Killed);
+    }
+
+    #[tokio::test]
+    async fn non_interactive_task_rejects_pty_ops() {
+        // A pipe task (id that isn't interactive) has no PTY surface.
+        let id = spawn("echo hi", None, None).expect("spawn");
+        assert!(!is_interactive(id));
+        assert!(write_bytes(id, b"x").is_err());
+        assert!(screen_snapshot(id).is_err());
     }
 
     #[tokio::test]

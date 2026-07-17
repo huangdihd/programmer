@@ -47,13 +47,39 @@ pub fn tool() -> Tool {
          `kill` (terminate a running task). \
          Tasks start with stdin open, so a command that reads input will wait \
          for `write`/eof rather than seeing an empty stream. \
+         Set `interactive: true` on create to run the command in a real \
+         terminal (PTY) instead — required for full-screen/interactive programs \
+         (vim, htop, REPLs, menus). Drive an interactive task with `keys` (type \
+         text and/or send named keys) and read what it displays with `screen`; \
+         `write`/`output` are for pipe tasks only. \
          Prefer the `command` tool for anything that finishes quickly — use \
          background tasks only when the command should outlive the current step.",
         json!({
             "action": {
                 "type": "string",
                 "description": "The action to perform.",
-                "enum": ["create", "list", "output", "write", "wait", "kill"]
+                "enum": ["create", "list", "output", "write", "wait", "kill", "screen", "keys", "resize"]
+            },
+            "interactive": {
+                "type": "boolean",
+                "description": "create only: run the command in a PTY so interactive/full-screen programs work. Drive it with the keys/screen actions."
+            },
+            "rows": {
+                "type": "integer",
+                "description": "Terminal height in rows for an interactive task (create/resize; default 24)."
+            },
+            "cols": {
+                "type": "integer",
+                "description": "Terminal width in columns for an interactive task (create/resize; default 80)."
+            },
+            "text": {
+                "type": "string",
+                "description": "keys only: literal text to type into an interactive task (no newline is added — send an `enter` key to submit)."
+            },
+            "keys": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "keys only: named keys to send in order, e.g. [\"enter\"], [\"ctrl-c\"], [\"up\",\"up\",\"enter\"]. Supports enter/tab/escape/backspace/space, arrows, home/end/pageup/pagedown, delete/insert, f1-f12, and ctrl-<letter>."
             },
             "command": {
                 "type": "string",
@@ -111,6 +137,16 @@ struct Args {
     timeout: Option<u64>,
     #[serde(default)]
     tail: Option<usize>,
+    #[serde(default)]
+    interactive: Option<bool>,
+    #[serde(default)]
+    rows: Option<u16>,
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    keys: Option<Vec<String>>,
 }
 
 /// Which task actions mutate state (start/stop processes or drive them). Used
@@ -123,7 +159,7 @@ pub fn action_is_mutating(arguments: &str) -> bool {
         action: String,
     }
     match serde_json::from_str::<ActionOnly>(arguments) {
-        Ok(a) => matches!(a.action.as_str(), "create" | "kill" | "write"),
+        Ok(a) => matches!(a.action.as_str(), "create" | "kill" | "write" | "keys"),
         // Unparseable arguments: assume the worst.
         Err(_) => true,
     }
@@ -141,6 +177,23 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                 Some(ref c) if !c.trim().is_empty() => c.clone(),
                 _ => return Err("error: 'command' is required for create".to_string()),
             };
+            if args.interactive.unwrap_or(false) {
+                let rows = args.rows.unwrap_or(24).clamp(4, 200);
+                let cols = args.cols.unwrap_or(80).clamp(20, 400);
+                let id = tasks::spawn_interactive(
+                    &command,
+                    args.dir.as_deref(),
+                    args.name.as_deref(),
+                    rows,
+                    cols,
+                )?;
+                return Ok(format!(
+                    "started interactive task {id}: {command}\n\
+                     It runs in a {cols}x{rows} terminal. Read what it shows with \
+                     action=screen id={id}, type into it with action=keys id={id} \
+                     (text and/or named keys), and stop it with action=kill id={id}."
+                ));
+            }
             let id = tasks::spawn(&command, args.dir.as_deref(), args.name.as_deref())?;
             Ok(format!(
                 "started background task {id}: {command}\n\
@@ -167,6 +220,11 @@ pub async fn run(arguments: &str) -> Result<String, String> {
 
         "write" => {
             let id = require_id(args.id, "write")?;
+            if tasks::is_interactive(id) {
+                return Err(format!(
+                    "error: task {id} is interactive — send input with action=keys, not write"
+                ));
+            }
             let eof = args.eof.unwrap_or(false);
             let mut input = args.input.unwrap_or_default();
             if input.is_empty() && !eof {
@@ -218,8 +276,70 @@ pub async fn run(arguments: &str) -> Result<String, String> {
             Ok(format!("kill signal sent to task {id}"))
         }
 
+        "screen" => {
+            let id = require_id(args.id, "screen")?;
+            let snap = tasks::screen_snapshot(id)?;
+            let mut header = format!(
+                "task {id} screen ({cols}x{rows}), cursor row={r} col={c}",
+                cols = snap.cols,
+                rows = snap.rows,
+                r = snap.cursor_row,
+                c = snap.cursor_col,
+            );
+            if snap.alt {
+                header.push_str(", alt-screen");
+            }
+            header.push_str(if snap.mouse {
+                ", mouse ON (mouse events can be forwarded)"
+            } else {
+                ", mouse off"
+            });
+            Ok(format!("{header}\n--- screen ---\n{}", snap.text))
+        }
+
+        "keys" => {
+            let id = require_id(args.id, "keys")?;
+            let mut bytes: Vec<u8> = Vec::new();
+            if let Some(text) = args.text.as_deref() {
+                bytes.extend_from_slice(text.as_bytes());
+            }
+            if let Some(keys) = args.keys.as_ref() {
+                for key in keys {
+                    match tasks::key_to_bytes(key) {
+                        Some(b) => bytes.extend_from_slice(&b),
+                        None => {
+                            return Err(format!(
+                                "error: unknown key '{key}' — use enter/tab/escape/backspace/\
+                                 space, arrows, home/end/pageup/pagedown, delete/insert, \
+                                 f1-f12, or ctrl-<letter>"
+                            ));
+                        }
+                    }
+                }
+            }
+            if bytes.is_empty() {
+                return Err(
+                    "error: 'text' and/or 'keys' is required for keys".to_string()
+                );
+            }
+            tasks::write_bytes(id, &bytes)?;
+            Ok(format!(
+                "sent input to task {id}\nRead its updated screen with action=screen id={id}."
+            ))
+        }
+
+        "resize" => {
+            let id = require_id(args.id, "resize")?;
+            let (Some(rows), Some(cols)) = (args.rows, args.cols) else {
+                return Err("error: 'rows' and 'cols' are required for resize".to_string());
+            };
+            tasks::resize(id, rows.clamp(4, 200), cols.clamp(20, 400))?;
+            Ok(format!("resized task {id} to {cols}x{rows}"))
+        }
+
         other => Err(format!(
-            "error: unknown action '{other}' — use create, list, output, write, wait, or kill"
+            "error: unknown action '{other}' — use create, list, output, write, wait, \
+             kill, screen, keys, or resize"
         )),
     }
 }
@@ -281,6 +401,48 @@ mod tests {
         assert!(!action_is_mutating(r#"{"action":"wait","id":1}"#));
         // Garbage arguments are treated as mutating.
         assert!(action_is_mutating("not json"));
+    }
+
+    #[test]
+    fn keys_action_is_mutating_screen_is_not() {
+        assert!(action_is_mutating(r#"{"action":"keys","id":1,"text":"x"}"#));
+        assert!(!action_is_mutating(r#"{"action":"screen","id":1}"#));
+        assert!(!action_is_mutating(r#"{"action":"resize","id":1,"rows":30,"cols":100}"#));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_create_keys_screen_round_trip() {
+        // `cat` echoes typed input; create it interactive, type, and read back.
+        let created = run(r#"{"action":"create","command":"cat","interactive":true}"#)
+            .await
+            .expect("create should succeed");
+        assert!(created.contains("interactive task"), "got: {created}");
+        let id: u64 = created
+            .split_whitespace()
+            .nth(3)
+            .and_then(|w| w.trim_end_matches(':').parse().ok())
+            .expect("id in create message");
+
+        // Pipe stdin is refused for interactive tasks.
+        let refused = run(&format!(r#"{{"action":"write","id":{id},"input":"x"}}"#))
+            .await
+            .expect_err("write should be refused");
+        assert!(refused.contains("interactive"), "got: {refused}");
+
+        run(&format!(
+            r#"{{"action":"keys","id":{id},"text":"marker-xyz","keys":["enter"]}}"#
+        ))
+        .await
+        .expect("keys should succeed");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let screen = run(&format!(r#"{{"action":"screen","id":{id}}}"#))
+            .await
+            .expect("screen should succeed");
+        assert!(screen.contains("marker-xyz"), "screen: {screen}");
+
+        let _ = run(&format!(r#"{{"action":"kill","id":{id}}}"#)).await;
     }
 
     #[tokio::test]
