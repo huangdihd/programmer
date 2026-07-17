@@ -220,8 +220,8 @@ fn one_line_summary(value: Option<&serde_json::Value>, raw: &str) -> (String, bo
 
 /// One row of a line diff.
 enum DiffOp {
-    /// Unchanged line, present in both sides at (old index, new index).
-    Equal(usize, usize),
+    /// Unchanged line, referenced by its old-side index.
+    Equal(usize),
     /// Line removed from the old side (old index).
     Delete(usize),
     /// Line added on the new side (new index).
@@ -252,7 +252,7 @@ fn diff_ops(old: &[&str], new: &[&str]) -> Vec<DiffOp> {
     let (mut i, mut j) = (0, 0);
     while i < n && j < m {
         if old[i] == new[j] {
-            ops.push(DiffOp::Equal(i, j));
+            ops.push(DiffOp::Equal(i));
             i += 1;
             j += 1;
         } else if dp[i + 1][j] >= dp[i][j + 1] {
@@ -302,7 +302,6 @@ fn diff_lines(old: &str, new: &str, base: usize) -> Vec<Line<'static>> {
         .collect();
 
     use ratatui::style::Color;
-    let gutter_style = Style::new().fg(palette::FAINT);
     let context = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
     let removed = Style::new()
         .fg(palette::RED)
@@ -311,38 +310,31 @@ fn diff_lines(old: &str, new: &str, base: usize) -> Vec<Line<'static>> {
         .fg(palette::GREEN)
         .bg(Color::Rgb(0x25, 0x33, 0x1d));
 
-    // Width of each line-number column, sized to the largest number shown.
+    // Width of the line-number column, sized to the largest number shown.
     let max_no = base + old_lines.len().max(new_lines.len());
     let num_w = max_no.to_string().len();
 
-    // Pad content (marker + text) to a common width so the colored backgrounds
-    // form even blocks regardless of line length.
-    let content_w = ops
+    // Each row is `<sign> <line-no>  <text>`: the -/+/space sign sits directly
+    // in front of the line number so the two read as one unit. Pad every row to
+    // a common width so the colored backgrounds form even blocks.
+    let text_w = ops
         .iter()
         .zip(&keep)
         .filter(|&(_, &k)| k)
         .map(|(op, _)| {
             let text = match *op {
-                DiffOp::Equal(i, _) => old_lines[i],
-                DiffOp::Delete(i) => old_lines[i],
+                DiffOp::Equal(i) | DiffOp::Delete(i) => old_lines[i],
                 DiffOp::Insert(j) => new_lines[j],
             };
-            UnicodeWidthStr::width(text) + 2 // + "- " / "+ " / "  "
+            UnicodeWidthStr::width(text)
         })
         .max()
         .unwrap_or(0);
-    let pad_to = |s: &str, w: usize| {
-        let extra = w.saturating_sub(UnicodeWidthStr::width(s));
+    let row_w = 2 + num_w + 2 + text_w; // "<sign> " + number + "  " + text
+    let row = |sign: char, n: usize, text: &str| {
+        let s = format!("{sign} {n:>num_w$}  {text}");
+        let extra = row_w.saturating_sub(UnicodeWidthStr::width(s.as_str()));
         format!("{s}{}", " ".repeat(extra))
-    };
-    // Single right-aligned line-number column so every number sits in the same
-    // vertical stripe; the -/+/space marker tells which side the line is from.
-    let gutter = |n: Option<usize>| {
-        let text = match n {
-            Some(n) => format!("  {n:>num_w$} "),
-            None => format!("  {} ", " ".repeat(num_w)),
-        };
-        Span::styled(text, gutter_style)
     };
 
     let mut lines = Vec::new();
@@ -355,26 +347,16 @@ fn diff_lines(old: &str, new: &str, base: usize) -> Vec<Line<'static>> {
         // Emit a single separator for any run of collapsed lines, but not
         // before the very first rendered row.
         if pending_gap && !lines.is_empty() {
-            lines.push(Line::from(vec![
-                gutter(None),
-                Span::styled("  \u{22EF}", context),
-            ]));
+            let blank = " ".repeat(num_w);
+            lines.push(Line::from(Span::styled(format!("    {blank}\u{22EF}"), context)));
         }
         pending_gap = false;
-        match *op {
-            DiffOp::Equal(i, _) => lines.push(Line::from(vec![
-                gutter(Some(base + i)),
-                Span::styled(pad_to(&format!("  {}", old_lines[i]), content_w), context),
-            ])),
-            DiffOp::Delete(i) => lines.push(Line::from(vec![
-                gutter(Some(base + i)),
-                Span::styled(pad_to(&format!("- {}", old_lines[i]), content_w), removed),
-            ])),
-            DiffOp::Insert(j) => lines.push(Line::from(vec![
-                gutter(Some(base + j)),
-                Span::styled(pad_to(&format!("+ {}", new_lines[j]), content_w), added),
-            ])),
-        }
+        let line = match *op {
+            DiffOp::Equal(i) => Span::styled(row(' ', base + i, old_lines[i]), context),
+            DiffOp::Delete(i) => Span::styled(row('-', base + i, old_lines[i]), removed),
+            DiffOp::Insert(j) => Span::styled(row('+', base + j, new_lines[j]), added),
+        };
+        lines.push(Line::from(line));
     }
     lines
 }
