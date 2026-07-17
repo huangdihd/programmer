@@ -716,11 +716,24 @@ impl ConversationPanel {
         }
     }
 
-    pub fn get_input_param(&self, current_model: &str, skill_prompt: Option<&str>, plan_prompt: Option<&str>) -> InputParam {
+    pub fn get_input_param(
+        &self,
+        current_model: &str,
+        skill_prompt: Option<&str>,
+        plan_prompt: Option<&str>,
+        coauthor: Option<&str>,
+    ) -> InputParam {
         let mut system_prompt = format!(
             "{SYSTEM_PROMPT}\n\nYou are running as model: {current_model}\n\n{}",
             crate::tools::environment_info()
         );
+        if let Some(coauthor) = coauthor.map(str::trim).filter(|c| !c.is_empty()) {
+            system_prompt.push_str(&format!(
+                "\n\nWhen you create a git commit, add this trailer as the last \
+                 line(s) of the commit message, after a blank line:\n\
+                 Co-Authored-By: {coauthor}"
+            ));
+        }
         if let Some(prompt) = skill_prompt {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(prompt);
@@ -908,7 +921,7 @@ mod tests {
         // An orphaned call with no recorded output (cancelled mid-run).
         panel.items.push(MessageItem::Output(call("call_2")));
 
-        let InputParam::Items(items) = panel.get_input_param("test/model", None, None) else {
+        let InputParam::Items(items) = panel.get_input_param("test/model", None, None, None) else {
             panic!("expected an item list");
         };
         // Every call must be answered (missing ones synthesized), with all
@@ -972,7 +985,7 @@ mod tests {
         panel.add_tool_output(output("call_1"));
         panel.add_tool_output(output("call_2"));
 
-        let InputParam::Items(items) = panel.get_input_param("test/model", None, None) else {
+        let InputParam::Items(items) = panel.get_input_param("test/model", None, None, None) else {
             panic!("expected an item list");
         };
         let order: Vec<String> = items

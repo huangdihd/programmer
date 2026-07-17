@@ -31,6 +31,13 @@ pub struct ProgrammerConfig {
     /// it can't be reached by the normal Ctrl+T cycle or a bare `/mode yolo`.
     #[serde(default)]
     pub allow_yolo: bool,
+    /// Co-author identity (`Name <email>`) the agent adds as a
+    /// `Co-Authored-By:` trailer to git commit messages it writes. For the
+    /// co-author to show a GitHub avatar, the email must belong to a GitHub
+    /// account — e.g. that account's `<id>+<username>@users.noreply.github.com`
+    /// no-reply address. Set to omit/null to disable the trailer.
+    #[serde(default = "default_git_coauthor", skip_serializing_if = "Option::is_none")]
+    pub git_coauthor: Option<String>,
     /// Configured MCP (Model Context Protocol) servers. Each entry is spawned
     /// as a child process at startup; its tools are bridged into the tool list
     /// as `mcp__<server>__<tool>`. Empty by default (no servers, no overhead).
@@ -59,6 +66,12 @@ pub struct ProviderConfig {
     pub default_model: Option<String>,
 }
 
+/// Default co-author trailer. It's a placeholder — replace the email with one
+/// tied to a GitHub account to get an avatar (see [`ProgrammerConfig::git_coauthor`]).
+fn default_git_coauthor() -> Option<String> {
+    Some("programmer <noreply@programmer.local>".to_string())
+}
+
 impl Default for ProgrammerConfig {
     fn default() -> Self {
         let mut providers = HashMap::new();
@@ -76,6 +89,7 @@ impl Default for ProgrammerConfig {
             providers,
             classifier_model: None,
             allow_yolo: false,
+            git_coauthor: default_git_coauthor(),
             mcp_servers: Vec::new(),
             model: None,
             base_url: None,

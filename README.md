@@ -96,6 +96,12 @@ classifier_model = "openai/gpt-4o-mini"
 # Gate YOLO mode behind this flag so it can't be entered by accident.
 allow_yolo = true
 
+# Co-author trailer added to git commits the agent writes. For the co-author to
+# show a GitHub avatar, use an email tied to a GitHub account — e.g. a machine
+# user's or a GitHub App bot's `<id>+<name>@users.noreply.github.com`. Set to
+# "" to disable. (GitHub organizations can't be commit co-authors.)
+git_coauthor = "programmer <noreply@programmer.local>"
+
 [providers.openai]
 base_url = "https://api.openai.com/v1"
 api_key = "sk-your-key-here"
@@ -112,6 +118,7 @@ api_key = "sk-your-key-here"
 | `default_provider` | `"openai"` | Active provider at startup. |
 | `classifier_model` | (chat model) | `provider/model` for the Auto-mode classifier. Must be a **non-reasoning** model (see [Auto mode](#work-modes)). |
 | `allow_yolo` | `false` | Whether `/mode yolo` and `Ctrl+T` can reach YOLO mode. |
+| `git_coauthor` | `programmer <noreply@programmer.local>` | `Co-Authored-By:` trailer added to the agent's git commits. Use a GitHub-linked email for an avatar; `""` disables. |
 
 Each provider is a `[providers.<name>]` section. You can add as many as you want.
 

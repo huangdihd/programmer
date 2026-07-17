@@ -65,6 +65,7 @@ pub(crate) fn spawn_stream(app: &mut App<'_>) {
         &app.current_model,
         app.skill_registry.combined_prompt().as_deref(),
         plan_system_prompt(app),
+        app.config.git_coauthor.as_deref(),
     );
     let mcp = app.mcp_manager.clone();
     tokio::spawn(async move {
