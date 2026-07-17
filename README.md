@@ -270,13 +270,15 @@ programmer --mcp-server
 ```
 
 Tool calls are gated by the same classifier as the TUI, via `--mcp-mode`.
-Since there's no UI to approve, an "ask" verdict becomes a denial:
+Read-only tools always run; dangerous ones (`command`, `write_file`,
+`edit_file`, mutating `task` actions, …) are gated:
 
-| `--mcp-mode` | Behavior |
+| `--mcp-mode` | Behavior for dangerous tools |
 |---|---|
-| `auto` (default) / `manual` | Read-only tools run; dangerous tools (`command`, `write_file`, `edit_file`, mutating `task` actions, …) are refused |
-| `plan` | Read-only tools run; state-mutating tools are refused |
-| `yolo` | All tools run without gating |
+| `auto` (default) | The **LLM classifier** decides (needs a configured `classifier_model`/default model); runs only if it approves |
+| `manual` | The **human** confirms via MCP [elicitation](https://modelcontextprotocol.io) — the server prompts the client, which asks its user; clients without elicitation support get a refusal |
+| `plan` | Refused (read-only exploration only) |
+| `yolo` | Everything runs without gating |
 
 Register it with a client by pointing at the binary, e.g.:
 

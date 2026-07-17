@@ -62,8 +62,9 @@ Options:
   --providers       Open the provider management panel on startup
   --mcp-server      Run as an MCP server on stdio, exposing programmer's local
                     tools to any MCP client (no TUI)
-  --mcp-mode <mode> Tool-gating mode for --mcp-server: manual/auto (default,
-                    read-only allowed, dangerous refused), plan, or yolo (all)
+  --mcp-mode <mode> Tool-gating mode for --mcp-server: auto (default, LLM
+                    confirms dangerous tools), manual (human confirms via MCP
+                    elicitation), plan (read-only), or yolo (run everything)
   -h, --help        Show this help and exit";
 
 fn parse_args() -> Args {
@@ -112,6 +113,22 @@ fn parse_work_mode(s: &str) -> crate::classifier::WorkMode {
         "plan" => WorkMode::Plan,
         _ => WorkMode::Auto,
     }
+}
+
+/// Build the `(client, model)` the MCP server's `auto` mode uses to classify
+/// tool calls: the configured classifier model, else the default model. Returns
+/// `None` when no provider resolves (auto mode then refuses dangerous tools).
+async fn build_mcp_classifier() -> Option<(
+    async_openai::Client<async_openai::config::OpenAIConfig>,
+    String,
+)> {
+    let (config, _) = load_config().ok()?;
+    let pm = crate::providers::ProviderManager::new(&config).await;
+    let model = config
+        .classifier_model
+        .clone()
+        .unwrap_or_else(|| pm.default_model());
+    pm.resolve(&model).map(|(client, name)| (client.clone(), name))
 }
 
 /// Resolved session data ready for the application.
@@ -243,7 +260,10 @@ async fn main() -> color_eyre::Result<()> {
 
     // MCP server mode: no TUI, stdout is reserved for the JSON-RPC protocol.
     if args.mcp_server {
-        mcp::server::run_stdio_server(args.mcp_mode).await?;
+        let classifier = build_mcp_classifier().await;
+        mcp::server::McpServer::new(args.mcp_mode, classifier)
+            .run()
+            .await?;
         return Ok(());
     }
 
