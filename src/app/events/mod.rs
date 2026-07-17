@@ -319,13 +319,13 @@ pub(crate) fn tick(app: &mut App<'_>) {
 /// Recompute tab-completion candidates from the current input text.
 pub(crate) fn update_completions(app: &mut App<'_>) {
     let content = app.input_panel.get_content();
-    if content.starts_with('/') {
-        app.input_panel.completion =
-            CompletionEngine::complete(&content, &app.provider_manager, &app.skill_registry);
-        if let Some(ref mut c) = app.input_panel.completion {
-            c.visible = true;
-        }
+    app.input_panel.completion = if content.starts_with('/') {
+        CompletionEngine::complete(&content, &app.provider_manager, &app.skill_registry)
     } else {
-        app.input_panel.completion = None;
+        // Non-slash input may still carry a trailing `@file` reference.
+        CompletionEngine::complete_file_ref(&content)
+    };
+    if let Some(ref mut c) = app.input_panel.completion {
+        c.visible = true;
     }
 }

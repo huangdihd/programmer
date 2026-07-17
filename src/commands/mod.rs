@@ -200,6 +200,15 @@ impl CompletionEngine {
         }
     }
 
+    /// Complete an `@file` reference. Triggered when the whitespace-delimited
+    /// token at the end of the input begins with `@`; the part after `@` is
+    /// treated as a (possibly partial) path relative to the working directory.
+    pub(crate) fn complete_file_ref(content: &str) -> Option<CompletionState> {
+        let (prefix, partial) = active_at_token(content)?;
+        let candidates = list_path_candidates(&partial);
+        CompletionState::new(prefix, candidates)
+    }
+
     /// Complete a fixed set of subcommands for `cmd`.
     fn complete_subcommand(
         text: &str,
@@ -280,5 +289,170 @@ impl CompletionEngine {
             }
         }
         CompletionState::new(prefix, candidates)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `@file` reference completion + expansion
+// ---------------------------------------------------------------------------
+
+/// If the whitespace-delimited token at the end of `content` is an `@file`
+/// reference, return `(prefix_including_@, partial_path_after_@)`. The prefix
+/// is everything up to and including the `@`, so `prefix + candidate`
+/// reconstructs the whole input line.
+fn active_at_token(content: &str) -> Option<(String, String)> {
+    let token_start = content
+        .rfind(char::is_whitespace)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let token = &content[token_start..];
+    let partial = token.strip_prefix('@')?;
+    let prefix = format!("{}@", &content[..token_start]);
+    Some((prefix, partial.to_string()))
+}
+
+/// Directories skipped when the user hasn't started typing a name — they are
+/// large and rarely the intended reference.
+const NOISE_DIRS: &[&str] = &["target", "node_modules", ".git"];
+
+/// List path candidates for a (possibly partial) path, shell-completion style:
+/// only the directory named by the partial is read (one level), entries are
+/// filtered by the trailing name prefix, directories sort first and gain a
+/// trailing `/` so completion can descend into them.
+fn list_path_candidates(partial: &str) -> Vec<String> {
+    let (dir_part, name_prefix) = match partial.rfind('/') {
+        Some(i) => (&partial[..=i], &partial[i + 1..]),
+        None => ("", partial),
+    };
+    let read_path = if dir_part.is_empty() { "." } else { dir_part };
+    let Ok(entries) = std::fs::read_dir(read_path) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<(bool, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Hidden entries only when the user explicitly typed a leading dot.
+        if name.starts_with('.') && !name_prefix.starts_with('.') {
+            continue;
+        }
+        if !name.starts_with(name_prefix) {
+            continue;
+        }
+        if NOISE_DIRS.contains(&name.as_str()) && name_prefix.is_empty() {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let mut candidate = format!("{dir_part}{name}");
+        if is_dir {
+            candidate.push('/');
+        }
+        out.push((is_dir, candidate));
+    }
+    // Directories first, then alphabetical; cap the list so the popup stays small.
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    out.into_iter().map(|(_, c)| c).take(50).collect()
+}
+
+/// Maximum bytes read from a single `@file` reference before truncating.
+const MAX_REF_BYTES: usize = 100 * 1024;
+
+/// Expand `@path` references in a sent message by appending the contents of
+/// each referenced file. The `@path` token stays inline; the file body is
+/// attached in a fenced block below so the model sees both the reference and
+/// the content. Tokens that don't resolve to a readable file are left alone.
+pub(crate) async fn expand_file_references(text: &str) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    let mut attachments = String::new();
+
+    for raw in text.split_whitespace() {
+        let Some(path) = raw.strip_prefix('@') else {
+            continue;
+        };
+        // Ignore empty and already-processed references.
+        if path.is_empty() || seen.iter().any(|p| p == path) {
+            continue;
+        }
+        let Ok(meta) = tokio::fs::metadata(path).await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(path).await else {
+            continue;
+        };
+        seen.push(path.to_string());
+
+        let truncated = bytes.len() > MAX_REF_BYTES;
+        let slice = &bytes[..bytes.len().min(MAX_REF_BYTES)];
+        let content = String::from_utf8_lossy(slice);
+        attachments.push_str(&format!("\n\n--- Referenced file: {path} ---\n"));
+        attachments.push_str("```\n");
+        attachments.push_str(&content);
+        if !content.ends_with('\n') {
+            attachments.push('\n');
+        }
+        attachments.push_str("```");
+        if truncated {
+            attachments.push_str(&format!("\n(truncated to {MAX_REF_BYTES} bytes)"));
+        }
+    }
+
+    if attachments.is_empty() {
+        text.to_string()
+    } else {
+        format!("{text}{attachments}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_at_token_detects_trailing_reference() {
+        let (prefix, partial) = active_at_token("explain @src/con").unwrap();
+        assert_eq!(prefix, "explain @");
+        assert_eq!(partial, "src/con");
+    }
+
+    #[test]
+    fn active_at_token_ignores_non_reference_tokens() {
+        assert!(active_at_token("just some text").is_none());
+        assert!(active_at_token("email me a@b.com now").is_none());
+    }
+
+    #[test]
+    fn active_at_token_handles_bare_at() {
+        let (prefix, partial) = active_at_token("look at @").unwrap();
+        assert_eq!(prefix, "look at @");
+        assert_eq!(partial, "");
+    }
+
+    #[test]
+    fn list_path_candidates_reads_one_level() {
+        // Runs from the crate root, so `src/` exists with these entries.
+        let got = list_path_candidates("src/co");
+        assert!(got.iter().any(|c| c == "src/commands/"), "dir with slash: {got:?}");
+        assert!(got.iter().any(|c| c == "src/consts.rs"), "file: {got:?}");
+        // Directories sort before files.
+        let dir_pos = got.iter().position(|c| c == "src/commands/").unwrap();
+        let file_pos = got.iter().position(|c| c == "src/consts.rs").unwrap();
+        assert!(dir_pos < file_pos, "dirs first: {got:?}");
+    }
+
+    #[tokio::test]
+    async fn expand_file_references_attaches_content() {
+        let out = expand_file_references("look at @Cargo.toml please").await;
+        assert!(out.starts_with("look at @Cargo.toml please"), "keeps typed text");
+        assert!(out.contains("--- Referenced file: Cargo.toml ---"), "has header");
+        assert!(out.contains("[package]"), "has file content");
+    }
+
+    #[tokio::test]
+    async fn expand_file_references_leaves_plain_text_alone() {
+        let out = expand_file_references("no references here @nonexistent.xyz").await;
+        assert_eq!(out, "no references here @nonexistent.xyz");
     }
 }

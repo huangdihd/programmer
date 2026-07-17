@@ -6,7 +6,7 @@
 - ~~fix /init~~
 - interactive background task terminal(?)
 - installation script(publish to cargo?)
-- @ to quote file
+- ~~@ to quote file~~
 - ! to run a command interactively in the app(?)
 - ~~multi-provider support~~
 - ~~session persistence~~

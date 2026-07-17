@@ -33,12 +33,15 @@ use async_openai::types::responses::MessageItem as ApiMessageItem;
 
 /// Collect input, push to history, and start a user request.
 pub(crate) async fn send_message(app: &mut App<'_>) {
-    let text = app.input_panel.expanded_content();
-    if text.is_empty() {
+    let typed = app.input_panel.expanded_content();
+    if typed.is_empty() {
         return;
     }
-    app.input_panel.push_history(text.clone());
+    // History keeps the compact `@path` form; the model receives the referenced
+    // file contents appended.
+    app.input_panel.push_history(typed.clone());
     app.input_panel.clear();
+    let text = crate::commands::expand_file_references(&typed).await;
     start_request(app, text).await;
 }
 
