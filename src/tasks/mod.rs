@@ -565,15 +565,13 @@ pub fn key_to_bytes(name: &str) -> Option<Vec<u8>> {
 /// to live output. No-op for non-interactive tasks.
 pub fn scroll_screen(id: u64, delta: i32) {
     let reg = registry().lock().unwrap();
-    if let Some(entry) = reg.iter().find(|e| e.id == id) {
-        if let Some(pty) = &entry.pty {
-            if let Ok(mut parser) = pty.parser.lock() {
+    if let Some(entry) = reg.iter().find(|e| e.id == id)
+        && let Some(pty) = &entry.pty
+            && let Ok(mut parser) = pty.parser.lock() {
                 let current = parser.screen().scrollback() as i64;
                 let next = (current + delta as i64).max(0) as usize;
                 parser.set_scrollback(next);
             }
-        }
-    }
 }
 
 /// Encode one SGR (1006) mouse report. `code` is the button/motion/wheel code
@@ -801,7 +799,7 @@ mod tests {
     use super::*;
 
     fn echo_cmd() -> &'static str {
-        if cfg!(windows) { "echo task-out" } else { "echo task-out" }
+        "echo task-out"
     }
 
     #[tokio::test]

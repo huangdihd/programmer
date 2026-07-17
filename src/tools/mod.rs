@@ -288,6 +288,31 @@ fn truncate_output(output: String) -> String {
     )
 }
 
+/// A `Tool::Function` definition with a strict JSON-schema object for parameters.
+/// `required` should list every property name for strict mode to validate.
+fn function_tool(
+    name: &str,
+    description: &str,
+    properties: serde_json::Value,
+    required: &[&str],
+) -> Tool {
+    use async_openai::types::responses::FunctionTool;
+    use serde_json::json;
+
+    Tool::Function(FunctionTool {
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        parameters: Some(json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false,
+        })),
+        strict: Some(true),
+        defer_loading: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,29 +421,4 @@ mod tests {
         assert_eq!(program, "definitely_not_a_real_tool_xyz");
         assert!(prefix.is_empty());
     }
-}
-
-/// A `Tool::Function` definition with a strict JSON-schema object for parameters.
-/// `required` should list every property name for strict mode to validate.
-fn function_tool(
-    name: &str,
-    description: &str,
-    properties: serde_json::Value,
-    required: &[&str],
-) -> Tool {
-    use async_openai::types::responses::FunctionTool;
-    use serde_json::json;
-
-    Tool::Function(FunctionTool {
-        name: name.to_string(),
-        description: Some(description.to_string()),
-        parameters: Some(json!({
-            "type": "object",
-            "properties": properties,
-            "required": required,
-            "additionalProperties": false,
-        })),
-        strict: Some(true),
-        defer_loading: None,
-    })
 }

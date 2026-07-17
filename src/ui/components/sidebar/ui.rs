@@ -34,6 +34,7 @@ const CONT_INDENT: &str = "    ";
 impl Sidebar {
     /// Render the sidebar into `area`. Populates `self.click_map` so the
     /// caller can resolve mouse clicks back to section titles or items.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         area: Rect,
@@ -412,11 +413,10 @@ impl Sidebar {
         let mut tool_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for (key, _) in &tools {
-            if let Some(rest) = key.strip_prefix("mcp__") {
-                if let Some((server, _)) = rest.split_once("__") {
+            if let Some(rest) = key.strip_prefix("mcp__")
+                && let Some((server, _)) = rest.split_once("__") {
                     *tool_counts.entry(server.to_string()).or_default() += 1;
                 }
-            }
         }
 
         let entries: Vec<(String, usize)> = tool_counts.into_iter().collect();
@@ -659,6 +659,7 @@ impl Sidebar {
 /// Wraps `message` text to fit within `max_width`. The first line gets
 /// `prefix_spans` prepended; continuation lines use `indent` and
 /// `cont_style`.
+#[allow(clippy::too_many_arguments)]
 fn wrapped_item(
     lines: &mut Vec<Line<'static>>,
     prefix_spans: Vec<Span<'static>>,

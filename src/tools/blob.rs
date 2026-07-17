@@ -120,11 +120,10 @@ fn walk(
         let path_str = path.to_string_lossy();
 
         if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') || name == "target" || name == "node_modules" {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.starts_with('.') || name == "target" || name == "node_modules") {
                     continue;
                 }
-            }
             if walk(&path_str, pattern, results, count).is_err() {
                 continue;
             }

@@ -111,17 +111,12 @@ impl McpClient {
         let buf = stderr_buf.clone();
         let stderr_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
-            loop {
-                match reader.next_line().await {
-                    Ok(Some(line)) => {
-                        let mut guard = buf.lock().unwrap();
-                        if guard.len() >= STDERR_BUFFER_LINES {
-                            guard.pop_front();
-                        }
-                        guard.push_back(line);
-                    }
-                    _ => break,
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut guard = buf.lock().unwrap();
+                if guard.len() >= STDERR_BUFFER_LINES {
+                    guard.pop_front();
                 }
+                guard.push_back(line);
             }
         });
 
@@ -300,11 +295,10 @@ impl McpClient {
                 self.prompts_list_changed.store(true, Ordering::Relaxed);
             }
             "notifications/cancelled" => {
-                if let Some(p) = params {
-                    if let Some(rid) = p.get("requestId").and_then(|v| v.as_u64()) {
+                if let Some(p) = params
+                    && let Some(rid) = p.get("requestId").and_then(|v| v.as_u64()) {
                         *self.cancelled_id.lock().unwrap() = Some(rid);
                     }
-                }
             }
             "notifications/progress" => {
                 if let Some(p) = params {

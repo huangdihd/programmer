@@ -177,41 +177,6 @@ fn push_line_break(text: &mut String) {
     }
 }
 
-#[cfg(test)]
-mod clean_tests {
-    use super::*;
-
-    #[test]
-    fn strips_sgr_colour_codes() {
-        let input = "\u{1b}[38;2;206;146;23m\u{1b}[1mhi\u{1b}[0m there";
-        assert_eq!(clean_terminal_output(input), "hi there");
-    }
-
-    #[test]
-    fn strips_erase_line_and_keeps_text() {
-        let input = "start\u{1b}[Kend";
-        assert_eq!(clean_terminal_output(input), "startend");
-    }
-
-    #[test]
-    fn carriage_return_collapses_overwrites() {
-        let input = "downloading\u{1b}[K\r\u{1b}[2Kdone";
-        assert_eq!(clean_terminal_output(input), "done");
-    }
-
-    #[test]
-    fn osc_hyperlink_is_removed() {
-        let input = "\u{1b}]8;;https://eg.com\u{1b}\\link\u{1b}]8;;\u{1b}\\";
-        assert_eq!(clean_terminal_output(input), "link");
-    }
-
-    #[test]
-    fn alternat_screen_buffer_clear_survive() {
-        let input = "before\u{1b}[?1049h\u{1b}[2J\u{1b}[?1049lafter";
-        assert_eq!(clean_terminal_output(input), "beforeafter");
-    }
-}
-
 /// Strip ANSI escape sequences (CSI, OSC, ESC) and apply carriage-return
 /// overwrite semantics so progress bars collapse to their final frame. The
 /// model sees clean text and we don't burn tokens on terminal control noise.
@@ -327,4 +292,39 @@ fn clean_terminal_output(input: &str) -> String {
     lines.push(buf.iter().collect());
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod clean_tests {
+    use super::*;
+
+    #[test]
+    fn strips_sgr_colour_codes() {
+        let input = "\u{1b}[38;2;206;146;23m\u{1b}[1mhi\u{1b}[0m there";
+        assert_eq!(clean_terminal_output(input), "hi there");
+    }
+
+    #[test]
+    fn strips_erase_line_and_keeps_text() {
+        let input = "start\u{1b}[Kend";
+        assert_eq!(clean_terminal_output(input), "startend");
+    }
+
+    #[test]
+    fn carriage_return_collapses_overwrites() {
+        let input = "downloading\u{1b}[K\r\u{1b}[2Kdone";
+        assert_eq!(clean_terminal_output(input), "done");
+    }
+
+    #[test]
+    fn osc_hyperlink_is_removed() {
+        let input = "\u{1b}]8;;https://eg.com\u{1b}\\link\u{1b}]8;;\u{1b}\\";
+        assert_eq!(clean_terminal_output(input), "link");
+    }
+
+    #[test]
+    fn alternat_screen_buffer_clear_survive() {
+        let input = "before\u{1b}[?1049h\u{1b}[2J\u{1b}[?1049lafter";
+        assert_eq!(clean_terminal_output(input), "beforeafter");
+    }
 }

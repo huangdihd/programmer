@@ -112,8 +112,8 @@ impl PartialResponse {
                 let output_index = item_done_event.output_index as usize;
                 let mut incoming = item_done_event.item;
 
-                if let OutputItem::Reasoning(incoming_reasoning) = &mut incoming {
-                    if let Some(Some(OutputItem::Reasoning(existing))) =
+                if let OutputItem::Reasoning(incoming_reasoning) = &mut incoming
+                    && let Some(Some(OutputItem::Reasoning(existing))) =
                         self.items.get(output_index)
                     {
                         if incoming_reasoning.content.is_none() && existing.content.is_some() {
@@ -123,7 +123,6 @@ impl PartialResponse {
                             incoming_reasoning.summary = existing.summary.clone();
                         }
                     }
-                }
 
                 self.set_item(incoming, item_done_event.output_index);
                 self.mark_finished(item_done_event.output_index);
@@ -150,14 +149,13 @@ impl PartialResponse {
                         }
                         OutputItem::Reasoning(reasoning_item) => {
                             let contents = reasoning_item.content.get_or_insert_with(Vec::new);
-                            if contents.len() <= content_index {
-                                if let OutputContent::ReasoningText(reasoning_text) =
+                            if contents.len() <= content_index
+                                && let OutputContent::ReasoningText(reasoning_text) =
                                     part_added_event.part
                                 {
                                     contents
                                         .push(ReasoningItemContent::ReasoningText(reasoning_text));
                                 }
-                            }
                         }
                         _ => {}
                     }
@@ -230,13 +228,11 @@ impl PartialResponse {
                     return;
                 };
                 if output_text.annotations.len() <= annotation_added_event.annotation_index as usize
-                {
-                    if let Ok(annotation) =
+                    && let Ok(annotation) =
                         serde_json::from_value::<Annotation>(annotation_added_event.annotation)
                     {
                         output_text.annotations.push(annotation);
                     }
-                }
             }
 
             ResponseRefusalDelta(refusal_delta_event) => {

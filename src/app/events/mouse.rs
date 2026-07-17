@@ -25,14 +25,14 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollDown => {
-            if app.sidebar_area.map_or(false, |a| mouse.column >= a.x) {
+            if app.sidebar_area.is_some_and(|a| mouse.column >= a.x) {
                 if let Some(ref mut s) = app.sidebar { s.scroll_down(); }
             } else {
                 app.conversation_panel.scroll_down();
             }
         }
         MouseEventKind::ScrollUp => {
-            if app.sidebar_area.map_or(false, |a| mouse.column >= a.x) {
+            if app.sidebar_area.is_some_and(|a| mouse.column >= a.x) {
                 if let Some(ref mut s) = app.sidebar { s.scroll_up(); }
             } else {
                 app.conversation_panel.scroll_up();
@@ -41,7 +41,7 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
         MouseEventKind::Down(MouseButton::Left) => {
             // If click is in the sidebar, track it and don't start selection.
             app.sidebar_click_active = app.sidebar.is_some()
-                && app.sidebar_area.as_ref().map_or(false, |area| {
+                && app.sidebar_area.as_ref().is_some_and(|area| {
                     mouse.column >= area.x
                         && mouse.column < area.x + area.width
                         && mouse.row >= area.y
@@ -69,9 +69,9 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
             if app.sidebar_click_active {
                 app.sidebar_click_active = false;
                 // Only act if the release is still in the sidebar.
-                if let Some(ref sidebar) = app.sidebar {
-                    if let Some(ref area) = app.sidebar_area {
-                        if mouse.column > area.x
+                if let Some(ref sidebar) = app.sidebar
+                    && let Some(ref area) = app.sidebar_area
+                        && mouse.column > area.x
                             && mouse.column < area.x + area.width
                             && mouse.row >= area.y
                             && mouse.row < area.y + area.height
@@ -82,8 +82,6 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
                                 handle_sidebar_click(app, &target);
                             }
                         }
-                    }
-                }
                 return;
             }
             match app

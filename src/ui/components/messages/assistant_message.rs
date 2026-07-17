@@ -144,8 +144,8 @@ fn scan_copy_buttons(text: &Text<'_>, codes: &[String]) -> Vec<CodeCopyButton> {
         let mut x = 0u16;
         for span in &line.spans {
             let width = span.width() as u16;
-            if span.content.as_ref() == COPY_LABEL {
-                if let Some(content) = codes.get(buttons.len()) {
+            if span.content.as_ref() == COPY_LABEL
+                && let Some(content) = codes.get(buttons.len()) {
                     buttons.push(CodeCopyButton {
                         row: row as u16,
                         x_start: PAD_LEFT + x,
@@ -153,7 +153,6 @@ fn scan_copy_buttons(text: &Text<'_>, codes: &[String]) -> Vec<CodeCopyButton> {
                         content: content.clone(),
                     });
                 }
-            }
             x = x.saturating_add(width);
         }
     }

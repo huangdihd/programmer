@@ -38,6 +38,7 @@ pub enum AnswerAction {
     Answer(String),
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Mode {
     /// Navigating a list of preset choices.
     Choice { selected: usize },
@@ -69,7 +70,7 @@ impl QuestionPanel {
     pub fn new(question: Question, answer_tx: AnswerTx) -> Self {
         let mode = match &question.kind {
             QuestionKind::Choice { .. } => Mode::Choice { selected: 0 },
-            QuestionKind::Text { .. } => Mode::Text {
+            QuestionKind::Text => Mode::Text {
                 textarea: make_textarea(),
             },
         };

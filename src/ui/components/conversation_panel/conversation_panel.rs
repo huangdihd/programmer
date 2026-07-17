@@ -340,11 +340,10 @@ impl ConversationPanel {
                 self.copy_code_block(&content);
                 return;
             }
-            if self.items.get(index).is_some_and(is_foldable) {
-                if !self.expanded_items.remove(&index) {
+            if self.items.get(index).is_some_and(is_foldable)
+                && !self.expanded_items.remove(&index) {
                     self.expanded_items.insert(index);
                 }
-            }
         }
     }
 
@@ -437,7 +436,7 @@ impl ConversationPanel {
         let ((_, sel_top), (_, sel_bottom)) = sel.ordered();
         let mut lines = vec![String::new(); (sel_bottom - sel_top) as usize + 1];
 
-        let welcome = WelcomeMessage::default();
+        let welcome = WelcomeMessage;
         let welcome_height = welcome.line_count(width);
         extract_region(&mut lines, &sel, sel_top, 0, welcome_height, width, |b| {
             (&welcome).render(b.area, b)
@@ -513,8 +512,8 @@ impl ConversationPanel {
     /// affected cache entry is dropped to force a re-render.
     pub fn append_to_tool_output(&mut self, call_id: &str, extra: &str) -> bool {
         for item in self.items.iter_mut() {
-            if let MessageItem::ToolOutput { output, .. } = item {
-                if output.call_id == call_id {
+            if let MessageItem::ToolOutput { output, .. } = item
+                && output.call_id == call_id {
                     match &mut output.output {
                         FunctionCallOutput::Text(text) => text.push_str(extra),
                         other => *other = FunctionCallOutput::Text(extra.trim_start().to_string()),
@@ -525,7 +524,6 @@ impl ConversationPanel {
                     self.render_cache.entries.clear();
                     return true;
                 }
-            }
         }
         false
     }
@@ -543,9 +541,9 @@ impl ConversationPanel {
         // Non-conforming providers send error payloads the stream parser can't
         // deserialize; surface the embedded API error message instead of the
         // raw "missing field" noise when the payload is recognizable.
-        if let OpenAIError::JSONDeserialize(_, content) = &openai_error {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
-                if let Some(message) = value
+        if let OpenAIError::JSONDeserialize(_, content) = &openai_error
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+                && let Some(message) = value
                     .get("message")
                     .or_else(|| value.get("error").and_then(|e| e.get("message")))
                     .and_then(|m| m.as_str())
@@ -558,8 +556,6 @@ impl ConversationPanel {
                     self.add_error_string(format!("{code}: {message}"));
                     return;
                 }
-            }
-        }
         self.items
             .push(MessageItem::OpenAIError(std::sync::Arc::new(openai_error)));
         self.stick_to_bottom = true;
@@ -676,7 +672,7 @@ impl ConversationPanel {
 
     /// Whether a click at `(column, row)` lands on the jump-to-bottom indicator.
     pub fn jump_button_hit(&self, column: u16, row: u16) -> bool {
-        self.jump_button.map_or(false, |b| {
+        self.jump_button.is_some_and(|b| {
             column >= b.x && column < b.x + b.width && row >= b.y && row < b.y + b.height
         })
     }
@@ -933,7 +929,7 @@ mod tests {
             InputItem::Item(Item::Message(_)) => "message".to_string(),
             _ => "other".to_string(),
         };
-        let kinds: Vec<String> = items.iter().map(|i| kind(i)).collect();
+        let kinds: Vec<String> = items.iter().map(kind).collect();
         // Each call must be immediately followed by its output; a message the
         // model emitted after the call is pushed out to *after* that output, so
         // the assistant tool_calls block is always answered by tool results

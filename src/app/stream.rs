@@ -69,11 +69,13 @@ pub(crate) fn spawn_stream(app: &mut App<'_>) {
     );
     let mcp = app.mcp_manager.clone();
     tokio::spawn(async move {
-        let mut request = CreateResponse::default();
-        request.stream = Option::from(true);
-        request.input = input_param;
-        request.model = Option::from(model_name);
-        request.tools = Some(crate::tools::tools(mcp.as_deref()));
+        let request = CreateResponse {
+            stream: Option::from(true),
+            input: input_param,
+            model: Option::from(model_name),
+            tools: Some(crate::tools::tools(mcp.as_deref())),
+            ..Default::default()
+        };
 
         let mut attempt: u32 = 0;
         let stream = loop {
@@ -159,7 +161,7 @@ pub(crate) async fn handle_chunk_events(
             .filter(|item| {
                 !cancelled || !matches!(item, OutputItem::FunctionCall(_))
             })
-            .map(|item| MessageItem::Output(item.clone().into())),
+            .map(|item| MessageItem::Output(item.clone())),
     );
     if let Some((input, output)) = usage {
         app.conversation_panel.add_usage(input, output);

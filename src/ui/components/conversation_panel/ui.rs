@@ -128,7 +128,7 @@ impl Widget for &mut ConversationPanel {
         self.frame_count = self.frame_count.wrapping_add(1);
         let content_width = area.width.saturating_sub(1);
         let stick_to_bottom = self.stick_to_bottom;
-        let welcome_message = WelcomeMessage::default();
+        let welcome_message = WelcomeMessage;
         let welcome_height = welcome_message.line_count(content_width);
         let mut content_height: u16 = welcome_height;
 
@@ -241,7 +241,7 @@ impl Widget for &mut ConversationPanel {
             let needs_build = cache
                 .entries
                 .get(index)
-                .map_or(true, |entry| {
+                .is_none_or(|entry| {
                     entry.expanded != expanded
                         || entry.has_output != has_output
                         || (entry.lazy && in_viewport)
@@ -382,11 +382,10 @@ impl Widget for &mut ConversationPanel {
             y = y.saturating_add(*height);
         }
         self.pending_layout = pending.as_ref().map(|(_, height)| (y, *height));
-        if let Some((paragraph, height)) = &pending {
-            if visible(y, *height) {
+        if let Some((paragraph, height)) = &pending
+            && visible(y, *height) {
                 scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
             }
-        }
         scroll_view.render(area, buf, &mut self.scroll_view_state);
 
         // The scroll view has now clamped the offset to its real value; store it

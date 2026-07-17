@@ -234,8 +234,8 @@ impl App<'_> {
         (&self.footer).render(chunks[POS_FOOTER], buf);
 
         // ---- completion popup (floats above the input panel) ----
-        if let Some(ref completion) = self.input_panel.completion {
-            if completion.visible {
+        if let Some(ref completion) = self.input_panel.completion
+            && completion.visible {
                 let max_visible = 10u16;
                 let count = (completion.candidates.len() as u16).min(max_visible);
                 let popup_height = count;
@@ -263,7 +263,6 @@ impl App<'_> {
                 };
                 popup.render(popup_area, buf);
             }
-        }
 
         // ---- todo panel (floating overlay, centered) ----
         if let Some(panel) = &self.todo_panel {
@@ -280,11 +279,11 @@ impl App<'_> {
             // Dim the background.
             for row in area.y..area.y + area.height {
                 for col in area.x..area.x + area.width {
-                    if let Some(cell) = buf.cell_mut((col, row)) {
-                        if col < panel_area.x
+                    if let Some(cell) = buf.cell_mut((col, row))
+                        && (col < panel_area.x
                             || col >= panel_area.x + panel_area.width
                             || row < panel_area.y
-                            || row >= panel_area.y + panel_area.height
+                            || row >= panel_area.y + panel_area.height)
                         {
                             cell.set_style(
                                 Style::default()
@@ -292,7 +291,6 @@ impl App<'_> {
                                     .add_modifier(Modifier::DIM),
                             );
                         }
-                    }
                 }
             }
             panel.render(panel_area, buf);

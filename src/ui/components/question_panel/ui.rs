@@ -29,7 +29,7 @@ impl QuestionPanel {
             QuestionKind::Choice { options, .. } => {
                 (question_lines + options.len() as u16 + 1).max(3)
             }
-            QuestionKind::Text { .. } => {
+            QuestionKind::Text => {
                 // question + input + hint
                 (question_lines + 2).max(3)
             }
@@ -95,7 +95,7 @@ impl QuestionPanel {
                 Paragraph::new(hint).render(chunks[2], buf);
             }
             (QuestionKind::Choice { .. }, Mode::Text { textarea })
-            | (QuestionKind::Text { .. }, Mode::Text { textarea }) => {
+            | (QuestionKind::Text, Mode::Text { textarea }) => {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([

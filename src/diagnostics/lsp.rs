@@ -140,15 +140,14 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) =
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let Ok(byte) =
                 u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
             {
                 out.push(byte);
                 i += 3;
                 continue;
             }
-        }
         out.push(bytes[i]);
         i += 1;
     }
@@ -409,28 +408,23 @@ fn spawn_reader(
     cwd: PathBuf,
 ) {
     tokio::spawn(async move {
-        loop {
-            match read_message(&mut reader).await {
-                Ok(Some(msg)) => {
-                    if msg.get("method").and_then(Value::as_str)
-                        == Some("textDocument/publishDiagnostics")
-                    {
-                        if let Some(params) = msg.get("params") {
-                            let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
-                            let file = uri_to_path(uri, &cwd);
-                            let diags = params
-                                .get("diagnostics")
-                                .and_then(Value::as_array)
-                                .map(|arr| arr.iter().map(|d| diagnostic_from_lsp(d, &file)).collect())
-                                .unwrap_or_default();
-                            state.lock().await.by_uri.insert(uri.to_string(), diags);
-                            updated.notify_waiters();
-                        }
-                    } else {
-                        answer_server_request(&stdin, &msg).await;
-                    }
+        while let Ok(Some(msg)) = read_message(&mut reader).await {
+            if msg.get("method").and_then(Value::as_str)
+                == Some("textDocument/publishDiagnostics")
+            {
+                if let Some(params) = msg.get("params") {
+                    let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+                    let file = uri_to_path(uri, &cwd);
+                    let diags = params
+                        .get("diagnostics")
+                        .and_then(Value::as_array)
+                        .map(|arr| arr.iter().map(|d| diagnostic_from_lsp(d, &file)).collect())
+                        .unwrap_or_default();
+                    state.lock().await.by_uri.insert(uri.to_string(), diags);
+                    updated.notify_waiters();
                 }
-                _ => break, // EOF or parse error: the server is gone
+            } else {
+                answer_server_request(&stdin, &msg).await;
             }
         }
     });

@@ -192,17 +192,11 @@ pub(crate) fn extract_input_text(input: &InputItem) -> Option<String> {
     use async_openai::types::responses::Item;
 
     match input {
-        InputItem::Item(item) => match item {
-            Item::Message(msg) => match msg {
-                ApiMessageItem::Input(input_msg) => {
-                    input_msg.content.iter().find_map(|c| match c {
-                        InputContent::InputText(t) => Some(t.text.clone()),
-                        _ => None,
-                    })
-                }
+        InputItem::Item(Item::Message(ApiMessageItem::Input(input_msg))) => {
+            input_msg.content.iter().find_map(|c| match c {
+                InputContent::InputText(t) => Some(t.text.clone()),
                 _ => None,
-            },
-            _ => None,
+            })
         },
         InputItem::EasyMessage(msg) => match &msg.content {
             async_openai::types::responses::EasyInputContent::Text(t) => Some(t.clone()),

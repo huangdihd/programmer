@@ -34,29 +34,25 @@ impl<'a> UserMessage<'a> {
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
         let raw = match self.input_item {
-            InputItem::Item(item) => match item {
-                Message(message_item) => match message_item {
-                    Input(input_message) => input_message
-                        .content
-                        .iter()
-                        .map(|input_content| match input_content {
-                            InputContent::InputText(c) => c.text.clone(),
-                            _ => "Unsupported message".to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    Output(output_message) => output_message
-                        .content
-                        .iter()
-                        .map(|c| match c {
-                            OutputMessageContent::OutputText(t) => t.text.clone(),
-                            OutputMessageContent::Refusal(r) => r.refusal.clone(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                },
-                _ => "[Unsupported message]\n".to_string(),
-            },
+            InputItem::Item(Message(Input(input_message))) => input_message
+                .content
+                .iter()
+                .map(|input_content| match input_content {
+                    InputContent::InputText(c) => c.text.clone(),
+                    _ => "Unsupported message".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            InputItem::Item(Message(Output(output_message))) => output_message
+                .content
+                .iter()
+                .map(|c| match c {
+                    OutputMessageContent::OutputText(t) => t.text.clone(),
+                    OutputMessageContent::Refusal(r) => r.refusal.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            InputItem::Item(_) => "[Unsupported message]\n".to_string(),
             _ => "[Unsupported message]\n".to_string(),
         };
 

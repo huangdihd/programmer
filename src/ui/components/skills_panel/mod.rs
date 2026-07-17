@@ -94,11 +94,10 @@ impl SkillsPanel {
                 PanelAction::None
             }
             KeyCode::Char(' ') | KeyCode::Enter => {
-                if let Some(name) = names.get(self.selected) {
-                    if registry.toggle(name).is_some() {
+                if let Some(name) = names.get(self.selected)
+                    && registry.toggle(name).is_some() {
                         return PanelAction::Saved;
                     }
-                }
                 PanelAction::None
             }
             // Deactivate every skill at once.

@@ -200,12 +200,11 @@ impl ProviderPanel {
                 }
             }
             KeyCode::Enter => {
-                if let Some(name) = names.get(self.selected) {
-                    if config.default_provider != *name {
+                if let Some(name) = names.get(self.selected)
+                    && config.default_provider != *name {
                         config.default_provider = name.clone();
                         return PanelAction::Saved;
                     }
-                }
             }
             _ => {}
         }
@@ -251,8 +250,8 @@ impl ProviderPanel {
         };
 
         // --- When popup is visible (only for default_model field) ---
-        if form.focus == 3 {
-            if let Some(comp) = form.completion.as_mut() {
+        if form.focus == 3
+            && let Some(comp) = form.completion.as_mut() {
                 match key.code {
                     KeyCode::Esc => {
                         form.completion = None;
@@ -313,7 +312,6 @@ impl ProviderPanel {
                     _ => {}
                 }
             }
-        }
 
         match key.code {
             KeyCode::Esc => {
@@ -378,14 +376,13 @@ impl ProviderPanel {
                     form.error = Some(format!("provider '{name}' already exists"));
                     return PanelAction::None;
                 }
-                if let Some(original) = &form.original {
-                    if *original != name {
+                if let Some(original) = &form.original
+                    && *original != name {
                         config.providers.remove(original);
                         if config.default_provider == *original {
                             config.default_provider = name.clone();
                         }
                     }
-                }
                 config.providers.insert(
                     name.clone(),
                     ProviderConfig {

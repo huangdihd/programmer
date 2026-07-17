@@ -125,13 +125,12 @@ fn search(
 
         // Skip hidden directories and common non-source dirs.
         if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') || name == "target" || name == "node_modules" {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.starts_with('.') || name == "target" || name == "node_modules") {
                     continue;
                 }
-            }
             // Recursively search subdirectories
-            if let Err(_) = search(&path_str, re, include, results, count) {
+            if search(&path_str, re, include, results, count).is_err() {
                 continue;
             }
         } else if path.is_file() {
@@ -194,8 +193,8 @@ fn should_skip_file(file_name: &str, include: &Option<String>) -> bool {
 /// Shared with the `blob` tool, which matches file names by glob.
 pub(crate) fn simple_glob_match(pattern: &str, name: &str) -> bool {
     // Handle {a,b} alternation by trying each alternative.
-    if let Some(start) = pattern.find('{') {
-        if let Some(end) = pattern[start..].find('}') {
+    if let Some(start) = pattern.find('{')
+        && let Some(end) = pattern[start..].find('}') {
             let end = start + end;
             let prefix = &pattern[..start];
             let alts = &pattern[start + 1..end];
@@ -208,7 +207,6 @@ pub(crate) fn simple_glob_match(pattern: &str, name: &str) -> bool {
             }
             return false;
         }
-    }
     // Simple wildcard matching: * matches anything.
     if pattern == "*" {
         return true;

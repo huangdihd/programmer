@@ -51,7 +51,7 @@ pub(crate) fn continue_with_diagnostics(
         return false;
     }
     app.diag.mutating_turns += 1;
-    let reminder_due = app.diag.mutating_turns % crate::consts::OVERVIEW_REMINDER_EVERY == 0
+    let reminder_due = app.diag.mutating_turns.is_multiple_of(crate::consts::OVERVIEW_REMINDER_EVERY)
         && std::path::Path::new("PROGRAMMER.md").exists();
 
     if std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {

@@ -136,11 +136,10 @@ async fn run_in(arguments: &str, cwd: &Path) -> Result<String, String> {
         Err(e) => return Err(format!("error: could not serialize profile: {e}")),
     };
     let path = cwd.join(PROFILE_PATH);
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent) {
             return Err(format!("error: could not create {}: {e}", parent.display()));
         }
-    }
     if let Err(e) = std::fs::write(&path, toml) {
         return Err(format!("error: could not write {}: {e}", path.display()));
     }

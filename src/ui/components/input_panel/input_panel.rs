@@ -140,7 +140,7 @@ impl InputPanel<'_> {
     /// Push a message to the history (after sending).
     pub fn push_history(&mut self, text: String) {
         // Don't push duplicates of the last entry.
-        if self.history.last().map_or(true, |last| last != &text) {
+        if self.history.last() != Some(&text) {
             self.history.push(text);
         }
         self.history_index = -1;

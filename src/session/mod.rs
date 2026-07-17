@@ -186,17 +186,16 @@ impl SessionManager {
             std::fs::read_dir(&self.sessions_dir).map_err(|e| format!("read dir: {e}"))?;
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(true, |e| e != "json") {
+            if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
             // Quick-read: only parse the metadata fields, not the items.
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(s) = serde_json::from_slice::<SessionMeta>(&bytes) {
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(s) = serde_json::from_slice::<SessionMeta>(&bytes) {
                     sessions.push(s);
                 }
-            }
         }
-        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         Ok(sessions)
     }
 
@@ -487,18 +486,16 @@ pub(crate) fn pick_session(
                 KeyCode::Char('q') | KeyCode::Esc => break Outcome::Quit,
                 KeyCode::Char('n') => break Outcome::NewSession,
                 KeyCode::Char('d') => {
-                    if let Some(i) = list_state.selected() {
-                        if let Some(s) = sessions.get(i) {
+                    if let Some(i) = list_state.selected()
+                        && let Some(s) = sessions.get(i) {
                             confirm_uuid = Some(s.uuid.clone());
                         }
-                    }
                 }
                 KeyCode::Enter => {
-                    if let Some(i) = list_state.selected() {
-                        if let Some(s) = sessions.get(i) {
+                    if let Some(i) = list_state.selected()
+                        && let Some(s) = sessions.get(i) {
                             break Outcome::Selected(s.uuid.clone());
                         }
-                    }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     let i = list_state.selected().unwrap_or(0);
@@ -560,8 +557,6 @@ fn unix_to_local(secs: u64) -> String {
         format!("{}m ago", diff / 60)
     } else if diff < 86400 {
         format!("{}h ago", diff / 3600)
-    } else if diff < 604800 {
-        format!("{}d ago", diff / 86400)
     } else {
         format!("{}d ago", diff / 86400)
     }

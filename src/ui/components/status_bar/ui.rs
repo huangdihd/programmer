@@ -43,8 +43,8 @@ impl Widget for &StatusBar {
 
         let busy = self.status.is_busy();
         let mut text = format!(" {} {} ", icon, label);
-        if busy {
-            if let Some(dur) = self.elapsed() {
+        if busy
+            && let Some(dur) = self.elapsed() {
                 let secs = dur.as_secs_f64();
                 if secs < 60.0 {
                     text.push_str(&format!("({:.1}s)", secs));
@@ -54,7 +54,6 @@ impl Widget for &StatusBar {
                     text.push_str(&format!("({}m {:.0}s)", m, s));
                 }
             }
-        }
 
         let mut spans = vec![Span::styled(
             text,

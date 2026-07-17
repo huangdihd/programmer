@@ -173,13 +173,11 @@ impl McpHttpClient {
         };
 
         // Remember the negotiated protocol version for subsequent requests.
-        if method == "initialize" {
-            if let Ok(v) = &result {
-                if let Some(ver) = v.get("protocolVersion").and_then(|v| v.as_str()) {
+        if method == "initialize"
+            && let Ok(v) = &result
+                && let Some(ver) = v.get("protocolVersion").and_then(|v| v.as_str()) {
                     *self.protocol_version.lock().unwrap() = Some(ver.to_string());
                 }
-            }
-        }
         if let Err(e) = &result {
             self.log_line(e.clone());
         }
@@ -220,11 +218,10 @@ impl McpHttpClient {
             }
         }
         // Stream ended: flush any unterminated final event.
-        if let Some(data) = parser.finish() {
-            if let Some(result) = self.dispatch_sse_message(&data, id)? {
+        if let Some(data) = parser.finish()
+            && let Some(result) = self.dispatch_sse_message(&data, id)? {
                 return Ok(result);
             }
-        }
         Err("MCP SSE stream ended without a response".to_string())
     }
 

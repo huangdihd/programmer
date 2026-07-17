@@ -164,11 +164,10 @@ fn glob_matches(glob: &str, path: &str) -> bool {
     if glob_matches_exact(glob, path) {
         return true;
     }
-    if !glob.contains('/') {
-        if let Some(name) = path.rsplit('/').next() {
+    if !glob.contains('/')
+        && let Some(name) = path.rsplit('/').next() {
             return glob_matches_exact(glob, name);
         }
-    }
     false
 }
 

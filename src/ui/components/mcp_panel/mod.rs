@@ -147,8 +147,8 @@ impl McpPanel {
                 self.mode = Mode::Form(Form::default());
             }
             KeyCode::Char('e') => {
-                if let Some(name) = names.get(self.selected) {
-                    if let Some(cfg) = config.mcp_servers.iter().find(|s| &s.name == name) {
+                if let Some(name) = names.get(self.selected)
+                    && let Some(cfg) = config.mcp_servers.iter().find(|s| &s.name == name) {
                         let policy_str = match cfg.auto_approve {
                             McpPolicy::Trusted => "trusted",
                             McpPolicy::Review => "review",
@@ -171,7 +171,6 @@ impl McpPanel {
                             error: None,
                         });
                     }
-                }
             }
             KeyCode::Char('d') => {
                 if let Some(name) = names.get(self.selected) {
@@ -275,7 +274,7 @@ impl McpPanel {
             form.error = Some("either command (stdio) or url (http) is required".to_string());
             return PanelAction::None;
         }
-        if !url.is_empty() && !(url.starts_with("http://") || url.starts_with("https://")) {
+        if !(url.is_empty() || url.starts_with("http://") || url.starts_with("https://")) {
             form.error = Some("url must start with http:// or https://".to_string());
             return PanelAction::None;
         }
@@ -613,8 +612,6 @@ impl McpPanel {
     }
 
 }
-
-/// Truncate a command line for single-line display.
 
 #[cfg(test)]
 mod tests {

@@ -60,12 +60,11 @@ pub(crate) fn save_session(app: &mut App<'_>) {
         s
     });
     // Capture first user message for the picker preview.
-    if session.first_message.is_empty() {
-        if let Some(text) = helpers::first_user_text(&items) {
+    if session.first_message.is_empty()
+        && let Some(text) = helpers::first_user_text(&items) {
             session.first_message =
                 crate::session::truncate_first_line(&text, 80);
         }
-    }
     SessionManager::set_items(&mut session, items);
     session.history = app.input_panel.history.clone();
     session.work_mode = Some(app.work_mode);

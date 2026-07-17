@@ -175,6 +175,7 @@ impl std::fmt::Debug for App<'_> {
 
 impl App<'_> {
     /// Constructs a new instance of [`App`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         mut config: ProgrammerConfig,
         saved_items: Vec<MessageItem>,
@@ -190,22 +191,20 @@ impl App<'_> {
         let mut work_mode = WorkMode::default();
 
         let mut saved_activated_skills: Vec<String> = Vec::new();
-        if let Some(mgr) = &session_mgr {
-            if let Some(saved) = mgr.load(&session_uuid) {
+        if let Some(mgr) = &session_mgr
+            && let Some(saved) = mgr.load(&session_uuid) {
                 if let Some(wm) = saved.work_mode {
                     work_mode = wm;
                 }
-                if let Some(model) = saved.current_model {
-                    if provider_manager.resolve(&model).is_some() {
+                if let Some(model) = saved.current_model
+                    && provider_manager.resolve(&model).is_some() {
                         current_model = model;
                     }
-                }
                 if saved.classifier_model.is_some() {
                     config.classifier_model = saved.classifier_model;
                 }
                 saved_activated_skills = saved.activated_skills;
             }
-        }
         let mut conversation_panel = ConversationPanel::new();
         conversation_panel.restore_items(saved_items);
         for msg in startup_messages {

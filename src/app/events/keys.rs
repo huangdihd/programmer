@@ -76,7 +76,7 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- sidebar keyboard (when focused) ----
-    if app.sidebar.as_ref().map_or(false, |s| s.has_focus) {
+    if app.sidebar.as_ref().is_some_and(|s| s.has_focus) {
         if key_event.code == KeyCode::Esc {
             if let Some(ref mut s) = app.sidebar {
                 s.has_focus = false;
@@ -165,7 +165,7 @@ pub(crate) async fn handle_key_events(
         .input_panel
         .completion
         .as_ref()
-        .map_or(false, |c| c.visible)
+        .is_some_and(|c| c.visible)
     {
         match key_event.code {
             KeyCode::Tab => {

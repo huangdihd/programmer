@@ -29,6 +29,7 @@ use crate::consts::TICK_FPS;
 
 /// Representation of all possible events.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     /// An event that is emitted on a regular schedule.
     ///

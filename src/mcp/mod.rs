@@ -39,6 +39,7 @@ const TOOL_CALL_TIMEOUT_SECS: u64 = 120;
 
 /// A server connection over either transport. Delegates the small surface
 /// the manager needs; the JSON-RPC semantics are identical on both sides.
+#[allow(clippy::large_enum_variant)]
 enum McpConn {
     Stdio(McpClient),
     Http(McpHttpClient),
@@ -130,40 +131,28 @@ struct McpServer {
 impl McpServer {
     async fn refresh_if_stale(&self) {
         if !self.client.take_tools_list_changed() { return; }
-        match self.client.call_with_timeout("tools/list", None, HANDSHAKE_TIMEOUT_SECS).await {
-            Ok(raw) => {
-                if let Ok(r) = serde_json::from_value::<types::ListToolsResult>(raw) {
-                    *self.tools.lock().unwrap() = r.tools;
-                }
+        if let Ok(raw) = self.client.call_with_timeout("tools/list", None, HANDSHAKE_TIMEOUT_SECS).await
+            && let Ok(r) = serde_json::from_value::<types::ListToolsResult>(raw) {
+                *self.tools.lock().unwrap() = r.tools;
             }
-            Err(_) => {}
-        }
     }
 
     async fn refresh_resources_if_stale(&self) {
         let changed = self.client.take_resources_list_changed();
         let _upd = self.client.take_resources_updated();
         if !changed && !_upd { return; }
-        match self.client.call_with_timeout("resources/list", None, HANDSHAKE_TIMEOUT_SECS).await {
-            Ok(raw) => {
-                if let Ok(r) = serde_json::from_value::<types::ListResourcesResult>(raw) {
-                    *self.resources.lock().unwrap() = r.resources;
-                }
+        if let Ok(raw) = self.client.call_with_timeout("resources/list", None, HANDSHAKE_TIMEOUT_SECS).await
+            && let Ok(r) = serde_json::from_value::<types::ListResourcesResult>(raw) {
+                *self.resources.lock().unwrap() = r.resources;
             }
-            Err(_) => {}
-        }
     }
 
     async fn refresh_prompts_if_stale(&self) {
         if !self.client.take_prompts_list_changed() { return; }
-        match self.client.call_with_timeout("prompts/list", None, HANDSHAKE_TIMEOUT_SECS).await {
-            Ok(raw) => {
-                if let Ok(r) = serde_json::from_value::<types::ListPromptsResult>(raw) {
-                    *self.prompts.lock().unwrap() = r.prompts;
-                }
+        if let Ok(raw) = self.client.call_with_timeout("prompts/list", None, HANDSHAKE_TIMEOUT_SECS).await
+            && let Ok(r) = serde_json::from_value::<types::ListPromptsResult>(raw) {
+                *self.prompts.lock().unwrap() = r.prompts;
             }
-            Err(_) => {}
-        }
     }
 
     fn stderr_snapshot(&self) -> Vec<String> {
