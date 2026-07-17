@@ -32,6 +32,11 @@ pub(crate) async fn handle_key_events(
     app: &mut App<'_>,
     key_event: KeyEvent,
 ) -> color_eyre::Result<()> {
+    // ---- interactive terminal panel (fully modal; grabs input) ----
+    if app.terminal_pane.is_some() {
+        handle_terminal_key(app, key_event);
+        return Ok(());
+    }
     // ---- tool-call approval (Manual mode) ----
     if !app.approval.queue.is_empty() {
         return handle_approval_key(app, key_event);
@@ -283,6 +288,40 @@ pub(crate) async fn handle_key_events(
     Ok(())
 }
 
+/// Handle a key while the interactive terminal panel is open. `Ctrl+O` toggles
+/// input grab. While grabbed, keys are translated to terminal bytes and written
+/// to the task's PTY; while released, `Esc`/`q` close the panel.
+fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
+    use crate::ui::components::terminal_panel::key_event_to_bytes;
+
+    let Some(pane) = app.terminal_pane.as_mut() else {
+        return;
+    };
+
+    // Ctrl+O is the escape hatch — never forwarded.
+    if key_event.code == KeyCode::Char('o')
+        && key_event.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        pane.grabbed = !pane.grabbed;
+        return;
+    }
+
+    if pane.grabbed {
+        if let Some(bytes) = key_event_to_bytes(key_event) {
+            let _ = crate::tasks::write_bytes(pane.task_id, &bytes);
+        }
+        return;
+    }
+
+    // Released: the panel owns its keys.
+    match key_event.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.terminal_pane = None;
+        }
+        _ => {}
+    }
+}
+
 /// Enter combined with any of these modifiers inserts a newline instead of sending.
 pub(crate) fn is_newline_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
@@ -290,6 +329,13 @@ pub(crate) fn is_newline_modifier(modifiers: KeyModifiers) -> bool {
 
 /// Handles text pasted into the terminal (bracketed paste).
 pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
+    // While the terminal panel has input grabbed, a paste goes to the PTY.
+    if let Some(pane) = app.terminal_pane.as_ref() {
+        if pane.grabbed {
+            let _ = crate::tasks::write_bytes(pane.task_id, data.as_bytes());
+        }
+        return;
+    }
     let data = data.replace("\r\n", "\n").replace('\r', "\n");
     if let Some(panel) = app.question_panel.as_mut() {
         panel.handle_paste(&data);

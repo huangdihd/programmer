@@ -46,6 +46,8 @@ pub enum Command {
     Mcp(String),
     /// `/plan <approve|cancel>` — plan mode control.
     Plan(String),
+    /// `/terminal [id]` — open the interactive terminal panel for a task.
+    Terminal(String),
 }
 
 impl Command {
@@ -79,6 +81,7 @@ impl Command {
             "skill" | "skills" => Some(Command::Skill(args)),
             "mcp" => Some(Command::Mcp(args)),
             "plan" => Some(Command::Plan(args)),
+            "terminal" | "term" => Some(Command::Terminal(args)),
             _ => None,
         }
     }
@@ -87,7 +90,7 @@ impl Command {
     pub fn all_commands() -> &'static [&'static str] {
         &[
             "model", "new", "providers", "session", "mode", "classifier", "init", "todo", "skill",
-            "mcp", "plan", "clear", "quit", "help",
+            "mcp", "plan", "terminal", "clear", "quit", "help",
         ]
     }
 
@@ -104,6 +107,7 @@ impl Command {
             ("/skill manage", "Open the skills management panel"),
             ("/mcp show", "List configured MCP servers and their status"),
             ("/mcp manage", "Open the MCP server management panel"),
+            ("/terminal [id]", "Open the interactive terminal for a PTY task"),
             ("/todo | /t", "Open the todo list panel"),
             ("/new | /n", "Start a new session (saves current)"),
             ("/providers show", "List all configured providers and models"),

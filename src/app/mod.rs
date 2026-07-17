@@ -125,6 +125,8 @@ pub struct App<'a> {
     pub question_panel: Option<QuestionPanel>,
     /// Todo-list panel shown with `/todo`.
     pub todo_panel: Option<TodoPanel>,
+    /// Full-screen interactive terminal panel, when open (`/terminal`).
+    pub terminal_pane: Option<crate::ui::components::terminal_panel::TerminalPane>,
     /// Right-hand sidebar panel (toggled with Ctrl+B).
     pub sidebar: Option<Sidebar>,
     /// The sidebar's screen area from the last render, used to route mouse
@@ -234,6 +236,7 @@ impl App<'_> {
             mcp_panel: None,
             question_panel: None,
             todo_panel: None,
+            terminal_pane: None,
             sidebar: Some(Sidebar::new()),
             sidebar_area: None,
             todo_list: {

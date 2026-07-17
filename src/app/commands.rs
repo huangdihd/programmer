@@ -87,6 +87,56 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
     stream::spawn_stream(app);
 }
 
+/// Open the interactive terminal panel for a task. With no argument, opens the
+/// sole interactive task; with an id, opens that task if it is interactive.
+fn open_terminal(app: &mut App<'_>, arg: &str) {
+    use crate::ui::components::terminal_panel::TerminalPane;
+
+    let arg = arg.trim();
+    let id = if arg.is_empty() {
+        let interactive: Vec<u64> = crate::tasks::snapshot_all()
+            .iter()
+            .map(|t| t.id)
+            .filter(|id| crate::tasks::is_interactive(*id))
+            .collect();
+        match interactive.as_slice() {
+            [only] => *only,
+            [] => {
+                app.conversation_panel.add_warning_string(
+                    "no interactive tasks — create one with the task tool (interactive: true)",
+                );
+                return;
+            }
+            _ => {
+                app.conversation_panel.add_warning_string(
+                    "multiple interactive tasks — specify one with /terminal <id>",
+                );
+                return;
+            }
+        }
+    } else {
+        match arg.parse::<u64>() {
+            Ok(id) => id,
+            Err(_) => {
+                app.conversation_panel
+                    .add_warning_string(format!("/terminal: '{arg}' is not a task id"));
+                return;
+            }
+        }
+    };
+
+    if !crate::tasks::is_interactive(id) {
+        app.conversation_panel.add_warning_string(format!(
+            "task {id} is not interactive — only PTY tasks can be opened in the terminal"
+        ));
+        return;
+    }
+    let name = crate::tasks::snapshot(id)
+        .map(|s| s.name)
+        .unwrap_or_default();
+    app.terminal_pane = Some(TerminalPane::new(id, name));
+}
+
 // ---------------------------------------------------------------------------
 // Slash-command dispatch
 // ---------------------------------------------------------------------------
@@ -248,6 +298,10 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         Some(Command::Todo) => {
             app.input_panel.clear();
             app.todo_panel = Some(TodoPanel::new(app.todo_list.clone()));
+        }
+        Some(Command::Terminal(arg)) => {
+            app.input_panel.clear();
+            open_terminal(app, &arg);
         }
         Some(Command::Providers(arg)) => {
             app.input_panel.clear();

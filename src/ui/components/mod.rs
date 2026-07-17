@@ -26,4 +26,5 @@ pub mod question_panel;
 pub mod sidebar;
 pub mod skills_panel;
 pub mod status_bar;
+pub mod terminal_panel;
 pub mod todo_panel;

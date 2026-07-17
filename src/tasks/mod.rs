@@ -478,6 +478,17 @@ pub fn screen_snapshot(id: u64) -> Result<ScreenSnapshot, String> {
     })
 }
 
+/// Run `f` with a locked reference to an interactive task's vt100 screen, for
+/// cell-level rendering. Returns `None` if the task doesn't exist or isn't
+/// interactive.
+pub fn with_screen<R>(id: u64, f: impl FnOnce(&vt100::Screen) -> R) -> Option<R> {
+    let reg = registry().lock().unwrap();
+    let entry = reg.iter().find(|e| e.id == id)?;
+    let pty = entry.pty.as_ref()?;
+    let parser = pty.parser.lock().ok()?;
+    Some(f(parser.screen()))
+}
+
 /// Resize an interactive task's PTY and screen grid.
 pub fn resize(id: u64, rows: u16, cols: u16) -> Result<(), String> {
     let mut reg = registry().lock().unwrap();
