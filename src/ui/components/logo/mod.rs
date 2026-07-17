@@ -14,9 +14,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Rect;
 use ratatui::prelude::Widget;
-use ratatui_widgets::block::Block;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 
 pub struct Logo {}
 
@@ -28,9 +30,16 @@ impl Logo {
 
 impl Widget for Logo {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .title("Programmer")
-            .title_alignment(Alignment::Center);
-        block.render(area, buf)
+        let title = Line::styled(
+            "Programmer",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+        let separator =
+            Line::styled("─".repeat(area.width as usize), Style::default().fg(Color::DarkGray));
+        Paragraph::new(vec![title, separator])
+            .centered()
+            .render(area, buf);
     }
 }

@@ -58,9 +58,10 @@ impl App<'_> {
         }
     }
 
-    /// Render the main vertical layout area (logo, conversation, todo bar,
+    /// Render the main vertical layout area (conversation, todo bar,
     /// input, footer, overlays). Called either full-screen or in the left
-    /// portion when the sidebar is open.
+    /// portion when the sidebar is open.  The logo/title is rendered at the
+    /// top level so it spans the full width even when the sidebar is open.
     fn render_main(
         &mut self,
         area: Rect,
@@ -71,24 +72,20 @@ impl App<'_> {
     ) {
         // Named indices into the constraint array so they don't drift when
         // rows are added or removed.
-        const POS_LOGO: usize = 0;
-        const POS_CONV: usize = 1;
-        const POS_TODO: usize = 2;
-        const POS_BOTTOM: usize = 3;
-        const POS_FOOTER: usize = 4;
+        const POS_CONV: usize = 0;
+        const POS_TODO: usize = 1;
+        const POS_BOTTOM: usize = 2;
+        const POS_FOOTER: usize = 3;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),               // POS_LOGO
                 Constraint::Min(2),                  // POS_CONV
                 Constraint::Length(todo_bar_height), // POS_TODO
                 Constraint::Length(bottom_height),   // POS_BOTTOM
                 Constraint::Length(1),               // POS_FOOTER
             ])
             .split(area);
-        let logo = Logo::new();
-        logo.render(chunks[POS_LOGO], buf);
         self.conversation_panel.render(chunks[POS_CONV], buf);
 
         // ---- compact todo bar (inline, above the input area) ----
@@ -393,16 +390,28 @@ impl Widget for &mut App<'_> {
         let has_todo_bar = !self.todo_list.todos.is_empty() && self.todo_panel.is_none();
         let todo_bar_height: u16 = if has_todo_bar { 1 } else { 0 };
 
-        // ---- sidebar: conditionally split the screen horizontally ----
+        // ---- logo at top (full width, even with sidebar open) ----
+        let vert = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),  // logo
+                Constraint::Min(1),     // content area
+            ])
+            .split(area);
+        let logo = Logo::new();
+        logo.render(vert[0], buf);
+        let content_area = vert[1];
+
+        // ---- sidebar: conditionally split the content area horizontally ----
         if self.sidebar.is_some() {
-            let sidebar_width = Sidebar::needed_width().min(area.width / 3);
+            let sidebar_width = Sidebar::needed_width().min(content_area.width / 3);
             let horiz = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
                     Constraint::Min(10),               // main area
                     Constraint::Length(sidebar_width), // sidebar
                 ])
-                .split(area);
+                .split(content_area);
             self.sidebar_area = Some(horiz[1]);
 
             self.render_main(horiz[0], buf, has_todo_bar, todo_bar_height, bottom_height);
@@ -419,7 +428,7 @@ impl Widget for &mut App<'_> {
                 );
         } else {
             self.sidebar_area = None;
-            self.render_main(area, buf, has_todo_bar, todo_bar_height, bottom_height);
+            self.render_main(content_area, buf, has_todo_bar, todo_bar_height, bottom_height);
         }
     }
 }
