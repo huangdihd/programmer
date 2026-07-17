@@ -46,7 +46,10 @@ struct Args {
     session: bool,
     providers: bool,
     mcp_server: bool,
-    /// Work mode for `--mcp-server` tool gating (default Auto).
+    /// `--mcp-http [addr]`: run the HTTP MCP server + console. Carries the bind
+    /// address (default 127.0.0.1:8765).
+    mcp_http: Option<String>,
+    /// Work mode for MCP tool gating (default Auto).
     mcp_mode: crate::classifier::WorkMode,
 }
 
@@ -62,9 +65,12 @@ Options:
   --providers       Open the provider management panel on startup
   --mcp-server      Run as an MCP server on stdio, exposing programmer's local
                     tools to any MCP client (no TUI)
-  --mcp-mode <mode> Tool-gating mode for --mcp-server: auto (default, LLM
-                    confirms dangerous tools), manual (human confirms via MCP
-                    elicitation), plan (read-only), or yolo (run everything)
+  --mcp-http [addr] Run an HTTP MCP server (default 127.0.0.1:8765) with a
+                    ratatui approval console; the operator approves manual-mode
+                    calls and switches mode (Ctrl+T) live
+  --mcp-mode <mode> Tool-gating mode for the MCP server: auto (default; LLM
+                    confirms dangerous tools — manual/console for --mcp-http),
+                    manual, plan (read-only), or yolo (run everything)
   -h, --help        Show this help and exit";
 
 fn parse_args() -> Args {
@@ -75,6 +81,7 @@ fn parse_args() -> Args {
         session: false,
         providers: false,
         mcp_server: false,
+        mcp_http: None,
         mcp_mode: crate::classifier::WorkMode::Auto,
     };
     let mut i = 1;
@@ -91,6 +98,14 @@ fn parse_args() -> Args {
             "--session" => parsed.session = true,
             "--providers" => parsed.providers = true,
             "--mcp-server" | "--serve-mcp" => parsed.mcp_server = true,
+            "--mcp-http" => {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    parsed.mcp_http = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    parsed.mcp_http = Some(String::new());
+                }
+            }
             "--mcp-mode" => {
                 if let Some(m) = args.get(i + 1) {
                     parsed.mcp_mode = parse_work_mode(m);
@@ -264,6 +279,25 @@ async fn main() -> color_eyre::Result<()> {
         mcp::server::McpServer::new(args.mcp_mode, classifier)
             .run()
             .await?;
+        return Ok(());
+    }
+
+    // HTTP MCP server + ratatui approval console.
+    if let Some(addr_arg) = args.mcp_http {
+        let addr: std::net::SocketAddr = if addr_arg.trim().is_empty() {
+            ([127, 0, 0, 1], 8765).into()
+        } else {
+            match addr_arg.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("invalid --mcp-http address '{addr_arg}': {e}");
+                    std::process::exit(1);
+                }
+            }
+        };
+        let classifier = build_mcp_classifier().await;
+        let allow_yolo = load_config().map(|(c, _)| c.allow_yolo).unwrap_or(false);
+        mcp::http_server::serve(args.mcp_mode, classifier, addr, allow_yolo).await?;
         return Ok(());
     }
 

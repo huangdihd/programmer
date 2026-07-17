@@ -292,6 +292,19 @@ Register it with a client by pointing at the binary, e.g.:
 
 The tools run in the server process's working directory.
 
+#### Over HTTP, with an approval console
+
+```sh
+programmer --mcp-http            # default 127.0.0.1:8765
+programmer --mcp-http 0.0.0.0:9000 --mcp-mode manual
+```
+
+`--mcp-http` serves the same tools over plain-HTTP JSON-RPC (`POST /mcp`) and,
+because the transport isn't stdio, keeps the terminal for a small **ratatui
+approval console**. There you watch tool calls stream in, approve `manual`-mode
+calls (`y`/`n`), and switch the work mode live (`Ctrl+T`) — `auto` still uses
+the LLM classifier, `manual` waits for you at the console.
+
 ### Session management
 
 Sessions are saved to `~/.config/programmer/sessions/<uuid>.json`.

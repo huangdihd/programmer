@@ -19,7 +19,9 @@
 //! via `initialize` + `tools/list`, and routes `tools/call` requests.
 
 pub mod client;
+pub mod console;
 pub mod http_client;
+pub mod http_server;
 pub mod server;
 pub mod types;
 

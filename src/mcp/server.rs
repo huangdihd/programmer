@@ -296,12 +296,25 @@ fn error_envelope(id: &Value, code: i64, message: &str) -> String {
     .to_string()
 }
 
-fn tools_list_result() -> Value {
+pub(crate) fn tools_list_result() -> Value {
     let tools: Vec<Value> = crate::tools::mcp_server_tools()
         .iter()
         .filter_map(tool_to_spec)
         .collect();
     json!({ "tools": tools })
+}
+
+/// Build an MCP `initialize` result advertising the tools capability.
+pub(crate) fn initialize_result(params: Option<&Value>) -> Value {
+    let version = params
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    json!({
+        "protocolVersion": version,
+        "capabilities": { "tools": { "listChanged": false } },
+        "serverInfo": { "name": "programmer", "version": env!("CARGO_PKG_VERSION") },
+    })
 }
 
 /// Convert a function tool definition into an MCP tool spec.
@@ -319,7 +332,7 @@ fn tool_to_spec(tool: &Tool) -> Option<Value> {
     }))
 }
 
-fn tool_content(text: String, is_error: bool) -> Value {
+pub(crate) fn tool_content(text: String, is_error: bool) -> Value {
     json!({
         "content": [ { "type": "text", "text": text } ],
         "isError": is_error,
