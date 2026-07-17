@@ -92,34 +92,39 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
 fn open_terminal(app: &mut App<'_>, arg: &str) {
     use crate::ui::components::terminal_panel::TerminalPane;
 
-    let arg = arg.trim();
-    let id = if arg.is_empty() {
-        let interactive: Vec<u64> = crate::tasks::snapshot_all()
+    // Accept an id as the first token (completion may append the task name).
+    let first = arg.split_whitespace().next().unwrap_or("");
+    let id = if first.is_empty() {
+        // Auto-select the sole *running* interactive task.
+        let running: Vec<u64> = crate::tasks::snapshot_all()
             .iter()
+            .filter(|t| {
+                t.status == crate::tasks::TaskStatus::Running
+                    && crate::tasks::is_interactive(t.id)
+            })
             .map(|t| t.id)
-            .filter(|id| crate::tasks::is_interactive(*id))
             .collect();
-        match interactive.as_slice() {
+        match running.as_slice() {
             [only] => *only,
             [] => {
                 app.conversation_panel.add_warning_string(
-                    "no interactive tasks — create one with the task tool (interactive: true)",
+                    "no running interactive task — create one with the task tool (interactive: true)",
                 );
                 return;
             }
             _ => {
                 app.conversation_panel.add_warning_string(
-                    "multiple interactive tasks — specify one with /terminal <id>",
+                    "multiple running interactive tasks — specify one with /terminal <id>",
                 );
                 return;
             }
         }
     } else {
-        match arg.parse::<u64>() {
+        match first.parse::<u64>() {
             Ok(id) => id,
             Err(_) => {
                 app.conversation_panel
-                    .add_warning_string(format!("/terminal: '{arg}' is not a task id"));
+                    .add_warning_string(format!("/terminal: '{first}' is not a task id"));
                 return;
             }
         }

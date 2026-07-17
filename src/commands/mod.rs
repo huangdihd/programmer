@@ -200,8 +200,27 @@ impl CompletionEngine {
             "providers" | "provider" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
             "skill" | "skills" => Self::complete_skill(text, cmd, skill_registry),
             "mcp" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
+            "terminal" | "term" => Self::complete_terminal(text, cmd),
             _ => None,
         }
+    }
+
+    /// Complete a `/terminal` task id from the running interactive tasks. Each
+    /// candidate is `"<id>  <name>"`; the id is the first token so it still
+    /// parses when accepted with the name appended.
+    fn complete_terminal(text: &str, cmd: &str) -> Option<CompletionState> {
+        let after_cmd = text[cmd.len()..].trim_start();
+        let prefix = format!("/{} ", cmd);
+        let candidates: Vec<String> = crate::tasks::snapshot_all()
+            .iter()
+            .filter(|t| {
+                t.status == crate::tasks::TaskStatus::Running
+                    && crate::tasks::is_interactive(t.id)
+            })
+            .map(|t| format!("{}  {}", t.id, t.name))
+            .filter(|c| c.starts_with(after_cmd))
+            .collect();
+        CompletionState::new(prefix, candidates)
     }
 
     /// Complete an `@file` reference. Triggered when the whitespace-delimited
@@ -444,6 +463,24 @@ mod tests {
         let dir_pos = got.iter().position(|c| c == "src/commands/").unwrap();
         let file_pos = got.iter().position(|c| c == "src/consts.rs").unwrap();
         assert!(dir_pos < file_pos, "dirs first: {got:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_completion_lists_running_interactive_tasks() {
+        let id = crate::tasks::spawn_interactive("cat", None, Some("catname"), 10, 40)
+            .expect("spawn");
+        let state = CompletionEngine::complete_terminal("terminal ", "terminal")
+            .expect("candidates for the running task");
+        assert!(
+            state
+                .candidates
+                .iter()
+                .any(|c| c.starts_with(&format!("{id}  "))),
+            "candidates: {:?}",
+            state.candidates
+        );
+        crate::tasks::kill(id).ok();
     }
 
     #[tokio::test]
