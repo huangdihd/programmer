@@ -234,7 +234,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
                 async move {
                     // Let the info_string render before we push the init prompt.
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let _ = sender.send(crate::ui::event::Event::App(AppEvent::Start));
+                    let _ = sender.send(crate::ui::event::Event::App(AppEvent::StartInit));
                 }
             });
         }

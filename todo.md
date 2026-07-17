@@ -3,7 +3,7 @@
 - edit_file tool diff-style message
 - lint
 - remote control(?)
-- fix /init
+- ~~fix /init~~
 - interactive background task terminal(?)
 - installation script(publish to cargo?)
 - ~~multi-provider support~~
