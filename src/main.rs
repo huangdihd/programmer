@@ -46,6 +46,8 @@ struct Args {
     session: bool,
     providers: bool,
     mcp_server: bool,
+    /// Work mode for `--mcp-server` tool gating (default Auto).
+    mcp_mode: crate::classifier::WorkMode,
 }
 
 const HELP_TEXT: &str = "\
@@ -60,6 +62,8 @@ Options:
   --providers       Open the provider management panel on startup
   --mcp-server      Run as an MCP server on stdio, exposing programmer's local
                     tools to any MCP client (no TUI)
+  --mcp-mode <mode> Tool-gating mode for --mcp-server: manual/auto (default,
+                    read-only allowed, dangerous refused), plan, or yolo (all)
   -h, --help        Show this help and exit";
 
 fn parse_args() -> Args {
@@ -70,6 +74,7 @@ fn parse_args() -> Args {
         session: false,
         providers: false,
         mcp_server: false,
+        mcp_mode: crate::classifier::WorkMode::Auto,
     };
     let mut i = 1;
     while i < args.len() {
@@ -85,12 +90,28 @@ fn parse_args() -> Args {
             "--session" => parsed.session = true,
             "--providers" => parsed.providers = true,
             "--mcp-server" | "--serve-mcp" => parsed.mcp_server = true,
+            "--mcp-mode" => {
+                if let Some(m) = args.get(i + 1) {
+                    parsed.mcp_mode = parse_work_mode(m);
+                    i += 1;
+                }
+            }
             "-h" | "--help" => parsed.help = true,
             _ => {}
         }
         i += 1;
     }
     parsed
+}
+
+fn parse_work_mode(s: &str) -> crate::classifier::WorkMode {
+    use crate::classifier::WorkMode;
+    match s.to_ascii_lowercase().as_str() {
+        "manual" => WorkMode::Manual,
+        "yolo" => WorkMode::Yolo,
+        "plan" => WorkMode::Plan,
+        _ => WorkMode::Auto,
+    }
 }
 
 /// Resolved session data ready for the application.
@@ -222,7 +243,7 @@ async fn main() -> color_eyre::Result<()> {
 
     // MCP server mode: no TUI, stdout is reserved for the JSON-RPC protocol.
     if args.mcp_server {
-        mcp::server::run_stdio_server().await?;
+        mcp::server::run_stdio_server(args.mcp_mode).await?;
         return Ok(());
     }
 

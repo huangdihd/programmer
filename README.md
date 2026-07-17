@@ -269,12 +269,21 @@ client — another agent, Claude Desktop, etc. It speaks JSON-RPC 2.0 over stdio
 programmer --mcp-server
 ```
 
+Tool calls are gated by the same classifier as the TUI, via `--mcp-mode`.
+Since there's no UI to approve, an "ask" verdict becomes a denial:
+
+| `--mcp-mode` | Behavior |
+|---|---|
+| `auto` (default) / `manual` | Read-only tools run; dangerous tools (`command`, `write_file`, `edit_file`, mutating `task` actions, …) are refused |
+| `plan` | Read-only tools run; state-mutating tools are refused |
+| `yolo` | All tools run without gating |
+
 Register it with a client by pointing at the binary, e.g.:
 
 ```json
 {
   "mcpServers": {
-    "programmer": { "command": "programmer", "args": ["--mcp-server"] }
+    "programmer": { "command": "programmer", "args": ["--mcp-server", "--mcp-mode", "yolo"] }
   }
 }
 ```
