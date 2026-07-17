@@ -317,8 +317,16 @@ pub fn spawn_interactive(
     let mut cmd = CommandBuilder::new(program);
     cmd.arg(flag);
     cmd.arg(command);
-    if let Some(dir) = dir {
-        cmd.cwd(dir);
+    // portable-pty's CommandBuilder does NOT inherit the parent's cwd (it
+    // defaults to the home directory), so set it explicitly — to `dir` when
+    // given, otherwise the app's working directory, matching pipe tasks.
+    match dir {
+        Some(dir) => cmd.cwd(dir),
+        None => {
+            if let Ok(cwd) = std::env::current_dir() {
+                cmd.cwd(cwd);
+            }
+        }
     }
 
     let mut child = pair
@@ -890,6 +898,23 @@ mod tests {
         let (snap, still) = wait(id, Duration::from_secs(10)).await.expect("wait");
         assert!(!still);
         assert_eq!(snap.status, TaskStatus::Killed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_task_defaults_to_current_dir() {
+        // With no `dir`, the child must run in the app's cwd — not the home
+        // directory portable-pty would otherwise default to.
+        let cwd = std::env::current_dir().unwrap();
+        let id = spawn_interactive("pwd", None, Some("pwd"), 10, 80).expect("spawn");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snap = screen_snapshot(id).expect("screen");
+        assert!(
+            snap.text.contains(&cwd.to_string_lossy().to_string()),
+            "expected cwd {cwd:?} in screen: {}",
+            snap.text
+        );
+        kill(id).ok();
     }
 
     #[tokio::test]
