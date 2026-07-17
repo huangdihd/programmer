@@ -222,6 +222,9 @@ pub struct ConversationPanel {
     /// so a mouse click can be mapped back to the item under the cursor.
     view_area: Rect,
     view_offset: u16,
+    /// Screen area of the "jump to bottom" indicator from the last render, when
+    /// the view is scrolled up. `None` when at the bottom (indicator hidden).
+    jump_button: Option<Rect>,
     /// Per-item vertical extent in scroll-buffer coordinates: `(index, top, bottom)`.
     /// Recorded each render and consulted on click.
     item_layout: Vec<(usize, u16, u16)>,
@@ -257,6 +260,7 @@ impl ConversationPanel {
             expanded_items: HashSet::new(),
             view_area: Rect::ZERO,
             view_offset: 0,
+            jump_button: None,
             item_layout: Vec::new(),
             live_item_layout: Vec::new(),
             render_cache: RenderCache::default(),
@@ -663,6 +667,18 @@ impl ConversationPanel {
 
     pub fn is_at_bottom(&self) -> bool {
         self.scroll_view_state.is_at_bottom()
+    }
+
+    /// Record the "jump to bottom" indicator's screen area for this frame.
+    pub(crate) fn set_jump_button(&mut self, area: Option<Rect>) {
+        self.jump_button = area;
+    }
+
+    /// Whether a click at `(column, row)` lands on the jump-to-bottom indicator.
+    pub fn jump_button_hit(&self, column: u16, row: u16) -> bool {
+        self.jump_button.map_or(false, |b| {
+            column >= b.x && column < b.x + b.width && row >= b.y && row < b.y + b.height
+        })
     }
 
     pub fn scroll_up(&mut self) {

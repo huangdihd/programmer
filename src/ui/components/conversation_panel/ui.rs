@@ -27,6 +27,7 @@ use crate::ui::components::messages::user_message::UserMessage;
 use crate::ui::components::messages::warning_message::WarningMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
+use crate::ui::markdown_theme::palette;
 use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem};
 use std::collections::{HashMap, HashSet};
 use ratatui::buffer::Buffer;
@@ -405,6 +406,31 @@ impl Widget for &mut ConversationPanel {
                     }
                 }
             }
+        }
+
+        // "Jump to bottom" indicator: shown only while scrolled up, at the
+        // bottom-right of the view. Clickable (see the mouse handler).
+        if area.height > 0 && !self.scroll_view_state.is_at_bottom() {
+            let label = " \u{2193} latest ";
+            let w = label.chars().count() as u16;
+            if area.width >= w {
+                let x = area.x + area.width - w;
+                let y = area.y + area.height - 1;
+                buf.set_string(
+                    x,
+                    y,
+                    label,
+                    Style::new()
+                        .fg(palette::TEXT)
+                        .bg(palette::SURFACE)
+                        .add_modifier(Modifier::BOLD),
+                );
+                self.set_jump_button(Some(Rect { x, y, width: w, height: 1 }));
+            } else {
+                self.set_jump_button(None);
+            }
+        } else {
+            self.set_jump_button(None);
         }
 
         self.set_layout(area, offset, layout, live_layout);

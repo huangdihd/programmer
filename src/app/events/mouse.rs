@@ -50,6 +50,11 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
             if app.sidebar_click_active {
                 return;
             }
+            // Clicking the "jump to bottom" indicator snaps to the latest.
+            if app.conversation_panel.jump_button_hit(mouse.column, mouse.row) {
+                app.conversation_panel.scroll_to_bottom();
+                return;
+            }
             app.conversation_panel
                 .selection_begin(mouse.column, mouse.row)
         }

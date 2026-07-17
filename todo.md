@@ -1,5 +1,5 @@
 - multimodal support
-- Jump to bottom button
+- ~~Jump to bottom button~~
 - ~~http mcp~~
 - ~~edit_file tool diff-style message~~
 - lint
