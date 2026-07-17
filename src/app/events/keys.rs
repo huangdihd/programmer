@@ -307,8 +307,13 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
     }
 
     if pane.grabbed {
-        if let Some(bytes) = key_event_to_bytes(key_event) {
+        // Cursor keys need the child's DECCKM mode to pick CSI vs SS3.
+        let app_cursor = crate::tasks::with_screen(pane.task_id, |s| s.application_cursor())
+            .unwrap_or(false);
+        if let Some(bytes) = key_event_to_bytes(key_event, app_cursor) {
             let _ = crate::tasks::write_bytes(pane.task_id, &bytes);
+            // Typing snaps the view back to live output.
+            crate::tasks::scroll_screen(pane.task_id, i32::MIN);
         }
         return;
     }
@@ -326,18 +331,36 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
 /// the program has enabled mouse reporting. Swallowed otherwise.
 pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::MouseEvent) {
     use crate::ui::components::terminal_panel::mouse_event_to_bytes;
+    use crossterm::event::MouseEventKind;
 
     let Some(pane) = app.terminal_pane.as_ref() else {
         return;
     };
+    let mode = crate::tasks::with_screen(pane.task_id, |s| s.mouse_protocol_mode())
+        .unwrap_or(vt100::MouseProtocolMode::None);
+
+    // The wheel scrolls the local scrollback unless a grabbed program is
+    // consuming the mouse itself (then the wheel is forwarded below).
+    let program_wants_mouse = pane.grabbed && mode != vt100::MouseProtocolMode::None;
+    match mouse.kind {
+        MouseEventKind::ScrollUp if !program_wants_mouse => {
+            crate::tasks::scroll_screen(pane.task_id, 3);
+            return;
+        }
+        MouseEventKind::ScrollDown if !program_wants_mouse => {
+            crate::tasks::scroll_screen(pane.task_id, -3);
+            return;
+        }
+        _ => {}
+    }
+
+    // Everything else is only forwarded while grabbed.
     if !pane.grabbed {
         return;
     }
     let Some(grid) = pane.grid else {
         return;
     };
-    let mode = crate::tasks::with_screen(pane.task_id, |s| s.mouse_protocol_mode())
-        .unwrap_or(vt100::MouseProtocolMode::None);
     if let Some(bytes) = mouse_event_to_bytes(mouse, grid, mode) {
         let _ = crate::tasks::write_bytes(pane.task_id, &bytes);
     }

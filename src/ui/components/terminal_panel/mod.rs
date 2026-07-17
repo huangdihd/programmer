@@ -78,10 +78,14 @@ pub fn grid_area(area: Rect) -> Rect {
 }
 
 /// Translate a crossterm key event into the bytes a terminal would send for it.
-/// Returns `None` for keys with no terminal encoding.
-pub fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+/// Returns `None` for keys with no terminal encoding. `app_cursor` reflects the
+/// child's DECCKM mode: when set, cursor keys use the SS3 (`ESC O`) form the
+/// program expects instead of the default CSI (`ESC [`) form.
+pub fn key_event_to_bytes(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // Cursor keys: `ESC O <c>` in application mode, `ESC [ <c>` otherwise.
+    let cursor = |c: u8| -> [u8; 3] { [0x1b, if app_cursor { b'O' } else { b'[' }, c] };
     let mut out: Vec<u8> = Vec::new();
     match key.code {
         KeyCode::Char(c) => {
@@ -113,12 +117,12 @@ pub fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
         KeyCode::Backspace => out.push(0x7f),
         KeyCode::Esc => out.push(0x1b),
-        KeyCode::Left => out.extend_from_slice(b"\x1b[D"),
-        KeyCode::Right => out.extend_from_slice(b"\x1b[C"),
-        KeyCode::Up => out.extend_from_slice(b"\x1b[A"),
-        KeyCode::Down => out.extend_from_slice(b"\x1b[B"),
-        KeyCode::Home => out.extend_from_slice(b"\x1b[H"),
-        KeyCode::End => out.extend_from_slice(b"\x1b[F"),
+        KeyCode::Left => out.extend_from_slice(&cursor(b'D')),
+        KeyCode::Right => out.extend_from_slice(&cursor(b'C')),
+        KeyCode::Up => out.extend_from_slice(&cursor(b'A')),
+        KeyCode::Down => out.extend_from_slice(&cursor(b'B')),
+        KeyCode::Home => out.extend_from_slice(&cursor(b'H')),
+        KeyCode::End => out.extend_from_slice(&cursor(b'F')),
         KeyCode::PageUp => out.extend_from_slice(b"\x1b[5~"),
         KeyCode::PageDown => out.extend_from_slice(b"\x1b[6~"),
         KeyCode::Delete => out.extend_from_slice(b"\x1b[3~"),
@@ -267,12 +271,12 @@ pub fn render(pane: &TerminalPane, area: Rect, buf: &mut Buffer) {
     // Hint.
     let hint = if pane.grabbed {
         Line::from(Span::styled(
-            " Ctrl+O release input   keys & mouse go to the program",
+            " Ctrl+O release   keys & mouse → program   wheel: scroll back",
             Style::new().fg(palette::FAINT),
         ))
     } else {
         Line::from(Span::styled(
-            " Ctrl+O grab input   Esc / q close",
+            " Ctrl+O grab input   wheel: scroll   Esc / q close",
             Style::new().fg(palette::FAINT),
         ))
     };
@@ -349,29 +353,42 @@ mod tests {
     #[test]
     fn translates_plain_and_control_keys() {
         assert_eq!(
-            key_event_to_bytes(key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            key_event_to_bytes(key(KeyCode::Char('a'), KeyModifiers::NONE), false),
             Some(vec![b'a'])
         );
         assert_eq!(
-            key_event_to_bytes(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            key_event_to_bytes(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false),
             Some(vec![0x03])
         );
         assert_eq!(
-            key_event_to_bytes(key(KeyCode::Enter, KeyModifiers::NONE)),
+            key_event_to_bytes(key(KeyCode::Enter, KeyModifiers::NONE), false),
             Some(vec![b'\r'])
-        );
-        assert_eq!(
-            key_event_to_bytes(key(KeyCode::Up, KeyModifiers::NONE)),
-            Some(b"\x1b[A".to_vec())
         );
         // Alt prefixes ESC.
         assert_eq!(
-            key_event_to_bytes(key(KeyCode::Char('x'), KeyModifiers::ALT)),
+            key_event_to_bytes(key(KeyCode::Char('x'), KeyModifiers::ALT), false),
             Some(vec![0x1b, b'x'])
         );
         assert_eq!(
-            key_event_to_bytes(key(KeyCode::F(1), KeyModifiers::NONE)),
+            key_event_to_bytes(key(KeyCode::F(1), KeyModifiers::NONE), false),
             Some(b"\x1bOP".to_vec())
+        );
+    }
+
+    #[test]
+    fn cursor_keys_switch_between_csi_and_ss3() {
+        // Normal mode → CSI (ESC [), application-cursor mode → SS3 (ESC O).
+        assert_eq!(
+            key_event_to_bytes(key(KeyCode::Up, KeyModifiers::NONE), false),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(key(KeyCode::Up, KeyModifiers::NONE), true),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(key(KeyCode::Left, KeyModifiers::NONE), true),
+            Some(b"\x1bOD".to_vec())
         );
     }
 

@@ -560,6 +560,22 @@ pub fn key_to_bytes(name: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Scroll an interactive task's scrollback view by `delta` lines (positive =
+/// toward older output). Clamps at the bottom (0). Use `i32::MIN` to snap back
+/// to live output. No-op for non-interactive tasks.
+pub fn scroll_screen(id: u64, delta: i32) {
+    let reg = registry().lock().unwrap();
+    if let Some(entry) = reg.iter().find(|e| e.id == id) {
+        if let Some(pty) = &entry.pty {
+            if let Ok(mut parser) = pty.parser.lock() {
+                let current = parser.screen().scrollback() as i64;
+                let next = (current + delta as i64).max(0) as usize;
+                parser.set_scrollback(next);
+            }
+        }
+    }
+}
+
 /// Encode one SGR (1006) mouse report. `code` is the button/motion/wheel code
 /// (with any modifier bits already applied); `col0`/`row0` are 0-based cell
 /// coordinates (SGR is 1-based, so they're incremented); `release` selects the
