@@ -42,6 +42,9 @@ pub struct TerminalPane {
     pub grabbed: bool,
     /// Last grid size pushed to the PTY, so we only resize on change.
     last_size: Option<(u16, u16)>,
+    /// The vt100 grid's screen area from the last render, for translating mouse
+    /// coordinates into cell coordinates.
+    pub grid: Option<Rect>,
 }
 
 impl TerminalPane {
@@ -51,6 +54,7 @@ impl TerminalPane {
             name,
             grabbed: false,
             last_size: None,
+            grid: None,
         }
     }
 
@@ -125,6 +129,77 @@ pub fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Translate a crossterm mouse event into an SGR mouse report for the child,
+/// or `None` if it shouldn't be forwarded: the pointer is outside the grid, the
+/// program hasn't enabled mouse reporting, or the event kind isn't wanted in
+/// the program's current tracking mode.
+pub fn mouse_event_to_bytes(
+    mouse: crossterm::event::MouseEvent,
+    grid: Rect,
+    mode: vt100::MouseProtocolMode,
+) -> Option<Vec<u8>> {
+    use crossterm::event::{MouseButton as B, MouseEventKind as K};
+    use vt100::MouseProtocolMode as M;
+
+    if mode == M::None {
+        return None;
+    }
+    // Screen coordinates → 0-based cell coordinates within the grid.
+    if mouse.column < grid.x || mouse.row < grid.y {
+        return None;
+    }
+    let col = mouse.column - grid.x;
+    let row = mouse.row - grid.y;
+    if col >= grid.width || row >= grid.height {
+        return None;
+    }
+
+    let base = |b: B| -> u8 {
+        match b {
+            B::Left => 0,
+            B::Middle => 1,
+            B::Right => 2,
+        }
+    };
+    let (mut code, release) = match mouse.kind {
+        K::Down(b) => (base(b), false),
+        K::Up(b) => {
+            if mode == M::Press {
+                return None; // press-only tracking doesn't want releases
+            }
+            (base(b), true)
+        }
+        K::Drag(b) => {
+            if !matches!(mode, M::ButtonMotion | M::AnyMotion) {
+                return None;
+            }
+            (base(b) + 32, false)
+        }
+        K::Moved => {
+            if mode != M::AnyMotion {
+                return None;
+            }
+            (3 + 32, false)
+        }
+        K::ScrollUp => (64, false),
+        K::ScrollDown => (65, false),
+        K::ScrollLeft => (66, false),
+        K::ScrollRight => (67, false),
+    };
+    // Modifier bits.
+    let m = mouse.modifiers;
+    if m.contains(KeyModifiers::SHIFT) {
+        code += 4;
+    }
+    if m.contains(KeyModifiers::ALT) {
+        code += 8;
+    }
+    if m.contains(KeyModifiers::CONTROL) {
+        code += 16;
+    }
+    Some(tasks::sgr_mouse(code, col, row, release))
+}
+
 fn fkey(n: u8) -> Option<&'static [u8]> {
     Some(match n {
         1 => b"\x1bOP",
@@ -192,7 +267,7 @@ pub fn render(pane: &TerminalPane, area: Rect, buf: &mut Buffer) {
     // Hint.
     let hint = if pane.grabbed {
         Line::from(Span::styled(
-            " Ctrl+O release input   keys go to the program",
+            " Ctrl+O release input   keys & mouse go to the program",
             Style::new().fg(palette::FAINT),
         ))
     } else {
@@ -307,6 +382,57 @@ mod tests {
         assert_eq!(g.y, 1);
         assert_eq!(g.height, 22);
         assert_eq!(g.width, 80);
+    }
+
+    fn mev(kind: crossterm::event::MouseEventKind, col: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_click_encodes_sgr_with_local_coords() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        // Grid starts at y=1 (header above). A click at screen (5,3) is local
+        // (5,2) → SGR 1-based (6,3).
+        let grid = Rect::new(0, 1, 80, 22);
+        let m = mev(MouseEventKind::Down(MouseButton::Left), 5, 3);
+        let bytes =
+            mouse_event_to_bytes(m, grid, vt100::MouseProtocolMode::PressRelease).unwrap();
+        assert_eq!(bytes, b"\x1b[<0;6;3M".to_vec());
+    }
+
+    #[test]
+    fn mouse_gated_off_when_disabled_or_outside_grid() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let grid = Rect::new(0, 1, 80, 22);
+        let inside = mev(MouseEventKind::Down(MouseButton::Left), 5, 3);
+        assert!(mouse_event_to_bytes(inside, grid, vt100::MouseProtocolMode::None).is_none());
+        // Screen row 0 is the header, above the grid.
+        let above = mev(MouseEventKind::Down(MouseButton::Left), 5, 0);
+        assert!(
+            mouse_event_to_bytes(above, grid, vt100::MouseProtocolMode::PressRelease).is_none()
+        );
+    }
+
+    #[test]
+    fn drag_and_scroll_respect_tracking_mode() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let grid = Rect::new(0, 0, 80, 24);
+        let drag = mev(MouseEventKind::Drag(MouseButton::Left), 5, 3);
+        assert!(
+            mouse_event_to_bytes(drag, grid, vt100::MouseProtocolMode::PressRelease).is_none()
+        );
+        assert!(
+            mouse_event_to_bytes(drag, grid, vt100::MouseProtocolMode::ButtonMotion).is_some()
+        );
+        let scroll = mev(MouseEventKind::ScrollUp, 2, 2);
+        let bytes =
+            mouse_event_to_bytes(scroll, grid, vt100::MouseProtocolMode::Press).unwrap();
+        assert_eq!(bytes, b"\x1b[<64;3;3M".to_vec());
     }
 
     #[cfg(unix)]

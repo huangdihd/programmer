@@ -322,6 +322,27 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
     }
 }
 
+/// Forward a mouse event to the terminal panel's PTY when input is grabbed and
+/// the program has enabled mouse reporting. Swallowed otherwise.
+pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::MouseEvent) {
+    use crate::ui::components::terminal_panel::mouse_event_to_bytes;
+
+    let Some(pane) = app.terminal_pane.as_ref() else {
+        return;
+    };
+    if !pane.grabbed {
+        return;
+    }
+    let Some(grid) = pane.grid else {
+        return;
+    };
+    let mode = crate::tasks::with_screen(pane.task_id, |s| s.mouse_protocol_mode())
+        .unwrap_or(vt100::MouseProtocolMode::None);
+    if let Some(bytes) = mouse_event_to_bytes(mouse, grid, mode) {
+        let _ = crate::tasks::write_bytes(pane.task_id, &bytes);
+    }
+}
+
 /// Enter combined with any of these modifiers inserts a newline instead of sending.
 pub(crate) fn is_newline_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)

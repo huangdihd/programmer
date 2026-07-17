@@ -560,6 +560,16 @@ pub fn key_to_bytes(name: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Encode one SGR (1006) mouse report. `code` is the button/motion/wheel code
+/// (with any modifier bits already applied); `col0`/`row0` are 0-based cell
+/// coordinates (SGR is 1-based, so they're incremented); `release` selects the
+/// final `m` (release) vs `M` (press/motion). Shared by the UI's mouse
+/// forwarding and the `task send_mouse` action.
+pub fn sgr_mouse(code: u8, col0: u16, row0: u16, release: bool) -> Vec<u8> {
+    let final_char = if release { 'm' } else { 'M' };
+    format!("\x1b[<{code};{};{}{final_char}", col0 + 1, row0 + 1).into_bytes()
+}
+
 /// Read a child pipe to EOF, appending chunks to the task's output buffer.
 async fn drain_stream<R>(stream: Option<R>, id: u64)
 where
@@ -909,6 +919,13 @@ mod tests {
         let (snap, still) = wait(id, Duration::from_secs(10)).await.expect("wait");
         assert!(!still);
         assert_eq!(snap.status, TaskStatus::Killed);
+    }
+
+    #[test]
+    fn sgr_mouse_encodes_1based_press_and_release() {
+        // 0-based (5,2) → 1-based (6,3); press ends 'M', release ends 'm'.
+        assert_eq!(sgr_mouse(0, 5, 2, false), b"\x1b[<0;6;3M".to_vec());
+        assert_eq!(sgr_mouse(2, 0, 0, true), b"\x1b[<2;1;1m".to_vec());
     }
 
     #[cfg(unix)]

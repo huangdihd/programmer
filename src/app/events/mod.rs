@@ -66,11 +66,13 @@ async fn handle_crossterm(
             handle_key_events(app, key_event).await?
         }
         crossterm::event::Event::Paste(data) => keys::handle_paste(app, data),
-        // The provider panel and the interactive terminal own the whole screen;
-        // don't route mouse scrolls/clicks to the hidden conversation beneath.
-        // (Terminal mouse forwarding is a later stage.)
-        crossterm::event::Event::Mouse(_)
-            if app.provider_panel.is_some() || app.terminal_pane.is_some() => {}
+        crossterm::event::Event::Mouse(_) if app.provider_panel.is_some() => {}
+        // The interactive terminal owns the whole screen: forward the mouse to
+        // its PTY when grabbed (and the program wants it), otherwise swallow it
+        // so it doesn't scroll the hidden conversation beneath.
+        crossterm::event::Event::Mouse(mouse) if app.terminal_pane.is_some() => {
+            keys::handle_terminal_mouse(app, mouse);
+        }
         crossterm::event::Event::Mouse(mouse) => mouse::handle_mouse(app, mouse),
         _ => {}
     }

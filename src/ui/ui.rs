@@ -323,6 +323,7 @@ impl Widget for &mut App<'_> {
         if let Some(pane) = &mut self.terminal_pane {
             use crate::ui::components::terminal_panel;
             let grid = terminal_panel::grid_area(area);
+            pane.grid = Some(grid);
             pane.maybe_resize(grid.height.max(1), grid.width.max(1));
             terminal_panel::render(pane, area, buf);
             return;

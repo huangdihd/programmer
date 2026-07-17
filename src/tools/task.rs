@@ -50,15 +50,17 @@ pub fn tool() -> Tool {
          Set `interactive: true` on create to run the command in a real \
          terminal (PTY) instead — required for full-screen/interactive programs \
          (vim, htop, REPLs, menus). Drive an interactive task with `keys` (type \
-         text and/or send named keys) and read what it displays with `screen`; \
-         `write`/`output` are for pipe tasks only. \
+         text and/or send named keys), click with `send_mouse` (only works when \
+         the program has enabled mouse reporting — `screen` reports this), and \
+         read what it displays with `screen`; `write`/`output` are for pipe \
+         tasks only. \
          Prefer the `command` tool for anything that finishes quickly — use \
          background tasks only when the command should outlive the current step.",
         json!({
             "action": {
                 "type": "string",
                 "description": "The action to perform.",
-                "enum": ["create", "list", "output", "write", "wait", "kill", "screen", "keys", "resize"]
+                "enum": ["create", "list", "output", "write", "wait", "kill", "screen", "keys", "send_mouse", "resize"]
             },
             "interactive": {
                 "type": "boolean",
@@ -80,6 +82,24 @@ pub fn tool() -> Tool {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "keys only: named keys to send in order, e.g. [\"enter\"], [\"ctrl-c\"], [\"up\",\"up\",\"enter\"]. Supports enter/tab/escape/backspace/space, arrows, home/end/pageup/pagedown, delete/insert, f1-f12, and ctrl-<letter>."
+            },
+            "x": {
+                "type": "integer",
+                "description": "send_mouse only: 0-based column (matches the screen text the `screen` action returns)."
+            },
+            "y": {
+                "type": "integer",
+                "description": "send_mouse only: 0-based row (matches the screen text the `screen` action returns)."
+            },
+            "button": {
+                "type": "string",
+                "description": "send_mouse only: mouse button — left (default), middle, or right.",
+                "enum": ["left", "middle", "right"]
+            },
+            "mouse_action": {
+                "type": "string",
+                "description": "send_mouse only: gesture — click (press+release, default), press, release, scroll_up, scroll_down, or move.",
+                "enum": ["click", "press", "release", "scroll_up", "scroll_down", "move"]
             },
             "command": {
                 "type": "string",
@@ -147,6 +167,14 @@ struct Args {
     text: Option<String>,
     #[serde(default)]
     keys: Option<Vec<String>>,
+    #[serde(default)]
+    x: Option<u16>,
+    #[serde(default)]
+    y: Option<u16>,
+    #[serde(default)]
+    button: Option<String>,
+    #[serde(default)]
+    mouse_action: Option<String>,
 }
 
 /// Which task actions mutate state (start/stop processes or drive them). Used
@@ -159,7 +187,10 @@ pub fn action_is_mutating(arguments: &str) -> bool {
         action: String,
     }
     match serde_json::from_str::<ActionOnly>(arguments) {
-        Ok(a) => matches!(a.action.as_str(), "create" | "kill" | "write" | "keys"),
+        Ok(a) => matches!(
+            a.action.as_str(),
+            "create" | "kill" | "write" | "keys" | "send_mouse"
+        ),
         // Unparseable arguments: assume the worst.
         Err(_) => true,
     }
@@ -328,6 +359,48 @@ pub async fn run(arguments: &str) -> Result<String, String> {
             ))
         }
 
+        "send_mouse" => {
+            let id = require_id(args.id, "send_mouse")?;
+            let (Some(x), Some(y)) = (args.x, args.y) else {
+                return Err("error: 'x' and 'y' are required for send_mouse".to_string());
+            };
+            // Gate on the child's mouse mode: sending mouse to a program that
+            // hasn't asked for it does nothing useful.
+            let mode = tasks::with_screen(id, |s| s.mouse_protocol_mode())
+                .ok_or_else(|| format!("error: task {id} is not interactive"))?;
+            if mode == vt100::MouseProtocolMode::None {
+                return Err(format!(
+                    "error: task {id}'s program has not enabled mouse reporting; \
+                     use action=keys instead"
+                ));
+            }
+            let base = match args.button.as_deref().unwrap_or("left") {
+                "left" => 0u8,
+                "middle" => 1,
+                "right" => 2,
+                other => return Err(format!("error: unknown button '{other}'")),
+            };
+            let gesture = args.mouse_action.as_deref().unwrap_or("click");
+            let mut bytes: Vec<u8> = Vec::new();
+            match gesture {
+                "click" => {
+                    bytes.extend(tasks::sgr_mouse(base, x, y, false));
+                    bytes.extend(tasks::sgr_mouse(base, x, y, true));
+                }
+                "press" => bytes.extend(tasks::sgr_mouse(base, x, y, false)),
+                "release" => bytes.extend(tasks::sgr_mouse(base, x, y, true)),
+                "scroll_up" => bytes.extend(tasks::sgr_mouse(64, x, y, false)),
+                "scroll_down" => bytes.extend(tasks::sgr_mouse(65, x, y, false)),
+                "move" => bytes.extend(tasks::sgr_mouse(3 + 32, x, y, false)),
+                other => return Err(format!("error: unknown mouse_action '{other}'")),
+            }
+            tasks::write_bytes(id, &bytes)?;
+            Ok(format!(
+                "sent mouse {gesture} at ({x},{y}) to task {id}\n\
+                 Read the result with action=screen id={id}."
+            ))
+        }
+
         "resize" => {
             let id = require_id(args.id, "resize")?;
             let (Some(rows), Some(cols)) = (args.rows, args.cols) else {
@@ -339,7 +412,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
 
         other => Err(format!(
             "error: unknown action '{other}' — use create, list, output, write, wait, \
-             kill, screen, keys, or resize"
+             kill, screen, keys, send_mouse, or resize"
         )),
     }
 }
@@ -406,8 +479,28 @@ mod tests {
     #[test]
     fn keys_action_is_mutating_screen_is_not() {
         assert!(action_is_mutating(r#"{"action":"keys","id":1,"text":"x"}"#));
+        assert!(action_is_mutating(r#"{"action":"send_mouse","id":1,"x":1,"y":1}"#));
         assert!(!action_is_mutating(r#"{"action":"screen","id":1}"#));
         assert!(!action_is_mutating(r#"{"action":"resize","id":1,"rows":30,"cols":100}"#));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_mouse_requires_a_mouse_enabled_program() {
+        // `cat` never enables mouse reporting, so send_mouse must refuse.
+        let created = run(r#"{"action":"create","command":"cat","interactive":true}"#)
+            .await
+            .expect("create");
+        let id: u64 = created
+            .split_whitespace()
+            .nth(3)
+            .and_then(|w| w.trim_end_matches(':').parse().ok())
+            .expect("id");
+        let err = run(&format!(r#"{{"action":"send_mouse","id":{id},"x":1,"y":1}}"#))
+            .await
+            .expect_err("cat has no mouse reporting");
+        assert!(err.contains("mouse reporting"), "got: {err}");
+        let _ = run(&format!(r#"{{"action":"kill","id":{id}}}"#)).await;
     }
 
     #[cfg(unix)]
