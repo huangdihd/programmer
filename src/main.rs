@@ -260,7 +260,10 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         }
     });
 
-    match engine.run_turn(&mut conversation, &cancel, |_| {}).await {
+    match engine
+        .run_turn(&mut conversation, &cancel, &crate::engine::HeadlessSurface)
+        .await
+    {
         Ok(result) => {
             println!("{}", result.final_text);
             Ok(())

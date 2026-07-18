@@ -22,7 +22,10 @@
 pub(crate) mod classify;
 pub(crate) mod request;
 pub(crate) mod stream;
+pub(crate) mod surface;
 pub(crate) mod tools;
+
+pub(crate) use surface::{AgentSurface, HeadlessSurface, ReviewDecision};
 
 use crate::cancel::CancellationToken;
 use crate::classifier::Classifier;
@@ -55,9 +58,11 @@ pub(crate) enum EnginePolicy {
     /// Everything is allowed without review.
     Yolo,
     /// A synchronous rule classifier (e.g. a Manual-style policy). Its `Ask`
-    /// verdicts fold to denials — headless has no approval surface.
+    /// verdicts are routed to the surface for a decision. `dyn Classifier` is
+    /// already `Send + Sync` via the trait's supertrait bounds, so this matches
+    /// what [`crate::classifier::WorkMode::classifier`] returns directly.
     #[allow(dead_code)]
-    Sync(Box<dyn Classifier + Send + Sync>),
+    Sync(Box<dyn Classifier>),
     /// The Auto-mode LLM classifier.
     Llm(Box<LlmPolicy>),
 }
@@ -120,7 +125,7 @@ impl Engine {
         &self,
         conversation: &mut Conversation,
         cancel: &CancellationToken,
-        mut on_event: impl FnMut(EngineEvent<'_>),
+        surface: &dyn AgentSurface,
     ) -> Result<TurnResult, EngineError> {
         let retrying = AtomicBool::new(false);
 
@@ -189,7 +194,7 @@ impl Engine {
                 conversation.add_usage(input, output);
             }
             if !assistant_text.is_empty() {
-                on_event(EngineEvent::Assistant(&assistant_text));
+                surface.on_event(EngineEvent::Assistant(&assistant_text));
             }
 
             // ---- no tool calls → the turn is done ----
@@ -202,9 +207,9 @@ impl Engine {
 
             // ---- classify, then run the calls ----
             for call in &calls {
-                on_event(EngineEvent::ToolCall { name: &call.name });
+                surface.on_event(EngineEvent::ToolCall { name: &call.name });
             }
-            let outputs = self.run_calls(conversation, calls, cancel).await;
+            let outputs = self.run_calls(conversation, calls, cancel, surface).await;
             match outputs {
                 Some(outputs) => {
                     for out in outputs {
@@ -227,6 +232,7 @@ impl Engine {
         conversation: &Conversation,
         calls: Vec<FunctionToolCall>,
         cancel: &CancellationToken,
+        surface: &dyn AgentSurface,
     ) -> Option<Vec<crate::tools::ToolOutput>> {
         // Split off ask_user calls: they cannot be answered headlessly.
         let mut denied: Vec<crate::tools::ToolOutput> = Vec::new();
@@ -269,9 +275,21 @@ impl Engine {
             }
         };
 
-        // Headless has no approval surface: fold Ask verdicts into denials.
+        // Bubble each `Ask` verdict to the surface for a decision. A headless
+        // surface denies (folding the classifier's reason into the denial, as
+        // before); an interactive surface routes it to the user; a sub-agent's
+        // surface forwards it up the tree.
+        let mut allowed = outcome.allowed;
         for (call, reason) in outcome.ask {
-            denied.push(classify::classifier_denied_output(&call, &reason));
+            if cancel.is_cancelled() {
+                return None;
+            }
+            match surface.review(&call, &reason).await {
+                ReviewDecision::Approve => allowed.push(call),
+                ReviewDecision::Deny { reason } => {
+                    denied.push(classify::classifier_denied_output(&call, &reason))
+                }
+            }
         }
         denied.extend(outcome.denied);
 
@@ -279,7 +297,7 @@ impl Engine {
         // a throwaway channel (with a dropped receiver) is safe here.
         let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
         let outputs = tools::run_tool_batch(
-            outcome.allowed,
+            allowed,
             denied,
             cancel.clone(),
             format!("{} auto-approved (headless)", crate::classifier::WorkMode::Auto.icon()),
@@ -477,7 +495,7 @@ mod tests {
         conv.add_input_message(user("read the manifest"));
         let cancel = CancellationToken::new();
         let result = engine
-            .run_turn(&mut conv, &cancel, |_| {})
+            .run_turn(&mut conv, &cancel, &HeadlessSurface)
             .await
             .expect("turn completes");
 
@@ -518,7 +536,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            engine.run_turn(&mut conv, &cancel, |_| {}),
+            engine.run_turn(&mut conv, &cancel, &HeadlessSurface),
         )
         .await
         .expect("must not hang on ask_user")
@@ -548,7 +566,125 @@ mod tests {
         let mut conv = Conversation::new();
         conv.add_input_message(user("loop"));
         let cancel = CancellationToken::new();
-        let err = engine.run_turn(&mut conv, &cancel, |_| {}).await.unwrap_err();
+        let err = engine.run_turn(&mut conv, &cancel, &HeadlessSurface).await.unwrap_err();
         assert!(matches!(err, EngineError::IterationCap(3)), "got {err:?}");
+    }
+
+    /// A surface that decides every `review` the same way and records the
+    /// notifications it receives — a stand-in for the TUI / a parent agent.
+    struct TestSurface {
+        approve: bool,
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSurface for TestSurface {
+        fn on_event(&self, event: EngineEvent<'_>) {
+            let label = match event {
+                EngineEvent::Assistant(t) => format!("assistant:{t}"),
+                EngineEvent::ToolCall { name } => format!("tool:{name}"),
+            };
+            self.events.lock().unwrap().push(label);
+        }
+        async fn review(&self, _call: &FunctionToolCall, reason: &str) -> ReviewDecision {
+            if self.approve {
+                ReviewDecision::Approve
+            } else {
+                ReviewDecision::Deny {
+                    reason: format!("surface refused: {reason}"),
+                }
+            }
+        }
+    }
+
+    fn sync_engine(policy_mode: crate::classifier::WorkMode) -> Engine {
+        // A base_url is required to build the client, but `run_calls` never
+        // streams, so any address works.
+        let client = Client::with_config(OpenAIConfig::new().with_api_base("http://127.0.0.1:1"));
+        Engine {
+            client,
+            model_name: "mock".to_string(),
+            model_str: "mock/mock".to_string(),
+            tools: crate::tools::tools(None),
+            policy: EnginePolicy::Sync(policy_mode.classifier(std::collections::HashMap::new())),
+            mcp: None,
+            coauthor: None,
+            max_iterations: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_verdict_bubbles_to_surface_approve_runs_the_call() {
+        // Manual mode asks about write_file; an approving surface lets it run.
+        let tmp = std::env::temp_dir().join(format!("engine_review_ok_{}", std::process::id()));
+        let path = tmp.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&tmp);
+
+        let engine = sync_engine(crate::classifier::WorkMode::Manual);
+        let conv = Conversation::new();
+        let cancel = CancellationToken::new();
+        let surface = TestSurface {
+            approve: true,
+            events: std::sync::Mutex::new(Vec::new()),
+        };
+        let calls = vec![FunctionToolCall {
+            arguments: format!("{{\"path\":\"{path}\",\"content\":\"surfaced\"}}"),
+            call_id: "w1".into(),
+            namespace: None,
+            name: "write_file".into(),
+            id: None,
+            status: None,
+        }];
+        let outputs = engine
+            .run_calls(&conv, calls, &cancel, &surface)
+            .await
+            .expect("not cancelled");
+
+        assert_eq!(outputs.len(), 1);
+        assert!(!outputs[0].failed, "approved write should succeed");
+        assert_eq!(
+            std::fs::read_to_string(&tmp).unwrap_or_default(),
+            "surfaced",
+            "the approved write actually ran"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn ask_verdict_bubbles_to_surface_deny_blocks_the_call() {
+        // The same call, but a refusing surface turns it into a denial and the
+        // file is never written.
+        let tmp = std::env::temp_dir().join(format!("engine_review_no_{}", std::process::id()));
+        let path = tmp.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&tmp);
+
+        let engine = sync_engine(crate::classifier::WorkMode::Manual);
+        let conv = Conversation::new();
+        let cancel = CancellationToken::new();
+        let surface = TestSurface {
+            approve: false,
+            events: std::sync::Mutex::new(Vec::new()),
+        };
+        let calls = vec![FunctionToolCall {
+            arguments: format!("{{\"path\":\"{path}\",\"content\":\"surfaced\"}}"),
+            call_id: "w1".into(),
+            namespace: None,
+            name: "write_file".into(),
+            id: None,
+            status: None,
+        }];
+        let outputs = engine
+            .run_calls(&conv, calls, &cancel, &surface)
+            .await
+            .expect("not cancelled");
+
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].failed, "denied write is a failed output");
+        let denial = match &outputs[0].param.output {
+            async_openai::types::responses::FunctionCallOutput::Text(t) => t.clone(),
+            _ => String::new(),
+        };
+        assert!(denial.contains("surface refused"), "carries surface reason: {denial}");
+        assert!(!tmp.exists(), "the denied write never ran");
     }
 }
