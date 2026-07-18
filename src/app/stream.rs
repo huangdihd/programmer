@@ -145,7 +145,7 @@ pub(crate) async fn handle_chunk_events(
         }
         return;
     };
-    let base_index = app.conversation_panel.items.len();
+    let base_index = app.conversation_panel.conversation.items.len();
     for &live_idx in &app.conversation_panel.live_expanded_items {
         app.conversation_panel
             .expanded_items
@@ -153,7 +153,7 @@ pub(crate) async fn handle_chunk_events(
     }
     let cancelled = partial_response.cancelled.is_cancelled();
     let usage = partial_response.usage;
-    app.conversation_panel.items.extend(
+    app.conversation_panel.conversation.items.extend(
         partial_response
             .items
             .iter()

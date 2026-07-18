@@ -26,6 +26,7 @@ mod clipboard;
 mod commands;
 mod config;
 mod consts;
+mod conversation;
 mod diagnostics;
 mod mcp;
 mod prompts;

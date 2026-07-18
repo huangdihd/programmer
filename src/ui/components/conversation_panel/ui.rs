@@ -162,7 +162,7 @@ impl Widget for &mut ConversationPanel {
         // result items can be hidden (they draw inside their call's entry).
         let mut outputs_by_call: HashMap<&str, (&FunctionCallOutputItemParam, bool, Option<&str>)> =
             HashMap::new();
-        for item in &self.items {
+        for item in &self.conversation.items {
             if let MessageItem::ToolOutput { output, failed, approval_label } = item {
                 outputs_by_call.insert(
                     output.call_id.as_str(),
@@ -171,6 +171,7 @@ impl Widget for &mut ConversationPanel {
             }
         }
         let call_ids: HashSet<&str> = self
+            .conversation
             .items
             .iter()
             .filter_map(|item| match item {
@@ -191,20 +192,20 @@ impl Widget for &mut ConversationPanel {
             cache.entries.clear();
             self.selection = None;
         }
-        if cache.entries.len() > self.items.len() {
-            cache.entries.truncate(self.items.len());
+        if cache.entries.len() > self.conversation.items.len() {
+            cache.entries.truncate(self.conversation.items.len());
         }
 
         // First pass: compute estimated heights for every item without
         // fully rendering them, so we can figure out which ones are visible.
-        let mut est_heights: Vec<u16> = Vec::with_capacity(self.items.len());
-        for index in 0..self.items.len() {
-            let h = if matches!(&self.items[index], MessageItem::ToolOutput { output, .. }
+        let mut est_heights: Vec<u16> = Vec::with_capacity(self.conversation.items.len());
+        for index in 0..self.conversation.items.len() {
+            let h = if matches!(&self.conversation.items[index], MessageItem::ToolOutput { output, .. }
                 if call_ids.contains(output.call_id.as_str()))
             {
                 0 // hidden inside its call's entry
             } else {
-                estimate_item_height(&self.items[index], content_width)
+                estimate_item_height(&self.conversation.items[index], content_width)
             };
             est_heights.push(h);
         }
@@ -214,8 +215,8 @@ impl Widget for &mut ConversationPanel {
         // rest stay as cheap estimates until the user scrolls near them.
         let viewport_lines = area.height.max(20) as u32 * 4;
         let mut accum: u32 = 0;
-        let mut build_from = self.items.len();
-        for i in (0..self.items.len()).rev() {
+        let mut build_from = self.conversation.items.len();
+        for i in (0..self.conversation.items.len()).rev() {
             accum += est_heights[i] as u32;
             build_from = i;
             if accum >= viewport_lines {
@@ -229,13 +230,13 @@ impl Widget for &mut ConversationPanel {
         // Positions come from the cached heights (real for built entries,
         // estimates for lazy ones) — good enough to pick candidates, and
         // self-correcting as entries get built on subsequent frames.
-        let mut in_window = vec![false; self.items.len()];
+        let mut in_window = vec![false; self.conversation.items.len()];
         if !stick_to_bottom {
             let offset_y = self.scroll_view_state.offset().y as u32;
             let win_top = offset_y.saturating_sub(viewport_lines);
             let win_bottom = offset_y + area.height as u32 + viewport_lines;
             let mut y = welcome_height as u32;
-            for i in 0..self.items.len() {
+            for i in 0..self.conversation.items.len() {
                 let h = cache
                     .entries
                     .get(i)
@@ -249,9 +250,9 @@ impl Widget for &mut ConversationPanel {
             }
         }
 
-        for index in 0..self.items.len() {
+        for index in 0..self.conversation.items.len() {
             let expanded = self.expanded_items.contains(&index);
-            let (hidden, tool_output) = match &self.items[index] {
+            let (hidden, tool_output) = match &self.conversation.items[index] {
                 MessageItem::ToolOutput { output, .. } => {
                     (call_ids.contains(output.call_id.as_str()), None)
                 }
@@ -292,7 +293,7 @@ impl Widget for &mut ConversationPanel {
                     }
                 } else {
                     let (paragraph, copy_buttons) = build_item_paragraph(
-                        &self.items[index],
+                        &self.conversation.items[index],
                         content_width,
                         expanded,
                         tool_output,

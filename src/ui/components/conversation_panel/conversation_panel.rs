@@ -15,18 +15,14 @@
 
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
-use crate::prompts::SYSTEM_PROMPT;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem as ApiMessageItem;
-use async_openai::types::responses::{
-    FunctionCallOutput, FunctionCallOutputItemParam, InputContent, InputItem, InputMessage,
-    InputParam, InputRole, InputTextContent, Item, OutputItem, OutputStatus, ResponseStreamEvent,
-};
+use async_openai::types::responses::{InputParam, OutputItem, ResponseStreamEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tui_scrollview::ScrollViewState;
 use unicode_width::UnicodeWidthStr;
 
@@ -201,13 +197,12 @@ pub(crate) struct RenderCache {
 
 #[derive(Debug)]
 pub struct ConversationPanel {
-    pub(crate) items: Vec<MessageItem>,
+    /// The UI-free conversation model: history items and turn-usage counter.
+    /// The panel adds the view state below on top of it.
+    pub(crate) conversation: crate::conversation::Conversation,
     pub(crate) scroll_view_state: ScrollViewState,
     pub pending_message: Option<String>,
     pub receiving_response: Option<PartialResponse>,
-    /// Accumulated token usage across all responses in the current turn
-    /// (a turn may span multiple responses when tool calls are involved).
-    pub accumulated_usage: (u32, u32),
     /// The current active work phase of the turn. Replaces the old cluster of
     /// mutually-exclusive `tool_running`/`creating_tool_call`/… booleans:
     /// exactly one phase is active at a time, so a single enum models it
@@ -254,7 +249,7 @@ pub struct ConversationPanel {
 impl ConversationPanel {
     pub fn new() -> Self {
         ConversationPanel {
-            items: vec![],
+            conversation: crate::conversation::Conversation::new(),
             scroll_view_state: ScrollViewState::new(),
             pending_message: None,
             receiving_response: None,
@@ -272,7 +267,6 @@ impl ConversationPanel {
             selection: None,
             live_paragraphs: Vec::new(),
             pending_layout: None,
-            accumulated_usage: (0, 0),
         }
     }
 
@@ -343,7 +337,7 @@ impl ConversationPanel {
                 self.copy_code_block(&content);
                 return;
             }
-            if self.items.get(index).is_some_and(is_foldable)
+            if self.conversation.items.get(index).is_some_and(is_foldable)
                 && !self.expanded_items.remove(&index) {
                     self.expanded_items.insert(index);
                 }
@@ -494,160 +488,104 @@ impl ConversationPanel {
     }
 
     /// Appends a tool result so it is both rendered and sent back to the model
-    /// on the next request. The `failed` flag is authoritative (reported by the
-    /// tool via [`crate::tools::run_tool_call`]), stored alongside the output so
-    /// renderers and the classifier never re-parse the text for an `error:`
-    /// prefix.
+    /// on the next request. Delegates to [`Conversation::add_tool_output`].
     pub fn add_tool_output(&mut self, output: crate::tools::ToolOutput) {
-        self.items.push(MessageItem::ToolOutput {
-            output: output.param,
-            failed: output.failed,
-            approval_label: output.approval_label,
-        });
+        self.conversation.add_tool_output(output);
     }
 
     /// Append text to the stored output of the tool call identified by
-    /// `call_id`, so post-edit feedback (diagnostics) renders inside that call's
-    /// result — visible when the user expands it — and is sent to the model as
-    /// part of the tool result. Returns whether a matching output was found.
-    ///
-    /// This is the one place `items` is mutated rather than appended, so the
-    /// affected cache entry is dropped to force a re-render.
+    /// `call_id` (post-edit diagnostics feedback). Returns whether a matching
+    /// output was found; on success the affected cache entry is dropped so the
+    /// result — which may render non-adjacent to its call — rebuilds cleanly.
     pub fn append_to_tool_output(&mut self, call_id: &str, extra: &str) -> bool {
-        for item in self.items.iter_mut() {
-            if let MessageItem::ToolOutput { output, .. } = item
-                && output.call_id == call_id {
-                    match &mut output.output {
-                        FunctionCallOutput::Text(text) => text.push_str(extra),
-                        other => *other = FunctionCallOutput::Text(extra.trim_start().to_string()),
-                    }
-                    // The result renders inside its call's entry, which isn't
-                    // necessarily adjacent (a batch interleaves several calls and
-                    // outputs). Drop the whole cache so it rebuilds cleanly.
-                    self.render_cache.entries.clear();
-                    return true;
-                }
+        if self.conversation.append_to_tool_output(call_id, extra) {
+            self.render_cache.entries.clear();
+            true
+        } else {
+            false
         }
-        false
     }
 
     pub fn add_input_message(&mut self, input_message_item: ApiMessageItem) {
-        self.items
-            .push(MessageItem::Input(InputItem::Item(Item::from(
-                input_message_item,
-            ))));
+        self.conversation.add_input_message(input_message_item);
         // A new user message should always bring the view back to the bottom.
         self.stick_to_bottom = true;
     }
 
     pub fn add_error(&mut self, openai_error: OpenAIError) {
-        // Non-conforming providers send error payloads the stream parser can't
-        // deserialize; surface the embedded API error message instead of the
-        // raw "missing field" noise when the payload is recognizable.
-        if let OpenAIError::JSONDeserialize(_, content) = &openai_error
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
-                && let Some(message) = value
-                    .get("message")
-                    .or_else(|| value.get("error").and_then(|e| e.get("message")))
-                    .and_then(|m| m.as_str())
-                {
-                    let code = value
-                        .get("code")
-                        .or_else(|| value.get("error").and_then(|e| e.get("code")))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("api error");
-                    self.add_error_string(format!("{code}: {message}"));
-                    return;
-                }
-        self.items
-            .push(MessageItem::OpenAIError(std::sync::Arc::new(openai_error)));
+        self.conversation.add_error(openai_error);
         self.stick_to_bottom = true;
     }
 
     pub fn add_error_string(&mut self, message: impl Into<String>) {
-        self.items.push(MessageItem::Error(message.into()));
+        self.conversation.add_error_string(message);
         self.stick_to_bottom = true;
     }
 
     pub fn add_info_string(&mut self, message: impl Into<String>) {
-        self.items.push(MessageItem::Info(message.into()));
+        self.conversation.add_info_string(message);
         self.stick_to_bottom = true;
     }
 
     pub fn add_meta(&mut self, label: impl Into<String>, text: impl Into<String>) {
-        self.items.push(MessageItem::Meta {
-            label: label.into(),
-            text: text.into(),
-        });
+        self.conversation.add_meta(label, text);
         self.stick_to_bottom = true;
     }
 
     pub fn add_warning_string(&mut self, message: impl Into<String>) {
-        self.items.push(MessageItem::Warning(message.into()));
+        self.conversation.add_warning_string(message);
         self.stick_to_bottom = true;
     }
 
     /// Whether there is API-visible history worth compacting: any input/output
     /// item after the last `/compact` boundary.
     pub fn has_compactable_history(&self) -> bool {
-        let start = self
-            .items
-            .iter()
-            .rposition(|item| matches!(item, MessageItem::Compacted { .. }))
-            .map_or(0, |i| i + 1);
-        self.items[start..]
-            .iter()
-            .any(|item| matches!(item, MessageItem::Input(_) | MessageItem::Output(_)))
+        self.conversation.has_compactable_history()
     }
 
     /// Record a finished `/compact`: push the boundary carrying `summary`.
     /// History before it stays visible in the UI but stops being sent to the
-    /// API (see `get_input_param`).
+    /// API (see [`Conversation::to_input_param`]).
     pub fn apply_compaction(&mut self, summary: String) {
-        self.items.push(MessageItem::Compacted { summary });
+        self.conversation.apply_compaction(summary);
         self.stick_to_bottom = true;
     }
 
     pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
-        self.accumulated_usage.0 += input_tokens;
-        self.accumulated_usage.1 += output_tokens;
+        self.conversation.add_usage(input_tokens, output_tokens);
     }
 
     /// Flush the accumulated usage as a message and reset the counter.
     pub fn flush_usage(&mut self) {
-        let (input, output) = self.accumulated_usage;
-        if input > 0 || output > 0 {
-            self.items.push(MessageItem::Usage(input, output));
-            self.accumulated_usage = (0, 0);
+        if self.conversation.flush_usage() {
             self.stick_to_bottom = true;
         }
     }
 
     /// Reset the accumulated usage counter (on /clear, new session, etc.).
     pub fn reset_accumulated_usage(&mut self) {
-        self.accumulated_usage = (0, 0);
+        self.conversation.reset_accumulated_usage();
     }
 
     /// Clear all conversation history and pending state.
     pub fn clear_messages(&mut self) {
-        self.items.clear();
+        self.conversation.clear();
         self.pending_message = None;
         self.expanded_items.clear();
         self.live_expanded_items.clear();
         self.selection = None;
         self.stick_to_bottom = true;
-        self.accumulated_usage = (0, 0);
     }
 
     /// Restore a previous session's items into the conversation.
     pub fn restore_items(&mut self, items: Vec<MessageItem>) {
-        self.items = items;
+        self.conversation.restore_items(items);
         self.stick_to_bottom = true;
     }
 
     /// Iterate over the current conversation items (for persistence).
     pub fn items(&self) -> impl Iterator<Item = &MessageItem> {
-        self.items.iter()
+        self.conversation.items()
     }
 
     /// Ends the in-flight response (e.g. after a stream error), keeping whatever
@@ -658,7 +596,7 @@ impl ConversationPanel {
             // Transfer live expanded state before items become historical,
             // so reasoning/tool-call items the user expanded during streaming
             // stay expanded instead of auto-collapsing.
-            let base_index = self.items.len();
+            let base_index = self.conversation.items.len();
             for &live_idx in &self.live_expanded_items {
                 self.expanded_items.insert(base_index + live_idx);
             }
@@ -675,8 +613,9 @@ impl ConversationPanel {
             } else {
                 partial.into_aborted_items()
             };
-            self.items
-                .extend(items.into_iter().map(MessageItem::Output));
+            for item in items {
+                self.conversation.add_output(item);
+            }
         }
     }
 
@@ -736,6 +675,9 @@ impl ConversationPanel {
         }
     }
 
+    /// Build the API request input from the conversation history. Delegates to
+    /// [`Conversation::to_input_param`] — the history-shaping logic lives on the
+    /// model so the headless engine produces byte-identical requests.
     pub fn get_input_param(
         &self,
         current_model: &str,
@@ -743,139 +685,8 @@ impl ConversationPanel {
         plan_prompt: Option<&str>,
         coauthor: Option<&str>,
     ) -> InputParam {
-        let mut system_prompt = format!(
-            "{SYSTEM_PROMPT}\n\nYou are running as model: {current_model}\n\n{}",
-            crate::tools::environment_info()
-        );
-        if let Some(coauthor) = coauthor.map(str::trim).filter(|c| !c.is_empty()) {
-            system_prompt.push_str(&format!(
-                "\n\nWhen you create a git commit, add this trailer as the last \
-                 line(s) of the commit message, after a blank line:\n\
-                 Co-Authored-By: {coauthor}"
-            ));
-        }
-        if let Some(prompt) = skill_prompt {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(prompt);
-        }
-        if let Some(prompt) = plan_prompt {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(prompt);
-        }
-        let developer_message =
-            InputItem::from(Item::Message(ApiMessageItem::Input(InputMessage {
-                content: vec![InputContent::InputText(system_prompt.into())],
-                role: InputRole::Developer,
-                status: Some(OutputStatus::Completed),
-            })));
-
-        // A `/compact` boundary replaces everything before it with its summary:
-        // only items after the last boundary reach the API.
-        let (compact_summary, live_items) = match self
-            .items
-            .iter()
-            .rposition(|item| matches!(item, MessageItem::Compacted { .. }))
-        {
-            Some(idx) => {
-                let MessageItem::Compacted { summary } = &self.items[idx] else {
-                    unreachable!()
-                };
-                (Some(summary.as_str()), &self.items[idx + 1..])
-            }
-            None => (None, &self.items[..]),
-        };
-
-        // Recorded function_call_output items, keyed by call id.
-        let mut recorded_outputs: HashMap<&str, &FunctionCallOutputItemParam> = HashMap::new();
-        for item in live_items {
-            if let MessageItem::ToolOutput { output, .. } = item {
-                recorded_outputs.entry(output.call_id.as_str()).or_insert(output);
-            }
-        }
-
-        // Outputs must stay grouped after the whole assistant output block, in
-        // call order (`reasoning, call_1, call_2, output_1, output_2`), matching
-        // how OpenAI documents multi-turn tool use. Interleaving them between
-        // the calls makes chat-completions-backed providers split the block
-        // into several assistant messages, and thinking models (e.g. DeepSeek)
-        // then reject the later ones for missing reasoning content.
-        let mut input_items = vec![developer_message];
-        // The compacted history enters as a user message right after the
-        // developer message (not inside it), so the static system-prompt
-        // prefix keeps hitting the provider's KV cache.
-        if let Some(summary) = compact_summary {
-            input_items.push(InputItem::from(Item::Message(ApiMessageItem::Input(
-                InputMessage {
-                    content: vec![InputContent::InputText(InputTextContent {
-                        text: format!(
-                            "[The earlier conversation was compacted. Summary of \
-                             everything before this point:]\n\n{summary}"
-                        ),
-                    })],
-                    role: InputRole::User,
-                    status: Some(OutputStatus::Completed),
-                },
-            ))));
-        }
-        let mut pending_outputs: Vec<InputItem> = Vec::new();
-        for message_item in live_items {
-            match message_item {
-                // A stored output marks the boundary after an assistant block:
-                // flush that block's outputs here, in call order.
-                MessageItem::ToolOutput { .. } => {
-                    input_items.append(&mut pending_outputs);
-                }
-                MessageItem::Input(input_item) => {
-                    input_items.append(&mut pending_outputs);
-                    input_items.push(input_item.clone());
-                }
-                MessageItem::Meta { text, .. } => {
-                    input_items.append(&mut pending_outputs);
-                    input_items.push(InputItem::from(Item::Message(ApiMessageItem::Input(InputMessage {
-                        content: vec![InputContent::InputText(InputTextContent { text: text.clone() })],
-                        role: InputRole::User,
-                        status: Some(OutputStatus::Completed),
-                    }))));
-                }
-                MessageItem::Output(output_item) => {
-                    // A non-call output (an assistant message or reasoning the
-                    // model emitted *after* its tool calls) closes the tool-call
-                    // block: flush the pending outputs first so every
-                    // `function_call` stays immediately followed by its
-                    // `function_call_output`. Otherwise a trailing message wedges
-                    // between a call and its output, and chat-completions-backed
-                    // providers reject the assistant tool_calls message for not
-                    // being followed by tool results.
-                    if !matches!(output_item, OutputItem::FunctionCall(_)) {
-                        input_items.append(&mut pending_outputs);
-                    }
-                    input_items.push(output_item.clone().into());
-                    if let OutputItem::FunctionCall(call) = output_item {
-                        let output = match recorded_outputs.remove(call.call_id.as_str()) {
-                            Some(output) => output.clone(),
-                            // A call with no recorded output (e.g. the user
-                            // cancelled while the tool was running) would make
-                            // the API reject the whole history; answer it
-                            // synthetically.
-                            None => FunctionCallOutputItemParam {
-                                call_id: call.call_id.clone(),
-                                output: FunctionCallOutput::Text(
-                                    "error: tool execution was cancelled before it completed"
-                                        .to_string(),
-                                ),
-                                id: None,
-                                status: None,
-                            },
-                        };
-                        pending_outputs.push(InputItem::from(Item::FunctionCallOutput(output)));
-                    }
-                }
-                _ => {}
-            }
-        }
-        input_items.append(&mut pending_outputs);
-
-        InputParam::Items(input_items)
+        self.conversation
+            .to_input_param(current_model, skill_prompt, plan_prompt, coauthor)
     }
 }
 
@@ -883,6 +694,7 @@ impl ConversationPanel {
 mod tests {
     use super::*;
     use crate::cancel::CancellationToken;
+    use async_openai::types::responses::{InputContent, InputMessage, InputRole, OutputStatus};
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget;
 
@@ -919,182 +731,6 @@ mod tests {
             "offset should decrease: {bottom} -> {after}"
         );
         assert!(!panel.stick_to_bottom, "scrolling up disables auto-follow");
-    }
-
-    #[test]
-    fn function_call_outputs_stay_grouped_after_the_assistant_block() {
-        use async_openai::types::responses::{
-            AssistantRole, FunctionToolCall, OutputMessage, OutputMessageContent,
-            OutputTextContent,
-        };
-
-        let call = |call_id: &str| {
-            OutputItem::FunctionCall(FunctionToolCall {
-                arguments: "{}".into(),
-                call_id: call_id.into(),
-                namespace: None,
-                name: "command".into(),
-                id: None,
-                status: None,
-            })
-        };
-        let output = |call_id: &str| crate::tools::ToolOutput {
-            param: FunctionCallOutputItemParam {
-                call_id: call_id.into(),
-                output: FunctionCallOutput::Text("ok".into()),
-                id: None,
-                status: None,
-            },
-            failed: false,
-            approval_label: None,
-        };
-        let assistant_text = |text: &str| {
-            OutputItem::Message(OutputMessage {
-                content: vec![OutputMessageContent::OutputText(OutputTextContent {
-                    annotations: vec![],
-                    logprobs: None,
-                    text: text.into(),
-                })],
-                id: "msg_1".into(),
-                role: AssistantRole::Assistant,
-                phase: None,
-                status: OutputStatus::Completed,
-            })
-        };
-
-        let mut panel = ConversationPanel::new();
-        panel.add_input_message(user_message("hi"));
-        // The model emitted text *after* the call within the same response, so
-        // the recorded output ended up separated from its call by that text.
-        panel.items.push(MessageItem::Output(call("call_1")));
-        panel
-            .items
-            .push(MessageItem::Output(assistant_text("trailing text")));
-        panel.add_tool_output(output("call_1"));
-        // An orphaned call with no recorded output (cancelled mid-run).
-        panel.items.push(MessageItem::Output(call("call_2")));
-
-        let InputParam::Items(items) = panel.get_input_param("test/model", None, None, None) else {
-            panic!("expected an item list");
-        };
-        // Every call must be answered (missing ones synthesized), with all
-        // outputs grouped after the assistant output block in call order —
-        // never interleaved between the calls.
-        let kind = |item: &InputItem| match item {
-            InputItem::Item(Item::FunctionCall(c)) => format!("call:{}", c.call_id),
-            InputItem::Item(Item::FunctionCallOutput(o)) => format!("output:{}", o.call_id),
-            InputItem::Item(Item::Message(_)) => "message".to_string(),
-            _ => "other".to_string(),
-        };
-        let kinds: Vec<String> = items.iter().map(kind).collect();
-        // Each call must be immediately followed by its output; a message the
-        // model emitted after the call is pushed out to *after* that output, so
-        // the assistant tool_calls block is always answered by tool results
-        // before any other message — what chat-completions providers require.
-        assert_eq!(
-            kinds,
-            vec![
-                "message", // developer
-                "message", // user
-                "call:call_1",
-                "output:call_1",
-                "message", // trailing assistant text, moved after the output
-                "call:call_2",
-                "output:call_2", // synthesized for the orphaned call
-            ]
-        );
-    }
-
-    #[test]
-    fn compaction_replaces_older_history_with_the_summary() {
-        let mut panel = ConversationPanel::new();
-        panel.add_input_message(user_message("old message one"));
-        panel.add_input_message(user_message("old message two"));
-        assert!(panel.has_compactable_history());
-
-        panel.apply_compaction("the compact summary".to_string());
-        assert!(!panel.has_compactable_history(), "boundary resets history");
-
-        panel.add_input_message(user_message("new message"));
-        assert!(panel.has_compactable_history());
-
-        let InputParam::Items(items) = panel.get_input_param("test/model", None, None, None)
-        else {
-            panic!("expected an item list");
-        };
-        let texts: Vec<String> = items
-            .iter()
-            .filter_map(|item| match item {
-                InputItem::Item(Item::Message(ApiMessageItem::Input(m))) => {
-                    m.content.iter().find_map(|c| match c {
-                        InputContent::InputText(t) => Some(t.text.clone()),
-                        _ => None,
-                    })
-                }
-                _ => None,
-            })
-            .collect();
-        // developer message, then the summary, then only post-boundary items.
-        assert_eq!(texts.len(), 3, "got: {texts:#?}");
-        assert!(texts[1].contains("the compact summary"));
-        assert!(texts[2].contains("new message"));
-        assert!(
-            !texts.iter().any(|t| t.contains("old message")),
-            "compacted history must not reach the API"
-        );
-    }
-
-    #[test]
-    fn parallel_call_outputs_are_not_interleaved_between_calls() {
-        use async_openai::types::responses::FunctionToolCall;
-
-        let call = |call_id: &str| {
-            OutputItem::FunctionCall(FunctionToolCall {
-                arguments: "{}".into(),
-                call_id: call_id.into(),
-                namespace: None,
-                name: "command".into(),
-                id: None,
-                status: None,
-            })
-        };
-        let output = |call_id: &str| crate::tools::ToolOutput {
-            param: FunctionCallOutputItemParam {
-                call_id: call_id.into(),
-                output: FunctionCallOutput::Text("ok".into()),
-                id: None,
-                status: None,
-            },
-            failed: false,
-            approval_label: None,
-        };
-
-        let mut panel = ConversationPanel::new();
-        panel.add_input_message(user_message("hi"));
-        // One response with two parallel calls; outputs recorded afterwards.
-        panel.items.push(MessageItem::Output(call("call_1")));
-        panel.items.push(MessageItem::Output(call("call_2")));
-        panel.add_tool_output(output("call_1"));
-        panel.add_tool_output(output("call_2"));
-
-        let InputParam::Items(items) = panel.get_input_param("test/model", None, None, None) else {
-            panic!("expected an item list");
-        };
-        let order: Vec<String> = items
-            .iter()
-            .filter_map(|item| match item {
-                InputItem::Item(Item::FunctionCall(c)) => Some(format!("call:{}", c.call_id)),
-                InputItem::Item(Item::FunctionCallOutput(o)) => {
-                    Some(format!("output:{}", o.call_id))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            order,
-            vec!["call:call_1", "call:call_2", "output:call_1", "output:call_2"],
-            "outputs must come after both calls, never between them"
-        );
     }
 
     #[test]
