@@ -100,7 +100,15 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
     app.input_panel.push_history(input.to_string());
     app.input_panel.clear();
 
-    match crate::tasks::spawn_interactive(&command, None, Some(&command), 24, 80) {
+    // Spawn at the size the terminal panel will render at, so the first frame
+    // doesn't have to resize the fresh PTY. A resize racing the child's
+    // startup leaves a SIGWINCH pending from the fork/exec window, which the
+    // kernel then delivers at the worst moment (e.g. inside Python 3.14's
+    // REPL `tcsetattr`, which dies on EINTR).
+    let (rows, cols) = crossterm::terminal::size()
+        .map(|(w, h)| (h.saturating_sub(2).max(1), w.max(1)))
+        .unwrap_or((24, 80));
+    match crate::tasks::spawn_interactive(&command, None, Some(&command), rows, cols) {
         Ok(id) => {
             let mut pane = TerminalPane::new(id, command);
             // Grab input immediately — the user typed `!` to interact.
