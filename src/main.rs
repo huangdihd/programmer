@@ -28,6 +28,7 @@ mod config;
 mod consts;
 mod conversation;
 mod diagnostics;
+mod engine;
 mod mcp;
 mod prompts;
 mod providers;

@@ -15,7 +15,6 @@
 
 //! Standalone helper functions and constants that don't depend on `App`.
 
-use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
     InputContent, InputItem, OutputItem,
@@ -23,38 +22,6 @@ use async_openai::types::responses::{
 };
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
-
-// ---------------------------------------------------------------------------
-// Retry helpers
-// ---------------------------------------------------------------------------
-
-/// Whether a failed `create_stream` is worth retrying: transport-level errors
-/// with no HTTP status (connection refused, DNS, reset), plus transient server
-/// responses (429 rate-limit and 5xx gateway/overload codes).
-pub(crate) fn is_retryable(error: &OpenAIError) -> bool {
-    match error {
-        OpenAIError::Reqwest(e) => match e.status() {
-            None => true,
-            Some(status) => {
-                status.as_u16() == 429
-                    || matches!(status.as_u16(), 500 | 502 | 503 | 504)
-            }
-        },
-        _ => false,
-    }
-}
-
-/// Exponential backoff for retry `attempt` (1-based): `2^(attempt-1)` seconds
-/// capped at 30s, plus up to ~500ms of jitter to avoid synchronized retries.
-pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
-    const CAP_SECS: u64 = 30;
-    let base = 1u64.checked_shl(attempt - 1).unwrap_or(CAP_SECS).min(CAP_SECS);
-    let jitter_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() as u64) % 500)
-        .unwrap_or(0);
-    std::time::Duration::from_secs(base) + std::time::Duration::from_millis(jitter_ms)
-}
 
 // ---------------------------------------------------------------------------
 // String helpers

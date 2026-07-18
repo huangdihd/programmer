@@ -16,16 +16,13 @@
 //! Streaming API request lifecycle: spawn, handle chunks, handle errors.
 
 use super::App;
-use super::helpers;
 use crate::classifier::{PlanPhase, WorkMode};
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
 use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
 use crate::ui::event::{AppEvent, Event};
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{CreateResponse, OutputItem, ResponseStreamEvent};
-use futures::StreamExt;
-use std::sync::atomic::Ordering;
+use async_openai::types::responses::{OutputItem, ResponseStreamEvent};
 
 /// Build an optional plan-mode system prompt snippet.
 fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
@@ -60,67 +57,39 @@ pub(crate) fn spawn_stream(app: &mut App<'_>) {
     };
     let sender = app.events.sender.clone();
     let retrying = app.cancel.stream_retrying.clone();
-    retrying.store(false, Ordering::Relaxed);
-    let input_param = app.conversation_panel.get_input_param(
-        &app.current_model,
-        app.skill_registry.combined_prompt().as_deref(),
-        plan_system_prompt(app),
-        app.config.git_coauthor.as_deref(),
-    );
-    let mcp = app.mcp_manager.clone();
-    tokio::spawn(async move {
-        let request = CreateResponse {
-            stream: Option::from(true),
-            input: input_param,
-            model: Option::from(model_name),
-            tools: Some(crate::tools::tools(mcp.as_deref())),
-            ..Default::default()
-        };
 
-        let mut attempt: u32 = 0;
-        let stream = loop {
-            match client.responses().create_stream(request.clone()).await {
-                Ok(stream) => break Ok(stream),
-                Err(e) if helpers::is_retryable(&e)
-                    && attempt < crate::consts::MAX_STREAM_RETRIES =>
-                {
-                    if cancel_token.is_cancelled() {
-                        retrying.store(false, Ordering::Relaxed);
-                        return;
-                    }
-                    attempt += 1;
-                    retrying.store(true, Ordering::Relaxed);
-                    tokio::time::sleep(helpers::backoff_delay(attempt)).await;
-                }
-                Err(e) => break Err(e),
-            }
-        };
-        retrying.store(false, Ordering::Relaxed);
-        match stream {
-            Ok(mut response_stream) => {
-                while let Some(response_stream_event) = response_stream.next().await {
-                    if cancel_token.is_cancelled() {
-                        return;
-                    }
-                    match response_stream_event {
-                        Ok(response_event) => {
-                            let _ = sender
-                                .send(Event::App(AppEvent::ChunkReceived(response_event)));
-                        }
-                        Err(openai_error) => {
-                            let _ = sender
-                                .send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
-                        }
-                    }
-                }
-            }
-            Err(openai_error) => {
-                if !cancel_token.is_cancelled() {
-                    let _ =
-                        sender.send(Event::App(AppEvent::OpenAIErrorReceived(openai_error)));
-                }
-            }
-        }
+    // Build the request from the shared primitive so it matches what the
+    // headless engine would send for the same history.
+    let skill_prompt = app.skill_registry.combined_prompt();
+    let ctx = crate::engine::request::SystemContext {
+        current_model: &app.current_model,
+        skill_prompt: skill_prompt.as_deref(),
+        plan_prompt: plan_system_prompt(app),
+        coauthor: app.config.git_coauthor.as_deref(),
+    };
+    let tools = crate::tools::tools(app.mcp_manager.as_deref());
+    let request = crate::engine::request::build_request(
+        &app.conversation_panel.conversation,
+        &ctx,
+        model_name,
+        tools,
+    );
+
+    tokio::spawn(async move {
+        crate::engine::stream::stream_with_retries(
+            &client,
+            &request,
+            &cancel_token,
+            &retrying,
+            |result| {
+                let event = match result {
+                    Ok(response_event) => AppEvent::ChunkReceived(response_event),
+                    Err(openai_error) => AppEvent::OpenAIErrorReceived(openai_error),
+                };
+                let _ = sender.send(Event::App(event));
+            },
+        )
+        .await;
     });
 }
 
