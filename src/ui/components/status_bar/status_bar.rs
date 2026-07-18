@@ -36,6 +36,8 @@ pub enum StatusState {
     Classifying,
     /// Diagnostics checkers are running after an edit.
     Checking,
+    /// `/compact` is summarizing the conversation.
+    Compacting,
     /// The model called `ask_user` and is waiting for the user's response.
     WaitingAnswer,
     /// Tool calls are queued for approval in Manual mode.
@@ -54,6 +56,7 @@ impl StatusState {
                 | StatusState::CreatingToolCall
                 | StatusState::ToolRunning
                 | StatusState::Classifying
+                | StatusState::Compacting
         )
     }
 }

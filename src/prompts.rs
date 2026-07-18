@@ -197,3 +197,23 @@ You are in **Plan Mode**. You must NOT make any changes yet.
    choose how to execute the plan.
 
 Your response should end with a complete plan — not with a tool call.";
+
+// ---------------------------------------------------------------------------
+// /compact — context compaction
+// ---------------------------------------------------------------------------
+
+pub(crate) const COMPACT_PROMPT: &str = "\
+The conversation above is about to be compacted: everything so far will be \
+replaced by the summary you write now, and future turns will see only that \
+summary plus new messages. Write a dense continuation summary that lets you \
+seamlessly pick the work back up. Include, grounded strictly in the actual \
+conversation:
+
+1. INTENT — what the user is trying to accomplish, and any explicit \
+   constraints or preferences they stated.
+2. STATE — what has been done so far: files created/edited (with paths), \
+   commands run and their relevant results, decisions made and why.
+3. IN FLIGHT — the task being worked on right now and its exact status.
+4. NEXT — concrete pending steps or open questions, if any.
+
+Do not invent details. Do not call tools. Output only the summary text.";

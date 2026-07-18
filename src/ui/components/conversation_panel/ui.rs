@@ -63,6 +63,10 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
         | MessageItem::Warning(_) | MessageItem::Info(_) => 1,
         MessageItem::Meta { .. } => 1,
         MessageItem::Usage(_, _) => 1,
+        // Usually collapsed to its one-line divider (like Reasoning, the
+        // estimate ignores the expanded state — the real height comes from the
+        // built paragraph).
+        MessageItem::Compacted { .. } => 1,
     }
 }
 
@@ -119,7 +123,28 @@ fn build_item_paragraph(
         MessageItem::Usage(input, output) => (
             UsageMessage::new(*input, *output).into_paragraph(),
             Vec::new(),
-        )
+        ),
+        MessageItem::Compacted { summary } => {
+            use ratatui::text::{Line, Span, Text};
+            use ratatui::widgets::Wrap;
+            let arrow = if expanded { "\u{25BE}" } else { "\u{25B8}" };
+            let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+                format!("{arrow} \u{2500}\u{2500} context compacted \u{2500}\u{2500}"),
+                Style::new().fg(palette::MUTED).add_modifier(Modifier::BOLD),
+            ))];
+            if expanded {
+                for line in summary.lines() {
+                    lines.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::new().fg(palette::MUTED),
+                    )));
+                }
+            }
+            (
+                Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+                Vec::new(),
+            )
+        }
     }
 }
 

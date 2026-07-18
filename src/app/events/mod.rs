@@ -109,6 +109,9 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             commands::send_message(app).await;
         }
         AppEvent::StartInit => handle_start_init(app),
+        AppEvent::CompactFinished(result, cancel_token) => {
+            handle_compact_finished(app, result, cancel_token)
+        }
         AppEvent::Quit => app.quit(),
         AppEvent::ProvidersChanged => handle_providers_changed(app).await,
         AppEvent::McpChanged => handle_mcp_changed(app).await,
@@ -272,6 +275,34 @@ fn handle_start_init(app: &mut App<'_>) {
     // Fresh turn: start from an un-cancelled root token.
     app.cancel.active = CancellationToken::new();
     stream::spawn_stream(app);
+}
+
+/// `/compact` finished: install the summary as the new context boundary, or
+/// surface the error. Results from a cancelled run are dropped.
+fn handle_compact_finished(
+    app: &mut App<'_>,
+    result: Result<String, String>,
+    cancel_token: CancellationToken,
+) {
+    if cancel_token.is_cancelled() {
+        return;
+    }
+    app.conversation_panel.phase = ActivePhase::None;
+    match result {
+        Ok(summary) => {
+            app.conversation_panel.apply_compaction(summary);
+            app.conversation_panel.add_info_string(
+                "Context compacted — older history is summarized for the model \
+                 (click the divider to read the summary) but stays visible here."
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            app.conversation_panel
+                .add_error_string(format!("compaction failed: {e}"));
+        }
+    }
+    session::mark_dirty(app);
 }
 
 /// Providers changed: rebuild the manager and reset the model if it vanished.

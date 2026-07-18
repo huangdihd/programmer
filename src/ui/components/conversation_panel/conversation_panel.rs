@@ -54,6 +54,8 @@ pub enum ActivePhase {
     Classifying,
     /// Diagnostics checkers are running after an edit.
     Checking,
+    /// `/compact` is summarizing the conversation to shrink the context.
+    Compacting,
 }
 
 /// Number of rows scrolled per mouse-wheel notch.
@@ -120,6 +122,7 @@ fn is_foldable(item: &MessageItem) -> bool {
         MessageItem::Output(OutputItem::Reasoning(_))
             | MessageItem::Output(OutputItem::FunctionCall(_))
             | MessageItem::ToolOutput { .. }
+            | MessageItem::Compacted { .. }
     )
 }
 
@@ -486,7 +489,7 @@ impl ConversationPanel {
         self.receiving_response.is_some()
             || matches!(
                 self.phase,
-                ActivePhase::ToolRunning | ActivePhase::Classifying
+                ActivePhase::ToolRunning | ActivePhase::Classifying | ActivePhase::Compacting
             )
     }
 
@@ -581,6 +584,27 @@ impl ConversationPanel {
 
     pub fn add_warning_string(&mut self, message: impl Into<String>) {
         self.items.push(MessageItem::Warning(message.into()));
+        self.stick_to_bottom = true;
+    }
+
+    /// Whether there is API-visible history worth compacting: any input/output
+    /// item after the last `/compact` boundary.
+    pub fn has_compactable_history(&self) -> bool {
+        let start = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, MessageItem::Compacted { .. }))
+            .map_or(0, |i| i + 1);
+        self.items[start..]
+            .iter()
+            .any(|item| matches!(item, MessageItem::Input(_) | MessageItem::Output(_)))
+    }
+
+    /// Record a finished `/compact`: push the boundary carrying `summary`.
+    /// History before it stays visible in the UI but stops being sent to the
+    /// API (see `get_input_param`).
+    pub fn apply_compaction(&mut self, summary: String) {
+        self.items.push(MessageItem::Compacted { summary });
         self.stick_to_bottom = true;
     }
 
@@ -745,9 +769,25 @@ impl ConversationPanel {
                 status: Some(OutputStatus::Completed),
             })));
 
+        // A `/compact` boundary replaces everything before it with its summary:
+        // only items after the last boundary reach the API.
+        let (compact_summary, live_items) = match self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, MessageItem::Compacted { .. }))
+        {
+            Some(idx) => {
+                let MessageItem::Compacted { summary } = &self.items[idx] else {
+                    unreachable!()
+                };
+                (Some(summary.as_str()), &self.items[idx + 1..])
+            }
+            None => (None, &self.items[..]),
+        };
+
         // Recorded function_call_output items, keyed by call id.
         let mut recorded_outputs: HashMap<&str, &FunctionCallOutputItemParam> = HashMap::new();
-        for item in &self.items {
+        for item in live_items {
             if let MessageItem::ToolOutput { output, .. } = item {
                 recorded_outputs.entry(output.call_id.as_str()).or_insert(output);
             }
@@ -760,8 +800,25 @@ impl ConversationPanel {
         // into several assistant messages, and thinking models (e.g. DeepSeek)
         // then reject the later ones for missing reasoning content.
         let mut input_items = vec![developer_message];
+        // The compacted history enters as a user message right after the
+        // developer message (not inside it), so the static system-prompt
+        // prefix keeps hitting the provider's KV cache.
+        if let Some(summary) = compact_summary {
+            input_items.push(InputItem::from(Item::Message(ApiMessageItem::Input(
+                InputMessage {
+                    content: vec![InputContent::InputText(InputTextContent {
+                        text: format!(
+                            "[The earlier conversation was compacted. Summary of \
+                             everything before this point:]\n\n{summary}"
+                        ),
+                    })],
+                    role: InputRole::User,
+                    status: Some(OutputStatus::Completed),
+                },
+            ))));
+        }
         let mut pending_outputs: Vec<InputItem> = Vec::new();
-        for message_item in &self.items {
+        for message_item in live_items {
             match message_item {
                 // A stored output marks the boundary after an assistant block:
                 // flush that block's outputs here, in call order.
@@ -945,6 +1002,45 @@ mod tests {
                 "call:call_2",
                 "output:call_2", // synthesized for the orphaned call
             ]
+        );
+    }
+
+    #[test]
+    fn compaction_replaces_older_history_with_the_summary() {
+        let mut panel = ConversationPanel::new();
+        panel.add_input_message(user_message("old message one"));
+        panel.add_input_message(user_message("old message two"));
+        assert!(panel.has_compactable_history());
+
+        panel.apply_compaction("the compact summary".to_string());
+        assert!(!panel.has_compactable_history(), "boundary resets history");
+
+        panel.add_input_message(user_message("new message"));
+        assert!(panel.has_compactable_history());
+
+        let InputParam::Items(items) = panel.get_input_param("test/model", None, None, None)
+        else {
+            panic!("expected an item list");
+        };
+        let texts: Vec<String> = items
+            .iter()
+            .filter_map(|item| match item {
+                InputItem::Item(Item::Message(ApiMessageItem::Input(m))) => {
+                    m.content.iter().find_map(|c| match c {
+                        InputContent::InputText(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        // developer message, then the summary, then only post-boundary items.
+        assert_eq!(texts.len(), 3, "got: {texts:#?}");
+        assert!(texts[1].contains("the compact summary"));
+        assert!(texts[2].contains("new message"));
+        assert!(
+            !texts.iter().any(|t| t.contains("old message")),
+            "compacted history must not reach the API"
         );
     }
 

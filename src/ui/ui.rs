@@ -39,6 +39,7 @@ impl App<'_> {
         match cp.phase {
             ActivePhase::Classifying => StatusState::Classifying,
             ActivePhase::Checking => StatusState::Checking,
+            ActivePhase::Compacting => StatusState::Compacting,
             ActivePhase::ToolRunning => StatusState::ToolRunning,
             ActivePhase::CreatingToolCall => StatusState::CreatingToolCall,
             ActivePhase::Outputting => StatusState::Outputting,

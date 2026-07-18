@@ -4,6 +4,7 @@
 - ~~edit_file tool diff-style message~~
 - ~~lint~~
 - remote control(?)
+- ~~/compact~~
 - ~~fix /init~~
 - ~~interactive background task terminal~~
 - installation script(publish to cargo?)

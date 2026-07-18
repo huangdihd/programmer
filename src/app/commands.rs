@@ -119,6 +119,105 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
     }
 }
 
+/// `/compact`: ask the model for a continuation summary of the conversation so
+/// far, then (in [`super::events`]'s `CompactFinished` handler) install it as a
+/// context boundary — the model afterwards sees the summary instead of the
+/// summarized history, while the UI keeps everything visible.
+pub(crate) fn start_compact(app: &mut App<'_>) {
+    use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
+    use crate::ui::event::Event;
+    use async_openai::types::responses::{CreateResponse, InputItem, InputParam, Item, OutputItem, OutputMessageContent};
+
+    if app.conversation_panel.is_busy() {
+        app.conversation_panel
+            .add_warning_string("cannot compact while a turn is in flight");
+        return;
+    }
+    if !app.conversation_panel.has_compactable_history() {
+        app.conversation_panel
+            .add_info_string("nothing to compact yet".to_string());
+        return;
+    }
+    let (client, model_name) = match app.provider_manager.resolve(&app.current_model) {
+        Some((c, m)) => (c.clone(), m),
+        None => {
+            app.conversation_panel
+                .add_error_string(format!("unknown provider/model: {}", app.current_model));
+            return;
+        }
+    };
+
+    // The full current context plus the summarization instruction. No tools:
+    // the model must answer with the summary text, not act.
+    let mut input_items = match app.conversation_panel.get_input_param(
+        &app.current_model,
+        None,
+        None,
+        None,
+    ) {
+        InputParam::Items(items) => items,
+        InputParam::Text(text) => vec![InputItem::from(Item::Message(
+            ApiMessageItem::Input(InputMessage {
+                content: vec![InputContent::InputText(InputTextContent { text })],
+                role: InputRole::User,
+                status: Some(OutputStatus::Completed),
+            }),
+        ))],
+    };
+    input_items.push(InputItem::from(Item::Message(ApiMessageItem::Input(
+        InputMessage {
+            content: vec![InputContent::InputText(InputTextContent {
+                text: crate::prompts::COMPACT_PROMPT.to_string(),
+            })],
+            role: InputRole::User,
+            status: Some(OutputStatus::Completed),
+        },
+    ))));
+
+    app.conversation_panel.phase = ActivePhase::Compacting;
+    app.cancel.active = crate::cancel::CancellationToken::new();
+    let cancel_token = app.cancel.active.child();
+    let sender = app.events.sender.clone();
+    tokio::spawn(async move {
+        let request = CreateResponse {
+            input: InputParam::Items(input_items),
+            model: Some(model_name),
+            ..Default::default()
+        };
+        let result = match client.responses().create(request).await {
+            Ok(response) => {
+                let text = response
+                    .output
+                    .iter()
+                    .filter_map(|item| match item {
+                        OutputItem::Message(msg) => Some(msg.content.iter().filter_map(
+                            |c| match c {
+                                OutputMessageContent::OutputText(t) => Some(t.text.as_str()),
+                                _ => None,
+                            },
+                        )),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.trim().is_empty() {
+                    Err("the model returned an empty summary".to_string())
+                } else {
+                    Ok(text)
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        if !cancel_token.is_cancelled() {
+            let _ = sender.send(Event::App(crate::ui::event::AppEvent::CompactFinished(
+                result,
+                cancel_token,
+            )));
+        }
+    });
+}
+
 /// Open the interactive terminal panel for a task. With no argument, opens the
 /// sole interactive task; with an id, opens that task if it is interactive.
 fn open_terminal(app: &mut App<'_>, arg: &str) {
@@ -339,6 +438,10 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         Some(Command::Terminal(arg)) => {
             app.input_panel.clear();
             open_terminal(app, &arg);
+        }
+        Some(Command::Compact) => {
+            app.input_panel.clear();
+            start_compact(app);
         }
         Some(Command::Providers(arg)) => {
             app.input_panel.clear();

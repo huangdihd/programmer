@@ -48,6 +48,9 @@ pub enum Command {
     Plan(String),
     /// `/terminal [id]` — open the interactive terminal panel for a task.
     Terminal(String),
+    /// `/compact` — summarize the conversation so far and shrink the context
+    /// the model sees to that summary plus everything after it.
+    Compact,
 }
 
 impl Command {
@@ -82,6 +85,7 @@ impl Command {
             "mcp" => Some(Command::Mcp(args)),
             "plan" => Some(Command::Plan(args)),
             "terminal" | "term" => Some(Command::Terminal(args)),
+            "compact" => Some(Command::Compact),
             _ => None,
         }
     }
@@ -90,7 +94,7 @@ impl Command {
     pub fn all_commands() -> &'static [&'static str] {
         &[
             "model", "new", "providers", "session", "mode", "classifier", "init", "todo", "skill",
-            "mcp", "plan", "terminal", "clear", "quit", "help",
+            "mcp", "plan", "terminal", "compact", "clear", "quit", "help",
         ]
     }
 
@@ -108,6 +112,7 @@ impl Command {
             ("/mcp show", "List configured MCP servers and their status"),
             ("/mcp manage", "Open the MCP server management panel"),
             ("/terminal [id]", "Open the interactive terminal for a PTY task"),
+            ("/compact", "Summarize older history to shrink the model's context"),
             ("/todo | /t", "Open the todo list panel"),
             ("/new | /n", "Start a new session (saves current)"),
             ("/providers show", "List all configured providers and models"),

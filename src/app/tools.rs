@@ -431,6 +431,9 @@ pub(crate) fn build_classifier_context(app: &App<'_>) -> (String, String) {
             MessageItem::Usage(_, _) => {
                 // Token usage counters — not useful for classification.
             }
+            MessageItem::Compacted { summary } => {
+                full_ctx.push(format!("\n[Conversation before this point was compacted; its summary]\n{summary}"));
+            }
         }
     }
 

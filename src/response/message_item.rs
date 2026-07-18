@@ -39,6 +39,11 @@ pub enum MessageItem {
     Info(String),
     Meta { label: String, text: String },
     Usage(u32, u32), // (input_tokens, output_tokens)
+    /// A `/compact` boundary: everything before this item was summarized into
+    /// `summary`, which is sent to the model in place of that history. The
+    /// older items stay in the list for the UI scrollback but are no longer
+    /// part of the API input.
+    Compacted { summary: String },
 }
 
 impl Clone for MessageItem {
@@ -60,6 +65,9 @@ impl Clone for MessageItem {
                 text: text.clone(),
             },
             MessageItem::Usage(i, o) => MessageItem::Usage(*i, *o),
+            MessageItem::Compacted { summary } => MessageItem::Compacted {
+                summary: summary.clone(),
+            },
         }
     }
 }

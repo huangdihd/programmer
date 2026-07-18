@@ -81,6 +81,10 @@ pub enum AppEvent {
         seed: bool,
         cancel_token: CancellationToken,
     },
+    /// `/compact` finished: `Ok` carries the summary to install as the new
+    /// context boundary, `Err` the error to surface. The token identifies the
+    /// run so a summary from a cancelled compaction is dropped.
+    CompactFinished(Result<String, String>, CancellationToken),
     /// Cancel the current in-flight request (streaming or tool calls).
     Cancel,
     /// Quit the application.
@@ -130,6 +134,10 @@ impl std::fmt::Debug for AppEvent {
             Self::DiagnosticsCompleted { .. } => {
                 f.debug_struct("DiagnosticsCompleted").finish()
             }
+            Self::CompactFinished(r, _) => f
+                .debug_tuple("CompactFinished")
+                .field(&r.as_ref().map(|_| ".."))
+                .finish(),
             Self::Cancel => write!(f, "Cancel"),
             Self::Quit => write!(f, "Quit"),
             Self::Start => write!(f, "Start"),

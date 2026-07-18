@@ -48,6 +48,8 @@ pub(crate) enum SerializableMessageItem {
     Info(String),
     Meta { label: String, text: String },
     Usage { input_tokens: u32, output_tokens: u32 },
+    /// A `/compact` boundary carrying the summary of everything before it.
+    Compacted { summary: String },
 }
 
 impl From<MessageItem> for SerializableMessageItem {
@@ -69,6 +71,7 @@ impl From<MessageItem> for SerializableMessageItem {
                 input_tokens: i,
                 output_tokens: o,
             },
+            MessageItem::Compacted { summary } => SerializableMessageItem::Compacted { summary },
         }
     }
 }
@@ -105,6 +108,9 @@ impl From<SerializableMessageItem> for MessageItem {
                 input_tokens,
                 output_tokens,
             } => MessageItem::Usage(input_tokens, output_tokens),
+            SerializableMessageItem::Compacted { summary } => {
+                MessageItem::Compacted { summary }
+            }
         }
     }
 }
