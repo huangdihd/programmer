@@ -16,9 +16,10 @@
 //! Full-screen interactive terminal panel: renders an interactive task's vt100
 //! screen and (when grabbed) forwards the user's keystrokes to its PTY.
 //!
-//! Opened with `/terminal [id]`. `Ctrl+O` toggles input grab: while grabbed,
-//! every key is translated to terminal bytes and written to the child; while
-//! released, the panel handles its own keys (`Esc`/`q` to close).
+//! Opened with `/terminal [id]` or a `!command`. `Ctrl+O` toggles input grab:
+//! while grabbed, every key is translated to terminal bytes and written to the
+//! child; while released, the panel handles its own keys (`Esc`/`q` to close).
+//! When the task exits, the panel closes itself and focus returns to the input.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -45,6 +46,10 @@ pub struct TerminalPane {
     /// The vt100 grid's screen area from the last render, for translating mouse
     /// coordinates into cell coordinates.
     pub grid: Option<Rect>,
+    /// Consecutive ticks the task has been observed finished. Once this passes
+    /// a short grace period (letting the PTY reader flush the output tail),
+    /// the panel auto-closes and focus returns to the input.
+    pub finished_ticks: u8,
 }
 
 impl TerminalPane {
@@ -55,6 +60,7 @@ impl TerminalPane {
             grabbed: false,
             last_size: None,
             grid: None,
+            finished_ticks: 0,
         }
     }
 

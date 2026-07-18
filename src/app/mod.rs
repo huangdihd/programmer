@@ -127,6 +127,10 @@ pub struct App<'a> {
     pub todo_panel: Option<TodoPanel>,
     /// Full-screen interactive terminal panel, when open (`/terminal`).
     pub terminal_pane: Option<crate::ui::components::terminal_panel::TerminalPane>,
+    /// `!command` tasks whose exit should hand the transcript to the agent:
+    /// `(task id, consecutive ticks observed finished)`. The tick counter is a
+    /// short grace period so the PTY reader can flush the tail of the output.
+    pub(crate) bang_watch: Vec<(u64, u8)>,
     /// Right-hand sidebar panel (toggled with Ctrl+B).
     pub sidebar: Option<Sidebar>,
     /// The sidebar's screen area from the last render, used to route mouse
@@ -236,6 +240,7 @@ impl App<'_> {
             question_panel: None,
             todo_panel: None,
             terminal_pane: None,
+            bang_watch: Vec::new(),
             sidebar: Some(Sidebar::new()),
             sidebar_area: None,
             todo_list: {

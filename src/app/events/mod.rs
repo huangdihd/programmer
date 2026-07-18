@@ -109,6 +109,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             commands::send_message(app).await;
         }
         AppEvent::StartInit => handle_start_init(app),
+        AppEvent::BangFinished(task_id) => handle_bang_finished(app, task_id).await,
         AppEvent::CompactFinished(result, cancel_token) => {
             handle_compact_finished(app, result, cancel_token)
         }
@@ -348,9 +349,106 @@ async fn handle_mcp_changed(app: &mut App<'_>) {
 ///
 /// Ticks fire at [`crate::consts::TICK_FPS`] to drive animation redraws; we
 /// piggy-back on them to flush a dirty session once the current turn has gone
-/// idle, debouncing saves to turn boundaries.
+/// idle, debouncing saves to turn boundaries, and to watch interactive tasks
+/// for exit (auto-closing the terminal panel, handing `!` results to the
+/// agent).
 pub(crate) fn tick(app: &mut App<'_>) {
     session::flush_if_dirty(app);
+    poll_finished_terminals(app);
+}
+
+/// Consecutive ticks a task must be seen finished before acting on it. At
+/// [`crate::consts::TICK_FPS`] (30) this is ~100 ms — enough for the PTY
+/// reader thread to flush the tail of the output after the child exits.
+const TASK_EXIT_GRACE_TICKS: u8 = 3;
+
+/// Watch interactive tasks for exit: close the terminal panel (returning focus
+/// to the input) and fire [`AppEvent::BangFinished`] for watched `!` commands.
+fn poll_finished_terminals(app: &mut App<'_>) {
+    use crate::tasks::TaskStatus;
+
+    let is_running = |id: u64| {
+        crate::tasks::snapshot(id)
+            .map(|s| s.status == TaskStatus::Running)
+            .unwrap_or(false)
+    };
+
+    // The open panel: auto-close once its task is gone.
+    if let Some(pane) = app.terminal_pane.as_mut() {
+        if is_running(pane.task_id) {
+            pane.finished_ticks = 0;
+        } else {
+            pane.finished_ticks += 1;
+            if pane.finished_ticks >= TASK_EXIT_GRACE_TICKS {
+                let pane = app.terminal_pane.take().unwrap();
+                // `!` tasks get their record via BangFinished below; announce
+                // the close only for plain `/terminal` panes.
+                if !app.bang_watch.iter().any(|(id, _)| *id == pane.task_id) {
+                    let status = crate::tasks::snapshot(pane.task_id)
+                        .map(|s| s.status.label())
+                        .unwrap_or("gone");
+                    app.conversation_panel.add_info_string(format!(
+                        "🖥 terminal [{}] {} — {status}",
+                        pane.task_id, pane.name
+                    ));
+                }
+            }
+        }
+    }
+
+    // Watched `!` commands: exited tasks go to the agent (even if the user
+    // closed the panel early and the command finished in the background).
+    let mut i = 0;
+    while i < app.bang_watch.len() {
+        let (id, ref mut ticks) = app.bang_watch[i];
+        if is_running(id) {
+            *ticks = 0;
+            i += 1;
+        } else {
+            *ticks += 1;
+            if *ticks >= TASK_EXIT_GRACE_TICKS {
+                app.bang_watch.remove(i);
+                app.events.send(AppEvent::BangFinished(id));
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Maximum transcript characters replayed to the model for a `!command`.
+const MAX_BANG_TRANSCRIPT: usize = 10_000;
+
+/// A watched `!command` exited: compose its transcript into a user message and
+/// start a turn so the agent responds to the outcome.
+async fn handle_bang_finished(app: &mut App<'_>, task_id: u64) {
+    use crate::tasks::TaskStatus;
+
+    let Some(snap) = crate::tasks::snapshot(task_id) else {
+        return;
+    };
+    let status = match (snap.status, snap.exit_code) {
+        (TaskStatus::Killed, _) => "killed".to_string(),
+        (_, Some(code)) => format!("exited with code {code}"),
+        (s, None) => s.label().to_string(),
+    };
+    let transcript = crate::tasks::transcript(task_id).unwrap_or_default();
+    let transcript = transcript.trim();
+    let body = if transcript.is_empty() {
+        "(no output)"
+    } else {
+        // Keep the tail — the interesting part — under the cap.
+        let mut start = transcript.len().saturating_sub(MAX_BANG_TRANSCRIPT);
+        while !transcript.is_char_boundary(start) {
+            start += 1;
+        }
+        &transcript[start..]
+    };
+    let text = format!(
+        "!{}\n[interactive terminal session {status}]\n```\n{body}\n```",
+        snap.command
+    );
+    commands::start_request(app, text).await;
 }
 
 /// Recompute tab-completion candidates from the current input text.
@@ -358,6 +456,9 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
     let content = app.input_panel.get_content();
     app.input_panel.completion = if content.starts_with('/') {
         CompletionEngine::complete(&content, &app.provider_manager, &app.skill_registry)
+    } else if content.starts_with('!') {
+        // Shell-style completion for `!command` lines.
+        CompletionEngine::complete_bang(&content)
     } else {
         // Non-slash input may still carry a trailing `@file` reference.
         CompletionEngine::complete_file_ref(&content)

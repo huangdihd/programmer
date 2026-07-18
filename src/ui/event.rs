@@ -85,6 +85,9 @@ pub enum AppEvent {
     /// context boundary, `Err` the error to surface. The token identifies the
     /// run so a summary from a cancelled compaction is dropped.
     CompactFinished(Result<String, String>, CancellationToken),
+    /// A `!command`'s interactive task exited: hand its transcript to the
+    /// model so the agent responds to the outcome. Carries the task id.
+    BangFinished(u64),
     /// Cancel the current in-flight request (streaming or tool calls).
     Cancel,
     /// Quit the application.
@@ -138,6 +141,7 @@ impl std::fmt::Debug for AppEvent {
                 .debug_tuple("CompactFinished")
                 .field(&r.as_ref().map(|_| ".."))
                 .finish(),
+            Self::BangFinished(id) => f.debug_tuple("BangFinished").field(id).finish(),
             Self::Cancel => write!(f, "Cancel"),
             Self::Quit => write!(f, "Quit"),
             Self::Start => write!(f, "Start"),

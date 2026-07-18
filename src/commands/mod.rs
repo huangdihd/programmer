@@ -237,6 +237,36 @@ impl CompletionEngine {
         CompletionState::new(prefix, candidates)
     }
 
+    /// Complete a `!command` line, shell-style: the first word completes
+    /// against the executables on `PATH` (or as a path when it contains `/`),
+    /// later words complete as file paths.
+    pub(crate) fn complete_bang(content: &str) -> Option<CompletionState> {
+        let after = content.strip_prefix('!')?;
+        let token_start = after
+            .rfind(char::is_whitespace)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let token = &after[token_start..];
+        let prefix = format!("!{}", &after[..token_start]);
+        let completing_command = token_start == 0;
+
+        let candidates = if completing_command && !token.contains('/') {
+            if token.is_empty() {
+                // A bare `!` would list every command on PATH — pure noise.
+                return None;
+            }
+            path_executables()
+                .iter()
+                .filter(|c| c.starts_with(token))
+                .take(50)
+                .cloned()
+                .collect()
+        } else {
+            list_path_candidates(token)
+        };
+        CompletionState::new(prefix, candidates)
+    }
+
     /// Complete a fixed set of subcommands for `cmd`.
     fn complete_subcommand(
         text: &str,
@@ -343,17 +373,43 @@ fn active_at_token(content: &str) -> Option<(String, String)> {
 /// large and rarely the intended reference.
 const NOISE_DIRS: &[&str] = &["target", "node_modules", ".git"];
 
+/// The user's home directory, from the environment (`HOME`, or `USERPROFILE`
+/// on Windows).
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(Into::into)
+}
+
+/// Expand a leading `~/` to the home directory. Any other path (including
+/// `~user/` forms) is returned unchanged.
+fn expand_tilde(path: &str) -> String {
+    match (path.strip_prefix("~/"), home_dir()) {
+        (Some(rest), Some(home)) => format!("{}/{rest}", home.to_string_lossy()),
+        _ => path.to_string(),
+    }
+}
+
 /// List path candidates for a (possibly partial) path, shell-completion style:
 /// only the directory named by the partial is read (one level), entries are
 /// filtered by the trailing name prefix, directories sort first and gain a
-/// trailing `/` so completion can descend into them.
+/// trailing `/` so completion can descend into them. A leading `~/` is
+/// expanded for the directory read but kept verbatim in the candidates.
 fn list_path_candidates(partial: &str) -> Vec<String> {
+    // A bare `~` can only become the home directory.
+    if partial == "~" {
+        return vec!["~/".to_string()];
+    }
     let (dir_part, name_prefix) = match partial.rfind('/') {
         Some(i) => (&partial[..=i], &partial[i + 1..]),
         None => ("", partial),
     };
-    let read_path = if dir_part.is_empty() { "." } else { dir_part };
-    let Ok(entries) = std::fs::read_dir(read_path) else {
+    let read_path = if dir_part.is_empty() {
+        ".".to_string()
+    } else {
+        expand_tilde(dir_part)
+    };
+    let Ok(entries) = std::fs::read_dir(&read_path) else {
         return Vec::new();
     };
 
@@ -382,6 +438,47 @@ fn list_path_candidates(partial: &str) -> Vec<String> {
     out.into_iter().map(|(_, c)| c).take(50).collect()
 }
 
+/// Executable names found on `PATH`, sorted and deduplicated. Scanned once per
+/// process (lazily, on the first `!` completion) — PATH changes mid-session are
+/// rare enough not to matter.
+fn path_executables() -> &'static [String] {
+    static CMDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CMDS.get_or_init(|| {
+        let mut names = std::collections::BTreeSet::new();
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if is_executable(&entry) {
+                        names.insert(entry.file_name().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        names.into_iter().collect()
+    })
+}
+
+/// Whether a directory entry is an executable program. Follows symlinks (e.g.
+/// Homebrew's bin directory is almost entirely symlinks).
+#[cfg(unix)]
+fn is_executable(entry: &std::fs::DirEntry) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(entry.path())
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_executable(entry: &std::fs::DirEntry) -> bool {
+    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+    ["exe", "cmd", "bat", "com", "ps1"]
+        .iter()
+        .any(|ext| name.ends_with(&format!(".{ext}")))
+}
+
 /// Maximum bytes read from a single `@file` reference before truncating.
 const MAX_REF_BYTES: usize = 100 * 1024;
 
@@ -401,13 +498,14 @@ pub(crate) async fn expand_file_references(text: &str) -> String {
         if path.is_empty() || seen.iter().any(|p| p == path) {
             continue;
         }
-        let Ok(meta) = tokio::fs::metadata(path).await else {
+        let fs_path = expand_tilde(path);
+        let Ok(meta) = tokio::fs::metadata(&fs_path).await else {
             continue;
         };
         if !meta.is_file() {
             continue;
         }
-        let Ok(bytes) = tokio::fs::read(path).await else {
+        let Ok(bytes) = tokio::fs::read(&fs_path).await else {
             continue;
         };
         seen.push(path.to_string());
@@ -456,6 +554,42 @@ mod tests {
         let (prefix, partial) = active_at_token("look at @").unwrap();
         assert_eq!(prefix, "look at @");
         assert_eq!(partial, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bang_completion_lists_path_commands_and_files() {
+        // `ls` exists on every Unix box; the exact name sorts first among the
+        // `ls*` matches, so the 50-candidate cap can't push it out.
+        let state = CompletionEngine::complete_bang("!ls").expect("commands starting with ls");
+        assert_eq!(state.candidates.first().map(String::as_str), Some("ls"), "{:?}", state.candidates);
+        assert_eq!(state.prefix, "!");
+        assert_eq!(state.line(0), "!ls");
+
+        // A bare `!` completes nothing.
+        assert!(CompletionEngine::complete_bang("!").is_none());
+
+        // Arguments complete as paths (runs from the crate root).
+        let state = CompletionEngine::complete_bang("!cat src/co").expect("path candidates");
+        assert_eq!(state.prefix, "!cat ");
+        assert!(state.candidates.iter().any(|c| c == "src/commands/"), "{:?}", state.candidates);
+
+        // A first word containing `/` completes as a path too.
+        let state = CompletionEngine::complete_bang("!./src/mai");
+        assert!(state.is_none() || state.unwrap().prefix == "!");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tilde_paths_expand_but_stay_tilde_in_candidates() {
+        let home = std::env::var("HOME").expect("HOME is set on unix");
+        assert_eq!(expand_tilde("~/xinbot/"), format!("{home}/xinbot/"));
+        assert_eq!(expand_tilde("plain/path"), "plain/path");
+
+        // A bare `~` completes to the home directory itself.
+        assert_eq!(list_path_candidates("~"), vec!["~/".to_string()]);
+        // Candidates under `~/` keep the tilde form the user typed.
+        assert!(list_path_candidates("~/").iter().all(|c| c.starts_with("~/")));
     }
 
     #[test]

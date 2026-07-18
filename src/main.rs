@@ -264,10 +264,12 @@ fn load_config() -> color_eyre::Result<(ProgrammerConfig, std::path::PathBuf)> {
         .unwrap_or_default()
         .try_deserialize()?;
 
-    if programmer_config.migrate_if_needed() {
-        std::fs::write(&config_path, toml::to_string(&programmer_config)?)?;
-    }
-    if !config_path.exists() {
+    if programmer_config.migrate_if_needed() || !config_path.exists() {
+        // First run on a fresh machine: the config directory doesn't exist yet
+        // and `fs::write` won't create parents.
+        if let Some(parent) = config_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         std::fs::write(&config_path, toml::to_string(&programmer_config)?)?;
     }
 

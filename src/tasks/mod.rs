@@ -81,6 +81,11 @@ struct PtyState {
     killed: Arc<AtomicBool>,
     rows: u16,
     cols: u16,
+    /// Raw byte transcript of everything the child wrote (escape sequences
+    /// included), capped like [`MAX_TASK_OUTPUT`]. The vt100 screen only holds
+    /// the visible grid plus scrollback; this keeps the whole session so a
+    /// finished `!command` can be replayed to the model via [`transcript`].
+    transcript: String,
 }
 
 /// One background task's bookkeeping entry.
@@ -363,6 +368,7 @@ pub fn spawn_interactive(
                         if let Ok(mut p) = parser.lock() {
                             p.process(&buf[..n]);
                         }
+                        append_transcript(id, &String::from_utf8_lossy(&buf[..n]));
                     }
                 }
             }
@@ -413,6 +419,7 @@ pub fn spawn_interactive(
                 killed,
                 rows,
                 cols,
+                transcript: String::new(),
             }),
         });
     }
@@ -772,15 +779,104 @@ fn append_output(id: u64, chunk: &str) {
     let mut reg = registry().lock().unwrap();
     if let Some(entry) = reg.iter_mut().find(|e| e.id == id) {
         entry.output.push_str(chunk);
-        if entry.output.len() > MAX_TASK_OUTPUT {
-            // Drop the oldest half at a char boundary.
-            let mut cut = entry.output.len() / 2;
-            while !entry.output.is_char_boundary(cut) {
-                cut += 1;
+        cap_buffer(&mut entry.output);
+    }
+}
+
+/// Append a raw PTY chunk to an interactive task's transcript buffer.
+fn append_transcript(id: u64, chunk: &str) {
+    let mut reg = registry().lock().unwrap();
+    if let Some(pty) = reg
+        .iter_mut()
+        .find(|e| e.id == id)
+        .and_then(|e| e.pty.as_mut())
+    {
+        pty.transcript.push_str(chunk);
+        cap_buffer(&mut pty.transcript);
+    }
+}
+
+/// Keep `buf` under [`MAX_TASK_OUTPUT`] by dropping the oldest half at a char
+/// boundary.
+fn cap_buffer(buf: &mut String) {
+    if buf.len() > MAX_TASK_OUTPUT {
+        let mut cut = buf.len() / 2;
+        while !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.replace_range(..cut, "[earlier output dropped]\n");
+    }
+}
+
+/// The full session transcript of an interactive task as plain text: raw PTY
+/// output run through [`strip_ansi`]. `None` if the id is unknown or the task
+/// isn't interactive.
+pub fn transcript(id: u64) -> Option<String> {
+    let reg = registry().lock().unwrap();
+    reg.iter()
+        .find(|e| e.id == id)
+        .and_then(|e| e.pty.as_ref())
+        .map(|pty| strip_ansi(&pty.transcript))
+}
+
+/// Strip terminal escape sequences and control characters from raw PTY output,
+/// keeping printable text, newlines, and tabs. A carriage return not followed
+/// by a newline restarts its line (so progress-bar redraws keep only the final
+/// state).
+pub fn strip_ansi(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut line_start = 0usize; // byte index in `out` where the current line begins
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.peek() {
+                // CSI: `ESC [` then parameter/intermediate bytes until a final
+                // byte in 0x40..=0x7e.
+                Some('[') => {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: `ESC ]` until BEL or ST (`ESC \`).
+                Some(']') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\x07' {
+                            break;
+                        }
+                        if n == '\x1b' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Two-character escape (charset selection, keypad modes, …).
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\n' => {
+                out.push('\n');
+                line_start = out.len();
             }
-            entry.output.replace_range(..cut, "[earlier output dropped]\n");
+            '\r' => {
+                // Part of a CRLF line ending — let the `\n` handle it.
+                if chars.peek() != Some(&'\n') {
+                    out.truncate(line_start);
+                }
+            }
+            '\t' => out.push('\t'),
+            c if c.is_control() => {}
+            c => out.push(c),
         }
     }
+    out
 }
 
 fn finish(id: u64, status: TaskStatus, exit_code: Option<i32>) {
@@ -977,5 +1073,35 @@ mod tests {
         assert!(still_running);
         assert_eq!(snap.status, TaskStatus::Running);
         let _ = kill(id);
+    }
+
+    #[test]
+    fn strip_ansi_removes_escapes_and_handles_cr() {
+        // SGR colors and cursor movement disappear; text stays.
+        assert_eq!(strip_ansi("\x1b[1;32mok\x1b[0m done"), "ok done");
+        // OSC title sequences (BEL- and ST-terminated) disappear.
+        assert_eq!(strip_ansi("\x1b]0;title\x07hi"), "hi");
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\hi"), "hi");
+        // CRLF is a plain newline; a lone CR restarts the line.
+        assert_eq!(strip_ansi("one\r\ntwo"), "one\ntwo");
+        assert_eq!(strip_ansi("50%\r100%\ndone"), "100%\ndone");
+        // A CR restart only rewinds to the current line, not earlier ones.
+        assert_eq!(strip_ansi("keep\nold\rnew"), "keep\nnew");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_task_records_transcript() {
+        let id = spawn_interactive("printf 'tr-123\\n'", None, None, 24, 80).expect("spawn");
+        let (_, still) = wait(id, Duration::from_secs(10)).await.expect("wait");
+        assert!(!still);
+        // Give the reader thread a moment to drain the PTY tail.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let text = transcript(id).expect("interactive task has a transcript");
+        assert!(text.contains("tr-123"), "transcript: {text}");
+        // Pipe tasks have no transcript.
+        let pid = spawn("echo hi", None, None).expect("spawn");
+        assert!(transcript(pid).is_none());
+        let _ = wait(pid, Duration::from_secs(10)).await;
     }
 }

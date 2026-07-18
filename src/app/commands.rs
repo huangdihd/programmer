@@ -89,6 +89,8 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
 
 /// Run a `!command` from the input: spawn it as an interactive PTY task and
 /// open the terminal panel focused on it, so the user drives it right away.
+/// The exit is watched from [`super::events`]'s tick: the panel closes, focus
+/// returns to the input, and the transcript goes to the agent for a response.
 pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
     use crate::ui::components::terminal_panel::TerminalPane;
 
@@ -99,6 +101,7 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
     }
     app.input_panel.push_history(input.to_string());
     app.input_panel.clear();
+    app.input_panel.completion = None;
 
     // Spawn at the size the terminal panel will render at, so the first frame
     // doesn't have to resize the fresh PTY. A resize racing the child's
@@ -110,10 +113,18 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
         .unwrap_or((24, 80));
     match crate::tasks::spawn_interactive(&command, None, Some(&command), rows, cols) {
         Ok(id) => {
+            // The record in the conversation; the transcript follows when the
+            // command exits and the agent picks it up.
+            app.conversation_panel.add_info_string(format!(
+                "🖥 !{command} — running in the interactive terminal; \
+                 the agent will respond when it exits"
+            ));
+            session::mark_dirty(app);
             let mut pane = TerminalPane::new(id, command);
             // Grab input immediately — the user typed `!` to interact.
             pane.grabbed = true;
             app.terminal_pane = Some(pane);
+            app.bang_watch.push((id, 0));
         }
         Err(e) => app.conversation_panel.add_error_string(e),
     }

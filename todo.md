@@ -1,9 +1,11 @@
 - multimodal support
-- ~~Jump to bottom button~~
+- ~~jump to bottom button~~
 - ~~http mcp~~
 - ~~edit_file tool diff-style message~~
 - ~~lint~~
 - remote control(?)
+- configurable restricted access control rule system
+- multi agents(traditional sub agents or use interactive background task system to launch it self again?)
 - ~~/compact~~
 - ~~fix /init~~
 - ~~interactive background task terminal~~
