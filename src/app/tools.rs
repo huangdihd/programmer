@@ -21,7 +21,6 @@ use crate::response::message_item::MessageItem;
 use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
 use crate::ui::event::{AppEvent, Event};
 use async_openai::types::responses::{FunctionToolCall, OutputItem};
-use futures::StreamExt;
 use std::collections::HashMap;
 use crate::cancel::CancellationToken;
 
@@ -206,45 +205,9 @@ pub(crate) fn batch_edited_files(app: &App<'_>, outputs: &[crate::tools::ToolOut
     })
 }
 
-/// Whether a tool has no side effects and so may run concurrently with other
-/// such calls. Only read-only tools qualify; everything else (writes, shell
-/// commands, MCP calls, and anything unrecognised) runs serially so a read can
-/// never race ahead of a write it might depend on.
-fn is_parallel_safe(name: &str) -> bool {
-    matches!(
-        name,
-        crate::tools::read_file::NAME
-            | crate::tools::grep::NAME
-            | crate::tools::blob::NAME
-            | crate::tools::fetch::NAME
-    )
-}
-
-/// Execute one tool call and stamp the approval label (unless the classifier
-/// already set one). Takes everything by value so each future is self-contained
-/// and can be driven concurrently in a `buffered` stream; the captured handles
-/// (`sender`, `mcp`) are cheap `Arc`-backed clones.
-async fn run_labeled_call(
-    call: FunctionToolCall,
-    sender: tokio::sync::mpsc::UnboundedSender<Event>,
-    mcp: Option<std::sync::Arc<crate::mcp::McpManager>>,
-    label: String,
-) -> crate::tools::ToolOutput {
-    let mut out = crate::tools::run_tool_call(&call, &sender, mcp.as_deref()).await;
-    if out.approval_label.is_none() {
-        out.approval_label = Some(label);
-    }
-    out
-}
-
 /// Run `allowed` tool calls in the background, prepend the `denied` outputs,
-/// and report everything back via [`AppEvent::ToolCallsCompleted`].
-///
-/// Consecutive read-only calls run concurrently (bounded by
-/// [`MAX_CONCURRENT_READ_TOOLS`]); writes and other side-effecting tools run one
-/// at a time. Output order always matches call order, and the ordering between a
-/// write and the reads around it is preserved, so a read never observes a
-/// half-applied write.
+/// and report everything back via [`AppEvent::ToolCallsCompleted`]. The
+/// batching/ordering logic lives in [`crate::engine::tools::run_tool_batch`].
 fn spawn_run(
     app: &mut App<'_>,
     allowed: Vec<FunctionToolCall>,
@@ -258,38 +221,15 @@ fn spawn_run(
     let mcp = app.mcp_manager.clone();
     let label = format!("{mode_icon} approved by {mode_name} mode");
     tokio::spawn(async move {
-        let mut outputs = denied;
-        let mut i = 0;
-        while i < allowed.len() {
-            if cancel_token.is_cancelled() {
-                break;
-            }
-            if is_parallel_safe(&allowed[i].name) {
-                // Take the maximal run of consecutive read-only calls and run
-                // them concurrently, preserving order.
-                let start = i;
-                while i < allowed.len() && is_parallel_safe(&allowed[i].name) {
-                    i += 1;
-                }
-                let futs: Vec<_> = allowed[start..i]
-                    .iter()
-                    .map(|call| {
-                        run_labeled_call(call.clone(), sender.clone(), mcp.clone(), label.clone())
-                    })
-                    .collect();
-                let mut batch: Vec<crate::tools::ToolOutput> = futures::stream::iter(futs)
-                    .buffered(crate::consts::MAX_CONCURRENT_READ_TOOLS)
-                    .collect()
-                    .await;
-                outputs.append(&mut batch);
-            } else {
-                let out =
-                    run_labeled_call(allowed[i].clone(), sender.clone(), mcp.clone(), label.clone())
-                        .await;
-                outputs.push(out);
-                i += 1;
-            }
-        }
+        let outputs = crate::engine::tools::run_tool_batch(
+            allowed,
+            denied,
+            cancel_token.clone(),
+            label,
+            sender.clone(),
+            mcp,
+        )
+        .await;
         let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
             outputs,
             cancel_token,

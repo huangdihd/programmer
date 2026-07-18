@@ -22,3 +22,4 @@
 pub(crate) mod classify;
 pub(crate) mod request;
 pub(crate) mod stream;
+pub(crate) mod tools;
