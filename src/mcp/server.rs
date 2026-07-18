@@ -16,14 +16,17 @@
 //! MCP server: expose programmer's own local tools to any MCP client over the
 //! stdio transport (newline-delimited JSON-RPC 2.0).
 //!
-//! Run with `programmer --mcp-server`. Tool calls are gated through the same
-//! classifier as the TUI, chosen with `--mcp-mode`:
-//! - `yolo` runs everything; `plan` refuses state-mutating tools.
-//! - `auto` sends dangerous calls to the LLM classifier (needs a configured
-//!   model) and runs them only if it approves.
-//! - `manual` asks the human through MCP **elicitation** — the server prompts
-//!   the client, which surfaces a confirmation to its user. Clients without
-//!   elicitation support fall back to a refusal.
+//! Run with `programmer --mcp-server`. This entrypoint is headless — a client
+//! launches it as a subprocess with no terminal — so it only accepts the
+//! non-interactive `--mcp-mode` values:
+//! - `auto` (default) sends dangerous calls to the LLM classifier (needs a
+//!   configured model) and runs them only if it approves.
+//! - `yolo` runs everything.
+//!
+//! The [`McpServer`] gate below still implements `plan` (refuse mutations) and
+//! `manual` (confirm through MCP **elicitation**) for completeness, but those
+//! belong to `--mcp-http`, which has a console; `--mcp-server` rejects them at
+//! startup (see `mcp_server_mode_ok` in `main`).
 //!
 //! Nothing but protocol messages is written to stdout.
 

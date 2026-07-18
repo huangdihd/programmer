@@ -64,13 +64,14 @@ Options:
   --session         Open the session management panel
   --providers       Open the provider management panel on startup
   --mcp-server      Run as an MCP server on stdio, exposing programmer's local
-                    tools to any MCP client (no TUI)
+                    tools to any MCP client. Headless (no terminal), so it only
+                    accepts --mcp-mode auto (default) or yolo
   --mcp-http [addr] Run an HTTP MCP server (default 127.0.0.1:8765) with a
                     ratatui approval console; the operator approves manual-mode
                     calls and switches mode (Ctrl+T) live
   --mcp-mode <mode> Tool-gating mode for the MCP server: auto (default; LLM
-                    confirms dangerous tools — manual/console for --mcp-http),
-                    manual, plan (read-only), or yolo (run everything)
+                    confirms dangerous tools), yolo (run everything). --mcp-http
+                    also accepts manual (console approval) and plan (read-only)
   -h, --help        Show this help and exit";
 
 fn parse_args() -> Args {
@@ -128,6 +129,15 @@ fn parse_work_mode(s: &str) -> crate::classifier::WorkMode {
         "plan" => WorkMode::Plan,
         _ => WorkMode::Auto,
     }
+}
+
+/// The headless `--mcp-server` (stdio, launched by a client with no terminal)
+/// only accepts non-interactive gating: `auto` (LLM classifier decides) or
+/// `yolo` (run everything). `manual` needs an approval surface and `plan` just
+/// refuses every mutation — both belong to the `--mcp-http` console instead.
+fn mcp_server_mode_ok(mode: crate::classifier::WorkMode) -> bool {
+    use crate::classifier::WorkMode;
+    matches!(mode, WorkMode::Auto | WorkMode::Yolo)
 }
 
 /// Build the `(client, model)` the MCP server's `auto` mode uses to classify
@@ -274,7 +284,16 @@ async fn main() -> color_eyre::Result<()> {
     }
 
     // MCP server mode: no TUI, stdout is reserved for the JSON-RPC protocol.
+    // Launched by an MCP client as a subprocess, so there is no terminal — only
+    // the non-interactive gating modes make sense here (see `mcp_server_mode_ok`).
     if args.mcp_server {
+        if !mcp_server_mode_ok(args.mcp_mode) {
+            eprintln!(
+                "--mcp-server is headless (stdio, no terminal) and supports only \
+                 --mcp-mode auto or yolo; use --mcp-http for a console (manual/plan)"
+            );
+            std::process::exit(2);
+        }
         let classifier = build_mcp_classifier().await;
         mcp::server::McpServer::new(args.mcp_mode, classifier)
             .run()
@@ -338,3 +357,23 @@ async fn main() -> color_eyre::Result<()> {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classifier::WorkMode;
+
+    #[test]
+    fn mcp_server_accepts_only_auto_and_yolo() {
+        assert!(mcp_server_mode_ok(WorkMode::Auto));
+        assert!(mcp_server_mode_ok(WorkMode::Yolo));
+        assert!(!mcp_server_mode_ok(WorkMode::Manual));
+        assert!(!mcp_server_mode_ok(WorkMode::Plan));
+    }
+
+    #[test]
+    fn mcp_mode_defaults_to_auto() {
+        assert!(matches!(parse_work_mode("something-unknown"), WorkMode::Auto));
+    }
+}
+

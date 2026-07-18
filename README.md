@@ -277,16 +277,20 @@ client — another agent, Claude Desktop, etc. It speaks JSON-RPC 2.0 over stdio
 programmer --mcp-server
 ```
 
-Tool calls are gated by the same classifier as the TUI, via `--mcp-mode`.
-Read-only tools always run; dangerous ones (`command`, `write_file`,
-`edit_file`, mutating `task` actions, …) are gated:
+`--mcp-server` is **headless**: a client launches it as a subprocess with no
+terminal, so it only accepts the non-interactive gating modes. Tool calls are
+gated by the same classifier as the TUI, via `--mcp-mode`. Read-only tools
+always run; dangerous ones (`command`, `write_file`, `edit_file`, mutating
+`task` actions, …) are gated:
 
 | `--mcp-mode` | Behavior for dangerous tools |
 |---|---|
 | `auto` (default) | The **LLM classifier** decides (needs a configured `classifier_model`/default model); runs only if it approves |
-| `manual` | The **human** confirms via MCP [elicitation](https://modelcontextprotocol.io) — the server prompts the client, which asks its user; clients without elicitation support get a refusal |
-| `plan` | Refused (read-only exploration only) |
 | `yolo` | Everything runs without gating |
+
+`manual` (human confirmation) and `plan` (read-only) need an approval surface, so
+`--mcp-server` rejects them at startup — use `--mcp-http` (below), which has a
+console, for those.
 
 Register it with a client by pointing at the binary, e.g.:
 
