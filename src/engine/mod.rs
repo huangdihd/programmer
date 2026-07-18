@@ -19,5 +19,6 @@
 //! `app` event handlers so the TUI keeps working unchanged while the same logic
 //! becomes reusable for a print mode and, later, in-process sub-agents.
 
+pub(crate) mod classify;
 pub(crate) mod request;
 pub(crate) mod stream;

@@ -16,28 +16,11 @@
 //! Standalone helper functions and constants that don't depend on `App`.
 
 use async_openai::types::responses::{
-    FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
-    InputContent, InputItem, OutputItem,
+    FunctionToolCall, InputContent, InputItem, OutputItem,
     MessageItem as ApiMessageItem,
 };
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
-
-// ---------------------------------------------------------------------------
-// String helpers
-// ---------------------------------------------------------------------------
-
-/// Truncate to at most `max` characters (on a char boundary), appending an
-/// ellipsis when clipped. Used to keep classifier context compact.
-pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
-    }
-}
 
 // ---------------------------------------------------------------------------
 // PROJECT.md overview reminder
@@ -109,26 +92,6 @@ pub(crate) fn init_prompt() -> String {
 // ---------------------------------------------------------------------------
 // Classifier helpers
 // ---------------------------------------------------------------------------
-
-/// Build a `function_call_output` carrying a classifier denial, fed back to the
-/// model so it learns why the call was blocked and can adjust.
-pub(crate) fn classifier_denied_output(
-    call: &FunctionToolCall,
-    reason: &str,
-) -> crate::tools::ToolOutput {
-    crate::tools::ToolOutput {
-        param: FunctionCallOutputItemParam {
-            call_id: call.call_id.clone(),
-            output: FunctionCallOutput::Text(format!(
-                "error: tool call blocked by classifier — {reason}"
-            )),
-            id: None,
-            status: None,
-        },
-        failed: true,
-        approval_label: Some(format!("\u{274c} denied by classifier — {reason}")),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Response parsing helpers
