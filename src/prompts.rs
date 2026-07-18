@@ -217,3 +217,16 @@ conversation:
 4. NEXT — concrete pending steps or open questions, if any.
 
 Do not invent details. Do not call tools. Output only the summary text.";
+
+// ---------------------------------------------------------------------------
+// Post-edit reminders
+// ---------------------------------------------------------------------------
+
+/// The hidden developer message nudging the agent to keep PROGRAMMER.md current,
+/// injected every few file-editing turns. Lives here (not in the UI) because the
+/// reminder is an agent-loop behaviour the engine drives, not view chrome.
+pub(crate) const OVERVIEW_REMINDER: &str = "Reminder: several edits have \
+    accumulated since PROGRAMMER.md was last written. If the architecture, \
+    build/test commands, directory layout, or conventions have changed, update \
+    PROGRAMMER.md now with write_file so it stays an accurate map for future \
+    sessions. If nothing meaningful changed, ignore this.";

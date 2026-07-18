@@ -233,7 +233,7 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         }
     };
 
-    let engine = Engine {
+    let mut engine = Engine {
         client: chat_client,
         model_name: chat_name,
         model_str: chat_model,
@@ -242,6 +242,8 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         mcp: None,
         coauthor: config.git_coauthor.clone(),
         max_iterations: crate::consts::ENGINE_MAX_ITERATIONS,
+        // Print mode stays lean: no post-edit diagnostics feedback for now.
+        diagnostics: crate::engine::DiagnosticsFeedback::default(),
     };
 
     let mut conversation = crate::conversation::Conversation::new();

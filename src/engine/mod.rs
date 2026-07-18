@@ -32,6 +32,7 @@ use crate::classifier::Classifier;
 use crate::conversation::Conversation;
 use crate::mcp::McpManager;
 use crate::mcp::types::McpPolicy;
+use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
 use crate::response::response_finish_reason::ResponseFinishReason;
 use async_openai::Client;
@@ -81,6 +82,28 @@ pub(crate) struct Engine {
     pub mcp: Option<Arc<McpManager>>,
     pub coauthor: Option<String>,
     pub max_iterations: usize,
+    /// Post-edit diagnostics feedback, driven inside the turn loop. Off by
+    /// default, so `-p` runs stay lean.
+    pub diagnostics: DiagnosticsFeedback,
+}
+
+/// Configuration and running state for the engine's post-edit feedback: after a
+/// tool batch that edited files, run the configured diagnostics checkers, diff
+/// against the baseline, and inject the delta (plus periodic PROGRAMMER.md
+/// reminders) back into the conversation — the same behaviour the TUI's
+/// post-edit pipeline provided, now owned by the shared loop. When `enabled` is
+/// false none of it runs, and the turn resumes straight after the tool outputs.
+#[derive(Default)]
+pub(crate) struct DiagnosticsFeedback {
+    /// Master switch. The TUI turns this on; `-p` leaves it off (for now).
+    pub enabled: bool,
+    /// Emit a PROGRAMMER.md refresh reminder every N file-editing turns, when set.
+    pub reminder_every: Option<usize>,
+    /// The last diagnostics snapshot to diff against; `None` until the first run
+    /// establishes the baseline. Persists across turns for a long-lived engine.
+    pub baseline: Option<Vec<crate::diagnostics::Diagnostic>>,
+    /// File-editing turns seen so far, driving the reminder cadence.
+    pub mutating_turns: usize,
 }
 
 /// The result of a completed turn.
@@ -122,7 +145,7 @@ impl Engine {
     /// an error/cap is hit. `conversation` is mutated in place with every
     /// output and tool result, exactly as the TUI would record them.
     pub(crate) async fn run_turn(
-        &self,
+        &mut self,
         conversation: &mut Conversation,
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
@@ -209,11 +232,32 @@ impl Engine {
             for call in &calls {
                 surface.on_event(EngineEvent::ToolCall { name: &call.name });
             }
+            // Remember which calls in this batch are file edits, so we know
+            // afterwards whether to run post-edit diagnostics.
+            let edit_call_ids: HashSet<String> = if self.diagnostics.enabled {
+                calls
+                    .iter()
+                    .filter(|c| {
+                        c.name == crate::tools::write_file::NAME
+                            || c.name == crate::tools::edit_file::NAME
+                    })
+                    .map(|c| c.call_id.clone())
+                    .collect()
+            } else {
+                HashSet::new()
+            };
             let outputs = self.run_calls(conversation, calls, cancel, surface).await;
             match outputs {
                 Some(outputs) => {
+                    let edited = self.diagnostics.enabled
+                        && outputs
+                            .iter()
+                            .any(|o| !o.failed && edit_call_ids.contains(&o.param.call_id));
                     for out in outputs {
                         conversation.add_tool_output(out);
+                    }
+                    if edited {
+                        self.run_post_edit_diagnostics(conversation).await;
                     }
                 }
                 None => return Err(EngineError::Cancelled),
@@ -307,6 +351,105 @@ impl Engine {
         .await;
         Some(outputs)
     }
+
+    /// After a file-editing batch, run the diagnostics checkers (if a profile is
+    /// configured), diff against the running baseline, and inject the delta —
+    /// plus a periodic PROGRAMMER.md reminder when due — back into the
+    /// conversation so the model reacts to the errors it just introduced. The
+    /// feedback is appended to the most recent editing tool's output when one is
+    /// present (so it renders inside that call) and otherwise added as its own
+    /// system note. Mirrors the TUI's old `continue_with_diagnostics` +
+    /// `apply_diagnostics`, but sequential inside the loop rather than spawned.
+    async fn run_post_edit_diagnostics(&mut self, conversation: &mut Conversation) {
+        self.diagnostics.mutating_turns += 1;
+        let reminder_due = self
+            .diagnostics
+            .reminder_every
+            .is_some_and(|n| n != 0 && self.diagnostics.mutating_turns.is_multiple_of(n))
+            && std::path::Path::new("PROGRAMMER.md").exists();
+
+        let mut parts: Vec<String> = Vec::new();
+
+        if std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
+            let cwd = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
+            let snapshot = crate::diagnostics::collect(&cwd).await.unwrap_or_default();
+            match &self.diagnostics.baseline {
+                Some(old) => {
+                    if let Some(summary) =
+                        crate::diagnostics::diff(old, &snapshot.diagnostics).summary()
+                    {
+                        parts.push(summary);
+                    }
+                }
+                None => {
+                    if !snapshot.diagnostics.is_empty() {
+                        parts.push(format!(
+                            "Diagnostics baseline established: {} problem(s) currently \
+                             in the project. Future edits will report changes relative \
+                             to this.",
+                            snapshot.diagnostics.len()
+                        ));
+                    }
+                }
+            }
+            for e in &snapshot.errors {
+                parts.push(format!("Diagnostics checker error: {e}"));
+            }
+            self.diagnostics.baseline = Some(snapshot.diagnostics);
+        }
+
+        if reminder_due {
+            parts.push(crate::prompts::OVERVIEW_REMINDER.to_string());
+        }
+
+        if parts.is_empty() {
+            return;
+        }
+        inject_post_edit_feedback(conversation, &parts.join("\n\n"));
+    }
+}
+
+/// Attach post-edit feedback `text` to `conversation`: appended inside the most
+/// recent editing tool's output when one is present (so it renders as part of
+/// that call's result and is sent back with it), otherwise added as its own
+/// system note.
+fn inject_post_edit_feedback(conversation: &mut Conversation, text: &str) {
+    if let Some(call_id) = last_edit_output_call_id(conversation) {
+        let block = format!("\n\n--- Post-edit check ---\n{text}");
+        if conversation.append_to_tool_output(&call_id, &block) {
+            return;
+        }
+    }
+    conversation.add_meta("\u{25B8} System", text);
+}
+
+/// The call id of the most recent file-editing tool output in `conversation`, so
+/// post-edit feedback can be appended inside that call's result.
+fn last_edit_output_call_id(conversation: &Conversation) -> Option<String> {
+    let names: std::collections::HashMap<&str, &str> = conversation
+        .items()
+        .filter_map(|it| match it {
+            MessageItem::Output(OutputItem::FunctionCall(fc)) => {
+                Some((fc.call_id.as_str(), fc.name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    conversation
+        .items()
+        .filter_map(|it| match it {
+            MessageItem::ToolOutput { output, .. } => {
+                let name = names.get(output.call_id.as_str()).copied();
+                matches!(
+                    name,
+                    Some(crate::tools::write_file::NAME) | Some(crate::tools::edit_file::NAME)
+                )
+                .then(|| output.call_id.clone())
+            }
+            _ => None,
+        })
+        .last()
 }
 
 /// Concatenate the text of every assistant message in `items` (skipping
@@ -439,6 +582,7 @@ mod tests {
             mcp: None,
             coauthor: None,
             max_iterations,
+            diagnostics: DiagnosticsFeedback::default(),
         }
     }
 
@@ -490,7 +634,7 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let engine = engine_for(&base, 10);
+        let mut engine = engine_for(&base, 10);
         let mut conv = Conversation::new();
         conv.add_input_message(user("read the manifest"));
         let cancel = CancellationToken::new();
@@ -530,7 +674,7 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let engine = engine_for(&base, 10);
+        let mut engine = engine_for(&base, 10);
         let mut conv = Conversation::new();
         conv.add_input_message(user("hi"));
         let cancel = CancellationToken::new();
@@ -562,7 +706,7 @@ mod tests {
             completed_frame(2),
         );
         let (base, _server) = spawn_mock_responses(vec![body]).await;
-        let engine = engine_for(&base, 3);
+        let mut engine = engine_for(&base, 3);
         let mut conv = Conversation::new();
         conv.add_input_message(user("loop"));
         let cancel = CancellationToken::new();
@@ -610,6 +754,7 @@ mod tests {
             mcp: None,
             coauthor: None,
             max_iterations: 10,
+            diagnostics: DiagnosticsFeedback::default(),
         }
     }
 
@@ -686,5 +831,120 @@ mod tests {
         };
         assert!(denial.contains("surface refused"), "carries surface reason: {denial}");
         assert!(!tmp.exists(), "the denied write never ran");
+    }
+
+    #[test]
+    fn post_edit_feedback_appends_inside_the_edit_output() {
+        use async_openai::types::responses::{FunctionCallOutput, FunctionCallOutputItemParam};
+        let mut conv = Conversation::new();
+        conv.add_output(OutputItem::FunctionCall(FunctionToolCall {
+            arguments: "{}".into(),
+            call_id: "e1".into(),
+            namespace: None,
+            name: "write_file".into(),
+            id: None,
+            status: None,
+        }));
+        conv.add_tool_output(crate::tools::ToolOutput {
+            param: FunctionCallOutputItemParam {
+                call_id: "e1".into(),
+                output: FunctionCallOutput::Text("wrote file".into()),
+                id: None,
+                status: None,
+            },
+            failed: false,
+            approval_label: None,
+        });
+
+        inject_post_edit_feedback(&mut conv, "2 new errors");
+
+        let out = conv
+            .items()
+            .find_map(|it| match it {
+                MessageItem::ToolOutput { output, .. } if output.call_id == "e1" => {
+                    match &output.output {
+                        FunctionCallOutput::Text(t) => Some(t.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("edit output present");
+        assert!(out.contains("wrote file"), "keeps the original output: {out}");
+        assert!(out.contains("--- Post-edit check ---"), "adds the header: {out}");
+        assert!(out.contains("2 new errors"), "carries the feedback: {out}");
+        // Folded into the output, so no separate system note.
+        assert!(!conv.items().any(|it| matches!(it, MessageItem::Meta { .. })));
+    }
+
+    #[test]
+    fn post_edit_feedback_without_an_edit_output_adds_a_system_note() {
+        let mut conv = Conversation::new();
+        conv.add_input_message(user("hi"));
+        inject_post_edit_feedback(&mut conv, "reminder text");
+        let meta = conv
+            .items()
+            .find_map(|it| match it {
+                MessageItem::Meta { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a system note was added");
+        assert_eq!(meta, "reminder text");
+    }
+
+    #[tokio::test]
+    async fn disabled_diagnostics_inject_nothing_after_an_edit() {
+        // With the feedback switch off (the default, i.e. `-p`), a write_file
+        // batch must leave the conversation exactly as before: no system note
+        // and no "Post-edit check" appended to the write output.
+        let tmp = std::env::temp_dir().join(format!("engine_diag_off_{}", std::process::id()));
+        let path = tmp.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&tmp);
+
+        let body1 = format!(
+            "{}{}",
+            item_added_frame(
+                1,
+                0,
+                &call_item("w1", "write_file", &format!("{{\"path\":\"{path}\",\"content\":\"x\"}}")),
+            ),
+            completed_frame(2),
+        );
+        let body2 = format!(
+            "{}{}",
+            item_added_frame(1, 0, &message_item("done")),
+            completed_frame(2),
+        );
+        let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
+
+        let mut engine = engine_for(&base, 10); // Yolo; diagnostics disabled by default.
+        let mut conv = Conversation::new();
+        conv.add_input_message(user("write it"));
+        let cancel = CancellationToken::new();
+        engine
+            .run_turn(&mut conv, &cancel, &HeadlessSurface)
+            .await
+            .expect("turn completes");
+
+        assert!(
+            !conv.items().any(|it| matches!(it, MessageItem::Meta { .. })),
+            "no system note when diagnostics feedback is off"
+        );
+        let out = conv
+            .items()
+            .find_map(|it| match it {
+                MessageItem::ToolOutput { output, .. } if output.call_id == "w1" => {
+                    match &output.output {
+                        async_openai::types::responses::FunctionCallOutput::Text(t) => {
+                            Some(t.clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(!out.contains("Post-edit check"), "nothing appended: {out}");
+        let _ = std::fs::remove_file(&tmp);
     }
 }

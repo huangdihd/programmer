@@ -40,13 +40,10 @@ pub(crate) fn lsp_checker_configured() -> bool {
 }
 
 /// The hidden developer message nudging the agent to keep PROGRAMMER.md current.
+/// The text now lives in [`crate::prompts::OVERVIEW_REMINDER`] so the engine's
+/// post-edit loop and this UI path share one source.
 pub(crate) fn overview_reminder() -> String {
-    "Reminder: several edits have accumulated since PROGRAMMER.md was last \
-     written. If the architecture, build/test commands, directory layout, or \
-     conventions have changed, update PROGRAMMER.md now with write_file so it \
-     stays an accurate map for future sessions. If nothing meaningful changed, \
-     ignore this."
-        .to_string()
+    crate::prompts::OVERVIEW_REMINDER.to_string()
 }
 
 /// The hidden developer prompt that drives the `/init` flow.
