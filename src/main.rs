@@ -53,6 +53,9 @@ struct Args {
     mcp_http: Option<String>,
     /// Work mode for MCP tool gating (default Auto).
     mcp_mode: crate::classifier::WorkMode,
+    /// `-p/--print <prompt>`: run one headless turn, print the final answer, and
+    /// exit. No TUI, no session persistence.
+    print: Option<String>,
 }
 
 const HELP_TEXT: &str = "\
@@ -74,6 +77,8 @@ Options:
   --mcp-mode <mode> Tool-gating mode for the MCP server: auto (default; LLM
                     confirms dangerous tools), yolo (run everything). --mcp-http
                     also accepts manual (console approval) and plan (read-only)
+  -p, --print <text> Run one headless turn on <text>, print the answer, and exit.
+                    No TUI or session. Honors --mcp-mode auto (default) or yolo
   -h, --help        Show this help and exit";
 
 fn parse_args() -> Args {
@@ -86,6 +91,7 @@ fn parse_args() -> Args {
         mcp_server: false,
         mcp_http: None,
         mcp_mode: crate::classifier::WorkMode::Auto,
+        print: None,
     };
     let mut i = 1;
     while i < args.len() {
@@ -112,6 +118,12 @@ fn parse_args() -> Args {
             "--mcp-mode" => {
                 if let Some(m) = args.get(i + 1) {
                     parsed.mcp_mode = parse_work_mode(m);
+                    i += 1;
+                }
+            }
+            "-p" | "--print" => {
+                if let Some(prompt) = args.get(i + 1) {
+                    parsed.print = Some(prompt.clone());
                     i += 1;
                 }
             }
@@ -156,6 +168,108 @@ async fn build_mcp_classifier() -> Option<(
         .clone()
         .unwrap_or_else(|| pm.default_model());
     pm.resolve(&model).map(|(client, name)| (client.clone(), name))
+}
+
+/// `-p/--print`: run a single headless turn and print the model's answer.
+///
+/// No TUI and no session persistence. Only the non-interactive gating modes
+/// apply — `auto` (LLM classifier) or `yolo` — mirroring `--mcp-server`; a
+/// print run has no way to answer `ask_user` or a Manual approval prompt.
+async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> color_eyre::Result<()> {
+    use crate::engine::{Engine, EnginePolicy};
+    use async_openai::types::responses::{
+        InputContent, InputMessage, InputRole, MessageItem as ApiMessageItem, OutputStatus, Tool,
+    };
+
+    if !mcp_server_mode_ok(mode) {
+        eprintln!(
+            "-p/--print is non-interactive and supports only --mcp-mode auto (default) or yolo"
+        );
+        std::process::exit(2);
+    }
+
+    let (config, _) = load_config()?;
+    let pm = crate::providers::ProviderManager::new(&config).await;
+    let chat_model = pm.default_model();
+    let Some((chat_client, chat_name)) = pm.resolve(&chat_model).map(|(c, n)| (c.clone(), n)) else {
+        eprintln!("no usable provider/model configured; run `programmer --providers` to add one");
+        std::process::exit(1);
+    };
+
+    // Full local tool set minus ask_user (unanswerable headlessly).
+    let tools: Vec<Tool> = crate::tools::tools(None)
+        .into_iter()
+        .filter(|t| !matches!(t, Tool::Function(f) if f.name == crate::tools::ask_user::NAME))
+        .collect();
+
+    let policy = match mode {
+        crate::classifier::WorkMode::Yolo => EnginePolicy::Yolo,
+        // Auto (and anything else that passed the gate): LLM classifier, using
+        // the configured classifier model or the chat model.
+        _ => {
+            let clf_model = config
+                .classifier_model
+                .clone()
+                .unwrap_or_else(|| chat_model.clone());
+            let Some((clf_client, clf_name)) =
+                pm.resolve(&clf_model).map(|(c, n)| (c.clone(), n))
+            else {
+                eprintln!("classifier model '{clf_model}' not found");
+                std::process::exit(1);
+            };
+            let mcp_policies = config
+                .mcp_servers
+                .iter()
+                .map(|s| (s.name.clone(), s.auto_approve))
+                .collect();
+            EnginePolicy::Llm(Box::new(crate::engine::LlmPolicy {
+                client: clf_client,
+                model_name: clf_name,
+                no_logprobs: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
+                mcp_policies,
+            }))
+        }
+    };
+
+    let engine = Engine {
+        client: chat_client,
+        model_name: chat_name,
+        model_str: chat_model,
+        tools,
+        policy,
+        mcp: None,
+        coauthor: config.git_coauthor.clone(),
+        max_iterations: crate::consts::ENGINE_MAX_ITERATIONS,
+    };
+
+    let mut conversation = crate::conversation::Conversation::new();
+    conversation.add_input_message(ApiMessageItem::Input(InputMessage {
+        content: vec![InputContent::InputText(prompt.into())],
+        role: InputRole::User,
+        status: Some(OutputStatus::Completed),
+    }));
+
+    // Ctrl-C cancels the in-flight turn.
+    let cancel = crate::cancel::CancellationToken::new();
+    let cancel_signal = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_signal.cancel();
+        }
+    });
+
+    match engine.run_turn(&mut conversation, &cancel, |_| {}).await {
+        Ok(result) => {
+            println!("{}", result.final_text);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Resolved session data ready for the application.
@@ -285,6 +399,11 @@ async fn main() -> color_eyre::Result<()> {
     if args.help {
         println!("{HELP_TEXT}");
         return Ok(());
+    }
+
+    // Print mode: one headless turn to stdout, no TUI.
+    if let Some(prompt) = args.print {
+        return run_print_mode(prompt, args.mcp_mode).await;
     }
 
     // MCP server mode: no TUI, stdout is reserved for the JSON-RPC protocol.
