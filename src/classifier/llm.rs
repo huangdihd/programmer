@@ -22,6 +22,7 @@
 use super::Verdict;
 use crate::prompts::CLASSIFIER_INSTRUCTIONS;
 use async_openai::config::OpenAIConfig;
+use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
     CreateResponse, IncludeEnum, InputParam, OutputItem, OutputMessageContent,
 };
@@ -184,11 +185,17 @@ async fn classify_fast(
     req.top_logprobs = Some(20);
     req.include = Some(vec![IncludeEnum::MessageOutputTextLogprobs]);
 
-    let response = client
-        .responses()
-        .create(req)
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = match client.responses().create(req).await {
+        Ok(r) => r,
+        // Some providers return logprobs in a non-spec shape (e.g. omitting
+        // the `bytes` field on empty tokens), which fails response
+        // deserialization even though the request itself succeeded. Treat
+        // that as "logprobs unavailable" so the caller falls back to the
+        // reasoned path and caches the provider as logprobs-less, instead
+        // of denying the tool call outright.
+        Err(OpenAIError::JSONDeserialize(..)) => return Ok(FastResult::NoLogprobs),
+        Err(e) => return Err(e.to_string()),
+    };
 
     let Some(OutputMessageContent::OutputText(text)) = first_text(&response) else {
         return Ok(FastResult::Ambiguous);
