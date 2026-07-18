@@ -747,11 +747,13 @@ mod tests {
             output: String::new(),
         }];
 
+        // `lsp_configured: true` keeps the (otherwise empty) diagnostics
+        // section visible so the ordering assertion below has both sections.
         sidebar.render(
             area,
             &mut buf,
             &[],
-            false,
+            true,
             None,
             &crate::todos::TodoList::default(),
             &tasks,
