@@ -44,7 +44,8 @@ pub fn tool() -> Tool {
          `write` (send a line of input to a running task's stdin; set eof to \
          close stdin — do this when the task reads input to end-of-stream), \
          `wait` (block until a task finishes or the timeout elapses), \
-         `kill` (terminate a running task). \
+         `kill` (terminate a running task), \
+         `transcript` (full raw session text of an interactive task). \
          Tasks start with stdin open, so a command that reads input will wait \
          for `write`/eof rather than seeing an empty stream. \
          Set `interactive: true` on create to run the command in a real \
@@ -54,13 +55,16 @@ pub fn tool() -> Tool {
          the program has enabled mouse reporting — `screen` reports this), and \
          read what it displays with `screen`; `write`/`output` are for pipe \
          tasks only. \
+         Note: PTY tasks merge stdout and stderr (this is how terminals work); \
+         use pipe tasks if you need them separated, or `transcript` to see the \
+         full raw session. \
          Prefer the `command` tool for anything that finishes quickly — use \
          background tasks only when the command should outlive the current step.",
         json!({
             "action": {
                 "type": "string",
                 "description": "The action to perform.",
-                "enum": ["create", "list", "output", "write", "wait", "kill", "screen", "keys", "send_mouse", "resize"]
+                "enum": ["create", "list", "output", "write", "wait", "kill", "screen", "keys", "send_mouse", "resize", "expect_screen", "screen_diff", "transcript"]
             },
             "interactive": {
                 "type": "boolean",
@@ -85,11 +89,11 @@ pub fn tool() -> Tool {
             },
             "x": {
                 "type": "integer",
-                "description": "send_mouse only: 0-based column (matches the screen text the `screen` action returns)."
+                "description": "send_mouse only: 0-based column (matches the screen text the `screen` action returns). Not required for scroll events."
             },
             "y": {
                 "type": "integer",
-                "description": "send_mouse only: 0-based row (matches the screen text the `screen` action returns)."
+                "description": "send_mouse only: 0-based row (matches the screen text the `screen` action returns). Not required for scroll events."
             },
             "button": {
                 "type": "string",
@@ -127,11 +131,19 @@ pub fn tool() -> Tool {
             },
             "timeout": {
                 "type": "integer",
-                "description": "wait only: seconds to block before giving up. Default 60, max 600."
+                "description": "wait/expect_screen only: seconds to block before giving up. Default 60, max 600."
             },
             "tail": {
                 "type": "integer",
                 "description": "output/wait only: how many trailing characters of output to return. Default 4000."
+            },
+            "pattern": {
+                "type": "string",
+                "description": "expect_screen only: substring to wait for on the screen."
+            },
+            "max_output": {
+                "type": "integer",
+                "description": "create only: override the output buffer cap in bytes (default 200000). When exceeded, the oldest half is dropped."
             }
         }),
         &["action"],
@@ -175,6 +187,10 @@ struct Args {
     button: Option<String>,
     #[serde(default)]
     mouse_action: Option<String>,
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    max_output: Option<usize>,
 }
 
 /// Which task actions mutate state (start/stop processes or drive them). Used
@@ -218,6 +234,9 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                     rows,
                     cols,
                 )?;
+                if let Some(max) = args.max_output {
+                    let _ = tasks::set_max_output(id, max);
+                }
                 return Ok(format!(
                     "started interactive task {id}: {command}\n\
                      It runs in a {cols}x{rows} terminal. Read what it shows with \
@@ -226,6 +245,9 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                 ));
             }
             let id = tasks::spawn(&command, args.dir.as_deref(), args.name.as_deref())?;
+            if let Some(max) = args.max_output {
+                let _ = tasks::set_max_output(id, max);
+            }
             Ok(format!(
                 "started background task {id}: {command}\n\
                  Check on it with action=output id={id}, or block on it with \
@@ -353,22 +375,33 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                     "error: 'text' and/or 'keys' is required for keys".to_string()
                 );
             }
-            tasks::write_bytes(id, &bytes)?;
+            let screen_text = tasks::write_bytes_and_wait(id, &bytes, 100, 5000).await?;
             Ok(format!(
-                "sent input to task {id}\nRead its updated screen with action=screen id={id}."
+                "sent input to task {id}\n--- screen ---\n{screen_text}"
             ))
         }
 
         "send_mouse" => {
             let id = require_id(args.id, "send_mouse")?;
-            let (Some(x), Some(y)) = (args.x, args.y) else {
-                return Err("error: 'x' and 'y' are required for send_mouse".to_string());
+            let gesture = args.mouse_action.as_deref().unwrap_or("click");
+            let is_scroll = matches!(gesture, "scroll_up" | "scroll_down");
+            // x/y are required for clicks and move, but scroll events only need
+            // the direction — default to (0,0) when omitted.
+            let (x, y) = if is_scroll {
+                (args.x.unwrap_or(0), args.y.unwrap_or(0))
+            } else {
+                let (Some(x), Some(y)) = (args.x, args.y) else {
+                    return Err("error: 'x' and 'y' are required for send_mouse".to_string());
+                };
+                (x, y)
             };
             // Gate on the child's mouse mode: sending mouse to a program that
-            // hasn't asked for it does nothing useful.
+            // hasn't asked for it does nothing useful. Scroll events are exempt
+            // — some programs enable alternate-screen scrolling without full
+            // mouse reporting.
             let mode = tasks::with_screen(id, |s| s.mouse_protocol_mode())
                 .ok_or_else(|| format!("error: task {id} is not interactive"))?;
-            if mode == vt100::MouseProtocolMode::None {
+            if !is_scroll && mode == vt100::MouseProtocolMode::None {
                 return Err(format!(
                     "error: task {id}'s program has not enabled mouse reporting; \
                      use action=keys instead"
@@ -395,10 +428,67 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                 other => return Err(format!("error: unknown mouse_action '{other}'")),
             }
             tasks::write_bytes(id, &bytes)?;
-            Ok(format!(
-                "sent mouse {gesture} at ({x},{y}) to task {id}\n\
-                 Read the result with action=screen id={id}."
-            ))
+            if is_scroll && args.x.is_none() && args.y.is_none() {
+                Ok(format!(
+                    "sent mouse {gesture} to task {id}\n\
+                     Read the result with action=screen id={id}."
+                ))
+            } else {
+                Ok(format!(
+                    "sent mouse {gesture} at ({x},{y}) to task {id}\n\
+                     Read the result with action=screen id={id}."
+                ))
+            }
+        }
+
+        "expect_screen" => {
+            let id = require_id(args.id, "expect_screen")?;
+            let pattern = args
+                .pattern
+                .as_deref()
+                .ok_or_else(|| "error: 'pattern' is required for expect_screen".to_string())?;
+            let timeout = args
+                .timeout
+                .unwrap_or(DEFAULT_WAIT_SECS)
+                .min(MAX_WAIT_SECS);
+            let (snap, matched) =
+                tasks::expect_screen(id, pattern, Duration::from_secs(timeout)).await?;
+            let mut msg = format!(
+                "task {id} screen ({cols}x{rows}), cursor row={r} col={c}",
+                cols = snap.cols,
+                rows = snap.rows,
+                r = snap.cursor_row,
+                c = snap.cursor_col,
+            );
+            if snap.alt {
+                msg.push_str(", alt-screen");
+            }
+            if matched {
+                msg.push_str(&format!("\n✓ pattern '{pattern}' found\n--- screen ---\n{}", snap.text));
+            } else {
+                msg.push_str(&format!(
+                    "\n✗ pattern '{pattern}' NOT found after {timeout}s\n--- screen ---\n{}",
+                    snap.text
+                ));
+            }
+            Ok(msg)
+        }
+
+        "screen_diff" => {
+            let id = require_id(args.id, "screen_diff")?;
+            let diff = tasks::screen_diff(id)?;
+            Ok(format!("task {id} screen diff:\n{diff}"))
+        }
+
+        "transcript" => {
+            let id = require_id(args.id, "transcript")?;
+            let text = tasks::transcript(id)
+                .ok_or_else(|| format!("error: no task with id {id} or not interactive"))?;
+            if text.is_empty() {
+                Ok(format!("task {id} transcript is empty"))
+            } else {
+                Ok(format!("task {id} transcript:\n{text}"))
+            }
         }
 
         "resize" => {
@@ -412,7 +502,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
 
         other => Err(format!(
             "error: unknown action '{other}' — use create, list, output, write, wait, \
-             kill, screen, keys, send_mouse, or resize"
+             kill, screen, keys, send_mouse, resize, expect_screen, screen_diff, or transcript"
         )),
     }
 }
@@ -440,23 +530,37 @@ fn render_summary(snap: &TaskSnapshot) -> String {
 /// Status header plus the trailing `tail` chars of output, for `output`/`wait`.
 fn render_full(snap: &TaskSnapshot, tail: usize) -> String {
     let mut text = render_summary(snap);
-    if snap.output.is_empty() {
+    if snap.output.is_empty() && snap.stderr.is_empty() {
         text.push_str("\n(no output captured yet)");
         return text;
     }
-    let total = snap.output.chars().count();
-    if total > tail {
-        let tail_text: String = snap
-            .output
-            .chars()
-            .skip(total - tail)
-            .collect();
-        text.push_str(&format!(
-            "\n--- output (last {tail} of {total} chars) ---\n{tail_text}"
-        ));
-    } else {
-        text.push_str(&format!("\n--- output ---\n{}", snap.output));
+
+    // Stdout.
+    if !snap.output.is_empty() {
+        let total = snap.output.chars().count();
+        if total > tail {
+            let tail_text: String = snap.output.chars().skip(total - tail).collect();
+            text.push_str(&format!(
+                "\n--- stdout (last {tail} of {total} chars) ---\n{tail_text}"
+            ));
+        } else {
+            text.push_str(&format!("\n--- stdout ---\n{}", snap.output));
+        }
     }
+
+    // Stderr.
+    if !snap.stderr.is_empty() {
+        let total = snap.stderr.chars().count();
+        if total > tail {
+            let tail_text: String = snap.stderr.chars().skip(total - tail).collect();
+            text.push_str(&format!(
+                "\n--- stderr (last {tail} of {total} chars) ---\n{tail_text}"
+            ));
+        } else {
+            text.push_str(&format!("\n--- stderr ---\n{}", snap.stderr));
+        }
+    }
+
     text
 }
 

@@ -188,6 +188,7 @@ pub(crate) async fn handle_key_events(
             }
             KeyCode::Up => {
                 if let Some(ref mut c) = app.input_panel.completion {
+                    let visible = 10usize;
                     if c.selected > 0 {
                         c.selected -= 1;
                     } else {
@@ -195,6 +196,8 @@ pub(crate) async fn handle_key_events(
                     }
                     if c.selected < c.scroll_offset {
                         c.scroll_offset = c.selected;
+                    } else if c.selected >= c.scroll_offset + visible {
+                        c.scroll_offset = c.selected - visible + 1;
                     }
                     let text = c.line(c.selected);
                     app.input_panel.set_content(&text);
@@ -205,7 +208,9 @@ pub(crate) async fn handle_key_events(
                 if let Some(ref mut c) = app.input_panel.completion {
                     c.selected = (c.selected + 1) % c.candidates.len();
                     let visible = 10usize;
-                    if c.selected >= c.scroll_offset + visible {
+                    if c.selected < c.scroll_offset {
+                        c.scroll_offset = c.selected;
+                    } else if c.selected >= c.scroll_offset + visible {
                         c.scroll_offset = c.selected - visible + 1;
                     }
                     let text = c.line(c.selected);

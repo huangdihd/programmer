@@ -86,6 +86,9 @@ struct PtyState {
     /// the visible grid plus scrollback; this keeps the whole session so a
     /// finished `!command` can be replayed to the model via [`transcript`].
     transcript: String,
+    /// Snapshot of screen text last returned to a [`screen_diff`] caller, so
+    /// the next call can compute a delta. `None` means no prior call.
+    last_screen_text: Option<String>,
 }
 
 /// One background task's bookkeeping entry.
@@ -98,9 +101,13 @@ struct TaskEntry {
     exit_code: Option<i32>,
     started: Instant,
     finished: Option<Instant>,
-    /// Combined stdout+stderr, capped at [`MAX_TASK_OUTPUT`]. Empty for
-    /// interactive tasks, whose output lives in the vt100 screen instead.
+    /// Stdout (pipe tasks only), capped at the task's `max_output`.
     output: String,
+    /// Stderr captured separately (pipe tasks only).
+    stderr_output: String,
+    /// Per-task output cap in chars. Defaults to [`MAX_TASK_OUTPUT`]; can be
+    /// overridden with [`set_max_output`].
+    max_output: usize,
     /// Signals the reader task to kill the child. `None` once finished.
     kill: Option<tokio::sync::oneshot::Sender<()>>,
     /// Feeds chunks to the child's stdin via the writer task. Dropping it
@@ -135,6 +142,8 @@ pub struct TaskSnapshot {
     pub exit_code: Option<i32>,
     pub elapsed: Duration,
     pub output: String,
+    /// Stderr captured separately (pipe tasks only; empty otherwise).
+    pub stderr: String,
 }
 
 fn registry() -> &'static Mutex<Vec<TaskEntry>> {
@@ -158,6 +167,7 @@ fn snapshot_entry(e: &TaskEntry) -> TaskSnapshot {
             .map(|f| f - e.started)
             .unwrap_or_else(|| e.started.elapsed()),
         output: entry_output(e),
+        stderr: e.stderr_output.clone(),
     }
 }
 
@@ -254,6 +264,8 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
             started: Instant::now(),
             finished: None,
             output: String::new(),
+            stderr_output: String::new(),
+            max_output: MAX_TASK_OUTPUT,
             kill: Some(kill_tx),
             stdin_tx: Some(stdin_tx),
             pty: None,
@@ -262,8 +274,8 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
 
     // Drain both pipes in their own tasks; a full pipe would otherwise block
     // the child.
-    let out_task = tokio::spawn(drain_stream(child.stdout.take(), id));
-    let err_task = tokio::spawn(drain_stream(child.stderr.take(), id));
+    let out_task = tokio::spawn(drain_stream(child.stdout.take(), id, false));
+    let err_task = tokio::spawn(drain_stream(child.stderr.take(), id, true));
     tokio::spawn(async move {
         tokio::select! {
             result = child.wait() => {
@@ -409,6 +421,8 @@ pub fn spawn_interactive(
             started: Instant::now(),
             finished: None,
             output: String::new(),
+            stderr_output: String::new(),
+            max_output: MAX_TASK_OUTPUT,
             kill: None,
             stdin_tx: None,
             pty: Some(PtyState {
@@ -420,6 +434,7 @@ pub fn spawn_interactive(
                 rows,
                 cols,
                 transcript: String::new(),
+                last_screen_text: None,
             }),
         });
     }
@@ -458,6 +473,36 @@ pub fn write_bytes(id: u64, bytes: &[u8]) -> Result<(), String> {
         .write_all(bytes)
         .and_then(|()| pty.writer.flush())
         .map_err(|e| format!("error: failed to send input to task {id}: {e}"))
+}
+
+/// Write raw bytes to an interactive task's PTY, then wait until the screen
+/// stabilizes (no changes for `stable_ms`). Returns the final screen text.
+pub async fn write_bytes_and_wait(
+    id: u64,
+    bytes: &[u8],
+    stable_ms: u64,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    write_bytes(id, bytes)?;
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut last_text = screen_snapshot(id)?.text;
+    let mut last_change = Instant::now();
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let current = screen_snapshot(id)?.text;
+        if current != last_text {
+            last_text = current;
+            last_change = Instant::now();
+        } else if last_change.elapsed() >= Duration::from_millis(stable_ms) {
+            // Screen stable — input consumed.
+            return Ok(last_text);
+        }
+        if Instant::now() >= deadline {
+            return Ok(last_text);
+        }
+    }
 }
 
 /// Snapshot an interactive task's current screen.
@@ -519,6 +564,123 @@ pub fn resize(id: u64, rows: u16, cols: u16) -> Result<(), String> {
     pty.rows = rows;
     pty.cols = cols;
     Ok(())
+}
+
+/// Override the output buffer cap for a task. New tasks default to
+/// [`MAX_TASK_OUTPUT`].
+#[allow(dead_code)]
+pub fn set_max_output(id: u64, max: usize) -> Result<(), String> {
+    let mut reg = registry().lock().unwrap();
+    let entry = reg
+        .iter_mut()
+        .find(|e| e.id == id)
+        .ok_or_else(|| format!("error: no task with id {id}"))?;
+    entry.max_output = max;
+    // Apply the new cap immediately to both buffers.
+    cap_buffer(&mut entry.output, max);
+    cap_buffer(&mut entry.stderr_output, max);
+    Ok(())
+}
+
+/// Return the stderr captured so far for a pipe task. `None` if the id is
+/// unknown or the task is interactive (whose stderr is untagged in the PTY).
+#[allow(dead_code)]
+pub fn stderr_output(id: u64) -> Option<String> {
+    let reg = registry().lock().unwrap();
+    reg.iter()
+        .find(|e| e.id == id)
+        .map(|e| e.stderr_output.clone())
+}
+
+/// Poll an interactive task's screen until `pattern` appears or `timeout`
+/// elapses. Returns the final snapshot and whether the pattern matched.
+pub async fn expect_screen(
+    id: u64,
+    pattern: &str,
+    timeout: Duration,
+) -> Result<(ScreenSnapshot, bool), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snap = screen_snapshot(id)?;
+        if snap.text.contains(pattern) {
+            return Ok((snap, true));
+        }
+        if Instant::now() >= deadline {
+            return Ok((snap, false));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Return only the lines that changed since the last [`screen_diff`] call (or
+/// the entire screen on the first call). Each changed line is prefixed with
+/// `+` (added), `-` (removed), or `~` (modified). Lines that exist in both
+/// old and new are omitted.
+pub fn screen_diff(id: u64) -> Result<String, String> {
+    let mut reg = registry().lock().unwrap();
+    let entry = reg
+        .iter_mut()
+        .find(|e| e.id == id)
+        .ok_or_else(|| format!("error: no task with id {id}"))?;
+    let pty = entry
+        .pty
+        .as_mut()
+        .ok_or_else(|| format!("error: task {id} is not interactive"))?;
+    let parser = pty.parser.lock().unwrap();
+    let screen = parser.screen();
+    let current = screen.contents();
+    let old = std::mem::take(&mut pty.last_screen_text);
+    // Drop the lock before computing the diff (it's pure string work).
+    drop(parser);
+    drop(reg);
+
+    let Some(old_text) = old else {
+        // First call — return the full screen.
+        let mut reg2 = registry().lock().unwrap();
+        #[allow(clippy::collapsible_if)]
+        if let Some(entry) = reg2.iter_mut().find(|e| e.id == id) {
+            if let Some(pty) = entry.pty.as_mut() {
+                pty.last_screen_text = Some(current.clone());
+            }
+        }
+        return Ok(format!("--- first diff (full screen) ---\n{current}"));
+    };
+
+    // Simple line-based diff: compare old and new line-by-line.
+    let old_lines: Vec<&str> = old_text.lines().collect();
+    let new_lines: Vec<&str> = current.lines().collect();
+    let mut out = String::new();
+    let max_len = old_lines.len().max(new_lines.len());
+    for i in 0..max_len {
+        match (old_lines.get(i), new_lines.get(i)) {
+            (Some(o), Some(n)) if o == n => {} // unchanged — skip
+            (Some(_), Some(n)) => {
+                out.push_str(&format!("~{n}\n"));
+            }
+            (Some(_), None) => {
+                out.push_str(&format!("-{}\n", old_lines[i]));
+            }
+            (None, Some(n)) => {
+                out.push_str(&format!("+{n}\n"));
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    // Restore the new text as last_screen_text for the next call.
+    let mut reg2 = registry().lock().unwrap();
+    #[allow(clippy::collapsible_if)]
+    if let Some(entry) = reg2.iter_mut().find(|e| e.id == id) {
+        if let Some(pty) = entry.pty.as_mut() {
+            pty.last_screen_text = Some(current);
+        }
+    }
+
+    if out.is_empty() {
+        Ok("(no changes)".to_string())
+    } else {
+        Ok(out.trim_end().to_string())
+    }
 }
 
 /// Translate a named key into the bytes a terminal sends for it. Returns `None`
@@ -591,8 +753,9 @@ pub fn sgr_mouse(code: u8, col0: u16, row0: u16, release: bool) -> Vec<u8> {
     format!("\x1b[<{code};{};{}{final_char}", col0 + 1, row0 + 1).into_bytes()
 }
 
-/// Read a child pipe to EOF, appending chunks to the task's output buffer.
-async fn drain_stream<R>(stream: Option<R>, id: u64)
+/// Read a child pipe to EOF, appending chunks to the task's output buffer
+/// (stdout) or stderr buffer.
+async fn drain_stream<R>(stream: Option<R>, id: u64, stderr: bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -602,7 +765,14 @@ where
     loop {
         match s.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => append_output(id, &String::from_utf8_lossy(&buf[..n])),
+            Ok(n) => {
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                if stderr {
+                    append_stderr(id, &chunk);
+                } else {
+                    append_output(id, &chunk);
+                }
+            }
         }
     }
 }
@@ -766,6 +936,8 @@ pub fn restore(saved: &[PersistedTask]) {
             started,
             finished: Some(now),
             output: t.output.clone(),
+            stderr_output: String::new(),
+            max_output: MAX_TASK_OUTPUT,
             kill: None,
             stdin_tx: None,
             pty: None,
@@ -779,7 +951,17 @@ fn append_output(id: u64, chunk: &str) {
     let mut reg = registry().lock().unwrap();
     if let Some(entry) = reg.iter_mut().find(|e| e.id == id) {
         entry.output.push_str(chunk);
-        cap_buffer(&mut entry.output);
+        let max = entry.max_output;
+        cap_buffer(&mut entry.output, max);
+    }
+}
+
+fn append_stderr(id: u64, chunk: &str) {
+    let mut reg = registry().lock().unwrap();
+    if let Some(entry) = reg.iter_mut().find(|e| e.id == id) {
+        entry.stderr_output.push_str(chunk);
+        let max = entry.max_output;
+        cap_buffer(&mut entry.stderr_output, max);
     }
 }
 
@@ -792,14 +974,13 @@ fn append_transcript(id: u64, chunk: &str) {
         .and_then(|e| e.pty.as_mut())
     {
         pty.transcript.push_str(chunk);
-        cap_buffer(&mut pty.transcript);
+        cap_buffer(&mut pty.transcript, MAX_TASK_OUTPUT);
     }
 }
 
-/// Keep `buf` under [`MAX_TASK_OUTPUT`] by dropping the oldest half at a char
-/// boundary.
-fn cap_buffer(buf: &mut String) {
-    if buf.len() > MAX_TASK_OUTPUT {
+/// Keep `buf` under `max` by dropping the oldest half at a char boundary.
+fn cap_buffer(buf: &mut String, max: usize) {
+    if buf.len() > max {
         let mut cut = buf.len() / 2;
         while !buf.is_char_boundary(cut) {
             cut += 1;

@@ -745,6 +745,7 @@ mod tests {
             exit_code: None,
             elapsed: Duration::from_secs(75),
             output: String::new(),
+            stderr: String::new(),
         }];
 
         // `lsp_configured: true` keeps the (otherwise empty) diagnostics
@@ -788,6 +789,7 @@ mod tests {
             exit_code: Some(101),
             elapsed: Duration::from_secs(9),
             output,
+            stderr: String::new(),
         }];
 
         sidebar.render(

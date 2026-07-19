@@ -5,7 +5,11 @@
 - ~~lint~~
 - remote control(?)
 - configurable restricted access control rule system
-- multi agents(traditional sub agents or use interactive background task system to launch it self again?)
+- multi agents(traditional sub agents or use interactive background task system to launch itself again?)
+- sandbox
+- default classifier model
+- monitor local file changes and prevent modifications after changes before read
+- after switch sessions using /new, task can't be cleaned and todos can't update as expectations
 - ~~/compact~~
 - ~~fix /init~~
 - ~~interactive background task terminal~~
@@ -39,10 +43,10 @@
 - ~~MCP progress in UI~~
 - ~~atomic file writes~~
 - ~~incremental search in panels~~
-- interactive task tool improvements (for TUI smoke testing):
-  - `expect_screen(pattern, timeout)`: block until screen contains a pattern
-  - `screen_diff`: return only changed regions since last screen snapshot
-  - reliable mouse scroll support in PTY
-  - stderr/stdout split or separate capture
-  - larger output tail or configurable output buffer size
-  - keys should auto-wait for program to consume input before returning
+- ~~interactive task tool improvements (for TUI smoke testing):~~
+  - ~~`expect_screen(pattern, timeout)`: block until screen contains a pattern~~
+  - ~~`screen_diff`: return only changed regions since last screen snapshot~~
+  - ~~reliable mouse scroll support in PTY~~
+  - ~~stderr/stdout split or separate capture~~ (PTY limitation, use transcript instead)
+  - ~~larger output tail or configurable output buffer size~~
+  - ~~keys should auto-wait for program to consume input before returning~~
