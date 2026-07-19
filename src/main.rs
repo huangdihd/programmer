@@ -233,7 +233,7 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         }
     };
 
-    let mut engine = Engine {
+    let engine = Engine {
         client: chat_client,
         model_name: chat_name,
         model_str: chat_model,

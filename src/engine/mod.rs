@@ -95,14 +95,25 @@ pub(crate) struct Engine {
 /// reminders) back into the conversation — the same behaviour the TUI's
 /// post-edit pipeline provided, now owned by the shared loop. When `enabled` is
 /// false none of it runs, and the turn resumes straight after the tool outputs.
-#[derive(Default)]
+///
+/// The mutable [`DiagnosticsState`] lives behind an `Arc<Mutex<_>>` so it
+/// survives across turns even though the TUI builds a fresh `Engine` per turn:
+/// the front-end holds the state and hands each turn's engine a clone.
+#[derive(Default, Clone)]
 pub(crate) struct DiagnosticsFeedback {
     /// Master switch. The TUI turns this on; `-p` leaves it off (for now).
     pub enabled: bool,
     /// Emit a PROGRAMMER.md refresh reminder every N file-editing turns, when set.
     pub reminder_every: Option<usize>,
+    /// Baseline + edit-turn counter, shared so it persists across per-turn engines.
+    pub state: Arc<Mutex<DiagnosticsState>>,
+}
+
+/// The cross-turn mutable state behind [`DiagnosticsFeedback`].
+#[derive(Default)]
+pub(crate) struct DiagnosticsState {
     /// The last diagnostics snapshot to diff against; `None` until the first run
-    /// establishes the baseline. Persists across turns for a long-lived engine.
+    /// establishes the baseline.
     pub baseline: Option<Vec<crate::diagnostics::Diagnostic>>,
     /// File-editing turns seen so far, driving the reminder cadence.
     pub mutating_turns: usize,
@@ -175,7 +186,7 @@ impl Engine {
     /// an error/cap is hit. `conversation` is mutated in place with every
     /// output and tool result, exactly as the TUI would record them.
     pub(crate) async fn run_turn(
-        &mut self,
+        &self,
         conversation: &Mutex<Conversation>,
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
@@ -193,13 +204,14 @@ impl Engine {
             // before the next await — a guard held across `.await` would make
             // this future non-`Send` and fail to compile under `tokio::spawn`,
             // which is exactly the discipline we want enforced.
-            let ctx = request::SystemContext {
-                current_model: &self.model_str,
-                skill_prompt: None,
-                plan_prompt: None,
-                coauthor: self.coauthor.as_deref(),
-            };
+            let skill_prompt = surface.skill_prompt();
             let req = {
+                let ctx = request::SystemContext {
+                    current_model: &self.model_str,
+                    skill_prompt: skill_prompt.as_deref(),
+                    plan_prompt: surface.plan_prompt(),
+                    coauthor: self.coauthor.as_deref(),
+                };
                 let conv = conversation.lock().unwrap();
                 request::build_request(&conv, &ctx, self.model_name.clone(), self.tools.clone())
             };
@@ -328,11 +340,14 @@ impl Engine {
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
     ) -> Option<Vec<crate::tools::ToolOutput>> {
-        // Split off ask_user calls: they cannot be answered headlessly.
+        // ask_user needs an interactive front-end to answer it. A surface that
+        // provides a tool-event channel (the TUI) can; without one (headless),
+        // pre-deny it so it doesn't hang forever on a dead answer channel.
+        let tool_sender = surface.tool_event_sender();
         let mut denied: Vec<crate::tools::ToolOutput> = Vec::new();
         let mut classifiable: Vec<FunctionToolCall> = Vec::new();
         for call in calls {
-            if call.name == crate::tools::ask_user::NAME {
+            if call.name == crate::tools::ask_user::NAME && tool_sender.is_none() {
                 denied.push(classify::classifier_denied_output(
                     &call,
                     "ask_user is unavailable in non-interactive mode",
@@ -391,14 +406,15 @@ impl Engine {
         denied.extend(outcome.denied);
 
         surface.on_event(EngineEvent::Phase(EnginePhase::RunningTools));
-        // The sender only matters for ask_user, which is already pre-denied, so
-        // a throwaway channel (with a dropped receiver) is safe here.
-        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // Use the front-end's tool channel when it has one (so ask_user and live
+        // task updates reach the UI); otherwise a throwaway channel with a
+        // dropped receiver — safe because ask_user is already pre-denied there.
+        let sender = tool_sender.unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().0);
         let outputs = tools::run_tool_batch(
             allowed,
             denied,
             cancel.clone(),
-            format!("{} auto-approved (headless)", crate::classifier::WorkMode::Auto.icon()),
+            surface.approval_label(),
             sender,
             self.mcp.clone(),
         )
@@ -415,15 +431,19 @@ impl Engine {
     /// system note. Mirrors the TUI's old `continue_with_diagnostics` +
     /// `apply_diagnostics`, but sequential inside the loop rather than spawned.
     async fn run_post_edit_diagnostics(
-        &mut self,
+        &self,
         conversation: &Mutex<Conversation>,
         surface: &dyn AgentSurface,
     ) {
-        self.diagnostics.mutating_turns += 1;
+        let mutating_turns = {
+            let mut st = self.diagnostics.state.lock().unwrap();
+            st.mutating_turns += 1;
+            st.mutating_turns
+        };
         let reminder_due = self
             .diagnostics
             .reminder_every
-            .is_some_and(|n| n != 0 && self.diagnostics.mutating_turns.is_multiple_of(n))
+            .is_some_and(|n| n != 0 && mutating_turns.is_multiple_of(n))
             && std::path::Path::new("PROGRAMMER.md").exists();
 
         let mut parts: Vec<String> = Vec::new();
@@ -432,8 +452,10 @@ impl Engine {
             surface.on_event(EngineEvent::Phase(EnginePhase::Checking));
             let cwd = std::env::current_dir()
                 .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
+            // No state lock held across this await — see the run_turn comment.
             let snapshot = crate::diagnostics::collect(&cwd).await.unwrap_or_default();
-            match &self.diagnostics.baseline {
+            let mut st = self.diagnostics.state.lock().unwrap();
+            match &st.baseline {
                 Some(old) => {
                     if let Some(summary) =
                         crate::diagnostics::diff(old, &snapshot.diagnostics).summary()
@@ -455,7 +477,7 @@ impl Engine {
             for e in &snapshot.errors {
                 parts.push(format!("Diagnostics checker error: {e}"));
             }
-            self.diagnostics.baseline = Some(snapshot.diagnostics);
+            st.baseline = Some(snapshot.diagnostics);
         }
 
         if reminder_due {
@@ -695,7 +717,7 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let mut engine = engine_for(&base, 10);
+        let engine = engine_for(&base, 10);
         let mut c = Conversation::new();
         c.add_input_message(user("read the manifest"));
         let conv = Mutex::new(c);
@@ -738,7 +760,7 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let mut engine = engine_for(&base, 10);
+        let engine = engine_for(&base, 10);
         let mut c = Conversation::new();
         c.add_input_message(user("hi"));
         let conv = Mutex::new(c);
@@ -771,7 +793,7 @@ mod tests {
             completed_frame(2),
         );
         let (base, _server) = spawn_mock_responses(vec![body]).await;
-        let mut engine = engine_for(&base, 3);
+        let engine = engine_for(&base, 3);
         let mut c = Conversation::new();
         c.add_input_message(user("loop"));
         let conv = Mutex::new(c);
@@ -993,7 +1015,7 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let mut engine = engine_for(&base, 10); // Yolo; diagnostics disabled by default.
+        let engine = engine_for(&base, 10); // Yolo; diagnostics disabled by default.
         let mut c = Conversation::new();
         c.add_input_message(user("write it"));
         let conv = Mutex::new(c);

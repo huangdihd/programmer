@@ -28,7 +28,9 @@
 //!    forwards to its parent, and ultimately to the human at the TUI.
 
 use super::EngineEvent;
+use crate::ui::event::Event;
 use async_openai::types::responses::FunctionToolCall;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// The outcome of asking a surface to review a tool call whose classifier
 /// verdict was `Ask`.
@@ -55,6 +57,38 @@ pub(crate) trait AgentSurface: Send + Sync {
     /// explanation for why the call was flagged. The surface returns whether the
     /// call may run; a `Deny` carries the reason to feed back to the model.
     async fn review(&self, call: &FunctionToolCall, reason: &str) -> ReviewDecision;
+
+    // --- Front-end context (defaulted; the headless surface takes the None /
+    // headless answer, so `-p` behaviour is unchanged). ---
+
+    /// The channel tools use to reach the front-end — `ask_user`'s prompt, live
+    /// task updates. `None` (the default) means there is no interactive
+    /// front-end, so `ask_user` is pre-denied rather than left hanging on a dead
+    /// answer channel.
+    fn tool_event_sender(&self) -> Option<UnboundedSender<Event>> {
+        None
+    }
+
+    /// The combined skill system-prompt to fold into every request this turn, if
+    /// any. The engine has no skill registry of its own; the front-end supplies
+    /// the resolved text.
+    fn skill_prompt(&self) -> Option<String> {
+        None
+    }
+
+    /// The plan-mode system-prompt snippet for this turn, if any.
+    fn plan_prompt(&self) -> Option<&str> {
+        None
+    }
+
+    /// The approval label recorded on auto-approved tool outputs (shown in the
+    /// UI). Defaults to the headless wording.
+    fn approval_label(&self) -> String {
+        format!(
+            "{} auto-approved (headless)",
+            crate::classifier::WorkMode::Auto.icon()
+        )
+    }
 }
 
 /// The surface for non-interactive runs (the `-p` print mode): progress events
