@@ -16,11 +16,10 @@
 //! Standalone helper functions and constants that don't depend on `App`.
 
 use async_openai::types::responses::{
-    FunctionToolCall, InputContent, InputItem, OutputItem,
+    InputContent, InputItem,
     MessageItem as ApiMessageItem,
 };
 use crate::response::message_item::MessageItem;
-use crate::response::partial_response::PartialResponse;
 
 // ---------------------------------------------------------------------------
 // PROJECT.md overview reminder
@@ -37,13 +36,6 @@ pub(crate) fn lsp_checker_configured() -> bool {
                 .iter()
                 .any(|c| c.kind == crate::diagnostics::CheckerKind::Lsp)
     )
-}
-
-/// The hidden developer message nudging the agent to keep PROGRAMMER.md current.
-/// The text now lives in [`crate::prompts::OVERVIEW_REMINDER`] so the engine's
-/// post-edit loop and this UI path share one source.
-pub(crate) fn overview_reminder() -> String {
-    crate::prompts::OVERVIEW_REMINDER.to_string()
 }
 
 /// The hidden developer prompt that drives the `/init` flow.
@@ -87,25 +79,8 @@ pub(crate) fn init_prompt() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Classifier helpers
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Response parsing helpers
 // ---------------------------------------------------------------------------
-
-/// Extracts the function/tool calls the model emitted in a finished response.
-pub(crate) fn function_calls(partial_response: &PartialResponse) -> Vec<FunctionToolCall> {
-    partial_response
-        .items
-        .iter()
-        .flatten()
-        .filter_map(|item| match item {
-            OutputItem::FunctionCall(call) => Some(call.clone()),
-            _ => None,
-        })
-        .collect()
-}
 
 /// Extract the text of the first user message from a list of items.
 pub(crate) fn first_user_text(items: &[MessageItem]) -> Option<String> {

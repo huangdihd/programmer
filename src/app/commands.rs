@@ -16,16 +16,30 @@
 //! Message sending and slash-command dispatch.
 
 use super::App;
-use super::{diagnostics, session, stream};
-use crate::classifier::WorkMode;
+use super::{diagnostics, session};
+use super::surface::TuiSurface;
+use crate::classifier::{PlanPhase, WorkMode};
 use crate::commands::Command;
 use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::provider_panel::ProviderPanel;
 use crate::ui::components::skills_panel::SkillsPanel;
 use crate::ui::components::todo_panel::TodoPanel;
-use crate::ui::event::AppEvent;
+use crate::ui::event::{AppEvent, Event};
 use async_openai::types::responses::{InputContent, InputMessage, InputRole, InputTextContent, OutputStatus};
 use async_openai::types::responses::MessageItem as ApiMessageItem;
+
+use crate::prompts::PLAN_PLANNING_PROMPT;
+
+/// Build an optional plan-mode system prompt snippet.
+fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
+    if app.work_mode != WorkMode::Plan {
+        return None;
+    }
+    match app.plan_phase {
+        PlanPhase::Planning => Some(PLAN_PLANNING_PROMPT),
+        PlanPhase::Reviewing => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Message sending
@@ -84,7 +98,29 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
     // Fresh turn: start from an un-cancelled root token so a prior turn's Esc
     // doesn't carry over to this one.
     app.cancel.active = crate::cancel::CancellationToken::new();
-    stream::spawn_stream(app);
+
+    let Some(engine) = app.build_engine() else {
+        app.conversation_panel
+            .add_error_string(format!("unknown provider/model: {}", app.current_model));
+        return;
+    };
+    let surface = TuiSurface {
+        tx: app.events.sender.clone(),
+        skill_prompt: app.skill_registry.combined_prompt(),
+        plan_prompt: plan_system_prompt(app),
+        approval_label: format!(
+            "{} approved by {} mode",
+            app.work_mode.icon(),
+            app.work_mode.label()
+        ),
+    };
+    let shared = app.conversation_panel.shared_conversation();
+    let cancel = app.cancel.active.clone();
+    let tx = app.events.sender.clone();
+    tokio::spawn(async move {
+        let result = engine.run_turn(&shared, &cancel, &surface).await;
+        let _ = tx.send(Event::App(AppEvent::TurnFinished(result)));
+    });
 }
 
 /// Run a `!command` from the input: spawn it as an interactive PTY task and

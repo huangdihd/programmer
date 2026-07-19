@@ -17,14 +17,11 @@
 //! plan review, todo/provider/skills/MCP panels), then global shortcuts,
 //! then the input panel.
 
-use super::super::{commands, session, stream, App};
+use super::super::{commands, session, App};
 use super::update_completions;
 use crate::classifier::WorkMode;
 use crate::ui::components::provider_panel::PanelAction;
-use crate::ui::event::{AppEvent, Event};
-use async_openai::types::responses::{
-    FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
-};
+use crate::ui::event::AppEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Handles the key events and updates the state of [`App`].
@@ -38,7 +35,7 @@ pub(crate) async fn handle_key_events(
         return Ok(());
     }
     // ---- tool-call approval (Manual mode) ----
-    if !app.approval.queue.is_empty() {
+    if app.pending_review.is_some() {
         return handle_approval_key(app, key_event);
     }
     // ---- question panel ----
@@ -414,99 +411,48 @@ fn handle_approval_key(
 ) -> color_eyre::Result<()> {
     match key_event.code {
         KeyCode::Up | KeyCode::Char('k') => {
-            app.approval.selected = app.approval.selected.saturating_sub(1);
+            if let Some(ref mut review) = app.pending_review {
+                review.selected = review.selected.saturating_sub(1);
+            }
         }
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-            if app.approval.selected + 1 < 4 {
-                app.approval.selected += 1;
+            if let Some(ref mut review) = app.pending_review
+                && review.selected + 1 < 2
+            {
+                review.selected += 1;
             }
         }
-        KeyCode::Enter => match app.approval.selected {
-            0 => {
-                if let Some((call, _)) = app.approval.queue.drain(..1).next() {
-                    app.approval.approved.push(call);
-                }
-                app.approval.selected = 0;
-                check_approval_done(app);
+        KeyCode::Enter => {
+            if let Some(review) = app.pending_review.take() {
+                use crate::engine::ReviewDecision;
+                use async_openai::types::responses::{FunctionCallOutput, FunctionCallOutputItemParam};
+                let decision = match review.selected {
+                    0 => ReviewDecision::Approve,
+                    _ => ReviewDecision::Deny {
+                        output: crate::tools::ToolOutput {
+                            param: FunctionCallOutputItemParam {
+                                call_id: review.call.call_id.clone(),
+                                output: FunctionCallOutput::Text(format!(
+                                    "error: tool call denied by user in Manual mode — {}",
+                                    review.reason,
+                                )),
+                                id: None,
+                                status: None,
+                            },
+                            failed: true,
+                            approval_label: Some(format!(
+                                "{} denied in Manual mode by user",
+                                WorkMode::Manual.icon()
+                            )),
+                        },
+                    },
+                };
+                let _ = review.reply.0.send(decision);
             }
-            1 => {
-                let denied = app.approval.queue.drain(..1).next();
-                if let Some((call, reason)) = denied {
-                    deny_single_call(app, call, reason);
-                }
-                app.approval.selected = 0;
-                check_approval_done(app);
-            }
-            2 => {
-                let approved: Vec<FunctionToolCall> =
-                    app.approval.queue.drain(..).map(|(c, _)| c).collect();
-                app.approval.approved.extend(approved);
-                app.approval.selected = 0;
-                check_approval_done(app);
-            }
-            3 => {
-                let all = std::mem::take(&mut app.approval.queue);
-                for (call, reason) in all {
-                    deny_single_call(app, call, reason);
-                }
-                app.approval.selected = 0;
-                check_approval_done(app);
-            }
-            _ => {}
-        },
+        }
         _ => {}
     }
     Ok(())
-}
-
-fn deny_single_call(app: &mut App<'_>, call: FunctionToolCall, reason: String) {
-    app.conversation_panel.add_info_string(format!(
-        "🛡 Denied: {} ({})",
-        call.name, reason
-    ));
-    let output = crate::tools::ToolOutput {
-        param: FunctionCallOutputItemParam {
-            call_id: call.call_id,
-            output: FunctionCallOutput::Text(format!(
-                "error: tool call denied by user — {} ({})",
-                call.name, reason
-            )),
-            id: None,
-            status: None,
-        },
-        failed: true,
-        approval_label: Some(format!("{} denied in Manual mode by user", WorkMode::Manual.icon())),
-    };
-    app.conversation_panel.add_tool_output(output);
-}
-
-/// If the approval queue is empty, run the approved calls and continue.
-fn check_approval_done(app: &mut App<'_>) {
-    if !app.approval.queue.is_empty() {
-        return;
-    }
-    let calls = std::mem::take(&mut app.approval.approved);
-    if calls.is_empty() {
-        stream::spawn_stream(app);
-        return;
-    }
-
-    let sender = app.events.sender.clone();
-    let cancel_token = app.cancel.active.child();
-    let mcp = app.mcp_manager.clone();
-    tokio::spawn(async move {
-        let mut outputs = Vec::new();
-        for call in &calls {
-            let mut out =
-                crate::tools::run_tool_call(call, &sender, mcp.as_deref()).await;
-            out.approval_label = Some(format!("{} approved in Manual mode by user", WorkMode::Manual.icon()));
-            outputs.push(out);
-        }
-        let _ = sender.send(Event::App(AppEvent::ToolCallsCompleted(
-            outputs,
-            cancel_token,
-        )));
-    });
 }
 
 // ---------------------------------------------------------------------------

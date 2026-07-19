@@ -21,8 +21,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod events;
 pub(crate) mod helpers;
 pub(crate) mod session;
-pub(crate) mod stream;
-pub(crate) mod tools;
+pub(crate) mod surface;
 
 use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
@@ -40,9 +39,8 @@ use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::question_panel::QuestionPanel;
 use crate::ui::components::todo_panel::TodoPanel;
 use crate::ui::event::{Event, EventHandler};
-use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
-    FunctionToolCall, ResponseStreamEvent,
+    FunctionToolCall,
 };
 use crossterm::event::KeyEvent;
 use ratatui::DefaultTerminal;
@@ -50,27 +48,23 @@ use ratatui::layout::Rect;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-/// Pending tool-call approvals in Manual mode and the state of the in-progress
-/// approval UI.
-#[derive(Default)]
-pub(crate) struct ApprovalState {
-    /// Pending tool-call approvals: (call, reason).
-    pub(crate) queue: Vec<(FunctionToolCall, String)>,
-    /// Calls the user has approved so far (waiting for all to be decided).
-    pub(crate) approved: Vec<FunctionToolCall>,
-    /// Which option is highlighted in the approval UI
-    /// (0=approve, 1=deny, 2=approve all, 3=deny all).
+/// A pending tool-call review request from the engine. Manual mode now gets
+/// per-call reviews (no batch), driven by the engine's `review()` callback.
+pub(crate) struct PendingReview {
+    pub(crate) call: FunctionToolCall,
+    pub(crate) reason: String,
+    /// 1-based position and batch total (e.g. (2, 5)).
+    pub(crate) position: (usize, usize),
+    /// The oneshot back to the engine.
+    pub(crate) reply: crate::ui::event::ReplyTx,
+    /// Which approval option is highlighted (0=Approve, 1=Deny).
     pub(crate) selected: usize,
 }
 
-/// Diagnostics baseline and the edit-turn counter behind PROGRAMMER.md reminders.
+/// UI-only diagnostics bookkeeping. The mutable state (baseline + edit-turn
+/// counter) lives in [`App::diagnostics_state`], shared with the engine, so the
+/// engine's post-edit feedback loop sees the same baseline the sidebar renders.
 pub(crate) struct DiagnosticsState {
-    /// The last full diagnostics snapshot, used to diff after each edit so the
-    /// model is told which problems it introduced vs. resolved.
-    pub(crate) baseline: Option<Vec<crate::diagnostics::Diagnostic>>,
-    /// Count of turns that edited files, driving the periodic reminder to keep
-    /// `PROGRAMMER.md` up to date.
-    pub(crate) mutating_turns: usize,
     /// Whether the project's diagnostics profile declares an LSP checker.
     pub(crate) lsp_configured: bool,
 }
@@ -91,6 +85,9 @@ pub(crate) struct CancelState {
 pub(crate) struct SessionState {
     /// Session UUID.
     pub(crate) uuid: String,
+    /// Whether the session was actually saved at least once during this run
+    /// (i.e. there was user input worth persisting).
+    pub(crate) did_save: bool,
     /// Session manager for persistence.
     pub(crate) mgr: Option<SessionManager>,
     /// Set when session state changed and needs persisting. The actual disk
@@ -144,13 +141,18 @@ pub struct App<'a> {
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     /// Current safety/work mode.
     pub work_mode: WorkMode,
-    /// Manual-mode tool-call approval queue and UI state.
-    pub(crate) approval: ApprovalState,
+    /// Manual-mode pending tool-call review (per-call, no batch). `None` when
+    /// no review is in progress.
+    pub(crate) pending_review: Option<PendingReview>,
     /// Classifier models discovered not to support logprobs, so Auto mode skips
     /// the single-token fast path and goes straight to the merged reasoned call.
     pub(crate) classifier_no_logprobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Diagnostics baseline and edit-turn bookkeeping.
     pub(crate) diag: DiagnosticsState,
+    /// Shared diagnostics state the engine also reads/writes for post-edit
+    /// feedback (baseline + edit-turn counter). The TUI holds this so it
+    /// persists across per-turn engines.
+    pub(crate) diagnostics_state: Arc<std::sync::Mutex<crate::engine::DiagnosticsState>>,
     /// Tracks whether the current mouse-drag started in the sidebar area.
     pub(crate) sidebar_click_active: bool,
     /// Cancellation tokens for the current request lifecycle.
@@ -251,15 +253,16 @@ impl App<'_> {
                 list
             },
             work_mode,
-            approval: ApprovalState::default(),
+            pending_review: None,
             classifier_no_logprobs: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
             diag: DiagnosticsState {
-                baseline: None,
-                mutating_turns: 0,
                 lsp_configured: helpers::lsp_checker_configured(),
             },
+            diagnostics_state: Arc::new(std::sync::Mutex::new(
+                crate::engine::DiagnosticsState::default(),
+            )),
             sidebar_click_active: false,
             cancel: CancelState {
                 active: CancellationToken::new(),
@@ -269,6 +272,7 @@ impl App<'_> {
                 uuid: session_uuid,
                 mgr: session_mgr,
                 dirty: false,
+                did_save: false,
             },
             skill_registry: crate::skills::SkillRegistry::load(),
             mcp_manager: None,
@@ -299,11 +303,64 @@ impl App<'_> {
         app
     }
 
+    /// Build a fresh [`crate::engine::Engine`] for the current app state.
+    /// Called at the start of every turn; the engine is immutable during a turn
+    /// and is dropped when the spawned task finishes.
+    pub(crate) fn build_engine(&self) -> Option<crate::engine::Engine> {
+        use crate::engine::{DiagnosticsFeedback, Engine, EnginePolicy, LlmPolicy};
+        use crate::consts::{ENGINE_MAX_ITERATIONS, OVERVIEW_REMINDER_EVERY};
+
+        let (client, model_name) = self.provider_manager.resolve(&self.current_model)?;
+        let model_str = self.current_model.clone();
+        let tools = crate::tools::tools(self.mcp_manager.as_deref());
+
+        let policy = match self.work_mode {
+            WorkMode::Yolo => EnginePolicy::Yolo,
+            WorkMode::Manual | WorkMode::Plan => {
+                let classifier = self.work_mode.classifier(build_mcp_policy_map(self));
+                EnginePolicy::Sync(classifier)
+            }
+            WorkMode::Auto => {
+                let model_str = self
+                    .config
+                    .classifier_model
+                    .clone()
+                    .unwrap_or_else(|| self.current_model.clone());
+                let (c_client, c_model_name) = self
+                    .provider_manager
+                    .resolve(&model_str)?;
+                EnginePolicy::Llm(Box::new(LlmPolicy {
+                    client: c_client.clone(),
+                    model_name: c_model_name,
+                    no_logprobs: self.classifier_no_logprobs.clone(),
+                    mcp_policies: build_mcp_policy_map(self),
+                }))
+            }
+        };
+
+        Some(Engine {
+            client: client.clone(),
+            model_name,
+            model_str,
+            tools,
+            policy,
+            mcp: self.mcp_manager.clone(),
+            coauthor: self.config.git_coauthor.clone(),
+            max_iterations: ENGINE_MAX_ITERATIONS,
+            diagnostics: DiagnosticsFeedback {
+                enabled: true,
+                reminder_every: Some(OVERVIEW_REMINDER_EVERY),
+                state: self.diagnostics_state.clone(),
+            },
+            stream_retrying: self.cancel.stream_retrying.clone(),
+        })
+    }
+
     /// Run the application's main loop. Returns the final session UUID.
     pub(crate) async fn run(
         mut self,
         mut terminal: DefaultTerminal,
-    ) -> (color_eyre::Result<()>, String) {
+    ) -> (color_eyre::Result<()>, Option<String>) {
         // Kick off diagnostics baseline seeding on startup.
         crate::app::diagnostics::maybe_seed_diagnostics_baseline(&mut self);
 
@@ -324,7 +381,11 @@ impl App<'_> {
         }
         .await;
         crate::diagnostics::shutdown_lsp().await;
-        let uuid = self.session.uuid.clone();
+        let uuid = if self.session.did_save {
+            Some(self.session.uuid.clone())
+        } else {
+            None
+        };
         (result, uuid)
     }
 
@@ -334,14 +395,6 @@ impl App<'_> {
 
     async fn handle_event(&mut self, event: Event) -> color_eyre::Result<()> {
         events::handle_event(self, event).await
-    }
-
-    pub async fn handle_chunk_events(&mut self, response_stream_event: ResponseStreamEvent) {
-        stream::handle_chunk_events(self, response_stream_event).await
-    }
-
-    pub async fn handle_error_events(&mut self, error: OpenAIError) {
-        stream::handle_error_events(self, error).await
     }
 
     pub async fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
@@ -356,4 +409,13 @@ impl App<'_> {
         session::save_session(self);
         self.running = false;
     }
+}
+
+/// Build a map of MCP server name → [`crate::mcp::types::McpPolicy`] from the config.
+pub(crate) fn build_mcp_policy_map(app: &App<'_>) -> std::collections::HashMap<String, crate::mcp::types::McpPolicy> {
+    app.config
+        .mcp_servers
+        .iter()
+        .map(|s| (s.name.clone(), s.auto_approve))
+        .collect()
 }

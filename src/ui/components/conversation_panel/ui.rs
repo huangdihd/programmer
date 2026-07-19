@@ -177,8 +177,7 @@ impl Widget for &mut ConversationPanel {
                 );
             }
         }
-        let call_ids: HashSet<&str> = self
-            .conversation
+        let call_ids: HashSet<&str> = conv
             .items
             .iter()
             .filter_map(|item| match item {

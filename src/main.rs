@@ -459,7 +459,6 @@ async fn main() -> color_eyre::Result<()> {
     };
 
     let bootstrap = resolve_session(resume);
-    let has_session_mgr = bootstrap.mgr.is_some();
     let (programmer_config, _config_path) = load_config()?;
 
     // ---- run the TUI ----
@@ -483,7 +482,7 @@ async fn main() -> color_eyre::Result<()> {
         // Guard drops here → terminal restored.
     }
 
-    if has_session_mgr && !final_uuid.is_empty() {
+    if let Some(final_uuid) = final_uuid {
         println!("Session saved. Resume with: programmer --resume {final_uuid}");
     }
 

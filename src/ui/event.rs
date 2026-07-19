@@ -50,7 +50,7 @@ pub enum Event {
 pub enum AppEvent {
     /// A raw streaming chunk of the engine's in-flight response, forwarded by
     /// the TUI surface for live token rendering.
-    ChunkReceived(ResponseStreamEvent),
+    ChunkReceived(Box<ResponseStreamEvent>),
     /// The engine committed the streamed response's items to the shared
     /// conversation: drop the live in-progress view (the committed copy renders
     /// from the conversation now).

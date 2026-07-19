@@ -46,7 +46,7 @@ pub(crate) fn flush_if_dirty(app: &mut App<'_>) {
 pub(crate) fn save_session(app: &mut App<'_>) {
     app.session.dirty = false;
     let Some(mgr) = &app.session.mgr else { return };
-    let items: Vec<MessageItem> = app.conversation_panel.items().cloned().collect();
+    let items: Vec<MessageItem> = app.conversation_panel.items_snapshot();
     // Don't persist a session with no user input — there's nothing worth
     // resuming, and empty sessions only clutter the picker. `/init` sends a
     // (developer-role) input message, which `first_user_text` picks up, so a
@@ -54,6 +54,7 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     if helpers::first_user_text(&items).is_none() {
         return;
     }
+    app.session.did_save = true;
     let mut session = mgr.load(&app.session.uuid).unwrap_or_else(|| {
         let mut s = mgr.create();
         s.uuid = app.session.uuid.clone();

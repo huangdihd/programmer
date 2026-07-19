@@ -34,7 +34,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// The outcome of asking a surface to review a tool call whose classifier
 /// verdict was `Ask`.
-pub(crate) enum ReviewDecision {
+pub enum ReviewDecision {
     /// Run the call.
     Approve,
     /// Block the call. The surface constructs the full denial output so each

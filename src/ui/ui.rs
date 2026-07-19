@@ -32,7 +32,7 @@ impl App<'_> {
         if self.question_panel.is_some() {
             return StatusState::WaitingAnswer;
         }
-        if !self.approval.queue.is_empty() {
+        if self.pending_review.is_some() {
             return StatusState::WaitingApproval;
         }
         let cp = &self.conversation_panel;
@@ -111,14 +111,12 @@ impl App<'_> {
 
         if let Some(panel) = &self.question_panel {
             panel.render(chunks[POS_BOTTOM], buf);
-        } else if !self.approval.queue.is_empty() {
-            let current = self.approval.approved.len() + 1;
-            let total = self.approval.approved.len() + self.approval.queue.len();
-            let (call, reason) = &self.approval.queue[0];
-            let detail_lines = crate::ui::tool_details::format_tool_details(&call.name, &call.arguments);
+        } else if let Some(ref review) = self.pending_review {
+            let (current, total) = review.position;
+            let detail_lines = crate::ui::tool_details::format_tool_details(&review.call.name, &review.call.arguments);
 
-            let labels = ["Approve", "Deny", "Approve all", "Deny all"];
-            let sel = self.approval.selected;
+            let labels = ["Approve", "Deny"];
+            let sel = review.selected;
             let option_lines: Vec<Line> = labels.iter().enumerate().map(|(i, label)| {
                 let marker = if i == sel { "❯" } else { " " };
                 let style = if i == sel {
@@ -144,7 +142,7 @@ impl App<'_> {
                 ]),
                 Line::from(vec![
                     Span::styled("  reason: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(reason.as_str(), Style::default().fg(Color::Yellow)),
+                    Span::styled(review.reason.as_str(), Style::default().fg(Color::Yellow)),
                 ]),
             ];
             for line in &detail_lines {
@@ -366,14 +364,14 @@ impl Widget for &mut App<'_> {
             .as_ref()
             .map(|q| q.needed_height())
             .unwrap_or(3);
-        let approval_height: u16 = if self.approval.queue.is_empty() {
-            3
-        } else {
+        let approval_height: u16 = if let Some(ref review) = self.pending_review {
             let detail_count = crate::ui::tool_details::format_tool_details(
-                &self.approval.queue[0].0.name,
-                &self.approval.queue[0].0.arguments,
+                &review.call.name,
+                &review.call.arguments,
             ).len() as u16;
-            4 + detail_count + 4 // title + reason + details + options
+            4 + detail_count + 2 // title + reason + details + options (2: approve/deny)
+        } else {
+            3
         };
         // The bottom row is either a modal (question / approval / plan review) or the input.
         // When it's the input, let it grow with multi-line content.
@@ -387,7 +385,7 @@ impl Widget for &mut App<'_> {
         };
         let bottom_height = if self.question_panel.is_some() {
             question_height
-        } else if !self.approval.queue.is_empty() {
+        } else if self.pending_review.is_some() {
             approval_height
         } else if plan_review_height > 0 {
             plan_review_height
@@ -430,7 +428,7 @@ impl Widget for &mut App<'_> {
                 .render(
                     horiz[1],
                     buf,
-                    self.diag.baseline.as_deref().unwrap_or(&[]),
+                    self.diagnostics_state.lock().unwrap().baseline.as_deref().unwrap_or(&[]),
                     self.diag.lsp_configured,
                     self.mcp_manager.as_deref(),
                     &self.todo_list,

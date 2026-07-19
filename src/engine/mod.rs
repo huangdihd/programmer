@@ -124,7 +124,7 @@ pub(crate) struct DiagnosticsState {
 
 /// The result of a completed turn.
 #[derive(Debug)]
-pub(crate) struct TurnResult {
+pub struct TurnResult {
     pub final_text: String,
     #[allow(dead_code)]
     pub usage: (u32, u32),
@@ -132,7 +132,7 @@ pub(crate) struct TurnResult {
 
 /// Why a turn could not complete.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum EngineError {
+pub enum EngineError {
     #[error("stream error: {0}")]
     Stream(OpenAIError),
     #[error("api error {code:?}: {message}")]
@@ -149,7 +149,7 @@ pub(crate) enum EngineError {
 /// Mirrors the TUI's `ActivePhase`; the headless surface ignores it.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
-pub(crate) enum EnginePhase {
+pub enum EnginePhase {
     /// Streaming a model response.
     Streaming,
     /// Classifying the requested tool calls.

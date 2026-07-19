@@ -39,3 +39,10 @@
 - ~~MCP progress in UI~~
 - ~~atomic file writes~~
 - ~~incremental search in panels~~
+- interactive task tool improvements (for TUI smoke testing):
+  - `expect_screen(pattern, timeout)`: block until screen contains a pattern
+  - `screen_diff`: return only changed regions since last screen snapshot
+  - reliable mouse scroll support in PTY
+  - stderr/stdout split or separate capture
+  - larger output tail or configurable output buffer size
+  - keys should auto-wait for program to consume input before returning

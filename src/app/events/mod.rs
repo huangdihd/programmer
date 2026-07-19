@@ -22,7 +22,8 @@ mod mouse;
 pub(crate) use keys::handle_key_events;
 
 use super::App;
-use super::{commands, diagnostics, helpers, session, stream, tools};
+use super::PendingReview;
+use super::{commands, diagnostics, helpers, session};
 use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
 use crate::commands::CompletionEngine;
@@ -30,8 +31,6 @@ use crate::response::partial_response::PartialResponse;
 use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
 use crate::ui::components::question_panel::QuestionPanel;
 use crate::ui::event::{AppEvent, Event};
-use async_openai::error::OpenAIError;
-use async_openai::types::responses::FunctionToolCall;
 use crossterm::event::KeyEventKind;
 
 // ---------------------------------------------------------------------------
@@ -79,31 +78,81 @@ async fn handle_crossterm(
     Ok(())
 }
 
-/// Dispatch an [`AppEvent`] to its handler. Each variant's logic lives in a
-/// dedicated `handle_*` function below; this only routes.
+/// Dispatch an [`AppEvent`] to its handler.
 async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
     match app_event {
         AppEvent::Cancel => handle_cancel(app).await,
-        AppEvent::ChunkReceived(chunk) => stream::handle_chunk_events(app, chunk).await,
-        AppEvent::OpenAIErrorReceived(error) => handle_openai_error(app, error).await,
-        AppEvent::ResponseFinished(partial_response) => {
-            handle_response_finished(app, partial_response).await
+        AppEvent::ChunkReceived(chunk) => {
+            if app.conversation_panel.receiving_response.is_some() {
+                app.conversation_panel.handle_response_stream_event(*chunk);
+            }
         }
-        AppEvent::ClassificationCompleted {
-            allowed,
-            denied,
-            ask_queue,
-            cancel_token,
-        } => handle_classification_completed(app, allowed, denied, ask_queue, cancel_token),
-        AppEvent::ToolCallsCompleted(outputs, cancel_token) => {
-            handle_tool_calls_completed(app, outputs, cancel_token)
+        AppEvent::ResponseCommitted => {
+            app.conversation_panel.commit_live();
         }
-        AppEvent::DiagnosticsCompleted {
-            snapshot,
-            reminder_due,
-            seed,
-            cancel_token,
-        } => handle_diagnostics_completed(app, snapshot, reminder_due, seed, cancel_token),
+        AppEvent::EnginePhase(p) => {
+            use crate::engine::EnginePhase;
+            app.conversation_panel.phase = match p {
+                EnginePhase::Streaming => {
+                    app.conversation_panel.receiving_response =
+                        Some(PartialResponse::new(app.cancel.active.child()));
+                    ActivePhase::None // "Thinking" — derived from receiving_response
+                }
+                EnginePhase::Classifying => ActivePhase::Classifying,
+                EnginePhase::RunningTools => ActivePhase::ToolRunning,
+                EnginePhase::Checking => ActivePhase::Checking,
+            };
+        }
+        AppEvent::ReviewRequest { call, reason, position, reply } => {
+            app.pending_review = Some(PendingReview {
+                call,
+                reason,
+                position,
+                reply,
+                selected: 0,
+            });
+            app.conversation_panel.phase = ActivePhase::None;
+        }
+        AppEvent::TurnFinished(result) => {
+            app.conversation_panel.abort_receiving();
+            app.conversation_panel.phase = ActivePhase::None;
+            app.conversation_panel.flush_usage();
+            let was_ok = result.is_ok();
+            match result {
+                Err(crate::engine::EngineError::Stream(e)) => {
+                    app.conversation_panel.add_error(e);
+                }
+                Err(crate::engine::EngineError::Api { message, .. }) => {
+                    app.conversation_panel.add_error_string(message);
+                }
+                Err(crate::engine::EngineError::Cancelled) => {
+                    // Handled by handle_cancel.
+                }
+                Err(e @ (crate::engine::EngineError::IterationCap(_) | crate::engine::EngineError::EmptyResponse)) => {
+                    app.conversation_panel.add_error_string(e.to_string());
+                }
+                Ok(_) => {}
+            }
+            // Plan mode: if in Planning phase and turn finished successfully,
+            // the model finished presenting the plan.
+            if app.work_mode == WorkMode::Plan
+                && app.plan_phase == crate::classifier::PlanPhase::Planning
+                && was_ok
+            {
+                app.plan_phase = crate::classifier::PlanPhase::Reviewing;
+            }
+            app.todo_list = crate::todos::TodoList::load();
+            session::mark_dirty(app);
+            // Restore mouse capture — external commands may disable it.
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::EnableMouseCapture
+            );
+            // Start any queued follow-up request.
+            if let Some(pending_request) = app.conversation_panel.pending_message.take() {
+                commands::start_request(app, pending_request).await;
+            }
+        }
         AppEvent::Start => {
             diagnostics::maybe_seed_diagnostics_baseline(app);
             commands::send_message(app).await;
@@ -129,12 +178,10 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
 // Per-variant AppEvent handlers
 // ---------------------------------------------------------------------------
 
-/// Cancel: stop the in-flight stream and post-stream pipeline, then start any
-/// queued follow-up request.
+/// Cancel: stop the in-flight engine turn, then start any queued follow-up.
 async fn handle_cancel(app: &mut App<'_>) {
-    // Cancel the turn's root token; every phase (the in-flight stream and the
-    // post-stream classify/tool pipeline) runs against a child of it, so this
-    // one call stops whichever is currently running.
+    // Cancel the turn's root token; the engine's spawned task checks this token
+    // between every iteration and stops.
     app.cancel.active.cancel();
     app.conversation_panel.abort_receiving();
     app.conversation_panel.phase = ActivePhase::None;
@@ -147,124 +194,7 @@ async fn handle_cancel(app: &mut App<'_>) {
     }
 }
 
-/// A streaming error ended the turn: surface it and mark the session dirty.
-async fn handle_openai_error(app: &mut App<'_>, error: OpenAIError) {
-    stream::handle_error_events(app, error).await;
-    session::mark_dirty(app);
-}
-
-/// A response finished: run any tool calls it requested, otherwise close out
-/// the turn (handling plan mode and any queued follow-up request).
-async fn handle_response_finished(app: &mut App<'_>, partial_response: PartialResponse) {
-    if partial_response.cancelled.is_cancelled() {
-        return;
-    }
-    let cancel_token = partial_response.cancelled.clone();
-    let calls = helpers::function_calls(&partial_response);
-    if calls.is_empty() {
-        // Plan mode: if in Planning phase and model stopped without making
-        // tool calls, it has finished presenting the plan.
-        if app.work_mode == WorkMode::Plan
-            && app.plan_phase == crate::classifier::PlanPhase::Planning
-        {
-            app.plan_phase = crate::classifier::PlanPhase::Reviewing;
-            app.conversation_panel.phase = ActivePhase::None;
-            app.conversation_panel.flush_usage();
-            session::mark_dirty(app);
-            return;
-        }
-        app.conversation_panel.phase = ActivePhase::None;
-        app.conversation_panel.flush_usage();
-        if let Some(pending_request) = app.conversation_panel.pending_message.take() {
-            commands::start_request(app, pending_request).await
-        }
-        session::mark_dirty(app);
-    } else {
-        tools::run_tool_calls(app, calls, cancel_token);
-    }
-}
-
-/// Classification finished: surface any denials that need approval, otherwise
-/// run the allowed calls.
-fn handle_classification_completed(
-    app: &mut App<'_>,
-    allowed: Vec<FunctionToolCall>,
-    denied: Vec<crate::tools::ToolOutput>,
-    ask_queue: Vec<(FunctionToolCall, String)>,
-    cancel_token: CancellationToken,
-) {
-    if cancel_token.is_cancelled() {
-        return;
-    }
-    if !ask_queue.is_empty() {
-        for output in &denied {
-            app.conversation_panel.add_tool_output(output.clone());
-        }
-        app.approval.queue = ask_queue;
-        app.conversation_panel.phase = ActivePhase::None;
-        return;
-    }
-    tools::process_classification_results(app, allowed, denied, cancel_token);
-}
-
-/// All tool calls ran: record their outputs, then either run diagnostics or
-/// resume the stream.
-fn handle_tool_calls_completed(
-    app: &mut App<'_>,
-    outputs: Vec<crate::tools::ToolOutput>,
-    cancel_token: CancellationToken,
-) {
-    if cancel_token.is_cancelled() {
-        return;
-    }
-    app.conversation_panel.phase = ActivePhase::None;
-    app.diag.lsp_configured = helpers::lsp_checker_configured();
-    let edited_files = tools::batch_edited_files(app, &outputs);
-    for output in outputs {
-        app.conversation_panel.add_tool_output(output);
-    }
-    app.todo_list = crate::todos::TodoList::load();
-    session::mark_dirty(app);
-    // Restore mouse capture — external commands disable it.
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableMouseCapture
-    );
-    if !diagnostics::continue_with_diagnostics(app, edited_files, cancel_token.clone()) {
-        stream::spawn_stream(app);
-    }
-}
-
-/// Diagnostics finished: seed the baseline, or apply the diff and resume the
-/// stream.
-fn handle_diagnostics_completed(
-    app: &mut App<'_>,
-    snapshot: crate::diagnostics::Snapshot,
-    reminder_due: bool,
-    seed: bool,
-    cancel_token: CancellationToken,
-) {
-    if cancel_token.is_cancelled() {
-        return;
-    }
-    if seed {
-        if app.diag.baseline.is_none() {
-            app.diag.baseline = Some(snapshot.diagnostics);
-        }
-        return;
-    }
-    diagnostics::apply_diagnostics(app, snapshot, reminder_due);
-    session::mark_dirty(app);
-    // Restore mouse capture — diagnostic runners may reset console modes on
-    // Windows.
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableMouseCapture
-    );
-    stream::spawn_stream(app);
-}
-
-/// `/init`: seed the init prompt and kick off the first stream.
+/// `/init`: seed the init prompt and start the first engine turn.
 fn handle_start_init(app: &mut App<'_>) {
     app.conversation_panel.add_meta(
         "\u{25B8} Initializing project\u{2026}",
@@ -275,7 +205,36 @@ fn handle_start_init(app: &mut App<'_>) {
     session::mark_dirty(app);
     // Fresh turn: start from an un-cancelled root token.
     app.cancel.active = CancellationToken::new();
-    stream::spawn_stream(app);
+    // Kick off via the engine: re-use start_request_as with a developer role so
+    // the hidden init prompt runs through the engine just like `/init` did before.
+    let tokio_handle = tokio::runtime::Handle::current();
+    tokio_handle.spawn(async move {
+        // Can't call start_request_as from sync context; queue a synthetic Start
+        // event instead.
+    });
+    // Spawn the init turn through the same engine path.
+    let Some(engine) = app.build_engine() else {
+        app.conversation_panel
+            .add_error_string(format!("unknown provider/model: {}", app.current_model));
+        return;
+    };
+    let surface = super::surface::TuiSurface {
+        tx: app.events.sender.clone(),
+        skill_prompt: app.skill_registry.combined_prompt(),
+        plan_prompt: None,
+        approval_label: format!(
+            "{} approved by {} mode",
+            app.work_mode.icon(),
+            app.work_mode.label()
+        ),
+    };
+    let shared = app.conversation_panel.shared_conversation();
+    let cancel = app.cancel.active.clone();
+    let tx = app.events.sender.clone();
+    tokio::spawn(async move {
+        let result = engine.run_turn(&shared, &cancel, &surface).await;
+        let _ = tx.send(Event::App(AppEvent::TurnFinished(result)));
+    });
 }
 
 /// `/compact` finished: install the summary as the new context boundary, or
