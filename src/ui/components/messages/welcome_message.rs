@@ -98,6 +98,11 @@ impl WelcomeMessage {
             )),
             Line::from(""),
             Line::from(Span::styled(
+                "https://github.com/huangdihd/programmer",
+                Style::default().fg(ACCENT),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
                 "© 2026 huangdihd  |  GPL-3.0-or-later  |  No warranty",
                 Style::default().fg(DIM),
             )),
@@ -116,8 +121,16 @@ impl WelcomeMessage {
                 Span::styled("          Send message", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  Ctrl+Q", Style::default().fg(ACCENT)),
-                Span::styled("         Quit", Style::default().fg(TEXT)),
+                Span::styled("  Alt+Enter", Style::default().fg(ACCENT)),
+                Span::styled("      Insert newline", Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Ctrl+T", Style::default().fg(ACCENT)),
+                Span::styled("         Cycle work mode", Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Ctrl+B", Style::default().fg(ACCENT)),
+                Span::styled("         Toggle sidebar", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
                 Span::styled("  Ctrl+C", Style::default().fg(ACCENT)),
@@ -125,7 +138,7 @@ impl WelcomeMessage {
             ]),
             Line::from(vec![
                 Span::styled("  Scroll", Style::default().fg(ACCENT)),
-                Span::styled("         Navigate conversation", Style::default().fg(TEXT)),
+                Span::styled("         Scroll conversation", Style::default().fg(TEXT)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
