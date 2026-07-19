@@ -390,6 +390,7 @@ impl ProviderPanel {
                         api_key,
                         models: None,
                         default_model: (!default_model.is_empty()).then_some(default_model),
+                        classifier_model: None,
                     },
                 );
                 // First provider ever: make it the default.
@@ -884,6 +885,7 @@ mod tests {
                     api_key: "k".into(),
                     models: None,
                     default_model: None,
+                    classifier_model: None,
                 },
             );
         }

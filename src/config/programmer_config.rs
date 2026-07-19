@@ -64,6 +64,10 @@ pub struct ProviderConfig {
     /// list (auto-discovered or manual) is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Model used for Auto-mode tool-call classification for this provider.
+    /// When absent, falls back to [`default_model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_model: Option<String>,
 }
 
 /// Default co-author trailer. It's a placeholder — replace the email with one
@@ -82,6 +86,7 @@ impl Default for ProgrammerConfig {
                 api_key: "sk-...".to_string(),
                 models: None,
                 default_model: None,
+                classifier_model: None,
             },
         );
         ProgrammerConfig {
@@ -125,6 +130,7 @@ impl ProgrammerConfig {
                 api_key,
                 models: Some(vec![model]),
                 default_model: None,
+                classifier_model: None,
             },
         );
         self.default_provider = "openai".to_string();

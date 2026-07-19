@@ -844,6 +844,29 @@ pub fn kill(id: u64) -> Result<(), String> {
     }
 }
 
+/// Kill every running task and clear the registry so the next session starts
+/// clean.
+pub fn kill_all() -> usize {
+    let mut reg = registry().lock().unwrap();
+    let mut count = 0;
+    for entry in reg.iter_mut() {
+        if entry.status != TaskStatus::Running {
+            continue;
+        }
+        if let Some(pty) = entry.pty.as_mut() {
+            pty.killed.store(true, Ordering::Relaxed);
+            if pty.killer.kill().is_ok() {
+                count += 1;
+            }
+        } else if let Some(tx) = entry.kill.take() {
+            let _ = tx.send(());
+            count += 1;
+        }
+    }
+    reg.clear();
+    count
+}
+
 /// Wait until the task finishes or `timeout` elapses. Returns the final
 /// snapshot either way, plus whether it is still running.
 pub async fn wait(id: u64, timeout: Duration) -> Result<(TaskSnapshot, bool), String> {

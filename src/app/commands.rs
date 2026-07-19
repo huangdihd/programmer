@@ -350,14 +350,19 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
             session::save_session(app);
             app.conversation_panel.clear_messages();
             diagnostics::reset_diagnostics_state(app);
+            let killed = crate::tasks::kill_all();
             if let Some(mgr) = &app.session.mgr {
                 let new_session = mgr.create();
                 app.session.uuid = new_session.uuid;
             }
             app.todo_list = crate::todos::TodoList::default();
             crate::todos::TodoList::clear_file();
+            let mut msg = "Started a new session. Previous session saved.".to_string();
+            if killed > 0 {
+                msg.push_str(&format!(" Killed {killed} background task(s)."));
+            }
             app.conversation_panel
-                .add_info_string("Started a new session. Previous session saved.".to_string());
+                .add_info_string(msg);
             session::save_session(app);
         }
         Some(Command::Model(model)) => {

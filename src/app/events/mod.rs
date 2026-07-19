@@ -89,6 +89,8 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         }
         AppEvent::ResponseCommitted => {
             app.conversation_panel.commit_live();
+            // Reload in case the model ran a `todo` tool this iteration.
+            app.todo_list = crate::todos::TodoList::load();
         }
         AppEvent::EnginePhase(p) => {
             use crate::engine::EnginePhase;

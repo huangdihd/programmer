@@ -166,7 +166,7 @@ async fn build_mcp_classifier() -> Option<(
     let model = config
         .classifier_model
         .clone()
-        .unwrap_or_else(|| pm.default_model());
+        .unwrap_or_else(|| pm.default_classifier_model());
     pm.resolve(&model).map(|(client, name)| (client.clone(), name))
 }
 
@@ -210,7 +210,7 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
             let clf_model = config
                 .classifier_model
                 .clone()
-                .unwrap_or_else(|| chat_model.clone());
+                .unwrap_or_else(|| pm.default_classifier_model());
             let Some((clf_client, clf_name)) =
                 pm.resolve(&clf_model).map(|(c, n)| (c.clone(), n))
             else {

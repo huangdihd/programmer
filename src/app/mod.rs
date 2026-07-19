@@ -325,7 +325,7 @@ impl App<'_> {
                     .config
                     .classifier_model
                     .clone()
-                    .unwrap_or_else(|| self.current_model.clone());
+                    .unwrap_or_else(|| self.provider_manager.default_classifier_model());
                 let (c_client, c_model_name) = self
                     .provider_manager
                     .resolve(&model_str)?;
