@@ -46,6 +46,13 @@ pub struct Conversation {
     /// current turn (a turn may span multiple responses when tool calls are
     /// involved). Flushed to a [`MessageItem::Usage`] at turn end.
     pub accumulated_usage: (u32, u32),
+    /// Bumped whenever an *existing* item is mutated in place (or the list is
+    /// replaced wholesale), as opposed to appended to. The renderer's cache is
+    /// keyed by item index, so appends are naturally cache-coherent — this
+    /// counter is how it notices in-place edits (e.g. the engine folding
+    /// post-edit diagnostics into a tool output) now that the engine writes to
+    /// the conversation without going through the panel.
+    pub(crate) mutation_version: u64,
 }
 
 impl Conversation {
@@ -71,8 +78,8 @@ impl Conversation {
     /// result — visible when the user expands it — and is sent to the model as
     /// part of the tool result. Returns whether a matching output was found.
     ///
-    /// This is the one place `items` is mutated rather than appended; the caller
-    /// (the panel wrapper) drops the affected cache entry to force a re-render.
+    /// This is the one place `items` is mutated rather than appended;
+    /// `mutation_version` is bumped so the renderer drops its cached layout.
     pub fn append_to_tool_output(&mut self, call_id: &str, extra: &str) -> bool {
         for item in self.items.iter_mut() {
             if let MessageItem::ToolOutput { output, .. } = item
@@ -81,6 +88,7 @@ impl Conversation {
                         FunctionCallOutput::Text(text) => text.push_str(extra),
                         other => *other = FunctionCallOutput::Text(extra.trim_start().to_string()),
                     }
+                    self.mutation_version += 1;
                     return true;
                 }
         }
@@ -190,11 +198,13 @@ impl Conversation {
     pub fn clear(&mut self) {
         self.items.clear();
         self.accumulated_usage = (0, 0);
+        self.mutation_version += 1;
     }
 
     /// Replace the conversation with a previous session's items.
     pub fn restore_items(&mut self, items: Vec<MessageItem>) {
         self.items = items;
+        self.mutation_version += 1;
     }
 
     /// Iterate over the current conversation items (for persistence and the

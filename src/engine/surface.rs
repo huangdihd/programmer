@@ -35,13 +35,13 @@ use tokio::sync::mpsc::UnboundedSender;
 /// The outcome of asking a surface to review a tool call whose classifier
 /// verdict was `Ask`.
 pub(crate) enum ReviewDecision {
-    /// Run the call. Only an interactive surface (the TUI, or a parent agent
-    /// relaying a human decision) produces this; the headless surface never
-    /// approves, so it is unconstructed until that wiring lands.
-    #[allow(dead_code)]
+    /// Run the call.
     Approve,
-    /// Block the call; `reason` is fed back to the model as the denial text.
-    Deny { reason: String },
+    /// Block the call. The surface constructs the full denial output so each
+    /// front-end keeps its own wording (the headless surface reuses the
+    /// classifier phrasing verbatim; the TUI uses its "denied by user" text)
+    /// — the engine records it as the call's failed result either way.
+    Deny { output: crate::tools::ToolOutput },
 }
 
 /// What the engine reports to and asks of. Implemented once per front-end:
@@ -54,9 +54,16 @@ pub(crate) trait AgentSurface: Send + Sync {
     fn on_event(&self, event: EngineEvent<'_>);
 
     /// A classifier `Ask` verdict needs a decision. `reason` is the classifier's
-    /// explanation for why the call was flagged. The surface returns whether the
-    /// call may run; a `Deny` carries the reason to feed back to the model.
-    async fn review(&self, call: &FunctionToolCall, reason: &str) -> ReviewDecision;
+    /// explanation for why the call was flagged; `position` is this call's
+    /// 1-based index and the batch total, so an interactive surface can show
+    /// "2 of 5" progress. The surface returns whether the call may run; a
+    /// `Deny` carries the full denial output to record.
+    async fn review(
+        &self,
+        call: &FunctionToolCall,
+        reason: &str,
+        position: (usize, usize),
+    ) -> ReviewDecision;
 
     // --- Front-end context (defaulted; the headless surface takes the None /
     // headless answer, so `-p` behaviour is unchanged). ---
@@ -101,9 +108,14 @@ pub(crate) struct HeadlessSurface;
 impl AgentSurface for HeadlessSurface {
     fn on_event(&self, _event: EngineEvent<'_>) {}
 
-    async fn review(&self, _call: &FunctionToolCall, reason: &str) -> ReviewDecision {
+    async fn review(
+        &self,
+        call: &FunctionToolCall,
+        reason: &str,
+        _position: (usize, usize),
+    ) -> ReviewDecision {
         ReviewDecision::Deny {
-            reason: reason.to_string(),
+            output: super::classify::classifier_denied_output(call, reason),
         }
     }
 }

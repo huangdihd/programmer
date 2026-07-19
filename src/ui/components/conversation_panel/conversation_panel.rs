@@ -193,13 +193,22 @@ pub(crate) struct RenderCache {
     pub width: u16,
     /// Parallel to the finished prefix of `items`, indexed identically.
     pub entries: Vec<CachedParagraph>,
+    /// The conversation's `mutation_version` the entries were built against.
+    /// Appends never bump it (index-keyed entries stay valid), but an in-place
+    /// mutation — e.g. the engine folding diagnostics into a tool output —
+    /// does, and every entry must be dropped.
+    pub seen_mutation_version: u64,
 }
 
 #[derive(Debug)]
 pub struct ConversationPanel {
     /// The UI-free conversation model: history items and turn-usage counter.
-    /// The panel adds the view state below on top of it.
-    pub(crate) conversation: crate::conversation::Conversation,
+    /// The panel adds the view state below on top of it. Shared with the
+    /// engine task that drives the turn — the engine appends under brief locks
+    /// from its background task while the panel renders it every frame, so
+    /// every access here locks briefly and never holds the guard across an
+    /// await (there are none in the UI thread) or a render sub-call.
+    pub(crate) conversation: std::sync::Arc<std::sync::Mutex<crate::conversation::Conversation>>,
     pub(crate) scroll_view_state: ScrollViewState,
     pub pending_message: Option<String>,
     pub receiving_response: Option<PartialResponse>,
@@ -249,7 +258,9 @@ pub struct ConversationPanel {
 impl ConversationPanel {
     pub fn new() -> Self {
         ConversationPanel {
-            conversation: crate::conversation::Conversation::new(),
+            conversation: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::conversation::Conversation::new(),
+            )),
             scroll_view_state: ScrollViewState::new(),
             pending_message: None,
             receiving_response: None,
@@ -337,10 +348,17 @@ impl ConversationPanel {
                 self.copy_code_block(&content);
                 return;
             }
-            if self.conversation.items.get(index).is_some_and(is_foldable)
-                && !self.expanded_items.remove(&index) {
-                    self.expanded_items.insert(index);
-                }
+            if self
+                .conversation
+                .lock()
+                .unwrap()
+                .items
+                .get(index)
+                .is_some_and(is_foldable)
+                && !self.expanded_items.remove(&index)
+            {
+                self.expanded_items.insert(index);
+            }
         }
     }
 
@@ -487,89 +505,83 @@ impl ConversationPanel {
             )
     }
 
+    /// The shared conversation handle, for the engine task that drives a turn.
+    pub fn shared_conversation(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::conversation::Conversation>> {
+        self.conversation.clone()
+    }
+
     /// Appends a tool result so it is both rendered and sent back to the model
     /// on the next request. Delegates to [`Conversation::add_tool_output`].
     pub fn add_tool_output(&mut self, output: crate::tools::ToolOutput) {
-        self.conversation.add_tool_output(output);
-    }
-
-    /// Append text to the stored output of the tool call identified by
-    /// `call_id` (post-edit diagnostics feedback). Returns whether a matching
-    /// output was found; on success the affected cache entry is dropped so the
-    /// result — which may render non-adjacent to its call — rebuilds cleanly.
-    pub fn append_to_tool_output(&mut self, call_id: &str, extra: &str) -> bool {
-        if self.conversation.append_to_tool_output(call_id, extra) {
-            self.render_cache.entries.clear();
-            true
-        } else {
-            false
-        }
+        self.conversation.lock().unwrap().add_tool_output(output);
     }
 
     pub fn add_input_message(&mut self, input_message_item: ApiMessageItem) {
-        self.conversation.add_input_message(input_message_item);
+        self.conversation.lock().unwrap().add_input_message(input_message_item);
         // A new user message should always bring the view back to the bottom.
         self.stick_to_bottom = true;
     }
 
     pub fn add_error(&mut self, openai_error: OpenAIError) {
-        self.conversation.add_error(openai_error);
+        self.conversation.lock().unwrap().add_error(openai_error);
         self.stick_to_bottom = true;
     }
 
     pub fn add_error_string(&mut self, message: impl Into<String>) {
-        self.conversation.add_error_string(message);
+        self.conversation.lock().unwrap().add_error_string(message);
         self.stick_to_bottom = true;
     }
 
     pub fn add_info_string(&mut self, message: impl Into<String>) {
-        self.conversation.add_info_string(message);
+        self.conversation.lock().unwrap().add_info_string(message);
         self.stick_to_bottom = true;
     }
 
     pub fn add_meta(&mut self, label: impl Into<String>, text: impl Into<String>) {
-        self.conversation.add_meta(label, text);
+        self.conversation.lock().unwrap().add_meta(label, text);
         self.stick_to_bottom = true;
     }
 
     pub fn add_warning_string(&mut self, message: impl Into<String>) {
-        self.conversation.add_warning_string(message);
+        self.conversation.lock().unwrap().add_warning_string(message);
         self.stick_to_bottom = true;
     }
 
     /// Whether there is API-visible history worth compacting: any input/output
     /// item after the last `/compact` boundary.
     pub fn has_compactable_history(&self) -> bool {
-        self.conversation.has_compactable_history()
+        self.conversation.lock().unwrap().has_compactable_history()
     }
 
     /// Record a finished `/compact`: push the boundary carrying `summary`.
     /// History before it stays visible in the UI but stops being sent to the
     /// API (see [`Conversation::to_input_param`]).
     pub fn apply_compaction(&mut self, summary: String) {
-        self.conversation.apply_compaction(summary);
+        self.conversation.lock().unwrap().apply_compaction(summary);
         self.stick_to_bottom = true;
     }
 
     pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
-        self.conversation.add_usage(input_tokens, output_tokens);
+        self.conversation.lock().unwrap().add_usage(input_tokens, output_tokens);
     }
 
     /// Flush the accumulated usage as a message and reset the counter.
     pub fn flush_usage(&mut self) {
-        if self.conversation.flush_usage() {
+        if self.conversation.lock().unwrap().flush_usage() {
             self.stick_to_bottom = true;
         }
     }
 
     /// Reset the accumulated usage counter (on /clear, new session, etc.).
     pub fn reset_accumulated_usage(&mut self) {
-        self.conversation.reset_accumulated_usage();
+        self.conversation.lock().unwrap().reset_accumulated_usage();
     }
 
     /// Clear all conversation history and pending state.
     pub fn clear_messages(&mut self) {
-        self.conversation.clear();
+        self.conversation.lock().unwrap().clear();
         self.pending_message = None;
         self.expanded_items.clear();
         self.live_expanded_items.clear();
@@ -579,24 +591,46 @@ impl ConversationPanel {
 
     /// Restore a previous session's items into the conversation.
     pub fn restore_items(&mut self, items: Vec<MessageItem>) {
-        self.conversation.restore_items(items);
+        self.conversation.lock().unwrap().restore_items(items);
         self.stick_to_bottom = true;
     }
 
-    /// Iterate over the current conversation items (for persistence).
-    pub fn items(&self) -> impl Iterator<Item = &MessageItem> {
-        self.conversation.items()
+    /// A snapshot of the current conversation items (for persistence).
+    pub fn items_snapshot(&self) -> Vec<MessageItem> {
+        self.conversation.lock().unwrap().items.clone()
     }
 
-    /// Ends the in-flight response (e.g. after a stream error), keeping whatever
-    /// was produced so far and clearing the "receiving" state so the turn is no
-    /// longer considered busy.
+    /// The engine committed the streamed response to the shared conversation:
+    /// drop the live in-progress view so the same content isn't rendered twice,
+    /// transferring live expanded state onto the now-committed items (which sit
+    /// at the tail of the conversation).
+    pub fn commit_live(&mut self) {
+        if let Some(partial) = self.receiving_response.take() {
+            let committed = partial.items.iter().flatten().count();
+            let base_index = self
+                .conversation
+                .lock()
+                .unwrap()
+                .items
+                .len()
+                .saturating_sub(committed);
+            for &live_idx in &self.live_expanded_items {
+                self.expanded_items.insert(base_index + live_idx);
+            }
+            self.live_expanded_items.clear();
+        }
+    }
+
+    /// Ends the in-flight response (stream error / cancellation), salvaging
+    /// whatever was produced so far into the conversation — the engine commits
+    /// nothing for a response that errored or was cancelled mid-stream — and
+    /// clearing the "receiving" state so the turn is no longer considered busy.
     pub fn abort_receiving(&mut self) {
         if let Some(partial) = self.receiving_response.take() {
             // Transfer live expanded state before items become historical,
             // so reasoning/tool-call items the user expanded during streaming
             // stay expanded instead of auto-collapsing.
-            let base_index = self.conversation.items.len();
+            let base_index = self.conversation.lock().unwrap().items.len();
             for &live_idx in &self.live_expanded_items {
                 self.expanded_items.insert(base_index + live_idx);
             }
@@ -613,8 +647,9 @@ impl ConversationPanel {
             } else {
                 partial.into_aborted_items()
             };
+            let mut conv = self.conversation.lock().unwrap();
             for item in items {
-                self.conversation.add_output(item);
+                conv.add_output(item);
             }
         }
     }
@@ -658,21 +693,16 @@ impl ConversationPanel {
         }
     }
 
-    pub fn handle_response_stream_event(
-        &mut self,
-        response_stream_event: ResponseStreamEvent,
-    ) -> Option<PartialResponse> {
+    /// Fold a streaming chunk into the live view. Rendering-only: the engine
+    /// owns the authoritative folding and commits the finished response to the
+    /// shared conversation itself — the live copy here just shows tokens as
+    /// they arrive, and is dropped on [`ConversationPanel::commit_live`].
+    pub fn handle_response_stream_event(&mut self, response_stream_event: ResponseStreamEvent) {
         let receiving_response = self
             .receiving_response
             .as_mut()
             .expect("handle_response_stream_event called with no receiving_response");
         receiving_response.handle_response_stream_event(response_stream_event);
-
-        if receiving_response.finished() {
-            self.receiving_response.take()
-        } else {
-            None
-        }
     }
 
     /// Build the API request input from the conversation history. Delegates to
@@ -686,6 +716,8 @@ impl ConversationPanel {
         coauthor: Option<&str>,
     ) -> InputParam {
         self.conversation
+            .lock()
+            .unwrap()
             .to_input_param(current_model, skill_prompt, plan_prompt, coauthor)
     }
 }

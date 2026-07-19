@@ -87,6 +87,9 @@ pub(crate) struct Engine {
     /// Post-edit diagnostics feedback, driven inside the turn loop. Off by
     /// default, so `-p` runs stay lean.
     pub diagnostics: DiagnosticsFeedback,
+    /// Set while the stream layer is retrying a dropped connection; shared so
+    /// a front-end can show a "retrying" indicator.
+    pub stream_retrying: Arc<AtomicBool>,
 }
 
 /// Configuration and running state for the engine's post-edit feedback: after a
@@ -191,7 +194,7 @@ impl Engine {
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
     ) -> Result<TurnResult, EngineError> {
-        let retrying = AtomicBool::new(false);
+        let retrying = &self.stream_retrying;
 
         for _ in 0..self.max_iterations {
             if cancel.is_cancelled() {
@@ -218,7 +221,7 @@ impl Engine {
             surface.on_event(EngineEvent::Phase(EnginePhase::Streaming));
             let mut partial = PartialResponse::new(cancel.child());
             let mut stream_err: Option<OpenAIError> = None;
-            stream::stream_with_retries(&self.client, &req, cancel, &retrying, |result| {
+            stream::stream_with_retries(&self.client, &req, cancel, retrying, |result| {
                 match result {
                     Ok(ev) => {
                         // Forward each chunk for live rendering, then fold it
@@ -392,15 +395,14 @@ impl Engine {
         // before); an interactive surface routes it to the user; a sub-agent's
         // surface forwards it up the tree.
         let mut allowed = outcome.allowed;
-        for (call, reason) in outcome.ask {
+        let ask_total = outcome.ask.len();
+        for (idx, (call, reason)) in outcome.ask.into_iter().enumerate() {
             if cancel.is_cancelled() {
                 return None;
             }
-            match surface.review(&call, &reason).await {
+            match surface.review(&call, &reason, (idx + 1, ask_total)).await {
                 ReviewDecision::Approve => allowed.push(call),
-                ReviewDecision::Deny { reason } => {
-                    denied.push(classify::classifier_denied_output(&call, &reason))
-                }
+                ReviewDecision::Deny { output } => denied.push(output),
             }
         }
         denied.extend(outcome.denied);
@@ -666,6 +668,7 @@ mod tests {
             coauthor: None,
             max_iterations,
             diagnostics: DiagnosticsFeedback::default(),
+            stream_retrying: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -822,12 +825,20 @@ mod tests {
             };
             self.events.lock().unwrap().push(label);
         }
-        async fn review(&self, _call: &FunctionToolCall, reason: &str) -> ReviewDecision {
+        async fn review(
+            &self,
+            call: &FunctionToolCall,
+            reason: &str,
+            _position: (usize, usize),
+        ) -> ReviewDecision {
             if self.approve {
                 ReviewDecision::Approve
             } else {
                 ReviewDecision::Deny {
-                    reason: format!("surface refused: {reason}"),
+                    output: classify::classifier_denied_output(
+                        call,
+                        &format!("surface refused: {reason}"),
+                    ),
                 }
             }
         }
@@ -847,6 +858,7 @@ mod tests {
             coauthor: None,
             max_iterations: 10,
             diagnostics: DiagnosticsFeedback::default(),
+            stream_retrying: Arc::new(AtomicBool::new(false)),
         }
     }
 

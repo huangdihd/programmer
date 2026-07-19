@@ -244,6 +244,7 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         max_iterations: crate::consts::ENGINE_MAX_ITERATIONS,
         // Print mode stays lean: no post-edit diagnostics feedback for now.
         diagnostics: crate::engine::DiagnosticsFeedback::default(),
+        stream_retrying: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let mut conversation = crate::conversation::Conversation::new();
