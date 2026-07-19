@@ -265,7 +265,7 @@ fn generate_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos()
-        ^ (std::process::id() as u32))
+        ^ std::process::id())
         .wrapping_mul(1_103_515_245);
     format!("{:x}{:08x}", millis, random)
 }
