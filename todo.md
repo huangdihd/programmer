@@ -10,6 +10,7 @@
 - ~~default classifier model~~
 - monitor local file changes and prevent modifications after changes before read
 - after switch sessions using /new, task can't be cleaned and todos can't update as expectations
+- thinking level adjustment
 - ~~/compact~~
 - ~~fix /init~~
 - ~~interactive background task terminal~~
