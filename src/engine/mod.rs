@@ -38,7 +38,9 @@ use crate::response::response_finish_reason::ResponseFinishReason;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{FunctionToolCall, OutputItem, OutputMessageContent, Tool};
+use async_openai::types::responses::{
+    FunctionToolCall, OutputItem, OutputMessageContent, ResponseStreamEvent, Tool,
+};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -129,14 +131,42 @@ pub(crate) enum EngineError {
     EmptyResponse,
 }
 
-/// Progress events emitted during a turn. Print mode ignores these; sub-agents
-/// will stream them.
+/// A coarse turn phase, surfaced so a front-end can show a status indicator.
+/// Mirrors the TUI's `ActivePhase`; the headless surface ignores it.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum EnginePhase {
+    /// Streaming a model response.
+    Streaming,
+    /// Classifying the requested tool calls.
+    Classifying,
+    /// Executing approved tool calls.
+    RunningTools,
+    /// Running post-edit diagnostics.
+    Checking,
+}
+
+/// Progress events emitted during a turn. Print mode ignores these; the TUI
+/// surface renders them; sub-agents forward them up. Because the conversation
+/// is shared with the front-end, *committed* history is read straight from it —
+/// these events carry only the in-flight/ephemeral state that isn't in the
+/// conversation yet (live stream tokens, phase, the commit boundary).
 #[allow(dead_code)]
 pub(crate) enum EngineEvent<'a> {
+    /// A raw streaming chunk of the in-flight response, for live token
+    /// rendering before the response is committed. Boxed because a
+    /// `ResponseStreamEvent` dwarfs the other variants.
+    StreamChunk(Box<ResponseStreamEvent>),
+    /// The streamed response's items were just committed to the shared
+    /// conversation; a live renderer should now drop its in-progress view so
+    /// the same content isn't shown twice.
+    ResponseCommitted,
     /// The model produced assistant text this iteration.
     Assistant(&'a str),
     /// A tool call is about to run.
     ToolCall { name: &'a str },
+    /// The turn moved to a new phase.
+    Phase(EnginePhase),
 }
 
 impl Engine {
@@ -146,7 +176,7 @@ impl Engine {
     /// output and tool result, exactly as the TUI would record them.
     pub(crate) async fn run_turn(
         &mut self,
-        conversation: &mut Conversation,
+        conversation: &Mutex<Conversation>,
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
     ) -> Result<TurnResult, EngineError> {
@@ -158,23 +188,32 @@ impl Engine {
             }
 
             // ---- stream one response, folding it locally ----
+            // The conversation is shared with the front-end (the TUI renders it
+            // every frame), so every touch takes a brief lock and releases it
+            // before the next await — a guard held across `.await` would make
+            // this future non-`Send` and fail to compile under `tokio::spawn`,
+            // which is exactly the discipline we want enforced.
             let ctx = request::SystemContext {
                 current_model: &self.model_str,
                 skill_prompt: None,
                 plan_prompt: None,
                 coauthor: self.coauthor.as_deref(),
             };
-            let req = request::build_request(
-                conversation,
-                &ctx,
-                self.model_name.clone(),
-                self.tools.clone(),
-            );
+            let req = {
+                let conv = conversation.lock().unwrap();
+                request::build_request(&conv, &ctx, self.model_name.clone(), self.tools.clone())
+            };
+            surface.on_event(EngineEvent::Phase(EnginePhase::Streaming));
             let mut partial = PartialResponse::new(cancel.child());
             let mut stream_err: Option<OpenAIError> = None;
             stream::stream_with_retries(&self.client, &req, cancel, &retrying, |result| {
                 match result {
-                    Ok(ev) => partial.handle_response_stream_event(ev),
+                    Ok(ev) => {
+                        // Forward each chunk for live rendering, then fold it
+                        // into our own partial to extract the committed items.
+                        surface.on_event(EngineEvent::StreamChunk(Box::new(ev.clone())));
+                        partial.handle_response_stream_event(ev);
+                    }
                     Err(e) => stream_err = Some(e),
                 }
             })
@@ -210,21 +249,29 @@ impl Engine {
                 .collect();
             let assistant_text = message_text(&items);
 
-            for item in items {
-                conversation.add_output(item);
+            {
+                let mut conv = conversation.lock().unwrap();
+                for item in items {
+                    conv.add_output(item);
+                }
+                if let Some((input, output)) = usage {
+                    conv.add_usage(input, output);
+                }
             }
-            if let Some((input, output)) = usage {
-                conversation.add_usage(input, output);
-            }
+            // Committed to the shared conversation: tell a live renderer to drop
+            // its in-progress view now (after the commit, so there is no frame
+            // where neither the in-flight nor the committed copy shows).
+            surface.on_event(EngineEvent::ResponseCommitted);
             if !assistant_text.is_empty() {
                 surface.on_event(EngineEvent::Assistant(&assistant_text));
             }
 
             // ---- no tool calls → the turn is done ----
             if calls.is_empty() {
+                let usage = conversation.lock().unwrap().accumulated_usage;
                 return Ok(TurnResult {
                     final_text: assistant_text,
-                    usage: conversation.accumulated_usage,
+                    usage,
                 });
             }
 
@@ -253,11 +300,14 @@ impl Engine {
                         && outputs
                             .iter()
                             .any(|o| !o.failed && edit_call_ids.contains(&o.param.call_id));
-                    for out in outputs {
-                        conversation.add_tool_output(out);
+                    {
+                        let mut conv = conversation.lock().unwrap();
+                        for out in outputs {
+                            conv.add_tool_output(out);
+                        }
                     }
                     if edited {
-                        self.run_post_edit_diagnostics(conversation).await;
+                        self.run_post_edit_diagnostics(conversation, surface).await;
                     }
                 }
                 None => return Err(EngineError::Cancelled),
@@ -273,7 +323,7 @@ impl Engine {
     /// forever on a dead answer channel.
     async fn run_calls(
         &self,
-        conversation: &Conversation,
+        conversation: &Mutex<Conversation>,
         calls: Vec<FunctionToolCall>,
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
@@ -292,6 +342,7 @@ impl Engine {
             }
         }
 
+        surface.on_event(EngineEvent::Phase(EnginePhase::Classifying));
         let outcome = match &self.policy {
             EnginePolicy::Yolo => classify::ClassificationOutcome {
                 allowed: classifiable,
@@ -302,9 +353,11 @@ impl Engine {
                 classify::classify_sync(classifier.as_ref(), &classifiable, cancel)?
             }
             EnginePolicy::Llm(p) => {
-                let items: Vec<&crate::response::message_item::MessageItem> =
-                    conversation.items().collect();
-                let (light, full) = classify::build_classifier_context(&items);
+                let (light, full) = {
+                    let conv = conversation.lock().unwrap();
+                    let items: Vec<&MessageItem> = conv.items().collect();
+                    classify::build_classifier_context(&items)
+                };
                 classify::classify_llm(
                     &p.client,
                     &p.model_name,
@@ -337,6 +390,7 @@ impl Engine {
         }
         denied.extend(outcome.denied);
 
+        surface.on_event(EngineEvent::Phase(EnginePhase::RunningTools));
         // The sender only matters for ask_user, which is already pre-denied, so
         // a throwaway channel (with a dropped receiver) is safe here.
         let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -360,7 +414,11 @@ impl Engine {
     /// present (so it renders inside that call) and otherwise added as its own
     /// system note. Mirrors the TUI's old `continue_with_diagnostics` +
     /// `apply_diagnostics`, but sequential inside the loop rather than spawned.
-    async fn run_post_edit_diagnostics(&mut self, conversation: &mut Conversation) {
+    async fn run_post_edit_diagnostics(
+        &mut self,
+        conversation: &Mutex<Conversation>,
+        surface: &dyn AgentSurface,
+    ) {
         self.diagnostics.mutating_turns += 1;
         let reminder_due = self
             .diagnostics
@@ -371,6 +429,7 @@ impl Engine {
         let mut parts: Vec<String> = Vec::new();
 
         if std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
+            surface.on_event(EngineEvent::Phase(EnginePhase::Checking));
             let cwd = std::env::current_dir()
                 .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
             let snapshot = crate::diagnostics::collect(&cwd).await.unwrap_or_default();
@@ -414,14 +473,16 @@ impl Engine {
 /// recent editing tool's output when one is present (so it renders as part of
 /// that call's result and is sent back with it), otherwise added as its own
 /// system note.
-fn inject_post_edit_feedback(conversation: &mut Conversation, text: &str) {
-    if let Some(call_id) = last_edit_output_call_id(conversation) {
+fn inject_post_edit_feedback(conversation: &Mutex<Conversation>, text: &str) {
+    let mut conv = conversation.lock().unwrap();
+    let call_id = last_edit_output_call_id(&conv);
+    if let Some(call_id) = call_id {
         let block = format!("\n\n--- Post-edit check ---\n{text}");
-        if conversation.append_to_tool_output(&call_id, &block) {
+        if conv.append_to_tool_output(&call_id, &block) {
             return;
         }
     }
-    conversation.add_meta("\u{25B8} System", text);
+    conv.add_meta("\u{25B8} System", text);
 }
 
 /// The call id of the most recent file-editing tool output in `conversation`, so
@@ -635,17 +696,20 @@ mod tests {
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
         let mut engine = engine_for(&base, 10);
-        let mut conv = Conversation::new();
-        conv.add_input_message(user("read the manifest"));
+        let mut c = Conversation::new();
+        c.add_input_message(user("read the manifest"));
+        let conv = Mutex::new(c);
         let cancel = CancellationToken::new();
         let result = engine
-            .run_turn(&mut conv, &cancel, &HeadlessSurface)
+            .run_turn(&conv, &cancel, &HeadlessSurface)
             .await
             .expect("turn completes");
 
         assert_eq!(result.final_text, "all done");
         // History order: user, call, tool output, final message.
         let kinds: Vec<&str> = conv
+            .lock()
+            .unwrap()
             .items()
             .map(|it| match it {
                 MessageItem::Input(_) => "input",
@@ -675,19 +739,20 @@ mod tests {
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
         let mut engine = engine_for(&base, 10);
-        let mut conv = Conversation::new();
-        conv.add_input_message(user("hi"));
+        let mut c = Conversation::new();
+        c.add_input_message(user("hi"));
+        let conv = Mutex::new(c);
         let cancel = CancellationToken::new();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            engine.run_turn(&mut conv, &cancel, &HeadlessSurface),
+            engine.run_turn(&conv, &cancel, &HeadlessSurface),
         )
         .await
         .expect("must not hang on ask_user")
         .expect("turn completes");
         assert_eq!(result.final_text, "done anyway");
         // The ask_user call got a denial tool output.
-        let denied = conv.items().any(|it| matches!(
+        let denied = conv.lock().unwrap().items().any(|it| matches!(
             it,
             MessageItem::ToolOutput { output, failed: true, .. }
                 if matches!(&output.output,
@@ -707,10 +772,11 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body]).await;
         let mut engine = engine_for(&base, 3);
-        let mut conv = Conversation::new();
-        conv.add_input_message(user("loop"));
+        let mut c = Conversation::new();
+        c.add_input_message(user("loop"));
+        let conv = Mutex::new(c);
         let cancel = CancellationToken::new();
-        let err = engine.run_turn(&mut conv, &cancel, &HeadlessSurface).await.unwrap_err();
+        let err = engine.run_turn(&conv, &cancel, &HeadlessSurface).await.unwrap_err();
         assert!(matches!(err, EngineError::IterationCap(3)), "got {err:?}");
     }
 
@@ -727,6 +793,10 @@ mod tests {
             let label = match event {
                 EngineEvent::Assistant(t) => format!("assistant:{t}"),
                 EngineEvent::ToolCall { name } => format!("tool:{name}"),
+                // Ephemeral progress events aren't asserted on in these tests.
+                EngineEvent::StreamChunk(_)
+                | EngineEvent::ResponseCommitted
+                | EngineEvent::Phase(_) => return,
             };
             self.events.lock().unwrap().push(label);
         }
@@ -766,7 +836,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         let engine = sync_engine(crate::classifier::WorkMode::Manual);
-        let conv = Conversation::new();
+        let conv = Mutex::new(Conversation::new());
         let cancel = CancellationToken::new();
         let surface = TestSurface {
             approve: true,
@@ -804,7 +874,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         let engine = sync_engine(crate::classifier::WorkMode::Manual);
-        let conv = Conversation::new();
+        let conv = Mutex::new(Conversation::new());
         let cancel = CancellationToken::new();
         let surface = TestSurface {
             approve: false,
@@ -836,8 +906,8 @@ mod tests {
     #[test]
     fn post_edit_feedback_appends_inside_the_edit_output() {
         use async_openai::types::responses::{FunctionCallOutput, FunctionCallOutputItemParam};
-        let mut conv = Conversation::new();
-        conv.add_output(OutputItem::FunctionCall(FunctionToolCall {
+        let mut c = Conversation::new();
+        c.add_output(OutputItem::FunctionCall(FunctionToolCall {
             arguments: "{}".into(),
             call_id: "e1".into(),
             namespace: None,
@@ -845,7 +915,7 @@ mod tests {
             id: None,
             status: None,
         }));
-        conv.add_tool_output(crate::tools::ToolOutput {
+        c.add_tool_output(crate::tools::ToolOutput {
             param: FunctionCallOutputItemParam {
                 call_id: "e1".into(),
                 output: FunctionCallOutput::Text("wrote file".into()),
@@ -855,10 +925,13 @@ mod tests {
             failed: false,
             approval_label: None,
         });
+        let conv = Mutex::new(c);
 
-        inject_post_edit_feedback(&mut conv, "2 new errors");
+        inject_post_edit_feedback(&conv, "2 new errors");
 
         let out = conv
+            .lock()
+            .unwrap()
             .items()
             .find_map(|it| match it {
                 MessageItem::ToolOutput { output, .. } if output.call_id == "e1" => {
@@ -874,15 +947,18 @@ mod tests {
         assert!(out.contains("--- Post-edit check ---"), "adds the header: {out}");
         assert!(out.contains("2 new errors"), "carries the feedback: {out}");
         // Folded into the output, so no separate system note.
-        assert!(!conv.items().any(|it| matches!(it, MessageItem::Meta { .. })));
+        assert!(!conv.lock().unwrap().items().any(|it| matches!(it, MessageItem::Meta { .. })));
     }
 
     #[test]
     fn post_edit_feedback_without_an_edit_output_adds_a_system_note() {
-        let mut conv = Conversation::new();
-        conv.add_input_message(user("hi"));
-        inject_post_edit_feedback(&mut conv, "reminder text");
+        let mut c = Conversation::new();
+        c.add_input_message(user("hi"));
+        let conv = Mutex::new(c);
+        inject_post_edit_feedback(&conv, "reminder text");
         let meta = conv
+            .lock()
+            .unwrap()
             .items()
             .find_map(|it| match it {
                 MessageItem::Meta { text, .. } => Some(text.clone()),
@@ -918,19 +994,22 @@ mod tests {
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
         let mut engine = engine_for(&base, 10); // Yolo; diagnostics disabled by default.
-        let mut conv = Conversation::new();
-        conv.add_input_message(user("write it"));
+        let mut c = Conversation::new();
+        c.add_input_message(user("write it"));
+        let conv = Mutex::new(c);
         let cancel = CancellationToken::new();
         engine
-            .run_turn(&mut conv, &cancel, &HeadlessSurface)
+            .run_turn(&conv, &cancel, &HeadlessSurface)
             .await
             .expect("turn completes");
 
         assert!(
-            !conv.items().any(|it| matches!(it, MessageItem::Meta { .. })),
+            !conv.lock().unwrap().items().any(|it| matches!(it, MessageItem::Meta { .. })),
             "no system note when diagnostics feedback is off"
         );
         let out = conv
+            .lock()
+            .unwrap()
             .items()
             .find_map(|it| match it {
                 MessageItem::ToolOutput { output, .. } if output.call_id == "w1" => {

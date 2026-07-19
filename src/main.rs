@@ -252,6 +252,9 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         role: InputRole::User,
         status: Some(OutputStatus::Completed),
     }));
+    // Shared behind a Mutex to match `run_turn`'s signature (the TUI shares the
+    // conversation with its render thread; print mode has only this one owner).
+    let conversation = std::sync::Mutex::new(conversation);
 
     // Ctrl-C cancels the in-flight turn.
     let cancel = crate::cancel::CancellationToken::new();
@@ -263,7 +266,7 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
     });
 
     match engine
-        .run_turn(&mut conversation, &cancel, &crate::engine::HeadlessSurface)
+        .run_turn(&conversation, &cancel, &crate::engine::HeadlessSurface)
         .await
     {
         Ok(result) => {
