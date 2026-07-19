@@ -7,7 +7,7 @@
 - configurable restricted access control rule system
 - multi agents(traditional sub agents or use interactive background task system to launch itself again?)
 - sandbox
-- default classifier model
+- ~~default classifier model~~
 - monitor local file changes and prevent modifications after changes before read
 - after switch sessions using /new, task can't be cleaned and todos can't update as expectations
 - ~~/compact~~
