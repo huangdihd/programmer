@@ -13,6 +13,7 @@
 - thinking level adjustment
 - /usage
 - title on terminal
+- /compact [model]
 - ~~/compact~~
 - ~~fix /init~~
 - ~~interactive background task terminal~~
