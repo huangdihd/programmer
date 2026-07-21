@@ -1,4 +1,4 @@
-- multimodal support
+- multimodal support(use /vision on/off to switch support)
 - ~~jump to bottom button~~
 - ~~http mcp~~
 - ~~edit_file tool diff-style message~~
