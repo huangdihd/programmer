@@ -4,6 +4,7 @@
 - ~~edit_file tool diff-style message~~
 - ~~lint~~
 - remote control(?)
+- improve command and task system
 - configurable restricted access control rule system
 - multi agents(traditional sub agents or use interactive background task system to launch itself again?)
 - sandbox
