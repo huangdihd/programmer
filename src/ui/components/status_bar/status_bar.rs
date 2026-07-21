@@ -59,6 +59,24 @@ impl StatusState {
                 | StatusState::Compacting
         )
     }
+
+    /// Emoji + short label suitable for terminal title bars.
+    pub(crate) fn emoji_label(self) -> &'static str {
+        match self {
+            StatusState::Idle => "\u{25cf} Ready",
+            StatusState::Connecting => "\u{25cc} Connecting",
+            StatusState::Retrying => "\u{21bb} Retrying",
+            StatusState::Thinking => "\u{25cf} Thinking",
+            StatusState::Outputting => "\u{25b8} Outputting",
+            StatusState::CreatingToolCall => "\u{2692} Creating tool call",
+            StatusState::ToolRunning => "\u{26a1} Running tools",
+            StatusState::Classifying => "\u{25cd} Evaluating",
+            StatusState::Checking => "\u{25c7} Checking diagnostics",
+            StatusState::Compacting => "\u{29c9} Compacting",
+            StatusState::WaitingAnswer => "? Waiting for answer",
+            StatusState::WaitingApproval => "\u{1f6e1} Waiting for approval",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -92,5 +110,60 @@ impl StatusBar {
 
     pub fn elapsed(&self) -> Option<std::time::Duration> {
         self.busy_start.map(|start| start.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every status variant has a human-readable emoji label.
+    #[test]
+    fn emoji_label_all_variants_non_empty() {
+        let variants = [
+            StatusState::Idle,
+            StatusState::Connecting,
+            StatusState::Retrying,
+            StatusState::Thinking,
+            StatusState::Outputting,
+            StatusState::CreatingToolCall,
+            StatusState::ToolRunning,
+            StatusState::Classifying,
+            StatusState::Checking,
+            StatusState::Compacting,
+            StatusState::WaitingAnswer,
+            StatusState::WaitingApproval,
+        ];
+        for v in variants {
+            let label = v.emoji_label();
+            assert!(!label.is_empty(), "{v:?} returned empty label");
+        }
+    }
+
+    /// Each variant has a visually distinct label so the user can tell
+    /// states apart at a glance.
+    #[test]
+    fn emoji_label_all_distinct() {
+        use std::collections::HashSet;
+        let variants = [
+            StatusState::Idle,
+            StatusState::Connecting,
+            StatusState::Retrying,
+            StatusState::Thinking,
+            StatusState::Outputting,
+            StatusState::CreatingToolCall,
+            StatusState::ToolRunning,
+            StatusState::Classifying,
+            StatusState::Checking,
+            StatusState::Compacting,
+            StatusState::WaitingAnswer,
+            StatusState::WaitingApproval,
+        ];
+        let labels: HashSet<&str> = variants.iter().map(|v| v.emoji_label()).collect();
+        assert_eq!(
+            labels.len(),
+            variants.len(),
+            "duplicate labels detected"
+        );
     }
 }

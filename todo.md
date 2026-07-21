@@ -12,7 +12,8 @@
 - after switch sessions using /new, task can't be cleaned and todos can't update as expectations
 - thinking level adjustment
 - /usage
-- title on terminal
+- method to refetch models from providers
+- ~~title on terminal~~
 - /compact [model]
 - ~~/compact~~
 - ~~fix /init~~

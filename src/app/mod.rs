@@ -159,6 +159,8 @@ pub struct App<'a> {
     pub(crate) cancel: CancelState,
     /// Session identity, persistence handle, and deferred-save flag.
     pub(crate) session: SessionState,
+    /// Project directory name for the terminal title.
+    pub(crate) project_name: String,
     /// Plan mode sub-phase. Only meaningful when `work_mode == WorkMode::Plan`.
     pub(crate) plan_phase: crate::classifier::PlanPhase,
     /// Which option is highlighted in the plan review bar.
@@ -191,6 +193,7 @@ impl App<'_> {
         session_mgr: Option<SessionManager>,
         startup_messages: Vec<String>,
         open_provider_panel: bool,
+        project_name: String,
     ) -> Self {
         let provider_manager = ProviderManager::new(&config).await;
         let mut current_model = provider_manager.default_model();
@@ -278,6 +281,7 @@ impl App<'_> {
             mcp_manager: None,
             plan_phase: crate::classifier::PlanPhase::default(),
             plan_review_selected: 0,
+            project_name,
         };
 
         if !saved_activated_skills.is_empty() {

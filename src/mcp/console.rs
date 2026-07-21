@@ -45,7 +45,7 @@ pub(crate) async fn run(
     addr: SocketAddr,
     allow_yolo: bool,
 ) -> color_eyre::Result<()> {
-    let (_guard, mut terminal) = crate::terminal::TerminalGuard::enter()?;
+    let (_guard, mut terminal) = crate::terminal::TerminalGuard::enter("programmer")?;
     let mut logs: VecDeque<LogEntry> = VecDeque::new();
     let mut pending: VecDeque<ApprovalRequest> = VecDeque::new();
     let mut events = EventStream::new();

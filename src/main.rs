@@ -461,11 +461,20 @@ async fn main() -> color_eyre::Result<()> {
     let bootstrap = resolve_session(resume);
     let (programmer_config, _config_path) = load_config()?;
 
+    // Derive a project name from the current directory for the terminal title.
+    let project_name = std::env::current_dir()
+        .ok()
+        .and_then(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "programmer".to_string());
+
     // ---- run the TUI ----
     let final_uuid;
     let result;
     {
-        let (_guard, terminal) = terminal::TerminalGuard::enter()?;
+        let (_guard, terminal) = terminal::TerminalGuard::enter(&project_name)?;
         (result, final_uuid) = App::new(
             programmer_config,
             bootstrap.items,
@@ -475,6 +484,7 @@ async fn main() -> color_eyre::Result<()> {
             bootstrap.mgr,
             bootstrap.messages,
             args.providers,
+            project_name,
         )
         .await
         .run(terminal)

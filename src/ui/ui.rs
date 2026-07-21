@@ -329,6 +329,12 @@ impl Widget for &mut App<'_> {
         // Resolve the single status the footer should show, then let the
         // status bar track its own busy timer.
         self.footer.status.set(self.resolve_status());
+        // Keep the terminal title in sync with the current status.
+        crate::terminal::set_terminal_title(&format!(
+            "{} {} \u{b7} programmer",
+            self.footer.status.status.emoji_label(),
+            self.project_name,
+        ));
         // Live MCP progress rides along as status detail while a call runs
         // (progress state is cleared when the call finishes).
         self.footer.status.detail = self
