@@ -71,7 +71,16 @@ impl McpConn {
     ) -> Result<(), String> {
         match self {
             McpConn::Stdio(c) => c.send_notification(method, params).await,
-            McpConn::Http(c) => c.send_notification(method, params).await,
+            // Notifications expect no response body, but the HTTP POST still
+            // awaits the server's status reply — give it a deadline too.
+            McpConn::Http(c) => tokio::time::timeout(
+                Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                c.send_notification(method, params),
+            )
+            .await
+            .map_err(|_| {
+                format!("MCP notification '{method}' timed out after {HANDSHAKE_TIMEOUT_SECS}s")
+            })?,
         }
     }
 

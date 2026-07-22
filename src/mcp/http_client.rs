@@ -67,9 +67,24 @@ impl McpHttpClient {
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(format!("unsupported URL scheme '{}'", parsed.scheme()));
         }
-        let client = reqwest::Client::builder()
+        let host = parsed.host_str().unwrap_or("");
+        let is_loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        let mut builder = reqwest::Client::builder()
             // Per-call deadlines come from `call_with_timeout`; no global one.
-            .user_agent(concat!("programmer/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("programmer/", env!("CARGO_PKG_VERSION")));
+        if is_loopback {
+            // HTTP_PROXY/system proxies must not intercept loopback servers:
+            // an intercepting local proxy (antivirus, VPN client) can stall
+            // or silently drop these connections.
+            builder = builder.no_proxy();
+        }
+        let client = builder
             .build()
             .map_err(|e| format!("cannot build HTTP client: {e}"))?;
         Ok(McpHttpClient {
