@@ -46,6 +46,16 @@ pub enum FinalizeError {
     StreamError(#[from] async_openai::error::OpenAIError),
 }
 
+/// Coarse kind of the output item currently streaming, for the status bar:
+/// reasoning reads as "Thinking", a message as "Outputting", and any tool-call
+/// variant (function/MCP/custom/code-interpreter) as "Creating tool call".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingKind {
+    Reasoning,
+    Message,
+    ToolCall,
+}
+
 #[derive(Debug)]
 pub struct PartialResponse {
     pub items: Vec<Option<OutputItem>>,
@@ -521,6 +531,27 @@ impl PartialResponse {
     /// UI shows as "Connecting" rather than "Thinking".
     pub fn started(&self) -> bool {
         self.items.iter().any(Option::is_some) || self.usage.is_some()
+    }
+
+    /// What the stream is producing right now, from the last in-progress item:
+    /// `None` between items (or before the first), otherwise its coarse kind.
+    /// Drives the status indicator during streaming.
+    pub fn streaming_kind(&self) -> Option<StreamingKind> {
+        self.items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, slot)| {
+                let item = slot.as_ref()?;
+                if self.finished_items.get(i).copied().unwrap_or(false) {
+                    return None;
+                }
+                Some(match item {
+                    OutputItem::Message(_) => StreamingKind::Message,
+                    OutputItem::Reasoning(_) => StreamingKind::Reasoning,
+                    _ => StreamingKind::ToolCall,
+                })
+            })
     }
 
     /// Returns true if any output item in this partial response is a function

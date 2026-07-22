@@ -53,7 +53,17 @@ impl App<'_> {
                         StatusState::Connecting
                     }
                 }
-                Some(_) => StatusState::Thinking,
+                // Streaming: derive the state from what the model is emitting
+                // right now — reasoning, visible text, or a tool call.
+                Some(partial) => match partial.streaming_kind() {
+                    Some(crate::response::partial_response::StreamingKind::ToolCall) => {
+                        StatusState::CreatingToolCall
+                    }
+                    Some(crate::response::partial_response::StreamingKind::Message) => {
+                        StatusState::Outputting
+                    }
+                    _ => StatusState::Thinking,
+                },
                 None => StatusState::Idle,
             },
         }
