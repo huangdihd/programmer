@@ -68,8 +68,10 @@ impl TaskStatus {
 /// into a vt100 screen grid. Present only for tasks created interactively;
 /// pipe-based tasks leave this `None` and use `kill`/`stdin_tx` instead.
 struct PtyState {
-    /// Writes bytes (keystrokes, mouse sequences) to the child.
-    writer: Box<dyn Write + Send>,
+    /// Writes bytes (keystrokes, mouse sequences) to the child. Shared with
+    /// the reader thread, which answers cursor-position queries (`ESC[6n`)
+    /// on the child's behalf — see `spawn_interactive`.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// The screen grid, fed by a background reader thread.
     parser: Arc<Mutex<vt100::Parser>>,
     /// Kept for `resize`.
@@ -308,6 +310,31 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
     Ok(id)
 }
 
+/// Restrict `LoadLibrary`'s search to the application and system directories.
+///
+/// Without this, portable-pty's `LoadLibrary("conpty.dll")` probe walks `PATH`
+/// and can pick up another program's ConPTY implementation — WezTerm ships
+/// `conpty.dll` + `OpenConsole.exe`, and under its host our PTY children hang
+/// with no output ever arriving. Cutting `PATH`/cwd out of the DLL search makes
+/// the probe fail cleanly so portable-pty falls back to the system ConPTY in
+/// kernel32. (Also standard DLL-hijack hardening; spawning child processes is
+/// unaffected.) Must run before the first `openpty`, which caches whichever
+/// implementation it finds first; `Once` makes repeat calls free.
+#[cfg(windows)]
+pub fn harden_dll_search() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetDefaultDllDirectories(flags: u32) -> i32;
+        }
+        unsafe {
+            SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        }
+    });
+}
+
 /// Spawn `command` in a real PTY as an interactive background task. Its output
 /// is parsed into a vt100 screen grid (readable via [`screen_snapshot`]) and it
 /// is driven with byte input via [`write_bytes`] rather than line-based stdin.
@@ -318,6 +345,8 @@ pub fn spawn_interactive(
     rows: u16,
     cols: u16,
 ) -> Result<u64, String> {
+    #[cfg(windows)]
+    harden_dll_search();
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -362,17 +391,61 @@ pub fn spawn_interactive(
         .master
         .take_writer()
         .map_err(|e| format!("error: failed to write pty: {e}"))?;
+    let writer = Arc::new(Mutex::new(writer));
     let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, PTY_SCROLLBACK)));
     let killed = Arc::new(AtomicBool::new(false));
 
     let id = next_id();
 
+    // Register the entry before the reader thread starts, so the first bytes
+    // (which can arrive within milliseconds) find the transcript buffer.
+    {
+        let mut reg = registry().lock().unwrap();
+        reg.push(TaskEntry {
+            id,
+            name: name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or(command)
+                .to_string(),
+            command: command.to_string(),
+            status: TaskStatus::Running,
+            exit_code: None,
+            started: Instant::now(),
+            finished: None,
+            output: String::new(),
+            stderr_output: String::new(),
+            max_output: MAX_TASK_OUTPUT,
+            kill: None,
+            stdin_tx: None,
+            pty: Some(PtyState {
+                writer: Arc::clone(&writer),
+                parser: Arc::clone(&parser),
+                master: pair.master,
+                killer,
+                killed: Arc::clone(&killed),
+                rows,
+                cols,
+                transcript: String::new(),
+                last_screen_text: None,
+            }),
+        });
+    }
+
     // Reader thread: pump PTY output into the vt100 parser until EOF. Blocking
     // reads keep this off the async runtime.
+    //
+    // No real terminal sits behind this PTY, so cursor-position queries
+    // (`ESC[6n`) are answered here from the vt100 grid. Windows ConPTY makes
+    // this load-bearing: it is created with INHERIT_CURSOR and blocks the
+    // child's startup on exactly that query until a report arrives.
     {
         let parser = Arc::clone(&parser);
+        let writer = Arc::clone(&writer);
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
+            // Tail of the previous chunk, kept so a query split across two
+            // reads is still recognised.
+            let mut window: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -381,6 +454,26 @@ pub fn spawn_interactive(
                             p.process(&buf[..n]);
                         }
                         append_transcript(id, &String::from_utf8_lossy(&buf[..n]));
+
+                        window.extend_from_slice(&buf[..n]);
+                        if window.windows(4).any(|w| w == b"\x1b[6n") {
+                            let (row, col) = parser
+                                .lock()
+                                .map(|p| p.screen().cursor_position())
+                                .unwrap_or((0, 0));
+                            // One write_all, not write!: conhost's
+                            // INHERIT_CURSOR handshake needs the whole report
+                            // in a single pipe write — write! would split it
+                            // per format fragment and the child never starts.
+                            let reply = format!("\x1b[{};{}R", row + 1, col + 1);
+                            if let Ok(mut w) = writer.lock() {
+                                let _ = w.write_all(reply.as_bytes());
+                                let _ = w.flush();
+                            }
+                            window.clear();
+                        } else if window.len() > 3 {
+                            window.drain(..window.len() - 3);
+                        }
                     }
                 }
             }
@@ -404,38 +497,6 @@ pub fn spawn_interactive(
                 Err(_) => (TaskStatus::Failed, None),
             };
             finish(id, status, code);
-        });
-    }
-
-    {
-        let mut reg = registry().lock().unwrap();
-        reg.push(TaskEntry {
-            id,
-            name: name
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or(command)
-                .to_string(),
-            command: command.to_string(),
-            status: TaskStatus::Running,
-            exit_code: None,
-            started: Instant::now(),
-            finished: None,
-            output: String::new(),
-            stderr_output: String::new(),
-            max_output: MAX_TASK_OUTPUT,
-            kill: None,
-            stdin_tx: None,
-            pty: Some(PtyState {
-                writer,
-                parser,
-                master: pair.master,
-                killer,
-                killed,
-                rows,
-                cols,
-                transcript: String::new(),
-                last_screen_text: None,
-            }),
         });
     }
 
@@ -469,9 +530,10 @@ pub fn write_bytes(id: u64, bytes: &[u8]) -> Result<(), String> {
     if status != TaskStatus::Running {
         return Err(format!("error: task {id} already finished ({})", status.label()));
     }
-    pty.writer
+    let mut writer = pty.writer.lock().unwrap();
+    writer
         .write_all(bytes)
-        .and_then(|()| pty.writer.flush())
+        .and_then(|()| writer.flush())
         .map_err(|e| format!("error: failed to send input to task {id}: {e}"))
 }
 
@@ -1233,6 +1295,22 @@ mod tests {
         let (snap, still) = wait(id, Duration::from_secs(10)).await.expect("wait");
         assert!(!still);
         assert_eq!(snap.status, TaskStatus::Killed);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn interactive_pty_shows_output_on_windows() {
+        // ConPTY path: output from a finished command must be visible both on
+        // the vt100 screen and in the transcript.
+        let id = spawn_interactive("echo win-pty-123", None, None, 24, 80).expect("spawn");
+        let (_, still) = wait(id, Duration::from_secs(15)).await.expect("wait");
+        assert!(!still, "interactive task should finish");
+        // Give the reader thread a moment to drain the PTY tail.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snap = screen_snapshot(id).expect("screen");
+        assert!(snap.text.contains("win-pty-123"), "screen: {:?}", snap.text);
+        let text = transcript(id).expect("transcript");
+        assert!(text.contains("win-pty-123"), "transcript: {text:?}");
     }
 
     #[test]
