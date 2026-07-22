@@ -166,11 +166,13 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
     }
 }
 
-/// `/compact`: ask the model for a continuation summary of the conversation so
-/// far, then (in [`super::events`]'s `CompactFinished` handler) install it as a
-/// context boundary — the model afterwards sees the summary instead of the
-/// summarized history, while the UI keeps everything visible.
-pub(crate) fn start_compact(app: &mut App<'_>) {
+/// `/compact [provider/model]`: ask the model for a continuation summary of the
+/// conversation so far, then (in [`super::events`]'s `CompactFinished` handler)
+/// install it as a context boundary — the model afterwards sees the summary
+/// instead of the summarized history, while the UI keeps everything visible.
+/// An argument picks a different model for the summarization request only; the
+/// chat model is unchanged.
+pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
     use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
     use crate::ui::event::Event;
     use async_openai::types::responses::{CreateResponse, InputItem, InputParam, Item, OutputItem, OutputMessageContent};
@@ -185,19 +187,28 @@ pub(crate) fn start_compact(app: &mut App<'_>) {
             .add_info_string("nothing to compact yet".to_string());
         return;
     }
-    let (client, model_name) = match app.provider_manager.resolve(&app.current_model) {
+    let target_model = if model_arg.is_empty() {
+        app.current_model.clone()
+    } else {
+        model_arg.to_string()
+    };
+    let (client, model_name) = match app.provider_manager.resolve(&target_model) {
         Some((c, m)) => (c.clone(), m),
         None => {
             app.conversation_panel
-                .add_error_string(format!("unknown provider/model: {}", app.current_model));
+                .add_error_string(format!("unknown provider/model: {target_model}"));
             return;
         }
     };
+    if !model_arg.is_empty() {
+        app.conversation_panel
+            .add_info_string(format!("compacting with {target_model}"));
+    }
 
     // The full current context plus the summarization instruction. No tools:
     // the model must answer with the summary text, not act.
     let mut input_items = match app.conversation_panel.get_input_param(
-        &app.current_model,
+        &target_model,
         None,
         None,
         None,
@@ -491,9 +502,11 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
             app.input_panel.clear();
             open_terminal(app, &arg);
         }
-        Some(Command::Compact) => {
+        Some(Command::Compact(arg)) => {
             app.input_panel.clear();
-            start_compact(app);
+            // Completion may append extra tokens; the model is the first one.
+            let model_arg = arg.split_whitespace().next().unwrap_or("").to_string();
+            start_compact(app, &model_arg);
         }
         Some(Command::Providers(arg)) => {
             app.input_panel.clear();

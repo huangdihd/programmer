@@ -48,9 +48,11 @@ pub enum Command {
     Plan(String),
     /// `/terminal [id]` — open the interactive terminal panel for a task.
     Terminal(String),
-    /// `/compact` — summarize the conversation so far and shrink the context
-    /// the model sees to that summary plus everything after it.
-    Compact,
+    /// `/compact [provider/model]` — summarize the conversation so far and
+    /// shrink the context the model sees to that summary plus everything
+    /// after it. The optional argument picks a different model for the
+    /// summarization request only.
+    Compact(String),
 }
 
 impl Command {
@@ -85,7 +87,7 @@ impl Command {
             "mcp" => Some(Command::Mcp(args)),
             "plan" => Some(Command::Plan(args)),
             "terminal" | "term" => Some(Command::Terminal(args)),
-            "compact" => Some(Command::Compact),
+            "compact" => Some(Command::Compact(args)),
             _ => None,
         }
     }
@@ -112,7 +114,7 @@ impl Command {
             ("/mcp show", "List configured MCP servers and their status"),
             ("/mcp manage", "Open the MCP server management panel"),
             ("/terminal [id]", "Open the interactive terminal for a PTY task"),
-            ("/compact", "Summarize older history to shrink the model's context"),
+            ("/compact [provider/model]", "Summarize older history to shrink the model's context"),
             ("/todo | /t", "Open the todo list panel"),
             ("/new | /n", "Start a new session (saves current)"),
             ("/providers show", "List all configured providers and models"),
@@ -201,6 +203,7 @@ impl CompletionEngine {
         match cmd {
             "model" | "m" => Self::complete_model(text, cmd, pm),
             "classifier" => Self::complete_model(text, cmd, pm),
+            "compact" => Self::complete_model(text, cmd, pm),
             "mode" => Self::complete_subcommand(text, cmd, &["manual", "edits", "auto"]),
             "providers" | "provider" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
             "skill" | "skills" => Self::complete_skill(text, cmd, skill_registry),

@@ -15,7 +15,7 @@
 - /usage
 - method to refetch models from providers
 - ~~title on terminal~~
-- /compact [model]
+- ~~/compact [model]~~
 - ~~/compact~~
 - ~~fix /init~~
 - ~~interactive background task terminal~~
