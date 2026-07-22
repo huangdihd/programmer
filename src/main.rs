@@ -241,7 +241,6 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         policy,
         mcp: None,
         coauthor: config.git_coauthor.clone(),
-        max_iterations: crate::consts::ENGINE_MAX_ITERATIONS,
         // Print mode stays lean: no post-edit diagnostics feedback for now.
         diagnostics: crate::engine::DiagnosticsFeedback::default(),
         stream_retrying: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -403,6 +402,8 @@ fn load_config() -> color_eyre::Result<(ProgrammerConfig, std::path::PathBuf)> {
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
+    #[cfg(windows)]
+    crate::tasks::harden_dll_search();
     let args = parse_args();
 
     if args.help {

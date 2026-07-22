@@ -144,11 +144,12 @@ mod tests {
     async fn denied_come_first_and_output_order_matches_call_order() {
         // A read, a write, a read — mixing the concurrent and serial paths.
         let tmp = std::env::temp_dir().join(format!("engine_batch_{}", std::process::id()));
-        let path = tmp.to_string_lossy().to_string();
+        // JSON-encode the path so Windows backslashes survive as valid JSON.
+        let path = serde_json::to_string(&tmp.to_string_lossy()).unwrap();
         let allowed = vec![
-            call("read_file", &format!("{{\"path\":\"{path}\"}}")),
-            call("write_file", &format!("{{\"path\":\"{path}\",\"content\":\"hi\"}}")),
-            call("read_file", &format!("{{\"path\":\"{path}\"}}")),
+            call("read_file", &format!("{{\"path\":{path}}}")),
+            call("write_file", &format!("{{\"path\":{path},\"content\":\"hi\"}}")),
+            call("read_file", &format!("{{\"path\":{path}}}")),
         ];
         let denied = vec![crate::engine::classify::classifier_denied_output(
             &call("command", "{}"),

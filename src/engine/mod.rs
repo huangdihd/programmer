@@ -83,7 +83,6 @@ pub(crate) struct Engine {
     pub policy: EnginePolicy,
     pub mcp: Option<Arc<McpManager>>,
     pub coauthor: Option<String>,
-    pub max_iterations: usize,
     /// Post-edit diagnostics feedback, driven inside the turn loop. Off by
     /// default, so `-p` runs stay lean.
     pub diagnostics: DiagnosticsFeedback,
@@ -139,8 +138,6 @@ pub enum EngineError {
     Api { code: Option<String>, message: String },
     #[error("cancelled")]
     Cancelled,
-    #[error("exceeded the {0}-iteration tool-loop cap")]
-    IterationCap(usize),
     #[error("the model returned no output")]
     EmptyResponse,
 }
@@ -186,7 +183,7 @@ pub(crate) enum EngineEvent<'a> {
 impl Engine {
     /// Run a full turn: stream a response, run any tool calls it requests, and
     /// loop until the model answers with no tool calls (returning its text) or
-    /// an error/cap is hit. `conversation` is mutated in place with every
+    /// an error is hit. `conversation` is mutated in place with every
     /// output and tool result, exactly as the TUI would record them.
     pub(crate) async fn run_turn(
         &self,
@@ -196,7 +193,7 @@ impl Engine {
     ) -> Result<TurnResult, EngineError> {
         let retrying = &self.stream_retrying;
 
-        for _ in 0..self.max_iterations {
+        loop {
             if cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
@@ -328,8 +325,6 @@ impl Engine {
                 None => return Err(EngineError::Cancelled),
             }
         }
-
-        Err(EngineError::IterationCap(self.max_iterations))
     }
 
     /// Classify and execute one batch of tool calls, returning the outputs (or
@@ -656,7 +651,7 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    fn engine_for(base_url: &str, max_iterations: usize) -> Engine {
+    fn engine_for(base_url: &str) -> Engine {
         let client = Client::with_config(OpenAIConfig::new().with_api_base(base_url.to_string()));
         Engine {
             client,
@@ -666,7 +661,6 @@ mod tests {
             policy: EnginePolicy::Yolo,
             mcp: None,
             coauthor: None,
-            max_iterations,
             diagnostics: DiagnosticsFeedback::default(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
         }
@@ -720,7 +714,7 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let engine = engine_for(&base, 10);
+        let engine = engine_for(&base);
         let mut c = Conversation::new();
         c.add_input_message(user("read the manifest"));
         let conv = Mutex::new(c);
@@ -763,7 +757,7 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let engine = engine_for(&base, 10);
+        let engine = engine_for(&base);
         let mut c = Conversation::new();
         c.add_input_message(user("hi"));
         let conv = Mutex::new(c);
@@ -785,24 +779,6 @@ mod tests {
                         if t.contains("non-interactive"))
         ));
         assert!(denied, "ask_user should be denied");
-    }
-
-    #[tokio::test]
-    async fn run_turn_hits_the_iteration_cap() {
-        // Every response calls a tool, so the loop never terminates on its own.
-        let body = format!(
-            "{}{}",
-            item_added_frame(1, 0, &call_item("c1", "read_file", "{\"path\":\"Cargo.toml\"}")),
-            completed_frame(2),
-        );
-        let (base, _server) = spawn_mock_responses(vec![body]).await;
-        let engine = engine_for(&base, 3);
-        let mut c = Conversation::new();
-        c.add_input_message(user("loop"));
-        let conv = Mutex::new(c);
-        let cancel = CancellationToken::new();
-        let err = engine.run_turn(&conv, &cancel, &HeadlessSurface).await.unwrap_err();
-        assert!(matches!(err, EngineError::IterationCap(3)), "got {err:?}");
     }
 
     /// A surface that decides every `review` the same way and records the
@@ -856,7 +832,6 @@ mod tests {
             policy: EnginePolicy::Sync(policy_mode.classifier(std::collections::HashMap::new())),
             mcp: None,
             coauthor: None,
-            max_iterations: 10,
             diagnostics: DiagnosticsFeedback::default(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
         }
@@ -866,7 +841,8 @@ mod tests {
     async fn ask_verdict_bubbles_to_surface_approve_runs_the_call() {
         // Manual mode asks about write_file; an approving surface lets it run.
         let tmp = std::env::temp_dir().join(format!("engine_review_ok_{}", std::process::id()));
-        let path = tmp.to_string_lossy().to_string();
+        // JSON-encode the path so Windows backslashes survive as valid JSON.
+        let path = serde_json::to_string(&tmp.to_string_lossy()).unwrap();
         let _ = std::fs::remove_file(&tmp);
 
         let engine = sync_engine(crate::classifier::WorkMode::Manual);
@@ -877,7 +853,7 @@ mod tests {
             events: std::sync::Mutex::new(Vec::new()),
         };
         let calls = vec![FunctionToolCall {
-            arguments: format!("{{\"path\":\"{path}\",\"content\":\"surfaced\"}}"),
+            arguments: format!("{{\"path\":{path},\"content\":\"surfaced\"}}"),
             call_id: "w1".into(),
             namespace: None,
             name: "write_file".into(),
@@ -904,7 +880,7 @@ mod tests {
         // The same call, but a refusing surface turns it into a denial and the
         // file is never written.
         let tmp = std::env::temp_dir().join(format!("engine_review_no_{}", std::process::id()));
-        let path = tmp.to_string_lossy().to_string();
+        let path = serde_json::to_string(&tmp.to_string_lossy()).unwrap();
         let _ = std::fs::remove_file(&tmp);
 
         let engine = sync_engine(crate::classifier::WorkMode::Manual);
@@ -915,7 +891,7 @@ mod tests {
             events: std::sync::Mutex::new(Vec::new()),
         };
         let calls = vec![FunctionToolCall {
-            arguments: format!("{{\"path\":\"{path}\",\"content\":\"surfaced\"}}"),
+            arguments: format!("{{\"path\":{path},\"content\":\"surfaced\"}}"),
             call_id: "w1".into(),
             namespace: None,
             name: "write_file".into(),
@@ -1027,7 +1003,7 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let engine = engine_for(&base, 10); // Yolo; diagnostics disabled by default.
+        let engine = engine_for(&base); // Yolo; diagnostics disabled by default.
         let mut c = Conversation::new();
         c.add_input_message(user("write it"));
         let conv = Mutex::new(c);

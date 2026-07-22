@@ -312,7 +312,7 @@ impl App<'_> {
     /// and is dropped when the spawned task finishes.
     pub(crate) fn build_engine(&self) -> Option<crate::engine::Engine> {
         use crate::engine::{DiagnosticsFeedback, Engine, EnginePolicy, LlmPolicy};
-        use crate::consts::{ENGINE_MAX_ITERATIONS, OVERVIEW_REMINDER_EVERY};
+        use crate::consts::OVERVIEW_REMINDER_EVERY;
 
         let (client, model_name) = self.provider_manager.resolve(&self.current_model)?;
         let model_str = self.current_model.clone();
@@ -350,7 +350,6 @@ impl App<'_> {
             policy,
             mcp: self.mcp_manager.clone(),
             coauthor: self.config.git_coauthor.clone(),
-            max_iterations: ENGINE_MAX_ITERATIONS,
             diagnostics: DiagnosticsFeedback {
                 enabled: true,
                 reminder_every: Some(OVERVIEW_REMINDER_EVERY),

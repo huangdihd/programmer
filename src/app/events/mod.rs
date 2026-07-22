@@ -130,7 +130,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 Err(crate::engine::EngineError::Cancelled) => {
                     // Handled by handle_cancel.
                 }
-                Err(e @ (crate::engine::EngineError::IterationCap(_) | crate::engine::EngineError::EmptyResponse)) => {
+                Err(e @ crate::engine::EngineError::EmptyResponse) => {
                     app.conversation_panel.add_error_string(e.to_string());
                 }
                 Ok(_) => {}
