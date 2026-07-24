@@ -224,7 +224,7 @@ Do not invent details. Do not call tools. Output only the summary text.";
 
 /// The hidden developer message nudging the agent to keep PROGRAMMER.md current,
 /// injected every few file-editing turns. Lives here (not in the UI) because the
-/// reminder is an agent-loop behaviour the engine drives, not view chrome.
+/// reminder is an agent-loop behaviour the runner drives, not view chrome.
 pub(crate) const OVERVIEW_REMINDER: &str = "Reminder: several edits have \
     accumulated since PROGRAMMER.md was last written. If the architecture, \
     build/test commands, directory layout, or conventions have changed, update \

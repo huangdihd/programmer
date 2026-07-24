@@ -16,7 +16,7 @@
 //! The shared streaming primitive: open a streaming response with bounded
 //! retries and deliver each event (or a terminal error) to a caller-supplied
 //! sink. Both the TUI (sink = send an `AppEvent` on the channel) and the
-//! headless engine (sink = fold a [`PartialResponse`] directly) drive their
+//! headless runner (sink = fold a [`PartialResponse`] directly) drive their
 //! requests through this one function so retry and cancellation semantics can
 //! never drift between the two paths.
 

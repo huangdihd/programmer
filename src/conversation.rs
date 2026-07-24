@@ -19,7 +19,7 @@
 //!
 //! This is deliberately independent of any rendering: [`ConversationPanel`]
 //! embeds a `Conversation` and adds the view state (scroll, folding, selection)
-//! on top, while the headless agent engine drives a bare `Conversation`. The
+//! on top, while the headless agent runner drives a bare `Conversation`. The
 //! history-shaping logic in [`Conversation::to_input_param`] — call/output
 //! grouping, orphaned-call synthesis, and the compaction boundary — is the one
 //! piece both paths must agree on exactly, so it lives here once.
@@ -49,8 +49,8 @@ pub struct Conversation {
     /// Bumped whenever an *existing* item is mutated in place (or the list is
     /// replaced wholesale), as opposed to appended to. The renderer's cache is
     /// keyed by item index, so appends are naturally cache-coherent — this
-    /// counter is how it notices in-place edits (e.g. the engine folding
-    /// post-edit diagnostics into a tool output) now that the engine writes to
+    /// counter is how it notices in-place edits (e.g. the runner folding
+    /// post-edit diagnostics into a tool output) now that the runner writes to
     /// the conversation without going through the panel.
     pub(crate) mutation_version: u64,
 }

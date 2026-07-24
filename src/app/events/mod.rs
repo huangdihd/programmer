@@ -92,17 +92,17 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             // Reload in case the model ran a `todo` tool this iteration.
             app.todo_list = crate::todos::TodoList::load();
         }
-        AppEvent::EnginePhase(p) => {
-            use crate::engine::EnginePhase;
+        AppEvent::RunnerPhase(p) => {
+            use crate::runner::RunnerPhase;
             app.conversation_panel.phase = match p {
-                EnginePhase::Streaming => {
+                RunnerPhase::Streaming => {
                     app.conversation_panel.receiving_response =
                         Some(PartialResponse::new(app.cancel.active.child()));
                     ActivePhase::None // "Thinking" — derived from receiving_response
                 }
-                EnginePhase::Classifying => ActivePhase::Classifying,
-                EnginePhase::RunningTools => ActivePhase::ToolRunning,
-                EnginePhase::Checking => ActivePhase::Checking,
+                RunnerPhase::Classifying => ActivePhase::Classifying,
+                RunnerPhase::RunningTools => ActivePhase::ToolRunning,
+                RunnerPhase::Checking => ActivePhase::Checking,
             };
         }
         AppEvent::ReviewRequest { call, reason, position, reply } => {
@@ -121,16 +121,16 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             app.conversation_panel.flush_usage();
             let was_ok = result.is_ok();
             match result {
-                Err(crate::engine::EngineError::Stream(e)) => {
+                Err(crate::runner::RunnerError::Stream(e)) => {
                     app.conversation_panel.add_error(e);
                 }
-                Err(crate::engine::EngineError::Api { message, .. }) => {
+                Err(crate::runner::RunnerError::Api { message, .. }) => {
                     app.conversation_panel.add_error_string(message);
                 }
-                Err(crate::engine::EngineError::Cancelled) => {
+                Err(crate::runner::RunnerError::Cancelled) => {
                     // Handled by handle_cancel.
                 }
-                Err(e @ crate::engine::EngineError::EmptyResponse) => {
+                Err(e @ crate::runner::RunnerError::EmptyResponse) => {
                     app.conversation_panel.add_error_string(e.to_string());
                 }
                 Ok(_) => {}
@@ -180,9 +180,9 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
 // Per-variant AppEvent handlers
 // ---------------------------------------------------------------------------
 
-/// Cancel: stop the in-flight engine turn, then start any queued follow-up.
+/// Cancel: stop the in-flight runner turn, then start any queued follow-up.
 async fn handle_cancel(app: &mut App<'_>) {
-    // Cancel the turn's root token; the engine's spawned task checks this token
+    // Cancel the turn's root token; the runner's spawned task checks this token
     // between every iteration and stops.
     app.cancel.active.cancel();
     app.conversation_panel.abort_receiving();
@@ -196,7 +196,7 @@ async fn handle_cancel(app: &mut App<'_>) {
     }
 }
 
-/// `/init`: seed the init prompt and start the first engine turn.
+/// `/init`: seed the init prompt and start the first runner turn.
 fn handle_start_init(app: &mut App<'_>) {
     app.conversation_panel.add_meta(
         "\u{25B8} Initializing project\u{2026}",
@@ -207,15 +207,15 @@ fn handle_start_init(app: &mut App<'_>) {
     session::mark_dirty(app);
     // Fresh turn: start from an un-cancelled root token.
     app.cancel.active = CancellationToken::new();
-    // Kick off via the engine: re-use start_request_as with a developer role so
-    // the hidden init prompt runs through the engine just like `/init` did before.
+    // Kick off via the runner: re-use start_request_as with a developer role so
+    // the hidden init prompt runs through the runner just like `/init` did before.
     let tokio_handle = tokio::runtime::Handle::current();
     tokio_handle.spawn(async move {
         // Can't call start_request_as from sync context; queue a synthetic Start
         // event instead.
     });
-    // Spawn the init turn through the same engine path.
-    let Some(engine) = app.build_engine() else {
+    // Spawn the init turn through the same runner path.
+    let Some(runner) = app.build_runner() else {
         app.conversation_panel
             .add_error_string(format!("unknown provider/model: {}", app.current_model));
         return;
@@ -234,7 +234,7 @@ fn handle_start_init(app: &mut App<'_>) {
     let cancel = app.cancel.active.clone();
     let tx = app.events.sender.clone();
     tokio::spawn(async move {
-        let result = engine.run_turn(&shared, &cancel, &surface).await;
+        let result = runner.run_turn(&shared, &cancel, &surface).await;
         let _ = tx.send(Event::App(AppEvent::TurnFinished(result)));
     });
 }

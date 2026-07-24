@@ -13,11 +13,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The TUI-side [`AgentSurface`] implementation: translates engine callbacks
+//! The TUI-side [`AgentSurface`] implementation: translates runner callbacks
 //! (stream chunks, phase changes, review requests) into [`AppEvent`]s on the
 //! app's event channel. A fresh instance is built for each turn.
 
-use crate::engine::{AgentSurface, EngineEvent, ReviewDecision};
+use crate::runner::{AgentSurface, RunnerEvent, ReviewDecision};
 use crate::ui::event::{AppEvent, Event, ReplyTx};
 use async_openai::types::responses::FunctionToolCall;
 use tokio::sync::mpsc;
@@ -37,13 +37,13 @@ pub(crate) struct TuiSurface {
 
 #[async_trait::async_trait]
 impl AgentSurface for TuiSurface {
-    fn on_event(&self, ev: EngineEvent<'_>) {
+    fn on_event(&self, ev: RunnerEvent<'_>) {
         let app_ev = match ev {
-            EngineEvent::StreamChunk(b) => AppEvent::ChunkReceived(Box::new(*b)),
-            EngineEvent::ResponseCommitted => AppEvent::ResponseCommitted,
-            EngineEvent::Phase(p) => AppEvent::EnginePhase(p),
+            RunnerEvent::StreamChunk(b) => AppEvent::ChunkReceived(Box::new(*b)),
+            RunnerEvent::ResponseCommitted => AppEvent::ResponseCommitted,
+            RunnerEvent::Phase(p) => AppEvent::RunnerPhase(p),
             // These are read from the shared conversation directly.
-            EngineEvent::Assistant(_) | EngineEvent::ToolCall { .. } => return,
+            RunnerEvent::Assistant(_) | RunnerEvent::ToolCall { .. } => return,
         };
         let _ = self.tx.send(Event::App(app_ev));
     }
@@ -63,7 +63,7 @@ impl AgentSurface for TuiSurface {
         }));
         reply_rx.await.unwrap_or_else(|_| {
             ReviewDecision::Deny {
-                output: crate::engine::classify::classifier_denied_output(call, "cancelled"),
+                output: crate::runner::classify::classifier_denied_output(call, "cancelled"),
             }
         })
     }

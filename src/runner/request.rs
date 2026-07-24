@@ -14,7 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Building the streaming API request from a [`Conversation`]. Shared by the
-//! TUI's `spawn_stream` and the headless engine so both produce byte-identical
+//! TUI's `spawn_stream` and the headless runner so both produce byte-identical
 //! requests for the same history and system context.
 
 use crate::conversation::Conversation;
@@ -27,7 +27,7 @@ pub(crate) struct SystemContext<'a> {
     pub current_model: &'a str,
     /// Combined instructions from active skills, if any.
     pub skill_prompt: Option<&'a str>,
-    /// Plan-mode instructions, computed by the TUI; the engine passes `None`.
+    /// Plan-mode instructions, computed by the TUI; the runner passes `None`.
     pub plan_prompt: Option<&'a str>,
     /// Git commit co-author trailer to request, if configured.
     pub coauthor: Option<&'a str>,
@@ -78,12 +78,10 @@ mod tests {
             plan_prompt: None,
             coauthor: Some("Ada <ada@example.com>"),
         };
-        let req = build_request(
-            &conv,
-            &ctx,
-            "model-x".to_string(),
-            crate::tools::tools(None),
-        );
+        let req = build_request(&conv, &ctx, "model-x".to_string(), {
+            use crate::tools::provider::ToolProvider;
+            crate::tools::provider::LocalToolProvider.tools()
+        });
 
         assert_eq!(req.stream, Some(true));
         assert_eq!(req.model.as_deref(), Some("model-x"));

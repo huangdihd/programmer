@@ -48,16 +48,16 @@ pub enum Event {
 ///
 /// You can extend this enum with your own custom events.
 pub enum AppEvent {
-    /// A raw streaming chunk of the engine's in-flight response, forwarded by
+    /// A raw streaming chunk of the runner's in-flight response, forwarded by
     /// the TUI surface for live token rendering.
     ChunkReceived(Box<ResponseStreamEvent>),
-    /// The engine committed the streamed response's items to the shared
+    /// The runner committed the streamed response's items to the shared
     /// conversation: drop the live in-progress view (the committed copy renders
     /// from the conversation now).
     ResponseCommitted,
-    /// The engine's turn moved to a new phase (classifying, running tools, …).
-    EnginePhase(crate::engine::EnginePhase),
-    /// The engine asks the user to review a tool call the classifier flagged
+    /// The runner's turn moved to a new phase (classifying, running tools, …).
+    RunnerPhase(crate::runner::RunnerPhase),
+    /// The runner asks the user to review a tool call the classifier flagged
     /// (`Ask` verdict). Carries the call, the classifier's reason, the call's
     /// 1-based position and batch total, and the oneshot the decision goes
     /// back on. Dropping the sender counts as a denial.
@@ -67,9 +67,9 @@ pub enum AppEvent {
         position: (usize, usize),
         reply: ReplyTx,
     },
-    /// The engine's turn ended, successfully or not. All end-of-turn bookkeeping
+    /// The runner's turn ended, successfully or not. All end-of-turn bookkeeping
     /// (usage flush, session save, pending-message start) hangs off this.
-    TurnFinished(Result<crate::engine::TurnResult, crate::engine::EngineError>),
+    TurnFinished(Result<crate::runner::TurnResult, crate::runner::RunnerError>),
     /// `/compact` finished: `Ok` carries the summary to install as the new
     /// context boundary, `Err` the error to surface. The token identifies the
     /// run so a summary from a cancelled compaction is dropped.
@@ -113,7 +113,7 @@ impl std::fmt::Debug for AnswerTx {
 
 /// Wraps the `oneshot::Sender` a [`AppEvent::ReviewRequest`] decision goes back
 /// on. Manual Debug impl because `oneshot::Sender` does not implement Debug.
-pub struct ReplyTx(pub tokio::sync::oneshot::Sender<crate::engine::ReviewDecision>);
+pub struct ReplyTx(pub tokio::sync::oneshot::Sender<crate::runner::ReviewDecision>);
 
 impl std::fmt::Debug for ReplyTx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -126,7 +126,7 @@ impl std::fmt::Debug for AppEvent {
         match self {
             Self::ChunkReceived(_) => f.debug_tuple("ChunkReceived").field(&"..").finish(),
             Self::ResponseCommitted => write!(f, "ResponseCommitted"),
-            Self::EnginePhase(_) => write!(f, "EnginePhase"),
+            Self::RunnerPhase(_) => write!(f, "RunnerPhase"),
             Self::ReviewRequest { call, .. } => f
                 .debug_struct("ReviewRequest")
                 .field("call", &call.name)

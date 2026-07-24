@@ -99,7 +99,7 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
     // doesn't carry over to this one.
     app.cancel.active = crate::cancel::CancellationToken::new();
 
-    let Some(engine) = app.build_engine() else {
+    let Some(runner) = app.build_runner() else {
         app.conversation_panel
             .add_error_string(format!("unknown provider/model: {}", app.current_model));
         return;
@@ -118,7 +118,7 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
     let cancel = app.cancel.active.clone();
     let tx = app.events.sender.clone();
     tokio::spawn(async move {
-        let result = engine.run_turn(&shared, &cancel, &surface).await;
+        let result = runner.run_turn(&shared, &cancel, &surface).await;
         let _ = tx.send(Event::App(AppEvent::TurnFinished(result)));
     });
 }

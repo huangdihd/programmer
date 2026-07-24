@@ -22,6 +22,7 @@ pub mod edit_file;
 pub mod fetch;
 pub mod grep;
 pub(crate) mod mcp_bridge;
+pub(crate) mod provider;
 pub mod read_file;
 pub mod task;
 pub mod todo;
@@ -142,32 +143,9 @@ pub fn environment_info() -> String {
     info
 }
 
-/// The full set of tool definitions advertised to the model on every request.
-///
-/// When `mcp` is provided, tools discovered from MCP servers are merged into
-/// the list with `mcp__<server>__<tool>` names.
-pub(crate) fn tools(mcp: Option<&crate::mcp::McpManager>) -> Vec<Tool> {
-    let mut tools: Vec<Tool> = vec![
-        command::tool(),
-        read_file::tool(),
-        write_file::tool(),
-        edit_file::tool(),
-        grep::tool(),
-        blob::tool(),
-        fetch::tool(),
-        ask_user::tool(),
-        configure_diagnostics::tool(),
-        diagnostics::tool(),
-        todo::tool(),
-        task::tool(),
-    ];
-
-    if let Some(mgr) = mcp {
-        mcp_bridge::extend_with_mcp_tools(&mut tools, mgr);
-    }
-
-    tools
-}
+// The advertised tool list is now assembled by the `provider` layer: the
+// built-ins are `provider::LocalToolProvider`, MCP servers are
+// `provider::McpToolProvider`, and `provider::ToolRegistry` aggregates them.
 
 /// A tool call's `function_call_output` together with whether the tool reported
 /// failure. The flag is authoritative — it comes from the tool's own `Result`,
@@ -188,6 +166,10 @@ pub struct ToolOutput {
 ///
 /// When `mcp` is provided and the tool name starts with `mcp__`, the call is
 /// forwarded to the appropriate MCP server.
+/// The pre-provider dispatcher, kept for its focused tests: it exercises the
+/// mcp / ask_user / local branches and the authoritative `failed` flag. The
+/// agent path now dispatches through [`provider::ToolRegistry`] instead.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn run_tool_call(
     call: &FunctionToolCall,
     sender: &tokio::sync::mpsc::UnboundedSender<crate::ui::event::Event>,
@@ -205,6 +187,13 @@ pub(crate) async fn run_tool_call(
         run_local_tool(&call.name, &call.arguments).await
     };
 
+    make_tool_output(&call.call_id, result)
+}
+
+/// Wrap a raw tool result into a [`ToolOutput`]: the `failed` flag comes straight
+/// from `Ok`/`Err` (the authoritative source, never sniffed from the text), and
+/// the text is truncated to the output budget.
+pub(crate) fn make_tool_output(call_id: &str, result: Result<String, String>) -> ToolOutput {
     let (text, failed) = match result {
         Ok(text) => (text, false),
         Err(text) => (text, true),
@@ -213,7 +202,7 @@ pub(crate) async fn run_tool_call(
 
     ToolOutput {
         param: FunctionCallOutputItemParam {
-            call_id: call.call_id.clone(),
+            call_id: call_id.to_string(),
             output: FunctionCallOutput::Text(text),
             id: None,
             status: None,

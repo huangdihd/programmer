@@ -28,11 +28,11 @@ mod config;
 mod consts;
 mod conversation;
 mod diagnostics;
-mod engine;
 mod mcp;
 mod prompts;
 mod providers;
 mod response;
+mod runner;
 mod session;
 mod skills;
 mod tasks;
@@ -176,9 +176,10 @@ async fn build_mcp_classifier() -> Option<(
 /// apply — `auto` (LLM classifier) or `yolo` — mirroring `--mcp-server`; a
 /// print run has no way to answer `ask_user` or a Manual approval prompt.
 async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> color_eyre::Result<()> {
-    use crate::engine::{Engine, EnginePolicy};
+    use crate::runner::{TurnRunner, RunnerPolicy};
+    use crate::tools::provider::{LocalToolProvider, ToolRegistry};
     use async_openai::types::responses::{
-        InputContent, InputMessage, InputRole, MessageItem as ApiMessageItem, OutputStatus, Tool,
+        InputContent, InputMessage, InputRole, MessageItem as ApiMessageItem, OutputStatus,
     };
 
     if !mcp_server_mode_ok(mode) {
@@ -196,14 +197,16 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         std::process::exit(1);
     };
 
-    // Full local tool set minus ask_user (unanswerable headlessly).
-    let tools: Vec<Tool> = crate::tools::tools(None)
-        .into_iter()
-        .filter(|t| !matches!(t, Tool::Function(f) if f.name == crate::tools::ask_user::NAME))
-        .collect();
+    // Local built-ins only (no MCP in print mode), behind the registry. ask_user
+    // stays advertised: the headless surface has no interactive channel, so the
+    // runner pre-denies any ask_user call (via the provider's requires_interaction)
+    // with a clear reason before it executes.
+    let tools = std::sync::Arc::new(ToolRegistry::new(vec![std::sync::Arc::new(
+        LocalToolProvider,
+    )]));
 
     let policy = match mode {
-        crate::classifier::WorkMode::Yolo => EnginePolicy::Yolo,
+        crate::classifier::WorkMode::Yolo => RunnerPolicy::Yolo,
         // Auto (and anything else that passed the gate): LLM classifier, using
         // the configured classifier model or the chat model.
         _ => {
@@ -217,32 +220,27 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
                 eprintln!("classifier model '{clf_model}' not found");
                 std::process::exit(1);
             };
-            let mcp_policies = config
-                .mcp_servers
-                .iter()
-                .map(|s| (s.name.clone(), s.auto_approve))
-                .collect();
-            EnginePolicy::Llm(Box::new(crate::engine::LlmPolicy {
+            // Print mode advertises local built-ins only (no MCP), so there are
+            // no per-server MCP policies to carry here.
+            RunnerPolicy::Llm(Box::new(crate::runner::LlmPolicy {
                 client: clf_client,
                 model_name: clf_name,
                 no_logprobs: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::HashSet::new(),
                 )),
-                mcp_policies,
             }))
         }
     };
 
-    let engine = Engine {
+    let runner = TurnRunner {
         client: chat_client,
         model_name: chat_name,
         model_str: chat_model,
         tools,
         policy,
-        mcp: None,
         coauthor: config.git_coauthor.clone(),
-        // Print mode stays lean: no post-edit diagnostics feedback for now.
-        diagnostics: crate::engine::DiagnosticsFeedback::default(),
+        // Print mode stays lean: no turn hooks (post-edit diagnostics, reminders).
+        hooks: Vec::new(),
         stream_retrying: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
@@ -265,8 +263,8 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         }
     });
 
-    match engine
-        .run_turn(&conversation, &cancel, &crate::engine::HeadlessSurface)
+    match runner
+        .run_turn(&conversation, &cancel, &crate::runner::HeadlessSurface)
         .await
     {
         Ok(result) => {

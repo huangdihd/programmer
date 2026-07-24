@@ -13,21 +13,21 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The engine's counterpart: whatever drives a turn reports progress to, and
+//! The runner's counterpart: whatever drives a turn reports progress to, and
 //! asks approval of, an [`AgentSurface`]. This is the seam that lets the same
-//! [`Engine`](super::Engine) serve a headless `-p` run, the interactive TUI, and
+//! [`TurnRunner`](super::TurnRunner) serve a headless `-p` run, the interactive TUI, and
 //! (later) an in-process sub-agent that bubbles its approval requests up to the
 //! main UI — each is just a different `AgentSurface` implementation.
 //!
 //! Two distinct interactions live here on purpose:
 //!
 //!  * [`AgentSurface::on_event`] is fire-and-forget — a notification the surface
-//!    renders (or ignores). It never blocks the engine.
+//!    renders (or ignores). It never blocks the runner.
 //!  * [`AgentSurface::review`] is request/response — a classifier `Ask` verdict
-//!    bubbles up and the engine waits for a decision. This is what a sub-agent
+//!    bubbles up and the runner waits for a decision. This is what a sub-agent
 //!    forwards to its parent, and ultimately to the human at the TUI.
 
-use super::EngineEvent;
+use super::RunnerEvent;
 use crate::ui::event::Event;
 use async_openai::types::responses::FunctionToolCall;
 use tokio::sync::mpsc::UnboundedSender;
@@ -40,18 +40,18 @@ pub enum ReviewDecision {
     /// Block the call. The surface constructs the full denial output so each
     /// front-end keeps its own wording (the headless surface reuses the
     /// classifier phrasing verbatim; the TUI uses its "denied by user" text)
-    /// — the engine records it as the call's failed result either way.
+    /// — the runner records it as the call's failed result either way.
     Deny { output: crate::tools::ToolOutput },
 }
 
-/// What the engine reports to and asks of. Implemented once per front-end:
+/// What the runner reports to and asks of. Implemented once per front-end:
 /// [`HeadlessSurface`] for non-interactive runs, a TUI surface that routes
 /// `review` to the approval console, and a sub-agent surface that forwards up.
 #[async_trait::async_trait]
 pub(crate) trait AgentSurface: Send + Sync {
-    /// A progress notification for this turn. Must not block — the engine calls
+    /// A progress notification for this turn. Must not block — the runner calls
     /// it inline between iterations.
-    fn on_event(&self, event: EngineEvent<'_>);
+    fn on_event(&self, event: RunnerEvent<'_>);
 
     /// A classifier `Ask` verdict needs a decision. `reason` is the classifier's
     /// explanation for why the call was flagged; `position` is this call's
@@ -77,7 +77,7 @@ pub(crate) trait AgentSurface: Send + Sync {
     }
 
     /// The combined skill system-prompt to fold into every request this turn, if
-    /// any. The engine has no skill registry of its own; the front-end supplies
+    /// any. The runner has no skill registry of its own; the front-end supplies
     /// the resolved text.
     fn skill_prompt(&self) -> Option<String> {
         None
@@ -106,7 +106,7 @@ pub(crate) struct HeadlessSurface;
 
 #[async_trait::async_trait]
 impl AgentSurface for HeadlessSurface {
-    fn on_event(&self, _event: EngineEvent<'_>) {}
+    fn on_event(&self, _event: RunnerEvent<'_>) {}
 
     async fn review(
         &self,

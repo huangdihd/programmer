@@ -48,22 +48,22 @@ use ratatui::layout::Rect;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-/// A pending tool-call review request from the engine. Manual mode now gets
-/// per-call reviews (no batch), driven by the engine's `review()` callback.
+/// A pending tool-call review request from the runner. Manual mode now gets
+/// per-call reviews (no batch), driven by the runner's `review()` callback.
 pub(crate) struct PendingReview {
     pub(crate) call: FunctionToolCall,
     pub(crate) reason: String,
     /// 1-based position and batch total (e.g. (2, 5)).
     pub(crate) position: (usize, usize),
-    /// The oneshot back to the engine.
+    /// The oneshot back to the runner.
     pub(crate) reply: crate::ui::event::ReplyTx,
     /// Which approval option is highlighted (0=Approve, 1=Deny).
     pub(crate) selected: usize,
 }
 
 /// UI-only diagnostics bookkeeping. The mutable state (baseline + edit-turn
-/// counter) lives in [`App::diagnostics_state`], shared with the engine, so the
-/// engine's post-edit feedback loop sees the same baseline the sidebar renders.
+/// counter) lives in [`App::diagnostics_state`], shared with the runner, so the
+/// runner's post-edit feedback loop sees the same baseline the sidebar renders.
 pub(crate) struct DiagnosticsState {
     /// Whether the project's diagnostics profile declares an LSP checker.
     pub(crate) lsp_configured: bool,
@@ -149,10 +149,10 @@ pub struct App<'a> {
     pub(crate) classifier_no_logprobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Diagnostics baseline and edit-turn bookkeeping.
     pub(crate) diag: DiagnosticsState,
-    /// Shared diagnostics state the engine also reads/writes for post-edit
+    /// Shared diagnostics state the runner also reads/writes for post-edit
     /// feedback (baseline + edit-turn counter). The TUI holds this so it
     /// persists across per-turn engines.
-    pub(crate) diagnostics_state: Arc<std::sync::Mutex<crate::engine::DiagnosticsState>>,
+    pub(crate) diagnostics_state: Arc<std::sync::Mutex<crate::runner::DiagnosticsState>>,
     /// Tracks whether the current mouse-drag started in the sidebar area.
     pub(crate) sidebar_click_active: bool,
     /// Cancellation tokens for the current request lifecycle.
@@ -264,7 +264,7 @@ impl App<'_> {
                 lsp_configured: helpers::lsp_checker_configured(),
             },
             diagnostics_state: Arc::new(std::sync::Mutex::new(
-                crate::engine::DiagnosticsState::default(),
+                crate::runner::DiagnosticsState::default(),
             )),
             sidebar_click_active: false,
             cancel: CancelState {
@@ -307,22 +307,35 @@ impl App<'_> {
         app
     }
 
-    /// Build a fresh [`crate::engine::Engine`] for the current app state.
-    /// Called at the start of every turn; the engine is immutable during a turn
+    /// Build a fresh [`crate::runner::TurnRunner`] for the current app state.
+    /// Called at the start of every turn; the runner is immutable during a turn
     /// and is dropped when the spawned task finishes.
-    pub(crate) fn build_engine(&self) -> Option<crate::engine::Engine> {
-        use crate::engine::{DiagnosticsFeedback, Engine, EnginePolicy, LlmPolicy};
+    pub(crate) fn build_runner(&self) -> Option<crate::runner::TurnRunner> {
+        use crate::runner::hooks::{DiagnosticsHook, OverviewReminderHook};
+        use crate::runner::{TurnRunner, RunnerPolicy, LlmPolicy};
         use crate::consts::OVERVIEW_REMINDER_EVERY;
+        use std::sync::Arc;
+
+        use crate::tools::provider::{LocalToolProvider, McpToolProvider, ToolProvider, ToolRegistry};
 
         let (client, model_name) = self.provider_manager.resolve(&self.current_model)?;
         let model_str = self.current_model.clone();
-        let tools = crate::tools::tools(self.mcp_manager.as_deref());
+        // Unify every tool source behind the registry: the local built-ins are
+        // one provider, all connected MCP servers another.
+        let mut providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(LocalToolProvider)];
+        if let Some(mcp) = &self.mcp_manager {
+            providers.push(Arc::new(McpToolProvider {
+                manager: mcp.clone(),
+                policies: build_mcp_policy_map(self),
+            }));
+        }
+        let tools = Arc::new(ToolRegistry::new(providers));
 
         let policy = match self.work_mode {
-            WorkMode::Yolo => EnginePolicy::Yolo,
+            WorkMode::Yolo => RunnerPolicy::Yolo,
             WorkMode::Manual | WorkMode::Plan => {
-                let classifier = self.work_mode.classifier(build_mcp_policy_map(self));
-                EnginePolicy::Sync(classifier)
+                let classifier = self.work_mode.classifier();
+                RunnerPolicy::Sync(classifier)
             }
             WorkMode::Auto => {
                 let model_str = self
@@ -333,28 +346,30 @@ impl App<'_> {
                 let (c_client, c_model_name) = self
                     .provider_manager
                     .resolve(&model_str)?;
-                EnginePolicy::Llm(Box::new(LlmPolicy {
+                RunnerPolicy::Llm(Box::new(LlmPolicy {
                     client: c_client.clone(),
                     model_name: c_model_name,
                     no_logprobs: self.classifier_no_logprobs.clone(),
-                    mcp_policies: build_mcp_policy_map(self),
                 }))
             }
         };
 
-        Some(Engine {
+        Some(TurnRunner {
             client: client.clone(),
             model_name,
             model_str,
             tools,
             policy,
-            mcp: self.mcp_manager.clone(),
             coauthor: self.config.git_coauthor.clone(),
-            diagnostics: DiagnosticsFeedback {
-                enabled: true,
-                reminder_every: Some(OVERVIEW_REMINDER_EVERY),
-                state: self.diagnostics_state.clone(),
-            },
+            hooks: vec![
+                Arc::new(DiagnosticsHook {
+                    state: self.diagnostics_state.clone(),
+                }),
+                Arc::new(OverviewReminderHook {
+                    state: self.diagnostics_state.clone(),
+                    every: OVERVIEW_REMINDER_EVERY,
+                }),
+            ],
             stream_retrying: self.cancel.stream_retrying.clone(),
         })
     }

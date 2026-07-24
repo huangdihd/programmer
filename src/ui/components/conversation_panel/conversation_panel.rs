@@ -195,7 +195,7 @@ pub(crate) struct RenderCache {
     pub entries: Vec<CachedParagraph>,
     /// The conversation's `mutation_version` the entries were built against.
     /// Appends never bump it (index-keyed entries stay valid), but an in-place
-    /// mutation — e.g. the engine folding diagnostics into a tool output —
+    /// mutation — e.g. the runner folding diagnostics into a tool output —
     /// does, and every entry must be dropped.
     pub seen_mutation_version: u64,
 }
@@ -204,7 +204,7 @@ pub(crate) struct RenderCache {
 pub struct ConversationPanel {
     /// The UI-free conversation model: history items and turn-usage counter.
     /// The panel adds the view state below on top of it. Shared with the
-    /// engine task that drives the turn — the engine appends under brief locks
+    /// runner task that drives the turn — the runner appends under brief locks
     /// from its background task while the panel renders it every frame, so
     /// every access here locks briefly and never holds the guard across an
     /// await (there are none in the UI thread) or a render sub-call.
@@ -505,7 +505,7 @@ impl ConversationPanel {
             )
     }
 
-    /// The shared conversation handle, for the engine task that drives a turn.
+    /// The shared conversation handle, for the runner task that drives a turn.
     pub fn shared_conversation(
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<crate::conversation::Conversation>> {
@@ -600,7 +600,7 @@ impl ConversationPanel {
         self.conversation.lock().unwrap().items.clone()
     }
 
-    /// The engine committed the streamed response to the shared conversation:
+    /// The runner committed the streamed response to the shared conversation:
     /// drop the live in-progress view so the same content isn't rendered twice,
     /// transferring live expanded state onto the now-committed items (which sit
     /// at the tail of the conversation).
@@ -622,7 +622,7 @@ impl ConversationPanel {
     }
 
     /// Ends the in-flight response (stream error / cancellation), salvaging
-    /// whatever was produced so far into the conversation — the engine commits
+    /// whatever was produced so far into the conversation — the runner commits
     /// nothing for a response that errored or was cancelled mid-stream — and
     /// clearing the "receiving" state so the turn is no longer considered busy.
     pub fn abort_receiving(&mut self) {
@@ -693,7 +693,7 @@ impl ConversationPanel {
         }
     }
 
-    /// Fold a streaming chunk into the live view. Rendering-only: the engine
+    /// Fold a streaming chunk into the live view. Rendering-only: the runner
     /// owns the authoritative folding and commits the finished response to the
     /// shared conversation itself — the live copy here just shows tokens as
     /// they arrive, and is dropped on [`ConversationPanel::commit_live`].
@@ -707,7 +707,7 @@ impl ConversationPanel {
 
     /// Build the API request input from the conversation history. Delegates to
     /// [`Conversation::to_input_param`] — the history-shaping logic lives on the
-    /// model so the headless engine produces byte-identical requests.
+    /// model so the headless runner produces byte-identical requests.
     pub fn get_input_param(
         &self,
         current_model: &str,

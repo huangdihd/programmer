@@ -13,15 +13,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Diagnostics: baseline seeding and state reset. The engine now owns the
+//! Diagnostics: baseline seeding and state reset. The runner now owns the
 //! post-edit feedback loop; these helpers only manage the shared state that
-//! both the engine and the sidebar read.
+//! both the runner and the sidebar read.
 
 use super::App;
 
 /// On the first turn of a session with a diagnostics profile, run the
 /// checkers once in the background to establish a baseline in the shared
-/// [`crate::engine::DiagnosticsState`] (accessible to both the engine and the UI).
+/// [`crate::runner::DiagnosticsState`] (accessible to both the runner and the UI).
 pub(crate) fn maybe_seed_diagnostics_baseline(app: &mut App<'_>) {
     {
         let state = app.diagnostics_state.lock().unwrap();

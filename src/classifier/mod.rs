@@ -69,19 +69,6 @@ pub trait Classifier: Send + Sync {
 const DANGEROUS_TOOLS: &[&str] =
     &["command", "write_file", "edit_file", "configure_diagnostics"];
 
-/// Tool names that are read-only — always safe, even in Plan/Planning phase.
-const READ_ONLY_TOOLS: &[&str] = &[
-    "read_file",
-    "grep",
-    "blob",
-    // `fetch` refuses private/internal addresses itself, so it is safe to
-    // classify as read-only despite touching the network.
-    "fetch",
-    "ask_user",
-    "diagnostics",
-    "todo",
-];
-
 /// The `task` tool is action-dependent: `create` runs an arbitrary command and
 /// `kill` terminates a process (gated like `command`), while `list`/`output`/
 /// `wait` only observe existing tasks and are safe everywhere.
@@ -116,66 +103,27 @@ pub(crate) fn classify_mcp_policy(
     }
 }
 
-/// Manual mode: every dangerous tool call must be approved.
-/// MCP tools are classified according to their server's [`McpPolicy`].
-pub struct ManualClassifier {
-    mcp_policies: HashMap<String, McpPolicy>,
-}
-
-impl ManualClassifier {
-    pub(crate) fn new(mcp_policies: HashMap<String, McpPolicy>) -> Self {
-        ManualClassifier { mcp_policies }
-    }
-}
+/// Manual mode. By the time a call reaches a sync classifier, the provider
+/// front gate ([`crate::tools::provider::ToolProvider::approval`]) has already
+/// auto-approved everything safe — read-only built-ins and tools on a trusted
+/// MCP server — so every remaining call is one the user must decide on.
+pub struct ManualClassifier;
 
 impl Classifier for ManualClassifier {
-    fn classify(&self, tool_name: &str, arguments: &str) -> Verdict {
-        // MCP tools: consult per-server policy first.
-        if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
-            return verdict;
-        }
-        // Built-in tools: ask for dangerous, allow for safe.
-        // Unknown MCP tools (not in any server's policy map) are treated as
-        // dangerous — we can't know their semantics.
-        if is_mutating(tool_name, arguments) || tool_name.starts_with("mcp__") {
-            Verdict::Ask {
-                reason: format!("{tool_name} requires approval in Manual mode"),
-            }
-        } else {
-            Verdict::Allow
+    fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
+        Verdict::Ask {
+            reason: format!("{tool_name} requires approval in Manual mode"),
         }
     }
 }
 
-/// Plan Planning phase: all read-only tools are allowed; anything that
-/// mutates state (write_file, edit_file, command, configure_diagnostics)
-/// is denied with a clear message to output a plan instead.
-/// MCP tools are classified according to their server's [`McpPolicy`].
-pub struct PlanPlanningClassifier {
-    mcp_policies: HashMap<String, McpPolicy>,
-}
-
-impl PlanPlanningClassifier {
-    pub(crate) fn new(mcp_policies: HashMap<String, McpPolicy>) -> Self {
-        PlanPlanningClassifier { mcp_policies }
-    }
-}
+/// Plan mode, Planning phase. The front gate has already cleared the read-only
+/// calls Plan mode permits, so every call reaching here mutates state and is
+/// denied with an instruction to output a plan instead.
+pub struct PlanPlanningClassifier;
 
 impl Classifier for PlanPlanningClassifier {
-    fn classify(&self, tool_name: &str, arguments: &str) -> Verdict {
-        // MCP tools: consult per-server policy first.
-        if let Some(verdict) = classify_mcp_policy(tool_name, &self.mcp_policies) {
-            return verdict;
-        }
-        // Read-only tools always allowed, including the task tool's
-        // observing actions (list/output/wait).
-        if READ_ONLY_TOOLS.contains(&tool_name)
-            || (tool_name == crate::tools::task::NAME
-                && !is_mutating(tool_name, arguments))
-        {
-            return Verdict::Allow;
-        }
-        // Everything else: denied. Tell the model to output a plan.
+    fn classify(&self, tool_name: &str, _arguments: &str) -> Verdict {
         Verdict::Deny {
             reason: format!(
                 "You are in Plan mode (Planning phase). Use read-only tools to \
@@ -276,14 +224,15 @@ impl WorkMode {
 
     /// Return the synchronous classifier for this mode. Auto has no sync
     /// classifier (it uses [`classify_tool_call`]); it falls back to asking so
-    /// callers that ignore [`uses_llm_classifier`] stay safe.
-    pub(crate) fn classifier(&self, mcp_policies: HashMap<String, McpPolicy>) -> Box<dyn Classifier> {
+    /// callers that ignore [`uses_llm_classifier`] stay safe. The classifiers no
+    /// longer take a policy map — the read-only/MCP-trust front gate now lives in
+    /// [`crate::tools::provider`], so only calls that genuinely need review reach
+    /// them.
+    pub(crate) fn classifier(&self) -> Box<dyn Classifier> {
         match self {
-            WorkMode::Manual | WorkMode::Auto => {
-                Box::new(ManualClassifier::new(mcp_policies))
-            }
+            WorkMode::Manual | WorkMode::Auto => Box::new(ManualClassifier),
             WorkMode::Yolo => Box::new(YoloClassifier),
-            WorkMode::Plan => Box::new(PlanPlanningClassifier::new(mcp_policies)),
+            WorkMode::Plan => Box::new(PlanPlanningClassifier),
         }
     }
 }
@@ -310,7 +259,7 @@ mod tests {
     use super::*;
 
     fn classify(mode: WorkMode, name: &str) -> Verdict {
-        mode.classifier(HashMap::new()).classify(name, r#"{}"#)
+        mode.classifier().classify(name, r#"{}"#)
     }
 
     #[test]
@@ -321,22 +270,19 @@ mod tests {
     }
 
     #[test]
-    fn manual_asks_for_dangerous() {
+    fn manual_asks_for_every_call_it_receives() {
+        // The provider front gate has already auto-approved the safe calls
+        // (read-only built-ins, trusted MCP), so Manual asks about the rest —
+        // whatever the tool.
         assert!(matches!(classify(WorkMode::Manual, "command"), Verdict::Ask { .. }));
         assert!(matches!(classify(WorkMode::Manual, "write_file"), Verdict::Ask { .. }));
-        assert!(matches!(classify(WorkMode::Manual, "read_file"), Verdict::Allow));
-        assert!(matches!(classify(WorkMode::Manual, "grep"), Verdict::Allow));
+        assert!(matches!(classify(WorkMode::Manual, "mcp__db__query"), Verdict::Ask { .. }));
     }
 
     #[test]
-    fn plan_planning_allows_read_only_denies_mutating() {
-        // Read-only: Allow in Plan Planning.
-        assert!(matches!(classify(WorkMode::Plan, "read_file"), Verdict::Allow));
-        assert!(matches!(classify(WorkMode::Plan, "grep"), Verdict::Allow));
-        assert!(matches!(classify(WorkMode::Plan, "blob"), Verdict::Allow));
-        assert!(matches!(classify(WorkMode::Plan, "ask_user"), Verdict::Allow));
-        assert!(matches!(classify(WorkMode::Plan, "todo"), Verdict::Allow));
-        // Mutating: Deny.
+    fn plan_denies_every_call_it_receives() {
+        // Read-only calls never reach the Plan classifier (the front gate clears
+        // them); everything that does is state-mutating and gets denied.
         assert!(matches!(classify(WorkMode::Plan, "command"), Verdict::Deny { .. }));
         assert!(matches!(classify(WorkMode::Plan, "write_file"), Verdict::Deny { .. }));
         assert!(matches!(classify(WorkMode::Plan, "edit_file"), Verdict::Deny { .. }));
@@ -384,29 +330,15 @@ mod tests {
     }
 
     #[test]
-    fn task_tool_is_classified_by_action() {
+    fn needs_review_splits_task_by_action() {
+        // The read-only/mutating split — including the task tool's per-action
+        // behaviour — lives in `needs_review`, which the provider front gate
+        // consults. The sync classifiers no longer branch on it.
         let create = r#"{"action":"create","command":"cargo watch"}"#;
         let kill = r#"{"action":"kill","id":1}"#;
         let list = r#"{"action":"list"}"#;
         let output = r#"{"action":"output","id":1}"#;
         let wait = r#"{"action":"wait","id":1}"#;
-
-        // Manual: mutating actions ask, observing actions pass.
-        let manual = WorkMode::Manual.classifier(HashMap::new());
-        assert!(matches!(manual.classify("task", create), Verdict::Ask { .. }));
-        assert!(matches!(manual.classify("task", kill), Verdict::Ask { .. }));
-        assert!(matches!(manual.classify("task", list), Verdict::Allow));
-        assert!(matches!(manual.classify("task", output), Verdict::Allow));
-        assert!(matches!(manual.classify("task", wait), Verdict::Allow));
-
-        // Plan Planning: mutating actions denied, observing actions pass.
-        let plan = WorkMode::Plan.classifier(HashMap::new());
-        assert!(matches!(plan.classify("task", create), Verdict::Deny { .. }));
-        assert!(matches!(plan.classify("task", kill), Verdict::Deny { .. }));
-        assert!(matches!(plan.classify("task", list), Verdict::Allow));
-        assert!(matches!(plan.classify("task", output), Verdict::Allow));
-
-        // Auto's pre-filter mirrors the same split.
         assert!(needs_review("task", create));
         assert!(needs_review("task", kill));
         assert!(!needs_review("task", list));
@@ -455,48 +387,10 @@ mod tests {
         assert!(v.is_none());
     }
 
-    #[test]
-    fn manual_mode_trusted_mcp_allowed() {
-        let mut policies = HashMap::new();
-        policies.insert("fs".to_string(), McpPolicy::Trusted);
-        let c = ManualClassifier::new(policies);
-        // MCP tool with Trusted policy: auto-approved even in Manual mode.
-        assert!(matches!(c.classify("mcp__fs__write", r#"{}"#), Verdict::Allow));
-    }
-
-    #[test]
-    fn manual_mode_review_mcp_asks() {
-        let mut policies = HashMap::new();
-        policies.insert("db".to_string(), McpPolicy::Review);
-        let c = ManualClassifier::new(policies);
-        // MCP tool with Review policy: Ask in Manual mode.
-        assert!(matches!(
-            c.classify("mcp__db__query", r#"{}"#),
-            Verdict::Ask { .. }
-        ));
-        // Built-in dangerous: still Ask.
-        assert!(matches!(c.classify("command", r#"{}"#), Verdict::Ask { .. }));
-    }
-
-    #[test]
-    fn plan_planning_trusted_mcp_allowed() {
-        let mut policies = HashMap::new();
-        policies.insert("fs".to_string(), McpPolicy::Trusted);
-        let c = PlanPlanningClassifier::new(policies);
-        // MCP tool with Trusted policy: auto-approved even in Plan Planning.
-        assert!(matches!(c.classify("mcp__fs__read", r#"{}"#), Verdict::Allow));
-        assert!(matches!(c.classify("mcp__fs__write", r#"{}"#), Verdict::Allow));
-    }
-
-    #[test]
-    fn plan_planning_review_mcp_denied() {
-        let mut policies = HashMap::new();
-        policies.insert("db".to_string(), McpPolicy::Review);
-        let c = PlanPlanningClassifier::new(policies);
-        // MCP tool with Review policy: denied in Plan Planning (not read-only).
-        assert!(matches!(
-            c.classify("mcp__db__query", r#"{}"#),
-            Verdict::Deny { .. }
-        ));
-    }
+    // The per-server MCP trust behaviour that used to be tested through the
+    // classifiers (trusted → allowed, review → asked/denied even in Manual/Plan)
+    // now lives in the provider front gate: `classify_mcp_policy` resolves the
+    // verdict (covered above) and `McpToolProvider::approval` turns it into
+    // AutoApprove / Classify. The sync classifiers only ever see calls that
+    // already need review, so they no longer carry a policy map.
 }

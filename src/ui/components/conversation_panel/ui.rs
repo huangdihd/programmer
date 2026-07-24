@@ -198,7 +198,7 @@ impl Widget for &mut ConversationPanel {
             cache.entries.clear();
             self.selection = None;
         }
-        // An in-place mutation (the engine folding diagnostics into a tool
+        // An in-place mutation (the runner folding diagnostics into a tool
         // output) invalidates by version; appends never bump it.
         if cache.seen_mutation_version != conv.mutation_version {
             cache.seen_mutation_version = conv.mutation_version;

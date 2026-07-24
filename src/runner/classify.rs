@@ -16,12 +16,11 @@
 //! Tool-call classification, free of any `App` or event channel. The two cores
 //! — the synchronous rule classifier and the Auto-mode LLM classifier — return
 //! a [`ClassificationOutcome`] instead of sending an event, so the TUI wraps
-//! them in a spawned task that forwards the result, while the headless engine
+//! them in a spawned task that forwards the result, while the headless runner
 //! calls them inline.
 
 use crate::cancel::CancellationToken;
 use crate::classifier::{Classifier, Verdict};
-use crate::mcp::types::McpPolicy;
 use crate::response::message_item::MessageItem;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
@@ -93,16 +92,13 @@ pub(crate) fn classify_sync(
 }
 
 /// Classify `calls` with the Auto-mode LLM classifier, partitioning them into
-/// allow / deny (Auto never asks — non-allow verdicts become denials). Each
-/// call is first checked against the MCP policy map and the `needs_review` fast
-/// path; only genuinely mutating calls reach the LLM. Returns `None` if
-/// cancelled.
-#[allow(clippy::too_many_arguments)]
+/// allow / deny (Auto never asks — non-allow verdicts become denials). The
+/// caller has already run the provider front gate, so every call here genuinely
+/// needs review; each is sent straight to the LLM. Returns `None` if cancelled.
 pub(crate) async fn classify_llm(
     client: &Client<OpenAIConfig>,
     model_name: &str,
     no_logprobs: &Arc<Mutex<HashSet<String>>>,
-    mcp_policies: &HashMap<String, McpPolicy>,
     light_context: &str,
     full_context: &str,
     calls: Vec<FunctionToolCall>,
@@ -118,18 +114,6 @@ pub(crate) async fn classify_llm(
             if cancel.is_cancelled() {
                 return None;
             }
-            if let Some(verdict) = crate::classifier::classify_mcp_policy(&call.name, mcp_policies) {
-                return Some(match verdict {
-                    Verdict::Allow => Decision::Allow(call),
-                    Verdict::Ask { reason } | Verdict::Deny { reason } => {
-                        Decision::Deny(classifier_denied_output(&call, &reason))
-                    }
-                });
-            }
-            if !crate::classifier::needs_review(&call.name, &call.arguments) {
-                return Some(Decision::Allow(call));
-            }
-
             let try_logprobs = !no_logprobs.lock().unwrap().contains(model_name);
             let outcome = crate::classifier::classify_tool_call(
                 client,
@@ -368,7 +352,6 @@ pub(crate) fn build_classifier_context(items: &[&MessageItem]) -> (String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classifier::WorkMode;
     use async_openai::types::responses::{
         InputContent, InputMessage, InputRole, MessageItem as ApiMessageItem, OutputStatus,
     };
@@ -384,26 +367,41 @@ mod tests {
         }
     }
 
+    /// Returns each verdict kind based on the tool name, so the partitioning
+    /// itself can be exercised independently of any work mode's rules.
+    struct MockClassifier;
+    impl Classifier for MockClassifier {
+        fn classify(&self, name: &str, _args: &str) -> Verdict {
+            match name {
+                "allow_me" => Verdict::Allow,
+                "deny_me" => Verdict::Deny { reason: "nope".into() },
+                _ => Verdict::Ask { reason: "confirm?".into() },
+            }
+        }
+    }
+
     #[test]
     fn classify_sync_partitions_by_verdict() {
-        // Manual mode: read-only tools allow, mutating tools ask.
-        let classifier = WorkMode::Manual.classifier(HashMap::new());
-        let calls = vec![call("read_file", "{}"), call("command", "{}")];
+        // Each verdict lands in its own bucket, preserving the call.
+        let calls = vec![
+            call("allow_me", "{}"),
+            call("deny_me", "{}"),
+            call("ask_me", "{}"),
+        ];
         let cancel = CancellationToken::new();
-        let outcome = classify_sync(classifier.as_ref(), &calls, &cancel).expect("not cancelled");
-        assert_eq!(outcome.allowed.len(), 1, "read_file allowed");
-        assert_eq!(outcome.allowed[0].name, "read_file");
-        assert_eq!(outcome.ask.len(), 1, "command asks");
-        assert_eq!(outcome.ask[0].0.name, "command");
-        assert!(outcome.denied.is_empty());
+        let outcome = classify_sync(&MockClassifier, &calls, &cancel).expect("not cancelled");
+        assert_eq!(outcome.allowed.len(), 1);
+        assert_eq!(outcome.allowed[0].name, "allow_me");
+        assert_eq!(outcome.denied.len(), 1, "deny_me denied");
+        assert_eq!(outcome.ask.len(), 1);
+        assert_eq!(outcome.ask[0].0.name, "ask_me");
     }
 
     #[test]
     fn classify_sync_returns_none_when_cancelled() {
-        let classifier = WorkMode::Manual.classifier(HashMap::new());
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert!(classify_sync(classifier.as_ref(), &[call("read_file", "{}")], &cancel).is_none());
+        assert!(classify_sync(&MockClassifier, &[call("ask_me", "{}")], &cancel).is_none());
     }
 
     #[test]

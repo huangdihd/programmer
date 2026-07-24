@@ -17,41 +17,29 @@
 //! read-only calls run concurrently; writes and other side-effecting tools run
 //! one at a time. Output order always matches call order, so a read never
 //! observes a half-applied write. The TUI wraps this in a spawned task that
-//! reports the outputs via `ToolCallsCompleted`; the headless engine awaits it
+//! reports the outputs via `ToolCallsCompleted`; the headless runner awaits it
 //! inline.
 
 use crate::cancel::CancellationToken;
-use crate::mcp::McpManager;
+use crate::tools::provider::{ToolCtx, ToolRegistry};
 use crate::ui::event::Event;
 use async_openai::types::responses::FunctionToolCall;
 use futures::StreamExt;
 use std::sync::Arc;
 
-/// Whether a tool has no side effects and so may run concurrently with other
-/// such calls. Only read-only tools qualify; everything else (writes, shell
-/// commands, MCP calls, and anything unrecognised) runs serially so a read can
-/// never race ahead of a write it might depend on.
-fn is_parallel_safe(name: &str) -> bool {
-    matches!(
-        name,
-        crate::tools::read_file::NAME
-            | crate::tools::grep::NAME
-            | crate::tools::blob::NAME
-            | crate::tools::fetch::NAME
-    )
-}
-
-/// Execute one tool call and stamp the approval label (unless the classifier
-/// already set one). Takes everything by value so each future is self-contained
-/// and can be driven concurrently in a `buffered` stream; the captured handles
-/// (`sender`, `mcp`) are cheap `Arc`-backed clones.
+/// Execute one tool call through the registry and stamp the approval label
+/// (unless the classifier already set one). Takes everything by value so each
+/// future is self-contained and can be driven concurrently in a `buffered`
+/// stream; the captured handles (`sender`, `registry`) are cheap `Arc`-backed
+/// clones.
 async fn run_labeled_call(
     call: FunctionToolCall,
     sender: tokio::sync::mpsc::UnboundedSender<Event>,
-    mcp: Option<Arc<McpManager>>,
+    registry: Arc<ToolRegistry>,
     label: String,
 ) -> crate::tools::ToolOutput {
-    let mut out = crate::tools::run_tool_call(&call, &sender, mcp.as_deref()).await;
+    let result = registry.call(&call, &ToolCtx { sender: &sender }).await;
+    let mut out = crate::tools::make_tool_output(&call.call_id, result);
     if out.approval_label.is_none() {
         out.approval_label = Some(label);
     }
@@ -72,7 +60,7 @@ pub(crate) async fn run_tool_batch(
     cancel: CancellationToken,
     approval_label: String,
     sender: tokio::sync::mpsc::UnboundedSender<Event>,
-    mcp: Option<Arc<McpManager>>,
+    registry: Arc<ToolRegistry>,
 ) -> Vec<crate::tools::ToolOutput> {
     let mut outputs = denied;
     let mut i = 0;
@@ -80,11 +68,11 @@ pub(crate) async fn run_tool_batch(
         if cancel.is_cancelled() {
             break;
         }
-        if is_parallel_safe(&allowed[i].name) {
+        if registry.is_read_only(&allowed[i].name) {
             // Take the maximal run of consecutive read-only calls and run
             // them concurrently, preserving order.
             let start = i;
-            while i < allowed.len() && is_parallel_safe(&allowed[i].name) {
+            while i < allowed.len() && registry.is_read_only(&allowed[i].name) {
                 i += 1;
             }
             let futs: Vec<_> = allowed[start..i]
@@ -93,7 +81,7 @@ pub(crate) async fn run_tool_batch(
                     run_labeled_call(
                         call.clone(),
                         sender.clone(),
-                        mcp.clone(),
+                        registry.clone(),
                         approval_label.clone(),
                     )
                 })
@@ -107,7 +95,7 @@ pub(crate) async fn run_tool_batch(
             let out = run_labeled_call(
                 allowed[i].clone(),
                 sender.clone(),
-                mcp.clone(),
+                registry.clone(),
                 approval_label.clone(),
             )
             .await;
@@ -140,6 +128,13 @@ mod tests {
         }
     }
 
+    /// A registry with just the local built-ins — enough for the batch tests.
+    fn local_registry() -> Arc<ToolRegistry> {
+        Arc::new(ToolRegistry::new(vec![Arc::new(
+            crate::tools::provider::LocalToolProvider,
+        )]))
+    }
+
     #[tokio::test]
     async fn denied_come_first_and_output_order_matches_call_order() {
         // A read, a write, a read — mixing the concurrent and serial paths.
@@ -151,7 +146,7 @@ mod tests {
             call("write_file", &format!("{{\"path\":{path},\"content\":\"hi\"}}")),
             call("read_file", &format!("{{\"path\":{path}}}")),
         ];
-        let denied = vec![crate::engine::classify::classifier_denied_output(
+        let denied = vec![crate::runner::classify::classifier_denied_output(
             &call("command", "{}"),
             "blocked for the test",
         )];
@@ -162,7 +157,7 @@ mod tests {
             CancellationToken::new(),
             "test-label".to_string(),
             tx,
-            None,
+            local_registry(),
         )
         .await;
 
@@ -184,7 +179,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let denied = vec![crate::engine::classify::classifier_denied_output(
+        let denied = vec![crate::runner::classify::classifier_denied_output(
             &call("command", "{}"),
             "blocked",
         )];
@@ -194,7 +189,7 @@ mod tests {
             cancel,
             "test-label".to_string(),
             tx,
-            None,
+            local_registry(),
         )
         .await;
         // Cancelled before running anything allowed: only the denial remains.

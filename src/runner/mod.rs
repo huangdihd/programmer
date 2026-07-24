@@ -13,13 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The UI-free agent engine: the turn primitives (request building, streaming,
+//! The UI-free agent runner: the turn primitives (request building, streaming,
 //! classification, tool execution) that both the TUI event loop and a headless
 //! driver share, plus the driver itself. Extracted incrementally from the
 //! `app` event handlers so the TUI keeps working unchanged while the same logic
 //! becomes reusable for a print mode and, later, in-process sub-agents.
 
 pub(crate) mod classify;
+pub(crate) mod hooks;
 pub(crate) mod request;
 pub(crate) mod stream;
 pub(crate) mod surface;
@@ -30,8 +31,6 @@ pub(crate) use surface::{AgentSurface, HeadlessSurface, ReviewDecision};
 use crate::cancel::CancellationToken;
 use crate::classifier::Classifier;
 use crate::conversation::Conversation;
-use crate::mcp::McpManager;
-use crate::mcp::types::McpPolicy;
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
 use crate::response::response_finish_reason::ResponseFinishReason;
@@ -39,25 +38,24 @@ use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
-    FunctionToolCall, OutputItem, OutputMessageContent, ResponseStreamEvent, Tool,
+    FunctionToolCall, OutputItem, OutputMessageContent, ResponseStreamEvent,
 };
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-/// The Auto-mode LLM classifier's inputs, boxed into [`EnginePolicy::Llm`] so
+/// The Auto-mode LLM classifier's inputs, boxed into [`RunnerPolicy::Llm`] so
 /// that variant isn't far larger than the others.
 pub(crate) struct LlmPolicy {
     pub client: Client<OpenAIConfig>,
     pub model_name: String,
     pub no_logprobs: Arc<Mutex<HashSet<String>>>,
-    pub mcp_policies: std::collections::HashMap<String, McpPolicy>,
 }
 
-/// How the engine decides whether a tool call may run. The TUI keeps its own
-/// `WorkMode` and maps per-classification; this is the engine-level equivalent
+/// How the runner decides whether a tool call may run. The TUI keeps its own
+/// `WorkMode` and maps per-classification; this is the runner-level equivalent
 /// for headless callers.
-pub(crate) enum EnginePolicy {
+pub(crate) enum RunnerPolicy {
     /// Everything is allowed without review.
     Yolo,
     /// A synchronous rule classifier (e.g. a Manual-style policy). Its `Ask`
@@ -70,48 +68,34 @@ pub(crate) enum EnginePolicy {
     Llm(Box<LlmPolicy>),
 }
 
-/// A headless agent engine: everything needed to run a turn to completion with
+/// A headless agent runner: everything needed to run a turn to completion with
 /// no UI. Reused by the `-p` print mode and, later, in-process sub-agents.
-pub(crate) struct Engine {
+pub(crate) struct TurnRunner {
     /// Client + resolved model id for the chat/completion calls.
     pub client: Client<OpenAIConfig>,
     pub model_name: String,
     /// `provider/model` string, named in the system-prompt banner.
     pub model_str: String,
-    /// The advertised tool set (must exclude `ask_user` — see `run_turn`).
-    pub tools: Vec<Tool>,
-    pub policy: EnginePolicy,
-    pub mcp: Option<Arc<McpManager>>,
+    /// Every tool source behind one interface: the local built-ins and the
+    /// connected MCP servers, each a provider. Supplies the advertised list, the
+    /// read-only / interaction metadata, and call routing.
+    pub tools: Arc<crate::tools::provider::ToolRegistry>,
+    pub policy: RunnerPolicy,
     pub coauthor: Option<String>,
-    /// Post-edit diagnostics feedback, driven inside the turn loop. Off by
-    /// default, so `-p` runs stay lean.
-    pub diagnostics: DiagnosticsFeedback,
+    /// Pluggable turn hooks (post-edit diagnostics, the PROGRAMMER.md reminder,
+    /// and any future check) run around each tool batch. Empty by default, so
+    /// `-p` runs stay lean.
+    pub hooks: Vec<Arc<dyn hooks::TurnHook>>,
     /// Set while the stream layer is retrying a dropped connection; shared so
     /// a front-end can show a "retrying" indicator.
     pub stream_retrying: Arc<AtomicBool>,
 }
 
-/// Configuration and running state for the engine's post-edit feedback: after a
-/// tool batch that edited files, run the configured diagnostics checkers, diff
-/// against the baseline, and inject the delta (plus periodic PROGRAMMER.md
-/// reminders) back into the conversation — the same behaviour the TUI's
-/// post-edit pipeline provided, now owned by the shared loop. When `enabled` is
-/// false none of it runs, and the turn resumes straight after the tool outputs.
-///
-/// The mutable [`DiagnosticsState`] lives behind an `Arc<Mutex<_>>` so it
-/// survives across turns even though the TUI builds a fresh `Engine` per turn:
-/// the front-end holds the state and hands each turn's engine a clone.
-#[derive(Default, Clone)]
-pub(crate) struct DiagnosticsFeedback {
-    /// Master switch. The TUI turns this on; `-p` leaves it off (for now).
-    pub enabled: bool,
-    /// Emit a PROGRAMMER.md refresh reminder every N file-editing turns, when set.
-    pub reminder_every: Option<usize>,
-    /// Baseline + edit-turn counter, shared so it persists across per-turn engines.
-    pub state: Arc<Mutex<DiagnosticsState>>,
-}
-
-/// The cross-turn mutable state behind [`DiagnosticsFeedback`].
+/// Cross-turn mutable state shared between the runner's hooks and the front-end
+/// (the UI renders the baseline; both survive the per-turn runners because the
+/// front-end holds this behind an `Arc<Mutex<_>>` and hands each turn's runner a
+/// clone). The [`hooks::DiagnosticsHook`] owns `baseline`; the
+/// [`hooks::OverviewReminderHook`] owns `mutating_turns`.
 #[derive(Default)]
 pub(crate) struct DiagnosticsState {
     /// The last diagnostics snapshot to diff against; `None` until the first run
@@ -131,7 +115,7 @@ pub struct TurnResult {
 
 /// Why a turn could not complete.
 #[derive(Debug, thiserror::Error)]
-pub enum EngineError {
+pub enum RunnerError {
     #[error("stream error: {0}")]
     Stream(OpenAIError),
     #[error("api error {code:?}: {message}")]
@@ -146,7 +130,7 @@ pub enum EngineError {
 /// Mirrors the TUI's `ActivePhase`; the headless surface ignores it.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
-pub enum EnginePhase {
+pub enum RunnerPhase {
     /// Streaming a model response.
     Streaming,
     /// Classifying the requested tool calls.
@@ -163,7 +147,7 @@ pub enum EnginePhase {
 /// these events carry only the in-flight/ephemeral state that isn't in the
 /// conversation yet (live stream tokens, phase, the commit boundary).
 #[allow(dead_code)]
-pub(crate) enum EngineEvent<'a> {
+pub(crate) enum RunnerEvent<'a> {
     /// A raw streaming chunk of the in-flight response, for live token
     /// rendering before the response is committed. Boxed because a
     /// `ResponseStreamEvent` dwarfs the other variants.
@@ -177,10 +161,10 @@ pub(crate) enum EngineEvent<'a> {
     /// A tool call is about to run.
     ToolCall { name: &'a str },
     /// The turn moved to a new phase.
-    Phase(EnginePhase),
+    Phase(RunnerPhase),
 }
 
-impl Engine {
+impl TurnRunner {
     /// Run a full turn: stream a response, run any tool calls it requests, and
     /// loop until the model answers with no tool calls (returning its text) or
     /// an error is hit. `conversation` is mutated in place with every
@@ -190,12 +174,12 @@ impl Engine {
         conversation: &Mutex<Conversation>,
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
-    ) -> Result<TurnResult, EngineError> {
+    ) -> Result<TurnResult, RunnerError> {
         let retrying = &self.stream_retrying;
 
         loop {
             if cancel.is_cancelled() {
-                return Err(EngineError::Cancelled);
+                return Err(RunnerError::Cancelled);
             }
 
             // ---- stream one response, folding it locally ----
@@ -213,9 +197,9 @@ impl Engine {
                     coauthor: self.coauthor.as_deref(),
                 };
                 let conv = conversation.lock().unwrap();
-                request::build_request(&conv, &ctx, self.model_name.clone(), self.tools.clone())
+                request::build_request(&conv, &ctx, self.model_name.clone(), self.tools.tools())
             };
-            surface.on_event(EngineEvent::Phase(EnginePhase::Streaming));
+            surface.on_event(RunnerEvent::Phase(RunnerPhase::Streaming));
             let mut partial = PartialResponse::new(cancel.child());
             let mut stream_err: Option<OpenAIError> = None;
             stream::stream_with_retries(&self.client, &req, cancel, retrying, |result| {
@@ -223,7 +207,7 @@ impl Engine {
                     Ok(ev) => {
                         // Forward each chunk for live rendering, then fold it
                         // into our own partial to extract the committed items.
-                        surface.on_event(EngineEvent::StreamChunk(Box::new(ev.clone())));
+                        surface.on_event(RunnerEvent::StreamChunk(Box::new(ev.clone())));
                         partial.handle_response_stream_event(ev);
                     }
                     Err(e) => stream_err = Some(e),
@@ -232,22 +216,22 @@ impl Engine {
             .await;
 
             if cancel.is_cancelled() {
-                return Err(EngineError::Cancelled);
+                return Err(RunnerError::Cancelled);
             }
             if let Some(e) = stream_err {
-                return Err(EngineError::Stream(e));
+                return Err(RunnerError::Stream(e));
             }
 
             let usage = partial.usage;
             let (finish_reason, items) = partial.into_parts();
             match finish_reason {
                 Some(ResponseFinishReason::ApiError { code, message, .. }) => {
-                    return Err(EngineError::Api { code, message });
+                    return Err(RunnerError::Api { code, message });
                 }
                 Some(ResponseFinishReason::StreamError(e)) => {
-                    return Err(EngineError::Stream(e));
+                    return Err(RunnerError::Stream(e));
                 }
-                None => return Err(EngineError::EmptyResponse),
+                None => return Err(RunnerError::EmptyResponse),
                 _ => {}
             }
 
@@ -273,9 +257,9 @@ impl Engine {
             // Committed to the shared conversation: tell a live renderer to drop
             // its in-progress view now (after the commit, so there is no frame
             // where neither the in-flight nor the committed copy shows).
-            surface.on_event(EngineEvent::ResponseCommitted);
+            surface.on_event(RunnerEvent::ResponseCommitted);
             if !assistant_text.is_empty() {
-                surface.on_event(EngineEvent::Assistant(&assistant_text));
+                surface.on_event(RunnerEvent::Assistant(&assistant_text));
             }
 
             // ---- no tool calls → the turn is done ----
@@ -289,40 +273,61 @@ impl Engine {
 
             // ---- classify, then run the calls ----
             for call in &calls {
-                surface.on_event(EngineEvent::ToolCall { name: &call.name });
+                surface.on_event(RunnerEvent::ToolCall { name: &call.name });
             }
-            // Remember which calls in this batch are file edits, so we know
-            // afterwards whether to run post-edit diagnostics.
-            let edit_call_ids: HashSet<String> = if self.diagnostics.enabled {
-                calls
-                    .iter()
-                    .filter(|c| {
-                        c.name == crate::tools::write_file::NAME
-                            || c.name == crate::tools::edit_file::NAME
-                    })
-                    .map(|c| c.call_id.clone())
-                    .collect()
-            } else {
-                HashSet::new()
-            };
+            // Snapshot the batch metadata the hooks self-gate on — but only when
+            // any are attached, so a headless `-p` run does no extra work. We need
+            // the edit call-ids to tell afterwards whether a file was actually
+            // written; the tool names go into the summary handed to each hook.
+            let hook_meta: Option<(Vec<String>, HashSet<String>)> = (!self.hooks.is_empty())
+                .then(|| {
+                    let tool_names = calls.iter().map(|c| c.name.clone()).collect();
+                    let edit_call_ids = calls
+                        .iter()
+                        .filter(|c| {
+                            c.name == crate::tools::write_file::NAME
+                                || c.name == crate::tools::edit_file::NAME
+                        })
+                        .map(|c| c.call_id.clone())
+                        .collect();
+                    (tool_names, edit_call_ids)
+                });
+
+            // Before-batch hooks (tools have not run, so `edited` is false).
+            if let Some((tool_names, _)) = &hook_meta {
+                let summary = hooks::BatchSummary {
+                    tool_names: tool_names.clone(),
+                    edited: false,
+                };
+                self.run_hooks(hooks::HookPhase::Before, conversation, &summary, surface)
+                    .await;
+            }
+
             let outputs = self.run_calls(conversation, calls, cancel, surface).await;
             match outputs {
                 Some(outputs) => {
-                    let edited = self.diagnostics.enabled
-                        && outputs
+                    let edited = match &hook_meta {
+                        Some((_, edit_call_ids)) => outputs
                             .iter()
-                            .any(|o| !o.failed && edit_call_ids.contains(&o.param.call_id));
+                            .any(|o| !o.failed && edit_call_ids.contains(&o.param.call_id)),
+                        None => false,
+                    };
                     {
                         let mut conv = conversation.lock().unwrap();
                         for out in outputs {
                             conv.add_tool_output(out);
                         }
                     }
-                    if edited {
-                        self.run_post_edit_diagnostics(conversation, surface).await;
+                    // After-batch hooks. Each self-gates on the summary, so we run
+                    // them after every batch and let e.g. the diagnostics hook
+                    // bow out when nothing was edited.
+                    if let Some((tool_names, _)) = hook_meta {
+                        let summary = hooks::BatchSummary { tool_names, edited };
+                        self.run_hooks(hooks::HookPhase::After, conversation, &summary, surface)
+                            .await;
                     }
                 }
-                None => return Err(EngineError::Cancelled),
+                None => return Err(RunnerError::Cancelled),
             }
         }
     }
@@ -345,7 +350,7 @@ impl Engine {
         let mut denied: Vec<crate::tools::ToolOutput> = Vec::new();
         let mut classifiable: Vec<FunctionToolCall> = Vec::new();
         for call in calls {
-            if call.name == crate::tools::ask_user::NAME && tool_sender.is_none() {
+            if self.tools.requires_interaction(&call.name) && tool_sender.is_none() {
                 denied.push(classify::classifier_denied_output(
                     &call,
                     "ask_user is unavailable in non-interactive mode",
@@ -355,17 +360,29 @@ impl Engine {
             }
         }
 
-        surface.on_event(EngineEvent::Phase(EnginePhase::Classifying));
-        let outcome = match &self.policy {
-            EnginePolicy::Yolo => classify::ClassificationOutcome {
-                allowed: classifiable,
+        // Front gate: the owning provider's policy decides whether each call
+        // needs the classifier at all. Auto-approved calls (read-only built-ins,
+        // trusted MCP servers) skip it entirely; only the rest are classified.
+        let mut auto_allowed: Vec<FunctionToolCall> = Vec::new();
+        let mut to_classify: Vec<FunctionToolCall> = Vec::new();
+        for call in classifiable {
+            match self.tools.approval(&call.name, &call.arguments) {
+                crate::tools::provider::ToolApproval::AutoApprove => auto_allowed.push(call),
+                crate::tools::provider::ToolApproval::Classify => to_classify.push(call),
+            }
+        }
+
+        surface.on_event(RunnerEvent::Phase(RunnerPhase::Classifying));
+        let mut outcome = match &self.policy {
+            RunnerPolicy::Yolo => classify::ClassificationOutcome {
+                allowed: to_classify,
                 denied: Vec::new(),
                 ask: Vec::new(),
             },
-            EnginePolicy::Sync(classifier) => {
-                classify::classify_sync(classifier.as_ref(), &classifiable, cancel)?
+            RunnerPolicy::Sync(classifier) => {
+                classify::classify_sync(classifier.as_ref(), &to_classify, cancel)?
             }
-            EnginePolicy::Llm(p) => {
+            RunnerPolicy::Llm(p) => {
                 let (light, full) = {
                     let conv = conversation.lock().unwrap();
                     let items: Vec<&MessageItem> = conv.items().collect();
@@ -375,15 +392,16 @@ impl Engine {
                     &p.client,
                     &p.model_name,
                     &p.no_logprobs,
-                    &p.mcp_policies,
                     &light,
                     &full,
-                    classifiable,
+                    to_classify,
                     cancel,
                 )
                 .await?
             }
         };
+        // Front-gate auto-approvals join whatever the classifier cleared.
+        outcome.allowed.extend(auto_allowed);
 
         // Bubble each `Ask` verdict to the surface for a decision. A headless
         // surface denies (folding the classifier's reason into the denial, as
@@ -402,7 +420,7 @@ impl Engine {
         }
         denied.extend(outcome.denied);
 
-        surface.on_event(EngineEvent::Phase(EnginePhase::RunningTools));
+        surface.on_event(RunnerEvent::Phase(RunnerPhase::RunningTools));
         // Use the front-end's tool channel when it has one (so ask_user and live
         // task updates reach the UI); otherwise a throwaway channel with a
         // dropped receiver — safe because ask_user is already pre-denied there.
@@ -413,78 +431,52 @@ impl Engine {
             cancel.clone(),
             surface.approval_label(),
             sender,
-            self.mcp.clone(),
+            self.tools.clone(),
         )
         .await;
         Some(outputs)
     }
 
-    /// After a file-editing batch, run the diagnostics checkers (if a profile is
-    /// configured), diff against the running baseline, and inject the delta —
-    /// plus a periodic PROGRAMMER.md reminder when due — back into the
-    /// conversation so the model reacts to the errors it just introduced. The
-    /// feedback is appended to the most recent editing tool's output when one is
-    /// present (so it renders inside that call) and otherwise added as its own
-    /// system note. Mirrors the TUI's old `continue_with_diagnostics` +
-    /// `apply_diagnostics`, but sequential inside the loop rather than spawned.
-    async fn run_post_edit_diagnostics(
+    /// Drive every attached hook for one `phase` of a tool batch, collecting the
+    /// feedback each returns and injecting the combined text into the
+    /// conversation. After-batch feedback is folded into the most recent editing
+    /// tool's output when present (so it renders inside that call) and otherwise
+    /// added as a system note; before-batch feedback — where there is no fresh
+    /// edit output to attach to — is always a system note.
+    async fn run_hooks(
         &self,
+        phase: hooks::HookPhase,
         conversation: &Mutex<Conversation>,
+        summary: &hooks::BatchSummary,
         surface: &dyn AgentSurface,
     ) {
-        let mutating_turns = {
-            let mut st = self.diagnostics.state.lock().unwrap();
-            st.mutating_turns += 1;
-            st.mutating_turns
+        let ctx = hooks::HookContext {
+            conversation,
+            surface,
+            batch: summary,
         };
-        let reminder_due = self
-            .diagnostics
-            .reminder_every
-            .is_some_and(|n| n != 0 && mutating_turns.is_multiple_of(n))
-            && std::path::Path::new("PROGRAMMER.md").exists();
-
         let mut parts: Vec<String> = Vec::new();
-
-        if std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
-            surface.on_event(EngineEvent::Phase(EnginePhase::Checking));
-            let cwd = std::env::current_dir()
-                .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
-            // No state lock held across this await — see the run_turn comment.
-            let snapshot = crate::diagnostics::collect(&cwd).await.unwrap_or_default();
-            let mut st = self.diagnostics.state.lock().unwrap();
-            match &st.baseline {
-                Some(old) => {
-                    if let Some(summary) =
-                        crate::diagnostics::diff(old, &snapshot.diagnostics).summary()
-                    {
-                        parts.push(summary);
-                    }
-                }
-                None => {
-                    if !snapshot.diagnostics.is_empty() {
-                        parts.push(format!(
-                            "Diagnostics baseline established: {} problem(s) currently \
-                             in the project. Future edits will report changes relative \
-                             to this.",
-                            snapshot.diagnostics.len()
-                        ));
-                    }
+        for hook in &self.hooks {
+            let out = match phase {
+                hooks::HookPhase::Before => hook.before_tool_batch(&ctx).await,
+                hooks::HookPhase::After => hook.after_tool_batch(&ctx).await,
+            };
+            if let Some(text) = out {
+                if !text.is_empty() {
+                    parts.push(text);
                 }
             }
-            for e in &snapshot.errors {
-                parts.push(format!("Diagnostics checker error: {e}"));
-            }
-            st.baseline = Some(snapshot.diagnostics);
         }
-
-        if reminder_due {
-            parts.push(crate::prompts::OVERVIEW_REMINDER.to_string());
-        }
-
         if parts.is_empty() {
             return;
         }
-        inject_post_edit_feedback(conversation, &parts.join("\n\n"));
+        let combined = parts.join("\n\n");
+        match phase {
+            hooks::HookPhase::After => inject_post_edit_feedback(conversation, &combined),
+            hooks::HookPhase::Before => {
+                conversation.lock().unwrap().add_meta("\u{25B8} System", &combined);
+            }
+        }
     }
 }
 
@@ -651,17 +643,18 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    fn engine_for(base_url: &str) -> Engine {
+    fn engine_for(base_url: &str) -> TurnRunner {
         let client = Client::with_config(OpenAIConfig::new().with_api_base(base_url.to_string()));
-        Engine {
+        TurnRunner {
             client,
             model_name: "mock".to_string(),
             model_str: "mock/mock".to_string(),
-            tools: crate::tools::tools(None),
-            policy: EnginePolicy::Yolo,
-            mcp: None,
+            tools: std::sync::Arc::new(crate::tools::provider::ToolRegistry::new(vec![
+                std::sync::Arc::new(crate::tools::provider::LocalToolProvider),
+            ])),
+            policy: RunnerPolicy::Yolo,
             coauthor: None,
-            diagnostics: DiagnosticsFeedback::default(),
+            hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -714,12 +707,12 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let engine = engine_for(&base);
+        let runner = engine_for(&base);
         let mut c = Conversation::new();
         c.add_input_message(user("read the manifest"));
         let conv = Mutex::new(c);
         let cancel = CancellationToken::new();
-        let result = engine
+        let result = runner
             .run_turn(&conv, &cancel, &HeadlessSurface)
             .await
             .expect("turn completes");
@@ -742,6 +735,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_custom_hook_fires_after_a_tool_batch_and_injects_feedback() {
+        // Demonstrates the pluggable-hook abstraction end to end: an arbitrary
+        // hook (not diagnostics) attached to the runner runs after the tool batch
+        // and its returned feedback lands in the conversation.
+        use crate::runner::hooks::{HookContext, TurnHook};
+
+        struct MarkerHook;
+        #[async_trait::async_trait]
+        impl TurnHook for MarkerHook {
+            fn name(&self) -> &str {
+                "marker"
+            }
+            async fn after_tool_batch(&self, _ctx: &HookContext<'_>) -> Option<String> {
+                Some("HOOK-RAN".to_string())
+            }
+        }
+
+        // Response 1: a read_file call; Response 2: the final message.
+        let body1 = format!(
+            "{}{}",
+            item_added_frame(1, 0, &call_item("c1", "read_file", "{\"path\":\"Cargo.toml\"}")),
+            completed_frame(2),
+        );
+        let body2 = format!(
+            "{}{}",
+            item_added_frame(1, 0, &message_item("done")),
+            completed_frame(2),
+        );
+        let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
+
+        let mut runner = engine_for(&base);
+        runner.hooks = vec![Arc::new(MarkerHook)];
+        let mut c = Conversation::new();
+        c.add_input_message(user("go"));
+        let conv = Mutex::new(c);
+        let cancel = CancellationToken::new();
+        runner
+            .run_turn(&conv, &cancel, &HeadlessSurface)
+            .await
+            .expect("turn completes");
+
+        // read_file is not an edit, so the feedback is added as a system note.
+        let has_marker = conv.lock().unwrap().items().any(|it| {
+            matches!(it, MessageItem::Meta { text, .. } if text.contains("HOOK-RAN"))
+        });
+        assert!(has_marker, "the custom hook's feedback should be injected");
+    }
+
+    #[tokio::test]
     async fn run_turn_pre_denies_ask_user_and_continues() {
         // Response 1 calls ask_user (which must be denied, not hang).
         // Response 2 finishes.
@@ -757,14 +799,14 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let engine = engine_for(&base);
+        let runner = engine_for(&base);
         let mut c = Conversation::new();
         c.add_input_message(user("hi"));
         let conv = Mutex::new(c);
         let cancel = CancellationToken::new();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            engine.run_turn(&conv, &cancel, &HeadlessSurface),
+            runner.run_turn(&conv, &cancel, &HeadlessSurface),
         )
         .await
         .expect("must not hang on ask_user")
@@ -790,14 +832,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentSurface for TestSurface {
-        fn on_event(&self, event: EngineEvent<'_>) {
+        fn on_event(&self, event: RunnerEvent<'_>) {
             let label = match event {
-                EngineEvent::Assistant(t) => format!("assistant:{t}"),
-                EngineEvent::ToolCall { name } => format!("tool:{name}"),
+                RunnerEvent::Assistant(t) => format!("assistant:{t}"),
+                RunnerEvent::ToolCall { name } => format!("tool:{name}"),
                 // Ephemeral progress events aren't asserted on in these tests.
-                EngineEvent::StreamChunk(_)
-                | EngineEvent::ResponseCommitted
-                | EngineEvent::Phase(_) => return,
+                RunnerEvent::StreamChunk(_)
+                | RunnerEvent::ResponseCommitted
+                | RunnerEvent::Phase(_) => return,
             };
             self.events.lock().unwrap().push(label);
         }
@@ -820,19 +862,20 @@ mod tests {
         }
     }
 
-    fn sync_engine(policy_mode: crate::classifier::WorkMode) -> Engine {
+    fn sync_engine(policy_mode: crate::classifier::WorkMode) -> TurnRunner {
         // A base_url is required to build the client, but `run_calls` never
         // streams, so any address works.
         let client = Client::with_config(OpenAIConfig::new().with_api_base("http://127.0.0.1:1"));
-        Engine {
+        TurnRunner {
             client,
             model_name: "mock".to_string(),
             model_str: "mock/mock".to_string(),
-            tools: crate::tools::tools(None),
-            policy: EnginePolicy::Sync(policy_mode.classifier(std::collections::HashMap::new())),
-            mcp: None,
+            tools: std::sync::Arc::new(crate::tools::provider::ToolRegistry::new(vec![
+                std::sync::Arc::new(crate::tools::provider::LocalToolProvider),
+            ])),
+            policy: RunnerPolicy::Sync(policy_mode.classifier()),
             coauthor: None,
-            diagnostics: DiagnosticsFeedback::default(),
+            hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -845,7 +888,7 @@ mod tests {
         let path = serde_json::to_string(&tmp.to_string_lossy()).unwrap();
         let _ = std::fs::remove_file(&tmp);
 
-        let engine = sync_engine(crate::classifier::WorkMode::Manual);
+        let runner = sync_engine(crate::classifier::WorkMode::Manual);
         let conv = Mutex::new(Conversation::new());
         let cancel = CancellationToken::new();
         let surface = TestSurface {
@@ -860,7 +903,7 @@ mod tests {
             id: None,
             status: None,
         }];
-        let outputs = engine
+        let outputs = runner
             .run_calls(&conv, calls, &cancel, &surface)
             .await
             .expect("not cancelled");
@@ -883,7 +926,7 @@ mod tests {
         let path = serde_json::to_string(&tmp.to_string_lossy()).unwrap();
         let _ = std::fs::remove_file(&tmp);
 
-        let engine = sync_engine(crate::classifier::WorkMode::Manual);
+        let runner = sync_engine(crate::classifier::WorkMode::Manual);
         let conv = Mutex::new(Conversation::new());
         let cancel = CancellationToken::new();
         let surface = TestSurface {
@@ -898,7 +941,7 @@ mod tests {
             id: None,
             status: None,
         }];
-        let outputs = engine
+        let outputs = runner
             .run_calls(&conv, calls, &cancel, &surface)
             .await
             .expect("not cancelled");
@@ -1003,12 +1046,12 @@ mod tests {
         );
         let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
 
-        let engine = engine_for(&base); // Yolo; diagnostics disabled by default.
+        let runner = engine_for(&base); // Yolo; diagnostics disabled by default.
         let mut c = Conversation::new();
         c.add_input_message(user("write it"));
         let conv = Mutex::new(c);
         let cancel = CancellationToken::new();
-        engine
+        runner
             .run_turn(&conv, &cancel, &HeadlessSurface)
             .await
             .expect("turn completes");

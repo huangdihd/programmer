@@ -429,7 +429,7 @@ fn handle_approval_key(
         }
         KeyCode::Enter => {
             if let Some(review) = app.pending_review.take() {
-                use crate::engine::ReviewDecision;
+                use crate::runner::ReviewDecision;
                 use async_openai::types::responses::{FunctionCallOutput, FunctionCallOutputItemParam};
                 let decision = match review.selected {
                     0 => ReviewDecision::Approve,
