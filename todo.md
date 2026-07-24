@@ -5,6 +5,7 @@
 - ~~lint~~
 - remote control(?)
 - improve command and task system
+- convert a command into a task
 - configurable restricted access control rule system
 - multi agents(traditional sub agents or use interactive background task system to launch itself again?)
 - sandbox
