@@ -134,6 +134,10 @@ impl ToolProvider for LocalToolProvider {
         if call.name == ask_user::NAME {
             // ask_user needs the UI channel, so it isn't part of run_local_tool.
             ask_user::run(&call.arguments, ctx.sender).await
+        } else if call.name == command::NAME {
+            // The command tool streams its output to the live registry (keyed by
+            // call id) so the TUI can render it as it runs.
+            command::run_with_live(&call.arguments, &call.call_id).await
         } else {
             run_local_tool(&call.name, &call.arguments).await
         }

@@ -50,6 +50,9 @@ pub struct AssistantMessage<'a> {
     /// reported failure, and an optional approval label — rendered inline so
     /// the call and its output appear as a single message.
     tool_output: Option<(&'a FunctionCallOutputItemParam, bool, Option<&'a str>)>,
+    /// For a still-running `command` call: its output so far, rendered live
+    /// until the committed result arrives.
+    live_output: Option<&'a str>,
 }
 
 impl<'a> AssistantMessage<'a> {
@@ -61,6 +64,7 @@ impl<'a> AssistantMessage<'a> {
             expanded: false,
             frame_count: None,
             tool_output: None,
+            live_output: None,
         }
     }
 
@@ -69,6 +73,11 @@ impl<'a> AssistantMessage<'a> {
         tool_output: Option<(&'a FunctionCallOutputItemParam, bool, Option<&'a str>)>,
     ) -> Self {
         self.tool_output = tool_output;
+        self
+    }
+
+    pub fn live_output(mut self, live_output: Option<&'a str>) -> Self {
+        self.live_output = live_output;
         self
     }
 
@@ -105,6 +114,7 @@ impl<'a> AssistantMessage<'a> {
                             .unwrap_or(false),
                     )
                     .approval_label(self.tool_output.and_then(|(_, _, label)| label))
+                    .live_output(self.live_output)
                     .expanded(self.expanded)
                     .into_text(),
                 Vec::new(),

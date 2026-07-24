@@ -13,16 +13,62 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use async_openai::types::responses::Tool;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::{function_tool, shell};
 
 pub const NAME: &str = "command";
+
+/// Cap on the live output buffer kept per running command. Only the tail is
+/// rendered in the UI while a command runs, so older bytes are dropped once the
+/// buffer grows past this.
+const MAX_LIVE_OUTPUT: usize = 16_384;
+
+/// In-flight command output, keyed by tool-call id. The `command` tool appends
+/// to it as bytes arrive; the TUI reads it every frame (see
+/// [`live_output`]) to render output in real time; the entry is removed when
+/// the command finishes, after which the committed tool result renders instead.
+fn live_registry() -> &'static Mutex<HashMap<String, String>> {
+    static LIVE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Append a raw output chunk to a running command's live buffer, keeping only
+/// the tail under [`MAX_LIVE_OUTPUT`]. Escape sequences are kept as-is and
+/// cleaned lazily on read by [`live_output`].
+fn append_live(call_id: &str, chunk: &str) {
+    let mut reg = live_registry().lock().unwrap();
+    let buf = reg.entry(call_id.to_string()).or_default();
+    buf.push_str(chunk);
+    if buf.len() > MAX_LIVE_OUTPUT {
+        let mut cut = buf.len() - MAX_LIVE_OUTPUT;
+        while !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.replace_range(..cut, "");
+    }
+}
+
+/// Drop a finished command's live buffer.
+fn finish_live(call_id: &str) {
+    live_registry().lock().unwrap().remove(call_id);
+}
+
+/// Snapshot the live (still-running) output for a command tool call, cleaned of
+/// terminal control sequences, or `None` if that call isn't currently running.
+/// Read by the conversation panel to render command output as it streams in.
+pub fn live_output(call_id: &str) -> Option<String> {
+    let raw = live_registry().lock().unwrap().get(call_id).cloned()?;
+    Some(clean_terminal_output(&raw))
+}
 
 pub fn tool() -> Tool {
     function_tool(
@@ -58,12 +104,35 @@ struct Args {
 }
 
 pub async fn run(arguments: &str) -> Result<String, String> {
+    run_inner(arguments, None).await
+}
+
+/// Like [`run`], but streams the command's output to the live registry under
+/// `call_id` while it runs, so the TUI can render it in real time. Used by the
+/// agent's tool path (which has a call id); the plain [`run`] is used by the
+/// MCP server and headless callers that have nowhere to show live output.
+pub async fn run_with_live(arguments: &str, call_id: &str) -> Result<String, String> {
+    let result = run_inner(arguments, Some(call_id)).await;
+    // Always drop the live buffer — success, failure, or timeout — so the
+    // committed result takes over and the registry never leaks an entry.
+    finish_live(call_id);
+    result
+}
+
+async fn run_inner(arguments: &str, live_id: Option<&str>) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
         Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
-    match execute(&args.command, args.dir.as_deref(), Some(args.timeout.unwrap_or(120))).await {
+    match execute(
+        &args.command,
+        args.dir.as_deref(),
+        Some(args.timeout.unwrap_or(120)),
+        live_id,
+    )
+    .await
+    {
         Ok((code, stdout, stderr)) => {
             // The exit code is the authoritative success signal — a non-zero
             // status means the command failed, regardless of what it printed.
@@ -78,11 +147,15 @@ pub async fn run(arguments: &str) -> Result<String, String> {
     }
 }
 
-/// Runs the command through the platform's native shell.
+/// Runs the command through the platform's native shell, draining stdout and
+/// stderr incrementally so a full pipe never blocks the child and — when
+/// `live_id` is set — the output is mirrored to the live registry as it
+/// arrives. Returns the exit code and the complete stdout/stderr.
 async fn execute(
     command: &str,
     dir: Option<&str>,
     timeout_secs: Option<u64>,
+    live_id: Option<&str>,
 ) -> std::io::Result<(Option<i32>, String, String)> {
     let (program, flag) = shell();
     let mut cmd = Command::new(program);
@@ -111,34 +184,63 @@ async fn execute(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = cmd
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    let output = match timeout_secs {
-        Some(secs) => {
-            match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await {
-                Ok(result) => result?,
-                Err(_elapsed) => {
-                    // `child` was moved into `wait_with_output`, whose future
-                    // got cancelled. `kill_on_drop(true)` on the command
-                    // builder ensures the child process is killed on drop.
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("command timed out after {secs}s"),
-                    ));
-                }
+    let live_id = live_id.map(str::to_string);
+    let out_fut = drain(child.stdout.take(), live_id.clone());
+    let err_fut = drain(child.stderr.take(), live_id);
+
+    // Drain both pipes concurrently with the wait so a chatty child can't fill
+    // a pipe and deadlock, and the live buffer keeps updating while we wait.
+    let combined = async { tokio::join!(out_fut, err_fut, child.wait()) };
+
+    let (stdout, stderr, status) = match timeout_secs {
+        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), combined).await {
+            Ok(triple) => triple,
+            Err(_elapsed) => {
+                // The `combined` future (holding the `child.wait()` borrow) is
+                // dropped here; returning drops `child` itself, and
+                // `kill_on_drop(true)` kills the process.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("command timed out after {secs}s"),
+                ));
             }
-        }
-        None => child.wait_with_output().await?,
+        },
+        None => combined.await,
     };
 
-    Ok((
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    Ok((status?.code(), stdout, stderr))
+}
+
+/// Read a child pipe to EOF, returning everything it produced. When `live_id`
+/// is set, each chunk is also appended to that call's live buffer so the UI can
+/// render it before the command finishes.
+async fn drain<R>(stream: Option<R>, live_id: Option<String>) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut acc = String::new();
+    let Some(mut stream) = stream else {
+        return acc;
+    };
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                if let Some(id) = &live_id {
+                    append_live(id, &chunk);
+                }
+                acc.push_str(&chunk);
+            }
+        }
+    }
+    acc
 }
 
 fn format_output(code: Option<i32>, stdout: &str, stderr: &str) -> String {
@@ -326,5 +428,46 @@ mod clean_tests {
     fn alternat_screen_buffer_clear_survive() {
         let input = "before\u{1b}[?1049h\u{1b}[2J\u{1b}[?1049lafter";
         assert_eq!(clean_terminal_output(input), "beforeafter");
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn live_output_streams_while_running_then_clears() {
+        // A command that prints a marker immediately, then stays alive briefly,
+        // so the live buffer can be observed before the command finishes.
+        let call_id = "live-output-test";
+        let args = if cfg!(windows) {
+            r#"{"command":"echo streaming-marker && ping -n 3 127.0.0.1 > NUL"}"#
+        } else {
+            r#"{"command":"echo streaming-marker && sleep 1"}"#
+        };
+
+        let handle = tokio::spawn(async move { run_with_live(args, call_id).await });
+
+        // Poll for the marker to appear in the live buffer while running.
+        let mut seen = false;
+        for _ in 0..60 {
+            if let Some(out) = live_output(call_id)
+                && out.contains("streaming-marker")
+            {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(seen, "live output should show the marker while the command runs");
+
+        let result = handle.await.unwrap();
+        assert!(result.unwrap().contains("streaming-marker"));
+        // Once finished, the live buffer is removed so the committed result
+        // renders instead.
+        assert!(
+            live_output(call_id).is_none(),
+            "live buffer should be cleared after the command finishes"
+        );
     }
 }

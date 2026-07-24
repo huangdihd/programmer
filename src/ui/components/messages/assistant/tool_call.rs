@@ -35,6 +35,10 @@ pub struct ToolCallMessage<'a> {
     /// Human-readable label explaining why this tool call was approved or
     /// denied (e.g. "approved by Auto mode", "denied in Manual mode by user").
     approval_label: Option<&'a str>,
+    /// Live output streamed by a still-running command (cleaned of terminal
+    /// control sequences). Rendered in place of the "waiting" spinner until the
+    /// call's committed `output` arrives.
+    live_output: Option<&'a str>,
 }
 
 impl<'a> ToolCallMessage<'a> {
@@ -45,11 +49,17 @@ impl<'a> ToolCallMessage<'a> {
             failed: false,
             expanded: false,
             approval_label: None,
+            live_output: None,
         }
     }
 
     pub fn output(mut self, output: Option<&'a FunctionCallOutputItemParam>) -> Self {
         self.output = output;
+        self
+    }
+
+    pub fn live_output(mut self, live_output: Option<&'a str>) -> Self {
+        self.live_output = live_output;
         self
     }
 
@@ -115,6 +125,8 @@ impl<'a> ToolCallMessage<'a> {
                     format!("  \u{23BF} {first}{suffix}"),
                     dim,
                 )));
+            } else if let Some(live) = self.live_output {
+                push_live_tail(&mut lines, live, muted);
             } else if !failed {
                 lines.push(Line::from(Span::styled("  \u{23BF} \u{2026}", muted)));
             }
@@ -192,9 +204,36 @@ impl<'a> ToolCallMessage<'a> {
             if first {
                 lines.push(Line::from(Span::styled("  \u{23BF} [no output]", detail_style())));
             }
+        } else if let Some(live) = self.live_output {
+            push_live_tail(&mut lines, live, muted);
         }
 
         Text::from(lines)
+    }
+}
+
+/// Lines of live command output shown while it runs. Only the tail matters for
+/// "is it making progress"; the full output lands in the committed result.
+const LIVE_TAIL_LINES: usize = 8;
+
+/// Append the tail of a running command's live output to `lines`, each row
+/// dimmed and marked with the result gutter. A leading `⋯` shows when earlier
+/// lines were dropped.
+fn push_live_tail(lines: &mut Vec<Line<'static>>, live: &str, muted: Style) {
+    let dim = muted.add_modifier(Modifier::DIM);
+    let all: Vec<&str> = live.lines().collect();
+    // A trailing newline yields no final empty entry from `.lines()`, so this is
+    // simply every non-terminated line the command has produced so far.
+    if all.is_empty() {
+        lines.push(Line::from(Span::styled("  \u{23BF} \u{2026}", muted)));
+        return;
+    }
+    let start = all.len().saturating_sub(LIVE_TAIL_LINES);
+    if start > 0 {
+        lines.push(Line::from(Span::styled("  \u{23BF} \u{22EF}", dim)));
+    }
+    for line in &all[start..] {
+        lines.push(Line::from(Span::styled(format!("  \u{23BF} {line}"), dim)));
     }
 }
 

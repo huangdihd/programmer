@@ -86,6 +86,7 @@ fn build_item_paragraph(
     content_width: u16,
     expanded: bool,
     tool_output: Option<(&FunctionCallOutputItemParam, bool, Option<&str>)>,
+    live_output: Option<&str>,
 ) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
     match item {
         MessageItem::ToolOutput { output, failed, .. } => {
@@ -103,6 +104,7 @@ fn build_item_paragraph(
         MessageItem::Output(output_item) => AssistantMessage::new(output_item, content_width)
             .expanded(expanded)
             .tool_output(tool_output)
+            .live_output(live_output)
             .into_paragraph(),
         MessageItem::OpenAIError(error) => (
             ErrorMessage::new(error.to_string()).into_paragraph(),
@@ -275,15 +277,28 @@ impl Widget for &mut ConversationPanel {
                 _ => (false, None),
             };
             let has_output = tool_output.is_some();
+            // A still-running `command` call streams its output live: fetch the
+            // in-flight buffer and force a rebuild each frame while it grows, so
+            // the panel shows output as it arrives rather than only the final
+            // committed result.
+            let live_output = match &conv.items[index] {
+                MessageItem::Output(OutputItem::FunctionCall(call))
+                    if !has_output && call.name == crate::tools::command::NAME =>
+                {
+                    crate::tools::command::live_output(&call.call_id)
+                }
+                _ => None,
+            };
             let in_viewport = index >= build_from || in_window[index];
-            let needs_build = cache
-                .entries
-                .get(index)
-                .is_none_or(|entry| {
-                    entry.expanded != expanded
-                        || entry.has_output != has_output
-                        || (entry.lazy && in_viewport)
-                });
+            let needs_build = live_output.is_some()
+                || cache
+                    .entries
+                    .get(index)
+                    .is_none_or(|entry| {
+                        entry.expanded != expanded
+                            || entry.has_output != has_output
+                            || (entry.lazy && in_viewport)
+                    });
             if needs_build {
                 let entry = if hidden {
                     CachedParagraph {
@@ -309,6 +324,7 @@ impl Widget for &mut ConversationPanel {
                         content_width,
                         expanded,
                         tool_output,
+                        live_output.as_deref(),
                     );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
