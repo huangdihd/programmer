@@ -53,8 +53,8 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     if typed.is_empty() {
         return;
     }
-    // History keeps the compact `@path` form; the model receives the referenced
-    // file contents appended.
+    // History keeps the compact `@path` form; the model receives a path-only
+    // reference for regular files or an image attachment when vision is on.
     app.input_panel.push_history(typed.clone());
     app.input_panel.clear();
     let expanded = crate::commands::expand_file_references(&typed, app.vision_enabled).await;

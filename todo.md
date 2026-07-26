@@ -6,6 +6,8 @@
 - ~~lint~~
 - remote control(?)
 - improve command and task system
+  - ~~stream command output in the TUI while it is running~~
+  - ~~view interactive and non-interactive tasks with `/terminal`~~
 - convert a command into a task
 - configurable restricted access control rule system
 - multi agents(traditional sub agents or use interactive background task system to launch itself again?)
@@ -25,11 +27,9 @@
 - installation script(publish to cargo?)
 - ~~git cooperator signature~~
 - ~~expose local tools as a MCP server~~
-- ~~@ to quote file~~
-- improve `@` file quoting
-  - ~~detect binary/non-text files instead of injecting their raw contents~~
-  - enforce configurable file-size and token-budget limits
-  - show metadata and a truncated preview for oversized files, with an explicit way to include more
+- ~~`@` to reference local files by path without injecting their contents~~
+- improve `@` references
+  - support referencing errors, warnings, and lint diagnostics
 - ~~! to run a command interactively in the app~~
 - ~~multi-provider support~~
 - ~~session persistence~~

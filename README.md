@@ -329,7 +329,8 @@ independently for each session.
 With `/vision on`, referencing a local PNG, JPEG, WEBP, or non-animated GIF as
 `@path` attaches it as an image input. `/vision off` stops sending both new and
 historical images without deleting them from the session; turning it back on
-restores them.
+restores them. Other local files are referenced by path only; their contents are
+not copied into the request context.
 
 | Flag / command | Action |
 |---|---|

@@ -16,6 +16,7 @@
 use crate::providers::ProviderManager;
 use async_openai::types::responses::{ImageDetail, InputImageContent};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use tokio::io::AsyncReadExt;
 
 // ---------------------------------------------------------------------------
 // Command parsing
@@ -518,8 +519,6 @@ fn is_executable(entry: &std::fs::DirEntry) -> bool {
         .any(|ext| name.ends_with(&format!(".{ext}")))
 }
 
-/// Maximum bytes read from a single `@file` reference before truncating.
-const MAX_REF_BYTES: usize = 100 * 1024;
 /// Keep local image attachments bounded: base64 and session JSON add roughly
 /// another third on top of the raw bytes.
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
@@ -533,16 +532,16 @@ pub(crate) struct ExpandedFileReferences {
     pub notices: Vec<String>,
 }
 
-/// Expand `@path` references in a sent message by appending the contents of
-/// each referenced file. The `@path` token stays inline; the file body is
-/// attached in a fenced block below so the model sees both the reference and
-/// the content. Tokens that don't resolve to a readable file are left alone.
+/// Expand `@path` references in a sent message. Supported images are attached
+/// when vision is enabled; every other existing file is passed to the model as
+/// a path-only reference so its contents do not consume the request context.
+/// Tokens that do not resolve to a readable file are left alone.
 pub(crate) async fn expand_file_references(
     text: &str,
     vision_enabled: bool,
 ) -> ExpandedFileReferences {
     let mut seen: Vec<String> = Vec::new();
-    let mut attachments = String::new();
+    let mut references = String::new();
     let mut images = Vec::new();
     let mut notices = Vec::new();
     let mut total_image_bytes = 0u64;
@@ -562,20 +561,17 @@ pub(crate) async fn expand_file_references(
         if !meta.is_file() {
             continue;
         }
-        if meta.len() > MAX_IMAGE_BYTES {
-            seen.push(path.to_string());
-            notices.push(format!(
-                "file @{path} is too large to reference ({} bytes; limit is {MAX_IMAGE_BYTES})",
-                meta.len()
-            ));
+
+        let Ok(mut file) = tokio::fs::File::open(&fs_path).await else {
             continue;
-        }
-        let Ok(bytes) = tokio::fs::read(&fs_path).await else {
+        };
+        let mut header = [0u8; 12];
+        let Ok(header_len) = file.read(&mut header).await else {
             continue;
         };
         seen.push(path.to_string());
 
-        if let Some(kind) = detect_image(&bytes) {
+        if let Some(kind) = detect_image(&header[..header_len]) {
             if !vision_enabled {
                 notices.push(format!(
                     "skipped image @{path}: vision is off; use /vision on to attach images"
@@ -588,12 +584,22 @@ pub(crate) async fn expand_file_references(
                 ));
                 continue;
             }
+            if meta.len() > MAX_IMAGE_BYTES {
+                notices.push(format!(
+                    "skipped image @{path}: file size is {} bytes; limit is {MAX_IMAGE_BYTES}",
+                    meta.len()
+                ));
+                continue;
+            }
             if total_image_bytes.saturating_add(meta.len()) > MAX_TOTAL_IMAGE_BYTES {
                 notices.push(format!(
                     "skipped image @{path}: total image size per message is limited to {MAX_TOTAL_IMAGE_BYTES} bytes"
                 ));
                 continue;
             }
+            let Ok(bytes) = tokio::fs::read(&fs_path).await else {
+                continue;
+            };
             if kind == ImageKind::Gif && gif_frame_count(&bytes).unwrap_or(2) != 1 {
                 notices.push(format!(
                     "skipped image @{path}: animated or malformed GIF files are not supported"
@@ -613,36 +619,16 @@ pub(crate) async fn expand_file_references(
             continue;
         }
 
-        let Ok(content) = std::str::from_utf8(&bytes) else {
-            notices.push(format!(
-                "skipped non-text file @{path}; enable vision only for PNG, JPEG, WEBP, or non-animated GIF images"
-            ));
-            continue;
-        };
-        if content.contains('\0') {
-            notices.push(format!("skipped binary file @{path}"));
-            continue;
-        }
-        let truncated = bytes.len() > MAX_REF_BYTES;
-        let slice_end = floor_char_boundary(content, bytes.len().min(MAX_REF_BYTES));
-        let content = &content[..slice_end];
-        attachments.push_str(&format!("\n\n--- Referenced file: {path} ---\n"));
-        attachments.push_str("```\n");
-        attachments.push_str(&content);
-        if !content.ends_with('\n') {
-            attachments.push('\n');
-        }
-        attachments.push_str("```");
-        if truncated {
-            attachments.push_str(&format!("\n(truncated to {MAX_REF_BYTES} bytes)"));
-        }
+        references.push_str(&format!(
+            "\n\nReferenced local file path (content not included): {fs_path}"
+        ));
     }
 
     ExpandedFileReferences {
-        text: if attachments.is_empty() {
+        text: if references.is_empty() {
             text.to_string()
         } else {
-            format!("{text}{attachments}")
+            format!("{text}{references}")
         },
         images,
         notices,
@@ -680,14 +666,6 @@ fn detect_image(bytes: &[u8]) -> Option<ImageKind> {
     } else {
         None
     }
-}
-
-fn floor_char_boundary(text: &str, mut index: usize) -> usize {
-    index = index.min(text.len());
-    while !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 /// Parse enough of a GIF stream to count image-descriptor blocks without
@@ -849,17 +827,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expand_file_references_attaches_content() {
+    async fn expand_file_references_adds_path_without_content() {
         let out = expand_file_references("look at @Cargo.toml please", false).await;
         assert!(
             out.text.starts_with("look at @Cargo.toml please"),
             "keeps typed text"
         );
         assert!(
-            out.text.contains("--- Referenced file: Cargo.toml ---"),
-            "has header"
+            out.text
+                .contains("Referenced local file path (content not included): Cargo.toml"),
+            "has path reference"
         );
-        assert!(out.text.contains("[package]"), "has file content");
+        assert!(
+            !out.text.contains("[package]"),
+            "does not inline file content"
+        );
         assert!(out.images.is_empty());
     }
 
@@ -869,6 +851,25 @@ mod tests {
         assert_eq!(out.text, "no references here @nonexistent.xyz");
         assert!(out.images.is_empty());
         assert!(out.notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn binary_file_reference_adds_only_its_path() {
+        let path =
+            std::env::temp_dir().join(format!("programmer_binary_{}.bin", std::process::id()));
+        tokio::fs::write(&path, [0, 0xff, 0xfe, 0xfd])
+            .await
+            .unwrap();
+        let reference = format!("@{}", path.display());
+
+        let out = expand_file_references(&reference, false).await;
+        assert!(out.text.contains(&format!(
+            "Referenced local file path (content not included): {}",
+            path.display()
+        )));
+        assert!(out.images.is_empty());
+        assert!(out.notices.is_empty());
+        tokio::fs::remove_file(path).await.ok();
     }
 
     #[tokio::test]
