@@ -17,7 +17,7 @@
 //! plan review, todo/provider/skills/MCP panels), then global shortcuts,
 //! then the input panel.
 
-use super::super::{commands, session, App};
+use super::super::{App, commands, session};
 use super::update_completions;
 use crate::classifier::WorkMode;
 use crate::ui::components::provider_panel::PanelAction;
@@ -54,18 +54,20 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- plan review (Plan mode) ----
-    if app.work_mode == WorkMode::Plan
-        && app.plan_phase == crate::classifier::PlanPhase::Reviewing
+    if app.work_mode == WorkMode::Plan && app.plan_phase == crate::classifier::PlanPhase::Reviewing
     {
         return handle_plan_review_key(app, key_event).await;
     }
 
     // ---- todo panel ----
     if let Some(panel) = app.todo_panel.as_mut() {
-        match panel.handle_key(key_event) {
+        let action = panel.handle_key(key_event);
+        app.todo_list = panel.list.clone();
+        app.sync_todos_to_store();
+        session::mark_dirty(app);
+        match action {
             crate::ui::components::todo_panel::PanelAction::Close => {
                 app.todo_panel = None;
-                app.todo_list = crate::todos::TodoList::load();
             }
             crate::ui::components::todo_panel::PanelAction::None => {}
         }
@@ -87,9 +89,7 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- Ctrl+B: toggle sidebar ----
-    if key_event.code == KeyCode::Char('b')
-        && key_event.modifiers == KeyModifiers::CONTROL
-    {
+    if key_event.code == KeyCode::Char('b') && key_event.modifiers == KeyModifiers::CONTROL {
         if app.sidebar.is_some() {
             app.sidebar = None;
         } else {
@@ -99,9 +99,7 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- Ctrl+T: cycle work mode ----
-    if key_event.code == KeyCode::Char('t')
-        && key_event.modifiers == KeyModifiers::CONTROL
-    {
+    if key_event.code == KeyCode::Char('t') && key_event.modifiers == KeyModifiers::CONTROL {
         app.work_mode = app.work_mode.next(app.config.allow_yolo);
         session::persist_config(app);
         return Ok(());
@@ -260,6 +258,7 @@ pub(crate) async fn handle_key_events(
         KeyCode::Up => {
             if app.input_panel.get_content().is_empty() {
                 if let Some(pending) = app.conversation_panel.pending_message.take() {
+                    app.pending_images.clear();
                     app.input_panel.set_content(&pending);
                 } else {
                     app.input_panel.history_up();
@@ -303,17 +302,15 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
     };
 
     // Ctrl+O is the escape hatch — never forwarded.
-    if key_event.code == KeyCode::Char('o')
-        && key_event.modifiers.contains(KeyModifiers::CONTROL)
-    {
+    if key_event.code == KeyCode::Char('o') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
         pane.grabbed = !pane.grabbed;
         return;
     }
 
     if pane.grabbed {
         // Cursor keys need the child's DECCKM mode to pick CSI vs SS3.
-        let app_cursor = crate::tasks::with_screen(pane.task_id, |s| s.application_cursor())
-            .unwrap_or(false);
+        let app_cursor =
+            crate::tasks::with_screen(pane.task_id, |s| s.application_cursor()).unwrap_or(false);
         if let Some(bytes) = key_event_to_bytes(key_event, app_cursor) {
             let _ = crate::tasks::write_bytes(pane.task_id, &bytes);
             // Typing snaps the view back to live output.
@@ -410,10 +407,7 @@ pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
 // ---------------------------------------------------------------------------
 
 /// Handle approval keys when tool calls are queued.
-fn handle_approval_key(
-    app: &mut App<'_>,
-    key_event: KeyEvent,
-) -> color_eyre::Result<()> {
+fn handle_approval_key(app: &mut App<'_>, key_event: KeyEvent) -> color_eyre::Result<()> {
     match key_event.code {
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(ref mut review) = app.pending_review {
@@ -430,7 +424,9 @@ fn handle_approval_key(
         KeyCode::Enter => {
             if let Some(review) = app.pending_review.take() {
                 use crate::runner::ReviewDecision;
-                use async_openai::types::responses::{FunctionCallOutput, FunctionCallOutputItemParam};
+                use async_openai::types::responses::{
+                    FunctionCallOutput, FunctionCallOutputItemParam,
+                };
                 let decision = match review.selected {
                     0 => ReviewDecision::Approve,
                     _ => ReviewDecision::Deny {
@@ -465,10 +461,7 @@ fn handle_approval_key(
 // ---------------------------------------------------------------------------
 
 /// Handle keyboard input in the plan review bar (Plan mode Reviewing phase).
-async fn handle_plan_review_key(
-    app: &mut App<'_>,
-    key_event: KeyEvent,
-) -> color_eyre::Result<()> {
+async fn handle_plan_review_key(app: &mut App<'_>, key_event: KeyEvent) -> color_eyre::Result<()> {
     let option_count = if app.config.allow_yolo { 4 } else { 3 };
     match key_event.code {
         KeyCode::Up | KeyCode::Char('k') => {
@@ -487,45 +480,43 @@ async fn handle_plan_review_key(
                 .add_info_string("Plan review cancelled — you can revise the plan.");
             session::save_session(app);
         }
-        KeyCode::Enter => {
-            match app.plan_review_selected {
-                0 => {
-                    approve_plan(
+        KeyCode::Enter => match app.plan_review_selected {
+            0 => {
+                approve_plan(
                         app,
                         WorkMode::Manual,
                         "Plan approved — executing with Manual mode.",
                         "The plan was approved by the user. Execute it now using the identified steps. Ask for approval before running commands or destructive edits.",
                     )
                     .await;
-                }
-                1 => {
+            }
+            1 => {
+                approve_plan(
+                    app,
+                    WorkMode::Auto,
+                    "Plan approved — executing with Auto mode.",
+                    "The plan was approved by the user. Execute it now using the identified steps.",
+                )
+                .await;
+            }
+            2 => {
+                if app.config.allow_yolo {
                     approve_plan(
-                        app,
-                        WorkMode::Auto,
-                        "Plan approved — executing with Auto mode.",
-                        "The plan was approved by the user. Execute it now using the identified steps.",
-                    )
-                    .await;
-                }
-                2 => {
-                    if app.config.allow_yolo {
-                        approve_plan(
                             app,
                             WorkMode::Yolo,
                             "Plan approved — executing with YOLO mode.",
                             "The plan was approved by the user. Execute it now using the identified steps. You have full autonomy.",
                         )
                         .await;
-                    } else {
-                        propose_plan_changes(app);
-                    }
-                }
-                3 => {
+                } else {
                     propose_plan_changes(app);
                 }
-                _ => {}
             }
-        }
+            3 => {
+                propose_plan_changes(app);
+            }
+            _ => {}
+        },
         _ => {
             // Any other key: pass through to input panel for feedback text
             app.input_panel.input(key_event);

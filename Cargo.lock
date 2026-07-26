@@ -2155,6 +2155,7 @@ dependencies = [
  "async-openai",
  "async-trait",
  "axum",
+ "base64",
  "color-eyre",
  "config",
  "crossterm",

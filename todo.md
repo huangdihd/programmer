@@ -1,6 +1,7 @@
-- multimodal support(use /vision on/off to switch support)
+- ~~multimodal support(use /vision on/off to switch support)~~
 - ~~jump to bottom button~~
 - ~~http mcp~~
+- redesign the `--mcp-http` mode UI
 - ~~edit_file tool diff-style message~~
 - ~~lint~~
 - remote control(?)
@@ -11,7 +12,8 @@
 - sandbox
 - ~~default classifier model~~
 - monitor local file changes and prevent modifications after changes before read
-- after switch sessions using /new, task can't be cleaned and todos can't update as expectations
+- ~~after switch sessions using /new, task can't be cleaned and todos can't update as expectations~~
+- fix intermittent failure where Esc does not interrupt the active operation
 - thinking level adjustment
 - /usage
 - method to refetch models from providers
@@ -24,6 +26,10 @@
 - ~~git cooperator signature~~
 - ~~expose local tools as a MCP server~~
 - ~~@ to quote file~~
+- improve `@` file quoting
+  - ~~detect binary/non-text files instead of injecting their raw contents~~
+  - enforce configurable file-size and token-budget limits
+  - show metadata and a truncated preview for oversized files, with an explicit way to include more
 - ~~! to run a command interactively in the app~~
 - ~~multi-provider support~~
 - ~~session persistence~~

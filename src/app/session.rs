@@ -45,6 +45,7 @@ pub(crate) fn flush_if_dirty(app: &mut App<'_>) {
 /// Persist the current conversation to the session file.
 pub(crate) fn save_session(app: &mut App<'_>) {
     app.session.dirty = false;
+    app.sync_todos_from_store();
     let Some(mgr) = &app.session.mgr else { return };
     let items: Vec<MessageItem> = app.conversation_panel.items_snapshot();
     // Don't persist a session with no user input — there's nothing worth
@@ -54,7 +55,6 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     if helpers::first_user_text(&items).is_none() {
         return;
     }
-    app.session.did_save = true;
     let mut session = mgr.load(&app.session.uuid).unwrap_or_else(|| {
         let mut s = mgr.create();
         s.uuid = app.session.uuid.clone();
@@ -62,21 +62,24 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     });
     // Capture first user message for the picker preview.
     if session.first_message.is_empty()
-        && let Some(text) = helpers::first_user_text(&items) {
-            session.first_message =
-                crate::session::truncate_first_line(&text, 80);
-        }
+        && let Some(text) = helpers::first_user_text(&items)
+    {
+        session.first_message = crate::session::truncate_first_line(&text, 80);
+    }
     SessionManager::set_items(&mut session, items);
     session.history = app.input_panel.history.clone();
     session.work_mode = Some(app.work_mode);
     session.current_model = Some(app.current_model.clone());
+    session.vision_enabled = app.vision_enabled;
     session.classifier_model = app.config.classifier_model.clone();
     session.todos = app.todo_list.todos.clone();
     session.activated_skills = app.skill_registry.activated_names().to_vec();
     session.tasks = crate::tasks::persist_all();
-    if let Err(e) = mgr.save(&mut session) {
-        app.conversation_panel
-            .add_error_string(format!("session save: {e}"));
+    match mgr.save(&mut session) {
+        Ok(()) => app.session.did_save = true,
+        Err(e) => app
+            .conversation_panel
+            .add_error_string(format!("session save: {e}")),
     }
 }
 
@@ -94,10 +97,8 @@ pub(crate) fn persist_config(app: &mut App<'_>) {
         .map_err(|e| format!("serialize config: {e}"))
         .and_then(|s| {
             let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, &s)
-                .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-            std::fs::rename(&tmp, &path)
-                .map_err(|e| format!("rename to {}: {e}", path.display()))
+            std::fs::write(&tmp, &s).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+            std::fs::rename(&tmp, &path).map_err(|e| format!("rename to {}: {e}", path.display()))
         });
     if let Err(e) = result {
         app.conversation_panel

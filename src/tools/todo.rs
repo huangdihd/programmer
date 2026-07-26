@@ -16,6 +16,7 @@
 use async_openai::types::responses::Tool;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Mutex;
 
 use super::function_tool;
 use crate::todos::TodoList;
@@ -25,8 +26,8 @@ pub const NAME: &str = "todo";
 pub fn tool() -> Tool {
     function_tool(
         NAME,
-        "Manage a project-level todo list for tracking tasks across the \
-         coding session. Use this to plan, track progress, and demonstrate \
+        "Manage this session's todo list for tracking tasks. Use this to plan, \
+         track progress, and demonstrate \
          thoroughness. Actions: \
          `list` (show all todos), \
          `add` (create a new todo with title and optional description), \
@@ -74,13 +75,15 @@ struct Args {
     status: Option<String>,
 }
 
-pub async fn run(arguments: &str) -> Result<String, String> {
+pub async fn run(arguments: &str, store: &Mutex<TodoList>) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return Err(format!("error: invalid arguments: {e}")),
     };
 
-    let mut list = TodoList::load();
+    let mut list = store
+        .lock()
+        .map_err(|_| "error: todo store lock was poisoned".to_string())?;
 
     match args.action.as_str() {
         "list" => Ok(list.render_table()),
@@ -91,11 +94,9 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                 _ => return Err("error: 'title' is required for add".to_string()),
             };
             let todo = list.add(title, args.description);
-            // Snapshot fields before saving (save needs &mut list).
             let id = todo.id.clone();
             let todo_title = todo.title.clone();
             let has_desc = todo.description.is_some();
-            let _ = list.save_to_file();
             let desc_note = if has_desc { " (with description)" } else { "" };
             Ok(format!("created todo {id}: {todo_title}{desc_note}"))
         }
@@ -114,8 +115,9 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                     let tid = todo.id.clone();
                     let ttitle = todo.title.clone();
                     let tstatus = todo.status.label();
-                    let _ = list.save_to_file();
-                    Ok(format!("updated todo {tid}: title={ttitle:?} status={tstatus}"))
+                    Ok(format!(
+                        "updated todo {tid}: title={ttitle:?} status={tstatus}"
+                    ))
                 }
                 Err(e) => Err(e),
             }
@@ -127,10 +129,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                 _ => return Err("error: 'id' is required for delete".to_string()),
             };
             match list.delete(&id) {
-                Ok(()) => {
-                    let _ = list.save_to_file();
-                    Ok(format!("deleted todo {id}"))
-                }
+                Ok(()) => Ok(format!("deleted todo {id}")),
                 Err(e) => Err(e),
             }
         }
@@ -138,5 +137,25 @@ pub async fn run(arguments: &str) -> Result<String, String> {
         other => Err(format!(
             "error: unknown action '{other}' — use list, add, update, or delete"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stores_are_isolated_per_session() {
+        let first = Mutex::new(TodoList::default());
+        let second = Mutex::new(TodoList::default());
+
+        run(r#"{"action":"add","title":"only in first"}"#, &first)
+            .await
+            .unwrap();
+
+        let first_list = run(r#"{"action":"list"}"#, &first).await.unwrap();
+        let second_list = run(r#"{"action":"list"}"#, &second).await.unwrap();
+        assert!(first_list.contains("only in first"));
+        assert_eq!(second_list, "No todos. Use `todo add` to create one.");
     }
 }

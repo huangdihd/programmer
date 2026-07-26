@@ -160,7 +160,11 @@ impl Selection {
     /// Selection endpoints ordered by (row, column): (start, end), inclusive.
     fn ordered(&self) -> ((u16, u16), (u16, u16)) {
         let (a, h) = (self.anchor, self.head);
-        if (a.1, a.0) <= (h.1, h.0) { (a, h) } else { (h, a) }
+        if (a.1, a.0) <= (h.1, h.0) {
+            (a, h)
+        } else {
+            (h, a)
+        }
     }
 
     /// The inclusive x range this selection covers on buffer row `row`.
@@ -387,7 +391,10 @@ impl ConversationPanel {
             }
             (column, row)
         };
-        Some((column - area.x, (row - area.y).saturating_add(self.view_offset)))
+        Some((
+            column - area.x,
+            (row - area.y).saturating_add(self.view_offset),
+        ))
     }
 
     /// Left button pressed: start a potential selection at this point.
@@ -519,7 +526,10 @@ impl ConversationPanel {
     }
 
     pub fn add_input_message(&mut self, input_message_item: ApiMessageItem) {
-        self.conversation.lock().unwrap().add_input_message(input_message_item);
+        self.conversation
+            .lock()
+            .unwrap()
+            .add_input_message(input_message_item);
         // A new user message should always bring the view back to the bottom.
         self.stick_to_bottom = true;
     }
@@ -545,7 +555,10 @@ impl ConversationPanel {
     }
 
     pub fn add_warning_string(&mut self, message: impl Into<String>) {
-        self.conversation.lock().unwrap().add_warning_string(message);
+        self.conversation
+            .lock()
+            .unwrap()
+            .add_warning_string(message);
         self.stick_to_bottom = true;
     }
 
@@ -564,7 +577,10 @@ impl ConversationPanel {
     }
 
     pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
-        self.conversation.lock().unwrap().add_usage(input_tokens, output_tokens);
+        self.conversation
+            .lock()
+            .unwrap()
+            .add_usage(input_tokens, output_tokens);
     }
 
     /// Flush the accumulated usage as a message and reset the counter.
@@ -714,11 +730,22 @@ impl ConversationPanel {
         skill_prompt: Option<&str>,
         plan_prompt: Option<&str>,
         coauthor: Option<&str>,
+        vision_enabled: bool,
     ) -> InputParam {
         self.conversation
             .lock()
             .unwrap()
-            .to_input_param(current_model, skill_prompt, plan_prompt, coauthor)
+            .to_input_param_with_vision(
+                current_model,
+                skill_prompt,
+                plan_prompt,
+                coauthor,
+                vision_enabled,
+            )
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.conversation.lock().unwrap().image_count()
     }
 }
 

@@ -225,7 +225,10 @@ pub(crate) async fn run_local_tool(name: &str, arguments: &str) -> Result<String
         fetch::NAME => fetch::run(arguments).await,
         configure_diagnostics::NAME => configure_diagnostics::run(arguments).await,
         diagnostics::NAME => diagnostics::run(arguments).await,
-        todo::NAME => todo::run(arguments).await,
+        todo::NAME => Err(
+            "error: the todo tool requires a session and is unavailable in standalone MCP mode"
+                .to_string(),
+        ),
         task::NAME => task::run(arguments).await,
         other => Err(format!("error: unknown tool '{other}'")),
     }
@@ -243,7 +246,6 @@ pub(crate) fn mcp_server_tools() -> Vec<Tool> {
         blob::tool(),
         fetch::tool(),
         diagnostics::tool(),
-        todo::tool(),
         task::tool(),
     ]
 }
@@ -400,7 +402,10 @@ mod tests {
     fn resolve_program_wraps_explicit_ps1() {
         let (program, prefix) = resolve_program(r"C:\scripts\deploy.ps1");
         assert_eq!(program, "powershell.exe");
-        assert_eq!(prefix.last().map(String::as_str), Some(r"C:\scripts\deploy.ps1"));
+        assert_eq!(
+            prefix.last().map(String::as_str),
+            Some(r"C:\scripts\deploy.ps1")
+        );
         assert!(prefix.contains(&"-File".to_string()));
     }
 

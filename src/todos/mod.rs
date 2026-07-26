@@ -13,17 +13,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Per-session todo list.
-//!
-//! Todos are stored as part of the session JSON (`Session::todos`). A
-//! well-known global file at `~/.config/programmer/todos.json` acts as the
-//! communication channel between the `todo` tool (which runs in a spawned
-//! task and can't access App state directly) and the App. The App syncs the
-//! file with its in-memory `TodoList` on startup, after tool calls, and
-//! before saving the session.
+//! Per-session todo list. The TUI and the `todo` tool share one in-memory list;
+//! persistence lives exclusively in `Session::todos`, so sessions cannot leak
+//! todo state into one another.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -97,67 +91,7 @@ pub struct TodoList {
     pub todos: Vec<Todo>,
 }
 
-// ---------------------------------------------------------------------------
-// Global file path (communication channel between App and tool)
-// ---------------------------------------------------------------------------
-
-/// Returns the path to the well-known todos file used by both the tool and
-/// the App: `~/.config/programmer/todos.json`.
-pub fn todos_file_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("programmer");
-    Some(dir.join("todos.json"))
-}
-
-// ---------------------------------------------------------------------------
-// File I/O (used by the tool; App syncs its in-memory list separately)
-// ---------------------------------------------------------------------------
-
 impl TodoList {
-    /// Load from the global todos file. An unparseable file is set aside as
-    /// `todos.json.corrupt` (not deleted — it may just be a schema mismatch
-    /// with another version of the program).
-    pub fn load() -> Self {
-        let Some(path) = todos_file_path() else {
-            return TodoList::default();
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(list) => list,
-                Err(_) => {
-                    let quarantine = path.with_extension("json.corrupt");
-                    let _ = std::fs::rename(&path, &quarantine);
-                    TodoList::default()
-                }
-            },
-            Err(_) => TodoList::default(),
-        }
-    }
-
-    /// Save to the global todos file atomically, creating parent directories
-    /// as needed. Uses temp-file + rename so a crash never leaves a truncated file.
-    pub fn save_to_file(&self) -> Result<(), String> {
-        let Some(path) = todos_file_path() else {
-            return Err("cannot locate config directory".to_string());
-        };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create config dir: {e}"))?;
-        }
-        let json =
-            serde_json::to_string_pretty(self).map_err(|e| format!("serialisation error: {e}"))?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &json).map_err(|e| format!("write error: {e}"))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("rename error: {e}"))?;
-        Ok(())
-    }
-
-    /// Delete the global todos file (e.g. on /clear or /new).
-    pub fn clear_file() {
-        if let Some(path) = todos_file_path() {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-
     // -- mutations --
 
     pub fn add(&mut self, title: String, description: Option<String>) -> &Todo {
@@ -266,7 +200,7 @@ fn generate_id() -> String {
         .unwrap_or_default()
         .subsec_nanos()
         ^ std::process::id())
-        .wrapping_mul(1_103_515_245);
+    .wrapping_mul(1_103_515_245);
     format!("{:x}{:08x}", millis, random)
 }
 
@@ -300,7 +234,10 @@ mod tests {
     #[test]
     fn status_parse() {
         assert_eq!(TodoStatus::parse("pending"), Some(TodoStatus::Pending));
-        assert_eq!(TodoStatus::parse("InProgress"), Some(TodoStatus::InProgress));
+        assert_eq!(
+            TodoStatus::parse("InProgress"),
+            Some(TodoStatus::InProgress)
+        );
         assert_eq!(TodoStatus::parse("done"), Some(TodoStatus::Completed));
         assert_eq!(TodoStatus::parse("cancel"), Some(TodoStatus::Cancelled));
         assert_eq!(TodoStatus::parse("bogus"), None);
@@ -319,8 +256,13 @@ mod tests {
         };
         assert_eq!(list.todos.len(), 1);
 
-        list.update(&id, Some("renamed".into()), None, Some(TodoStatus::Completed))
-            .unwrap();
+        list.update(
+            &id,
+            Some("renamed".into()),
+            None,
+            Some(TodoStatus::Completed),
+        )
+        .unwrap();
         assert_eq!(list.todos[0].title, "renamed");
         assert_eq!(list.todos[0].status, TodoStatus::Completed);
 
@@ -332,14 +274,5 @@ mod tests {
 
         // Delete non-existent
         assert!(list.delete(&id).is_err());
-    }
-
-    #[test]
-    fn todos_file_path_is_in_config_dir() {
-        let path = todos_file_path();
-        // The path is deterministic; it should end with `programmer/todos.json`.
-        if let Some(p) = path {
-            assert!(p.ends_with("programmer/todos.json"), "got: {p:?}");
-        }
     }
 }

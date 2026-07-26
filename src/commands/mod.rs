@@ -14,6 +14,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::providers::ProviderManager;
+use async_openai::types::responses::{ImageDetail, InputImageContent};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 // ---------------------------------------------------------------------------
 // Command parsing
@@ -53,6 +55,8 @@ pub enum Command {
     /// after it. The optional argument picks a different model for the
     /// summarization request only.
     Compact(String),
+    /// `/vision <on|off>` — enable or disable image attachments for this session.
+    Vision(String),
 }
 
 impl Command {
@@ -88,6 +92,7 @@ impl Command {
             "plan" => Some(Command::Plan(args)),
             "terminal" | "term" => Some(Command::Terminal(args)),
             "compact" => Some(Command::Compact(args)),
+            "vision" => Some(Command::Vision(args)),
             _ => None,
         }
     }
@@ -95,8 +100,23 @@ impl Command {
     /// All command names (without leading `/`), for completion.
     pub fn all_commands() -> &'static [&'static str] {
         &[
-            "model", "new", "providers", "session", "mode", "classifier", "init", "todo", "skill",
-            "mcp", "plan", "terminal", "compact", "clear", "quit", "help",
+            "model",
+            "new",
+            "providers",
+            "session",
+            "mode",
+            "classifier",
+            "init",
+            "todo",
+            "skill",
+            "mcp",
+            "plan",
+            "terminal",
+            "compact",
+            "vision",
+            "clear",
+            "quit",
+            "help",
         ]
     }
 
@@ -104,20 +124,45 @@ impl Command {
     pub fn descriptions() -> &'static [(&'static str, &'static str)] {
         &[
             ("/model <provider/model>", "Switch to a different model"),
-            ("/mode <manual|auto|plan|yolo>", "Set work mode (or cycle with Ctrl+T)"),
-            ("/classifier [provider/model]", "Set/show the Auto-mode classifier model"),
-            ("/init", "Explore the project, write PROGRAMMER.md, set up diagnostics"),
+            (
+                "/mode <manual|auto|plan|yolo>",
+                "Set work mode (or cycle with Ctrl+T)",
+            ),
+            (
+                "/classifier [provider/model]",
+                "Set/show the Auto-mode classifier model",
+            ),
+            (
+                "/init",
+                "Explore the project, write PROGRAMMER.md, set up diagnostics",
+            ),
             ("/plan approve", "Approve the current plan (Plan mode)"),
             ("/plan cancel", "Cancel plan and return to Auto mode"),
-            ("/skill <name|list|off>", "Activate, list, or clear agent skills"),
+            (
+                "/skill <name|list|off>",
+                "Activate, list, or clear agent skills",
+            ),
             ("/skill manage", "Open the skills management panel"),
             ("/mcp show", "List configured MCP servers and their status"),
             ("/mcp manage", "Open the MCP server management panel"),
-            ("/terminal [id]", "Open the interactive terminal for a PTY task"),
-            ("/compact [provider/model]", "Summarize older history to shrink the model's context"),
+            (
+                "/terminal [id]",
+                "Open the interactive terminal for a PTY task",
+            ),
+            (
+                "/compact [provider/model]",
+                "Summarize older history to shrink the model's context",
+            ),
+            (
+                "/vision <on|off>",
+                "Enable or disable image attachments for this session",
+            ),
             ("/todo | /t", "Open the todo list panel"),
             ("/new | /n", "Start a new session (saves current)"),
-            ("/providers show", "List all configured providers and models"),
+            (
+                "/providers show",
+                "List all configured providers and models",
+            ),
             ("/providers manage", "Open the provider management panel"),
             ("/session | /s", "Show current session info"),
             ("/clear | /c", "Clear the conversation history"),
@@ -204,6 +249,7 @@ impl CompletionEngine {
             "model" | "m" => Self::complete_model(text, cmd, pm),
             "classifier" => Self::complete_model(text, cmd, pm),
             "compact" => Self::complete_model(text, cmd, pm),
+            "vision" => Self::complete_subcommand(text, cmd, &["on", "off"]),
             "mode" => Self::complete_subcommand(text, cmd, &["manual", "edits", "auto"]),
             "providers" | "provider" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
             "skill" | "skills" => Self::complete_skill(text, cmd, skill_registry),
@@ -222,8 +268,7 @@ impl CompletionEngine {
         let candidates: Vec<String> = crate::tasks::snapshot_all()
             .iter()
             .filter(|t| {
-                t.status == crate::tasks::TaskStatus::Running
-                    && crate::tasks::is_interactive(t.id)
+                t.status == crate::tasks::TaskStatus::Running && crate::tasks::is_interactive(t.id)
             })
             .map(|t| format!("{}  {}", t.id, t.name))
             .filter(|c| c.starts_with(after_cmd))
@@ -245,10 +290,7 @@ impl CompletionEngine {
     /// later words complete as file paths.
     pub(crate) fn complete_bang(content: &str) -> Option<CompletionState> {
         let after = content.strip_prefix('!')?;
-        let token_start = after
-            .rfind(char::is_whitespace)
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let token_start = after.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
         let token = &after[token_start..];
         let prefix = format!("!{}", &after[..token_start]);
         let completing_command = token_start == 0;
@@ -271,11 +313,7 @@ impl CompletionEngine {
     }
 
     /// Complete a fixed set of subcommands for `cmd`.
-    fn complete_subcommand(
-        text: &str,
-        cmd: &str,
-        subcommands: &[&str],
-    ) -> Option<CompletionState> {
+    fn complete_subcommand(text: &str, cmd: &str, subcommands: &[&str]) -> Option<CompletionState> {
         let after_cmd = text[cmd.len()..].trim_start();
         let prefix = format!("/{} ", cmd);
         let candidates: Vec<String> = subcommands
@@ -484,14 +522,32 @@ fn is_executable(entry: &std::fs::DirEntry) -> bool {
 
 /// Maximum bytes read from a single `@file` reference before truncating.
 const MAX_REF_BYTES: usize = 100 * 1024;
+/// Keep local image attachments bounded: base64 and session JSON add roughly
+/// another third on top of the raw bytes.
+const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_IMAGES_PER_MESSAGE: usize = 20;
+
+#[derive(Debug, Default)]
+pub(crate) struct ExpandedFileReferences {
+    pub text: String,
+    pub images: Vec<InputImageContent>,
+    pub notices: Vec<String>,
+}
 
 /// Expand `@path` references in a sent message by appending the contents of
 /// each referenced file. The `@path` token stays inline; the file body is
 /// attached in a fenced block below so the model sees both the reference and
 /// the content. Tokens that don't resolve to a readable file are left alone.
-pub(crate) async fn expand_file_references(text: &str) -> String {
+pub(crate) async fn expand_file_references(
+    text: &str,
+    vision_enabled: bool,
+) -> ExpandedFileReferences {
     let mut seen: Vec<String> = Vec::new();
     let mut attachments = String::new();
+    let mut images = Vec::new();
+    let mut notices = Vec::new();
+    let mut total_image_bytes = 0u64;
 
     for raw in text.split_whitespace() {
         let Some(path) = raw.strip_prefix('@') else {
@@ -508,14 +564,70 @@ pub(crate) async fn expand_file_references(text: &str) -> String {
         if !meta.is_file() {
             continue;
         }
+        if meta.len() > MAX_IMAGE_BYTES {
+            seen.push(path.to_string());
+            notices.push(format!(
+                "file @{path} is too large to reference ({} bytes; limit is {MAX_IMAGE_BYTES})",
+                meta.len()
+            ));
+            continue;
+        }
         let Ok(bytes) = tokio::fs::read(&fs_path).await else {
             continue;
         };
         seen.push(path.to_string());
 
+        if let Some(kind) = detect_image(&bytes) {
+            if !vision_enabled {
+                notices.push(format!(
+                    "skipped image @{path}: vision is off; use /vision on to attach images"
+                ));
+                continue;
+            }
+            if images.len() >= MAX_IMAGES_PER_MESSAGE {
+                notices.push(format!(
+                    "skipped image @{path}: at most {MAX_IMAGES_PER_MESSAGE} images may be attached to one message"
+                ));
+                continue;
+            }
+            if total_image_bytes.saturating_add(meta.len()) > MAX_TOTAL_IMAGE_BYTES {
+                notices.push(format!(
+                    "skipped image @{path}: total image size per message is limited to {MAX_TOTAL_IMAGE_BYTES} bytes"
+                ));
+                continue;
+            }
+            if kind == ImageKind::Gif && gif_frame_count(&bytes).unwrap_or(2) != 1 {
+                notices.push(format!(
+                    "skipped image @{path}: animated or malformed GIF files are not supported"
+                ));
+                continue;
+            }
+            images.push(InputImageContent {
+                detail: ImageDetail::Auto,
+                file_id: None,
+                image_url: Some(format!(
+                    "data:{};base64,{}",
+                    kind.mime_type(),
+                    BASE64.encode(&bytes)
+                )),
+            });
+            total_image_bytes += meta.len();
+            continue;
+        }
+
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            notices.push(format!(
+                "skipped non-text file @{path}; enable vision only for PNG, JPEG, WEBP, or non-animated GIF images"
+            ));
+            continue;
+        };
+        if content.contains('\0') {
+            notices.push(format!("skipped binary file @{path}"));
+            continue;
+        }
         let truncated = bytes.len() > MAX_REF_BYTES;
-        let slice = &bytes[..bytes.len().min(MAX_REF_BYTES)];
-        let content = String::from_utf8_lossy(slice);
+        let slice_end = floor_char_boundary(content, bytes.len().min(MAX_REF_BYTES));
+        let content = &content[..slice_end];
         attachments.push_str(&format!("\n\n--- Referenced file: {path} ---\n"));
         attachments.push_str("```\n");
         attachments.push_str(&content);
@@ -528,10 +640,104 @@ pub(crate) async fn expand_file_references(text: &str) -> String {
         }
     }
 
-    if attachments.is_empty() {
-        text.to_string()
+    ExpandedFileReferences {
+        text: if attachments.is_empty() {
+            text.to_string()
+        } else {
+            format!("{text}{attachments}")
+        },
+        images,
+        notices,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageKind {
+    Png,
+    Jpeg,
+    Webp,
+    Gif,
+}
+
+impl ImageKind {
+    fn mime_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Webp => "image/webp",
+            Self::Gif => "image/gif",
+        }
+    }
+}
+
+fn detect_image(bytes: &[u8]) -> Option<ImageKind> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageKind::Png)
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some(ImageKind::Jpeg)
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(ImageKind::Webp)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(ImageKind::Gif)
     } else {
-        format!("{text}{attachments}")
+        None
+    }
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Parse enough of a GIF stream to count image-descriptor blocks without
+/// mistaking compressed payload bytes for frames.
+fn gif_frame_count(bytes: &[u8]) -> Option<usize> {
+    if detect_image(bytes) != Some(ImageKind::Gif) || bytes.len() < 13 {
+        return None;
+    }
+    let mut pos: usize = 13;
+    let packed = bytes[10];
+    if packed & 0x80 != 0 {
+        pos = pos.checked_add(3 * (1usize << ((packed & 0x07) + 1)))?;
+    }
+    let mut frames = 0;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            0x2c => {
+                frames += 1;
+                pos = pos.checked_add(10)?;
+                let local_packed = *bytes.get(pos - 1)?;
+                if local_packed & 0x80 != 0 {
+                    pos = pos.checked_add(3 * (1usize << ((local_packed & 0x07) + 1)))?;
+                }
+                pos = pos.checked_add(1)?;
+                skip_gif_sub_blocks(bytes, &mut pos)?;
+            }
+            0x21 => {
+                pos = pos.checked_add(2)?;
+                skip_gif_sub_blocks(bytes, &mut pos)?;
+            }
+            0x3b => return Some(frames),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn skip_gif_sub_blocks(bytes: &[u8], pos: &mut usize) -> Option<()> {
+    loop {
+        let size = usize::from(*bytes.get(*pos)?);
+        *pos = pos.checked_add(1)?;
+        if size == 0 {
+            return Some(());
+        }
+        *pos = pos.checked_add(size)?;
+        if *pos > bytes.len() {
+            return None;
+        }
     }
 }
 
@@ -565,7 +771,12 @@ mod tests {
         // `ls` exists on every Unix box; the exact name sorts first among the
         // `ls*` matches, so the 50-candidate cap can't push it out.
         let state = CompletionEngine::complete_bang("!ls").expect("commands starting with ls");
-        assert_eq!(state.candidates.first().map(String::as_str), Some("ls"), "{:?}", state.candidates);
+        assert_eq!(
+            state.candidates.first().map(String::as_str),
+            Some("ls"),
+            "{:?}",
+            state.candidates
+        );
         assert_eq!(state.prefix, "!");
         assert_eq!(state.line(0), "!ls");
 
@@ -575,7 +786,11 @@ mod tests {
         // Arguments complete as paths (runs from the crate root).
         let state = CompletionEngine::complete_bang("!cat src/co").expect("path candidates");
         assert_eq!(state.prefix, "!cat ");
-        assert!(state.candidates.iter().any(|c| c == "src/commands/"), "{:?}", state.candidates);
+        assert!(
+            state.candidates.iter().any(|c| c == "src/commands/"),
+            "{:?}",
+            state.candidates
+        );
 
         // A first word containing `/` completes as a path too.
         let state = CompletionEngine::complete_bang("!./src/mai");
@@ -592,14 +807,21 @@ mod tests {
         // A bare `~` completes to the home directory itself.
         assert_eq!(list_path_candidates("~"), vec!["~/".to_string()]);
         // Candidates under `~/` keep the tilde form the user typed.
-        assert!(list_path_candidates("~/").iter().all(|c| c.starts_with("~/")));
+        assert!(
+            list_path_candidates("~/")
+                .iter()
+                .all(|c| c.starts_with("~/"))
+        );
     }
 
     #[test]
     fn list_path_candidates_reads_one_level() {
         // Runs from the crate root, so `src/` exists with these entries.
         let got = list_path_candidates("src/co");
-        assert!(got.iter().any(|c| c == "src/commands/"), "dir with slash: {got:?}");
+        assert!(
+            got.iter().any(|c| c == "src/commands/"),
+            "dir with slash: {got:?}"
+        );
         assert!(got.iter().any(|c| c == "src/consts.rs"), "file: {got:?}");
         // Directories sort before files.
         let dir_pos = got.iter().position(|c| c == "src/commands/").unwrap();
@@ -610,8 +832,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn terminal_completion_lists_running_interactive_tasks() {
-        let id = crate::tasks::spawn_interactive("cat", None, Some("catname"), 10, 40)
-            .expect("spawn");
+        let id =
+            crate::tasks::spawn_interactive("cat", None, Some("catname"), 10, 40).expect("spawn");
         let state = CompletionEngine::complete_terminal("terminal ", "terminal")
             .expect("candidates for the running task");
         assert!(
@@ -627,15 +849,56 @@ mod tests {
 
     #[tokio::test]
     async fn expand_file_references_attaches_content() {
-        let out = expand_file_references("look at @Cargo.toml please").await;
-        assert!(out.starts_with("look at @Cargo.toml please"), "keeps typed text");
-        assert!(out.contains("--- Referenced file: Cargo.toml ---"), "has header");
-        assert!(out.contains("[package]"), "has file content");
+        let out = expand_file_references("look at @Cargo.toml please", false).await;
+        assert!(
+            out.text.starts_with("look at @Cargo.toml please"),
+            "keeps typed text"
+        );
+        assert!(
+            out.text.contains("--- Referenced file: Cargo.toml ---"),
+            "has header"
+        );
+        assert!(out.text.contains("[package]"), "has file content");
+        assert!(out.images.is_empty());
     }
 
     #[tokio::test]
     async fn expand_file_references_leaves_plain_text_alone() {
-        let out = expand_file_references("no references here @nonexistent.xyz").await;
-        assert_eq!(out, "no references here @nonexistent.xyz");
+        let out = expand_file_references("no references here @nonexistent.xyz", false).await;
+        assert_eq!(out.text, "no references here @nonexistent.xyz");
+        assert!(out.images.is_empty());
+        assert!(out.notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn image_reference_respects_vision_switch() {
+        let path =
+            std::env::temp_dir().join(format!("programmer_vision_{}.png", std::process::id()));
+        tokio::fs::write(&path, b"\x89PNG\r\n\x1a\nfake")
+            .await
+            .unwrap();
+        let reference = format!("@{}", path.display());
+
+        let off = expand_file_references(&reference, false).await;
+        assert!(off.images.is_empty());
+        assert!(off.notices.iter().any(|n| n.contains("vision is off")));
+
+        let on = expand_file_references(&reference, true).await;
+        assert_eq!(on.images.len(), 1);
+        assert!(
+            on.images[0]
+                .image_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        );
+        tokio::fs::remove_file(path).await.ok();
+    }
+
+    #[test]
+    fn gif_parser_distinguishes_single_frame_from_animation() {
+        let single = b"GIF89a\x01\0\x01\0\0\0\0,\0\0\0\0\x01\0\x01\0\0\x02\x01\0\0;";
+        let animated = b"GIF89a\x01\0\x01\0\0\0\0,\0\0\0\0\x01\0\x01\0\0\x02\x01\0\0,\0\0\0\0\x01\0\x01\0\0\x02\x01\0\0;";
+        assert_eq!(gif_frame_count(single), Some(1));
+        assert_eq!(gif_frame_count(animated), Some(2));
     }
 }

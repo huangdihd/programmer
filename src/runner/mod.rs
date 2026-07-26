@@ -82,6 +82,9 @@ pub(crate) struct TurnRunner {
     pub tools: Arc<crate::tools::provider::ToolRegistry>,
     pub policy: RunnerPolicy,
     pub coauthor: Option<String>,
+    /// Include stored image parts in API requests. When false, the conversation
+    /// preserves them but sends textual placeholders instead.
+    pub vision_enabled: bool,
     /// Pluggable turn hooks (post-edit diagnostics, the PROGRAMMER.md reminder,
     /// and any future check) run around each tool batch. Empty by default, so
     /// `-p` runs stay lean.
@@ -119,7 +122,10 @@ pub enum RunnerError {
     #[error("stream error: {0}")]
     Stream(OpenAIError),
     #[error("api error {code:?}: {message}")]
-    Api { code: Option<String>, message: String },
+    Api {
+        code: Option<String>,
+        message: String,
+    },
     #[error("cancelled")]
     Cancelled,
     #[error("the model returned no output")]
@@ -195,6 +201,7 @@ impl TurnRunner {
                     skill_prompt: skill_prompt.as_deref(),
                     plan_prompt: surface.plan_prompt(),
                     coauthor: self.coauthor.as_deref(),
+                    vision_enabled: self.vision_enabled,
                 };
                 let conv = conversation.lock().unwrap();
                 request::build_request(&conv, &ctx, self.model_name.clone(), self.tools.tools())
@@ -279,8 +286,8 @@ impl TurnRunner {
             // any are attached, so a headless `-p` run does no extra work. We need
             // the edit call-ids to tell afterwards whether a file was actually
             // written; the tool names go into the summary handed to each hook.
-            let hook_meta: Option<(Vec<String>, HashSet<String>)> = (!self.hooks.is_empty())
-                .then(|| {
+            let hook_meta: Option<(Vec<String>, HashSet<String>)> =
+                (!self.hooks.is_empty()).then(|| {
                     let tool_names = calls.iter().map(|c| c.name.clone()).collect();
                     let edit_call_ids = calls
                         .iter()
@@ -474,7 +481,10 @@ impl TurnRunner {
         match phase {
             hooks::HookPhase::After => inject_post_edit_feedback(conversation, &combined),
             hooks::HookPhase::Before => {
-                conversation.lock().unwrap().add_meta("\u{25B8} System", &combined);
+                conversation
+                    .lock()
+                    .unwrap()
+                    .add_meta("\u{25B8} System", &combined);
             }
         }
     }
@@ -602,7 +612,9 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let handle = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let bodies = bodies.clone();
                 let counter = counter.clone();
                 tokio::spawn(async move {
@@ -650,10 +662,11 @@ mod tests {
             model_name: "mock".to_string(),
             model_str: "mock/mock".to_string(),
             tools: std::sync::Arc::new(crate::tools::provider::ToolRegistry::new(vec![
-                std::sync::Arc::new(crate::tools::provider::LocalToolProvider),
+                std::sync::Arc::new(crate::tools::provider::LocalToolProvider::default()),
             ])),
             policy: RunnerPolicy::Yolo,
             coauthor: None,
+            vision_enabled: true,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
         }
@@ -697,7 +710,11 @@ mod tests {
         // Response 1: a `read_file` tool call. Response 2: the final message.
         let body1 = format!(
             "{}{}",
-            item_added_frame(1, 0, &call_item("c1", "read_file", "{\"path\":\"Cargo.toml\"}")),
+            item_added_frame(
+                1,
+                0,
+                &call_item("c1", "read_file", "{\"path\":\"Cargo.toml\"}")
+            ),
             completed_frame(2),
         );
         let body2 = format!(
@@ -755,7 +772,11 @@ mod tests {
         // Response 1: a read_file call; Response 2: the final message.
         let body1 = format!(
             "{}{}",
-            item_added_frame(1, 0, &call_item("c1", "read_file", "{\"path\":\"Cargo.toml\"}")),
+            item_added_frame(
+                1,
+                0,
+                &call_item("c1", "read_file", "{\"path\":\"Cargo.toml\"}")
+            ),
             completed_frame(2),
         );
         let body2 = format!(
@@ -777,9 +798,10 @@ mod tests {
             .expect("turn completes");
 
         // read_file is not an edit, so the feedback is added as a system note.
-        let has_marker = conv.lock().unwrap().items().any(|it| {
-            matches!(it, MessageItem::Meta { text, .. } if text.contains("HOOK-RAN"))
-        });
+        let has_marker =
+            conv.lock().unwrap().items().any(
+                |it| matches!(it, MessageItem::Meta { text, .. } if text.contains("HOOK-RAN")),
+            );
         assert!(has_marker, "the custom hook's feedback should be injected");
     }
 
@@ -813,13 +835,15 @@ mod tests {
         .expect("turn completes");
         assert_eq!(result.final_text, "done anyway");
         // The ask_user call got a denial tool output.
-        let denied = conv.lock().unwrap().items().any(|it| matches!(
-            it,
-            MessageItem::ToolOutput { output, failed: true, .. }
-                if matches!(&output.output,
-                    async_openai::types::responses::FunctionCallOutput::Text(t)
-                        if t.contains("non-interactive"))
-        ));
+        let denied = conv.lock().unwrap().items().any(|it| {
+            matches!(
+                it,
+                MessageItem::ToolOutput { output, failed: true, .. }
+                    if matches!(&output.output,
+                        async_openai::types::responses::FunctionCallOutput::Text(t)
+                            if t.contains("non-interactive"))
+            )
+        });
         assert!(denied, "ask_user should be denied");
     }
 
@@ -871,10 +895,11 @@ mod tests {
             model_name: "mock".to_string(),
             model_str: "mock/mock".to_string(),
             tools: std::sync::Arc::new(crate::tools::provider::ToolRegistry::new(vec![
-                std::sync::Arc::new(crate::tools::provider::LocalToolProvider),
+                std::sync::Arc::new(crate::tools::provider::LocalToolProvider::default()),
             ])),
             policy: RunnerPolicy::Sync(policy_mode.classifier()),
             coauthor: None,
+            vision_enabled: true,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
         }
@@ -952,7 +977,10 @@ mod tests {
             async_openai::types::responses::FunctionCallOutput::Text(t) => t.clone(),
             _ => String::new(),
         };
-        assert!(denial.contains("surface refused"), "carries surface reason: {denial}");
+        assert!(
+            denial.contains("surface refused"),
+            "carries surface reason: {denial}"
+        );
         assert!(!tmp.exists(), "the denied write never ran");
     }
 
@@ -996,11 +1024,23 @@ mod tests {
                 _ => None,
             })
             .expect("edit output present");
-        assert!(out.contains("wrote file"), "keeps the original output: {out}");
-        assert!(out.contains("--- Post-edit check ---"), "adds the header: {out}");
+        assert!(
+            out.contains("wrote file"),
+            "keeps the original output: {out}"
+        );
+        assert!(
+            out.contains("--- Post-edit check ---"),
+            "adds the header: {out}"
+        );
         assert!(out.contains("2 new errors"), "carries the feedback: {out}");
         // Folded into the output, so no separate system note.
-        assert!(!conv.lock().unwrap().items().any(|it| matches!(it, MessageItem::Meta { .. })));
+        assert!(
+            !conv
+                .lock()
+                .unwrap()
+                .items()
+                .any(|it| matches!(it, MessageItem::Meta { .. }))
+        );
     }
 
     #[test]
@@ -1035,7 +1075,11 @@ mod tests {
             item_added_frame(
                 1,
                 0,
-                &call_item("w1", "write_file", &format!("{{\"path\":\"{path}\",\"content\":\"x\"}}")),
+                &call_item(
+                    "w1",
+                    "write_file",
+                    &format!("{{\"path\":\"{path}\",\"content\":\"x\"}}")
+                ),
             ),
             completed_frame(2),
         );
@@ -1057,7 +1101,11 @@ mod tests {
             .expect("turn completes");
 
         assert!(
-            !conv.lock().unwrap().items().any(|it| matches!(it, MessageItem::Meta { .. })),
+            !conv
+                .lock()
+                .unwrap()
+                .items()
+                .any(|it| matches!(it, MessageItem::Meta { .. })),
             "no system note when diagnostics feedback is off"
         );
         let out = conv

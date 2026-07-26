@@ -42,14 +42,24 @@ pub(crate) enum SerializableMessageItem {
         #[serde(default)]
         approval_label: Option<String>,
     },
-    OpenAIError { message: String },
+    OpenAIError {
+        message: String,
+    },
     Error(String),
     Warning(String),
     Info(String),
-    Meta { label: String, text: String },
-    Usage { input_tokens: u32, output_tokens: u32 },
+    Meta {
+        label: String,
+        text: String,
+    },
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
     /// A `/compact` boundary carrying the summary of everything before it.
-    Compacted { summary: String },
+    Compacted {
+        summary: String,
+    },
 }
 
 impl From<MessageItem> for SerializableMessageItem {
@@ -57,9 +67,15 @@ impl From<MessageItem> for SerializableMessageItem {
         match item {
             MessageItem::Input(i) => SerializableMessageItem::Input(i),
             MessageItem::Output(o) => SerializableMessageItem::Output(o),
-            MessageItem::ToolOutput { output, failed, approval_label } => {
-                SerializableMessageItem::ToolOutput { output, failed, approval_label }
-            }
+            MessageItem::ToolOutput {
+                output,
+                failed,
+                approval_label,
+            } => SerializableMessageItem::ToolOutput {
+                output,
+                failed,
+                approval_label,
+            },
             MessageItem::OpenAIError(e) => SerializableMessageItem::OpenAIError {
                 message: e.to_string(),
             },
@@ -90,13 +106,23 @@ impl From<SerializableMessageItem> for MessageItem {
                     FunctionCallOutput::Text(t)
                         if t.trim_start().to_ascii_lowercase().starts_with("error:")
                 );
-                MessageItem::ToolOutput { output, failed, approval_label: None }
+                MessageItem::ToolOutput {
+                    output,
+                    failed,
+                    approval_label: None,
+                }
             }
             SerializableMessageItem::Input(i) => MessageItem::Input(i),
             SerializableMessageItem::Output(o) => MessageItem::Output(o),
-            SerializableMessageItem::ToolOutput { output, failed, approval_label } => {
-                MessageItem::ToolOutput { output, failed, approval_label }
-            }
+            SerializableMessageItem::ToolOutput {
+                output,
+                failed,
+                approval_label,
+            } => MessageItem::ToolOutput {
+                output,
+                failed,
+                approval_label,
+            },
             SerializableMessageItem::OpenAIError { message } => {
                 MessageItem::Error(format!("(restored) {message}"))
             }
@@ -108,9 +134,7 @@ impl From<SerializableMessageItem> for MessageItem {
                 input_tokens,
                 output_tokens,
             } => MessageItem::Usage(input_tokens, output_tokens),
-            SerializableMessageItem::Compacted { summary } => {
-                MessageItem::Compacted { summary }
-            }
+            SerializableMessageItem::Compacted { summary } => MessageItem::Compacted { summary },
         }
     }
 }
@@ -152,6 +176,9 @@ pub(crate) struct Session {
     /// Chat model in use when last saved (`provider/model`), restored on resume.
     #[serde(default)]
     pub(crate) current_model: Option<String>,
+    /// Whether image attachments are sent to the model in this session.
+    #[serde(default)]
+    pub(crate) vision_enabled: bool,
     /// Auto-mode classifier model when last saved, restored on resume.
     #[serde(default)]
     pub(crate) classifier_model: Option<String>,
@@ -197,9 +224,10 @@ impl SessionManager {
             }
             // Quick-read: only parse the metadata fields, not the items.
             if let Ok(bytes) = std::fs::read(&path)
-                && let Ok(s) = serde_json::from_slice::<SessionMeta>(&bytes) {
-                    sessions.push(s);
-                }
+                && let Ok(s) = serde_json::from_slice::<SessionMeta>(&bytes)
+            {
+                sessions.push(s);
+            }
         }
         sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         Ok(sessions)
@@ -209,8 +237,8 @@ impl SessionManager {
     pub(crate) fn create(&self) -> Session {
         let uuid = uuid_v4();
         let now = now_secs();
-        let working_dir = std::env::current_dir()
-            .map_or_else(|_| ".".to_string(), |p| p.display().to_string());
+        let working_dir =
+            std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
         Session {
             uuid,
             first_message: String::new(),
@@ -222,6 +250,7 @@ impl SessionManager {
             history: Vec::new(),
             work_mode: None,
             current_model: None,
+            vision_enabled: false,
             classifier_model: None,
             todos: Vec::new(),
             activated_skills: Vec::new(),
@@ -252,8 +281,7 @@ impl SessionManager {
         session.updated_at = now_secs();
         self.ensure_dir()?;
         let path = self.session_path(&session.uuid);
-        let json = serde_json::to_string_pretty(session)
-            .map_err(|e| format!("serialize: {e}"))?;
+        let json = serde_json::to_string_pretty(session).map_err(|e| format!("serialize: {e}"))?;
         // Atomic write: tmp → rename.
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
@@ -278,7 +306,10 @@ impl SessionManager {
     /// Replace session items from MessageItems. Also updates message_count.
     pub(crate) fn set_items(session: &mut Session, items: Vec<MessageItem>) {
         session.message_count = items.len();
-        session.items = items.into_iter().map(SerializableMessageItem::from).collect();
+        session.items = items
+            .into_iter()
+            .map(SerializableMessageItem::from)
+            .collect();
     }
 
     /// Path to a specific session file.
@@ -296,10 +327,7 @@ impl SessionManager {
 /// Returns the chosen UUID, or `None` if the user chose "new session".
 /// On quit (q / Esc) the process exits after cleanup.
 /// Press `d` on a session to delete it after confirmation.
-pub(crate) fn pick_session(
-    sessions: &[SessionMeta],
-    mgr: &SessionManager,
-) -> Option<String> {
+pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Option<String> {
     use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
     use crossterm::execute;
     use crossterm::terminal::{
@@ -476,10 +504,7 @@ pub(crate) fn pick_session(
                         }
                         confirm_uuid = None;
                     }
-                    KeyCode::Char('n')
-                    | KeyCode::Char('N')
-                    | KeyCode::Esc
-                    | KeyCode::Char('d') => {
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('d') => {
                         confirm_uuid = None;
                     }
                     _ => {}
@@ -493,15 +518,17 @@ pub(crate) fn pick_session(
                 KeyCode::Char('n') => break Outcome::NewSession,
                 KeyCode::Char('d') => {
                     if let Some(i) = list_state.selected()
-                        && let Some(s) = sessions.get(i) {
-                            confirm_uuid = Some(s.uuid.clone());
-                        }
+                        && let Some(s) = sessions.get(i)
+                    {
+                        confirm_uuid = Some(s.uuid.clone());
+                    }
                 }
                 KeyCode::Enter => {
                     if let Some(i) = list_state.selected()
-                        && let Some(s) = sessions.get(i) {
-                            break Outcome::Selected(s.uuid.clone());
-                        }
+                        && let Some(s) = sessions.get(i)
+                    {
+                        break Outcome::Selected(s.uuid.clone());
+                    }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     let i = list_state.selected().unwrap_or(0);
@@ -553,7 +580,6 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-
 fn unix_to_local(secs: u64) -> String {
     let now = now_secs();
     let diff = now.saturating_sub(secs);
@@ -574,7 +600,10 @@ pub(crate) fn truncate_first_line(s: &str, max_len: usize) -> String {
     if first_line.len() <= max_len {
         first_line.to_string()
     } else {
-        format!("{}…", &first_line[..first_line.floor_char_boundary(max_len)])
+        format!(
+            "{}…",
+            &first_line[..first_line.floor_char_boundary(max_len)]
+        )
     }
 }
 
@@ -598,5 +627,38 @@ mod tests {
     #[test]
     fn truncate_multiline() {
         assert_eq!(truncate_first_line("hello\nworld", 80), "hello");
+    }
+
+    #[test]
+    fn vision_and_todos_round_trip_independently_per_session() {
+        let sessions_dir =
+            std::env::temp_dir().join(format!("programmer-session-test-{}", uuid_v4()));
+        let mgr = SessionManager {
+            sessions_dir: sessions_dir.clone(),
+        };
+
+        let mut first = mgr.create();
+        first.vision_enabled = true;
+        let mut first_todos = crate::todos::TodoList::default();
+        first_todos.add("first session only".to_string(), None);
+        first.todos = first_todos.todos;
+
+        let mut second = mgr.create();
+        second.vision_enabled = false;
+        let mut second_todos = crate::todos::TodoList::default();
+        second_todos.add("second session only".to_string(), None);
+        second.todos = second_todos.todos;
+
+        mgr.save(&mut first).unwrap();
+        mgr.save(&mut second).unwrap();
+
+        let loaded_first = mgr.load(&first.uuid).unwrap();
+        let loaded_second = mgr.load(&second.uuid).unwrap();
+        assert!(loaded_first.vision_enabled);
+        assert!(!loaded_second.vision_enabled);
+        assert_eq!(loaded_first.todos[0].title, "first session only");
+        assert_eq!(loaded_second.todos[0].title, "second session only");
+
+        std::fs::remove_dir_all(sessions_dir).unwrap();
     }
 }

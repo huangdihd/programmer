@@ -16,7 +16,7 @@
 //! Mouse handling: routing scrolls and clicks between the conversation
 //! panel and the sidebar, plus text selection.
 
-use super::super::{session, App};
+use super::super::{App, session};
 use crate::ui::components::conversation_panel::conversation_panel::SelectionEnd;
 use crate::ui::components::sidebar::ClickTarget;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -26,14 +26,18 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollDown => {
             if app.sidebar_area.is_some_and(|a| mouse.column >= a.x) {
-                if let Some(ref mut s) = app.sidebar { s.scroll_down(); }
+                if let Some(ref mut s) = app.sidebar {
+                    s.scroll_down();
+                }
             } else {
                 app.conversation_panel.scroll_down();
             }
         }
         MouseEventKind::ScrollUp => {
             if app.sidebar_area.is_some_and(|a| mouse.column >= a.x) {
-                if let Some(ref mut s) = app.sidebar { s.scroll_up(); }
+                if let Some(ref mut s) = app.sidebar {
+                    s.scroll_up();
+                }
             } else {
                 app.conversation_panel.scroll_up();
             }
@@ -51,7 +55,10 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
                 return;
             }
             // Clicking the "jump to bottom" indicator snaps to the latest.
-            if app.conversation_panel.jump_button_hit(mouse.column, mouse.row) {
+            if app
+                .conversation_panel
+                .jump_button_hit(mouse.column, mouse.row)
+            {
                 app.conversation_panel.scroll_to_bottom();
                 return;
             }
@@ -71,26 +78,24 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
                 // Only act if the release is still in the sidebar.
                 if let Some(ref sidebar) = app.sidebar
                     && let Some(ref area) = app.sidebar_area
-                        && mouse.column > area.x
-                            && mouse.column < area.x + area.width
-                            && mouse.row >= area.y
-                            && mouse.row < area.y + area.height
-                        {
-                            let line_idx = (mouse.row - area.y) as usize;
-                            if line_idx < sidebar.click_map.len() {
-                                let target = sidebar.click_map[line_idx].clone();
-                                handle_sidebar_click(app, &target);
-                            }
-                        }
+                    && mouse.column > area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height
+                {
+                    let line_idx = (mouse.row - area.y) as usize;
+                    if line_idx < sidebar.click_map.len() {
+                        let target = sidebar.click_map[line_idx].clone();
+                        handle_sidebar_click(app, &target);
+                    }
+                }
                 return;
             }
             match app
                 .conversation_panel
                 .selection_end(mouse.column, mouse.row)
             {
-                SelectionEnd::Click => app
-                    .conversation_panel
-                    .handle_click(mouse.column, mouse.row),
+                SelectionEnd::Click => app.conversation_panel.handle_click(mouse.column, mouse.row),
                 SelectionEnd::Copied(text) => {
                     if !crate::clipboard::copy(&text) {
                         app.conversation_panel
@@ -113,15 +118,14 @@ fn handle_sidebar_click(app: &mut App<'_>, target: &ClickTarget) {
             }
         }
         ClickTarget::TodoItem(idx) => {
-            let mut sorted: Vec<&crate::todos::Todo> =
-                app.todo_list.todos.iter().collect();
-            sorted.sort_by_key(|t| {
-                crate::ui::components::sidebar::ui::todo_status_order(&t.status)
-            });
+            let mut sorted: Vec<&crate::todos::Todo> = app.todo_list.todos.iter().collect();
+            sorted
+                .sort_by_key(|t| crate::ui::components::sidebar::ui::todo_status_order(&t.status));
             if let Some(todo) = sorted.get(*idx) {
                 let id = todo.id.clone();
                 let _ = app.todo_list.toggle_status(&id);
-                let _ = app.todo_list.save_to_file();
+                app.sync_todos_to_store();
+                session::mark_dirty(app);
             }
         }
         ClickTarget::Task(id) => {

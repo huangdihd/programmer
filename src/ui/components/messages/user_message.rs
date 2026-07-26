@@ -39,7 +39,8 @@ impl<'a> UserMessage<'a> {
                 .iter()
                 .map(|input_content| match input_content {
                     InputContent::InputText(c) => c.text.clone(),
-                    _ => "Unsupported message".to_string(),
+                    InputContent::InputImage(_) => "🖼 Image attachment".to_string(),
+                    InputContent::InputFile(_) => "📎 File attachment".to_string(),
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),

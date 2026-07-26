@@ -87,7 +87,6 @@ impl TodoPanel {
                 KeyCode::Esc => {
                     let title = std::mem::take(title);
                     self.list.add(title, None);
-                    let _ = self.list.save_to_file();
                     self.selected = self.list.todos.len().saturating_sub(1);
                     self.add_mode = AddMode::Hidden;
                 }
@@ -99,7 +98,6 @@ impl TodoPanel {
                         Some(std::mem::take(input))
                     };
                     self.list.add(title, desc);
-                    let _ = self.list.save_to_file();
                     self.selected = self.list.todos.len().saturating_sub(1);
                     self.add_mode = AddMode::Hidden;
                 }
@@ -132,14 +130,12 @@ impl TodoPanel {
                     if let Some(todo) = self.list.todos.get(self.selected) {
                         let id = todo.id.clone();
                         let _ = self.list.toggle_status(&id);
-                        let _ = self.list.save_to_file();
                     }
                 }
                 KeyCode::Char('d') => {
                     if !self.list.todos.is_empty() {
                         let id = self.list.todos[self.selected].id.clone();
                         let _ = self.list.delete(&id);
-                        let _ = self.list.save_to_file();
                         if self.selected >= self.list.todos.len() && self.selected > 0 {
                             self.selected -= 1;
                         }

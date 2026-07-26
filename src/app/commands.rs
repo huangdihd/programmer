@@ -16,8 +16,8 @@
 //! Message sending and slash-command dispatch.
 
 use super::App;
-use super::{diagnostics, session};
 use super::surface::TuiSurface;
+use super::{diagnostics, session};
 use crate::classifier::{PlanPhase, WorkMode};
 use crate::commands::Command;
 use crate::ui::components::mcp_panel::McpPanel;
@@ -25,8 +25,10 @@ use crate::ui::components::provider_panel::ProviderPanel;
 use crate::ui::components::skills_panel::SkillsPanel;
 use crate::ui::components::todo_panel::TodoPanel;
 use crate::ui::event::{AppEvent, Event};
-use async_openai::types::responses::{InputContent, InputMessage, InputRole, InputTextContent, OutputStatus};
 use async_openai::types::responses::MessageItem as ApiMessageItem;
+use async_openai::types::responses::{
+    InputContent, InputMessage, InputRole, InputTextContent, OutputStatus,
+};
 
 use crate::prompts::PLAN_PLANNING_PROMPT;
 
@@ -55,18 +57,38 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     // file contents appended.
     app.input_panel.push_history(typed.clone());
     app.input_panel.clear();
-    let text = crate::commands::expand_file_references(&typed).await;
-    start_request(app, text).await;
+    let expanded = crate::commands::expand_file_references(&typed, app.vision_enabled).await;
+    for notice in expanded.notices {
+        app.conversation_panel.add_warning_string(notice);
+    }
+    start_request_with_images(app, expanded.text, expanded.images).await;
 }
 
 /// Start a turn from a message (with the user role).
 pub(crate) async fn start_request(app: &mut App<'_>, text: String) {
-    start_request_as(app, text, InputRole::User).await;
+    start_request_with_images(app, text, Vec::new()).await;
+}
+
+pub(crate) async fn start_request_with_images(
+    app: &mut App<'_>,
+    text: String,
+    images: Vec<async_openai::types::responses::InputImageContent>,
+) {
+    start_request_as_with_images(app, text, InputRole::User, images).await;
 }
 
 /// Start a turn from a message with the given role. `User` is a normal user
 /// message; `Developer` carries a hidden instruction (like `/init`).
 pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: InputRole) {
+    start_request_as_with_images(app, text, role, Vec::new()).await;
+}
+
+async fn start_request_as_with_images(
+    app: &mut App<'_>,
+    text: String,
+    role: InputRole,
+    mut images: Vec<async_openai::types::responses::InputImageContent>,
+) {
     if app.conversation_panel.is_busy() {
         let is_at_bottom = app.conversation_panel.is_at_bottom();
         match app.conversation_panel.pending_message.as_mut() {
@@ -76,16 +98,26 @@ pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: Inpu
             }
             None => app.conversation_panel.pending_message = Some(text),
         }
+        app.pending_images.append(&mut images);
         if is_at_bottom {
             app.conversation_panel.scroll_to_bottom()
         }
         return;
     }
 
+    if !app.vision_enabled && !images.is_empty() {
+        let count = images.len();
+        images.clear();
+        app.conversation_panel.add_warning_string(format!(
+            "omitted {count} queued image(s) because vision is off"
+        ));
+    }
+    let mut content = vec![InputContent::InputText(InputTextContent {
+        text: text.clone(),
+    })];
+    content.extend(images.into_iter().map(InputContent::InputImage));
     let input_message = InputMessage {
-        content: vec![InputContent::InputText(InputTextContent {
-            text: text.clone(),
-        })],
+        content,
         role,
         status: Option::from(OutputStatus::Completed),
     };
@@ -175,7 +207,9 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
 pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
     use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
     use crate::ui::event::Event;
-    use async_openai::types::responses::{CreateResponse, InputItem, InputParam, Item, OutputItem, OutputMessageContent};
+    use async_openai::types::responses::{
+        CreateResponse, InputItem, InputParam, Item, OutputItem, OutputMessageContent,
+    };
 
     if app.conversation_panel.is_busy() {
         app.conversation_panel
@@ -212,15 +246,16 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
         None,
         None,
         None,
+        app.vision_enabled,
     ) {
         InputParam::Items(items) => items,
-        InputParam::Text(text) => vec![InputItem::from(Item::Message(
-            ApiMessageItem::Input(InputMessage {
+        InputParam::Text(text) => vec![InputItem::from(Item::Message(ApiMessageItem::Input(
+            InputMessage {
                 content: vec![InputContent::InputText(InputTextContent { text })],
                 role: InputRole::User,
                 status: Some(OutputStatus::Completed),
-            }),
-        ))],
+            },
+        )))],
     };
     input_items.push(InputItem::from(Item::Message(ApiMessageItem::Input(
         InputMessage {
@@ -248,12 +283,12 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
                     .output
                     .iter()
                     .filter_map(|item| match item {
-                        OutputItem::Message(msg) => Some(msg.content.iter().filter_map(
-                            |c| match c {
+                        OutputItem::Message(msg) => {
+                            Some(msg.content.iter().filter_map(|c| match c {
                                 OutputMessageContent::OutputText(t) => Some(t.text.as_str()),
                                 _ => None,
-                            },
-                        )),
+                            }))
+                        }
                         _ => None,
                     })
                     .flatten()
@@ -288,8 +323,7 @@ fn open_terminal(app: &mut App<'_>, arg: &str) {
         let running: Vec<u64> = crate::tasks::snapshot_all()
             .iter()
             .filter(|t| {
-                t.status == crate::tasks::TaskStatus::Running
-                    && crate::tasks::is_interactive(t.id)
+                t.status == crate::tasks::TaskStatus::Running && crate::tasks::is_interactive(t.id)
             })
             .map(|t| t.id)
             .collect();
@@ -351,9 +385,10 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
             app.input_panel.clear();
             app.conversation_panel.clear_messages();
             diagnostics::reset_diagnostics_state(app);
+            app.pending_images.clear();
             session::delete_session(app);
             app.todo_list = crate::todos::TodoList::default();
-            crate::todos::TodoList::clear_file();
+            app.sync_todos_to_store();
             session::save_session(app);
         }
         Some(Command::New) => {
@@ -361,28 +396,28 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
             session::save_session(app);
             app.conversation_panel.clear_messages();
             diagnostics::reset_diagnostics_state(app);
+            app.pending_images.clear();
             let killed = crate::tasks::kill_all();
             if let Some(mgr) = &app.session.mgr {
                 let new_session = mgr.create();
                 app.session.uuid = new_session.uuid;
             }
             app.todo_list = crate::todos::TodoList::default();
-            crate::todos::TodoList::clear_file();
+            app.sync_todos_to_store();
+            app.vision_enabled = false;
             let mut msg = "Started a new session. Previous session saved.".to_string();
             if killed > 0 {
                 msg.push_str(&format!(" Killed {killed} background task(s)."));
             }
-            app.conversation_panel
-                .add_info_string(msg);
+            app.conversation_panel.add_info_string(msg);
             session::save_session(app);
         }
         Some(Command::Model(model)) => {
             app.input_panel.clear();
             let model = model.trim().to_string();
             if model.is_empty() {
-                app.conversation_panel.add_info_string(
-                    "usage: /model <provider/model> — e.g. /model openai/gpt-4o",
-                );
+                app.conversation_panel
+                    .add_info_string("usage: /model <provider/model> — e.g. /model openai/gpt-4o");
                 session::save_session(app);
                 return;
             }
@@ -395,6 +430,42 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
                 None => {
                     app.conversation_panel.add_error_string(format!(
                         "unknown provider/model: {model} — use /providers to list available",
+                    ));
+                }
+            }
+            session::save_session(app);
+        }
+        Some(Command::Vision(arg)) => {
+            app.input_panel.clear();
+            match arg.trim().to_ascii_lowercase().as_str() {
+                "on" => {
+                    app.vision_enabled = true;
+                    app.conversation_panel.add_info_string(
+                        "Vision enabled for this session. Reference images with @path.".to_string(),
+                    );
+                }
+                "off" => {
+                    let count = app.conversation_panel.image_count();
+                    app.vision_enabled = false;
+                    let suffix = if count == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            " {count} stored image(s) will be omitted from future requests until vision is enabled again."
+                        )
+                    };
+                    app.conversation_panel
+                        .add_info_string(format!("Vision disabled for this session.{suffix}"));
+                }
+                "" => {
+                    let state = if app.vision_enabled { "on" } else { "off" };
+                    app.conversation_panel.add_info_string(format!(
+                        "Vision is {state} for this session. Usage: /vision <on|off>"
+                    ));
+                }
+                other => {
+                    app.conversation_panel.add_error_string(format!(
+                        "unknown vision setting '{other}' — use /vision on or /vision off"
                     ));
                 }
             }
@@ -476,6 +547,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
             // /init doesn't stack — if a turn is already running, queue like any
             // other message.
             if app.conversation_panel.is_busy() {
+                app.pending_images.clear();
                 app.conversation_panel.pending_message = Some(super::helpers::init_prompt());
                 return;
             }
@@ -496,6 +568,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         }
         Some(Command::Todo) => {
             app.input_panel.clear();
+            app.sync_todos_from_store();
             app.todo_panel = Some(TodoPanel::new(app.todo_list.clone()));
         }
         Some(Command::Terminal(arg)) => {
@@ -539,8 +612,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
                             lines.push(format!("  {name}:"));
                             lines.push(models_str);
                         }
-                        app.conversation_panel
-                            .add_info_string(lines.join("\n"));
+                        app.conversation_panel.add_info_string(lines.join("\n"));
                     }
                 }
                 "manage" => {
@@ -577,14 +649,12 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
                             })
                             .collect();
                         lines.insert(0, "Skills:".to_string());
-                        app.conversation_panel
-                            .add_info_string(lines.join("\n"));
+                        app.conversation_panel.add_info_string(lines.join("\n"));
                     }
                 }
                 "off" | "clear" | "none" => {
                     app.skill_registry.clear();
-                    app.conversation_panel
-                        .add_info_string("skills deactivated");
+                    app.conversation_panel.add_info_string("skills deactivated");
                     session::save_session(app);
                 }
                 "manage" => {
@@ -630,14 +700,10 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
                                 crate::mcp::types::McpPolicy::Trusted => "trusted",
                                 crate::mcp::types::McpPolicy::Review => "review",
                             };
-                            lines.push(format!(
-                                "  {} ({}:{policy})",
-                                srv.name, srv.command
-                            ));
+                            lines.push(format!("  {} ({}:{policy})", srv.name, srv.command));
                         }
                         lines.insert(0, "MCP servers:".to_string());
-                        app.conversation_panel
-                            .add_info_string(lines.join("\n"));
+                        app.conversation_panel.add_info_string(lines.join("\n"));
                     }
                 }
                 "manage" => {
@@ -678,8 +744,9 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
                         session::save_session(app);
                         start_request_as(app, hidden.to_string(), InputRole::Developer).await;
                     } else {
-                        app.conversation_panel
-                            .add_info_string("No plan pending approval. Use /mode plan to enter Plan mode.");
+                        app.conversation_panel.add_info_string(
+                            "No plan pending approval. Use /mode plan to enter Plan mode.",
+                        );
                     }
                 }
                 "cancel" | "abort" => {

@@ -31,8 +31,8 @@ use crate::response::message_item::MessageItem;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
-    FunctionCallOutput, FunctionCallOutputItemParam, InputContent, InputItem, InputMessage,
-    InputParam, InputRole, InputTextContent, Item, OutputItem, OutputStatus,
+    EasyInputContent, FunctionCallOutput, FunctionCallOutputItemParam, InputContent, InputItem,
+    InputMessage, InputParam, InputRole, InputTextContent, Item, OutputItem, OutputStatus,
 };
 use std::collections::HashMap;
 
@@ -83,14 +83,15 @@ impl Conversation {
     pub fn append_to_tool_output(&mut self, call_id: &str, extra: &str) -> bool {
         for item in self.items.iter_mut() {
             if let MessageItem::ToolOutput { output, .. } = item
-                && output.call_id == call_id {
-                    match &mut output.output {
-                        FunctionCallOutput::Text(text) => text.push_str(extra),
-                        other => *other = FunctionCallOutput::Text(extra.trim_start().to_string()),
-                    }
-                    self.mutation_version += 1;
-                    return true;
+                && output.call_id == call_id
+            {
+                match &mut output.output {
+                    FunctionCallOutput::Text(text) => text.push_str(extra),
+                    other => *other = FunctionCallOutput::Text(extra.trim_start().to_string()),
                 }
+                self.mutation_version += 1;
+                return true;
+            }
         }
         false
     }
@@ -114,19 +115,19 @@ impl Conversation {
         // raw "missing field" noise when the payload is recognizable.
         if let OpenAIError::JSONDeserialize(_, content) = &openai_error
             && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
-                && let Some(message) = value
-                    .get("message")
-                    .or_else(|| value.get("error").and_then(|e| e.get("message")))
-                    .and_then(|m| m.as_str())
-                {
-                    let code = value
-                        .get("code")
-                        .or_else(|| value.get("error").and_then(|e| e.get("code")))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("api error");
-                    self.add_error_string(format!("{code}: {message}"));
-                    return;
-                }
+            && let Some(message) = value
+                .get("message")
+                .or_else(|| value.get("error").and_then(|e| e.get("message")))
+                .and_then(|m| m.as_str())
+        {
+            let code = value
+                .get("code")
+                .or_else(|| value.get("error").and_then(|e| e.get("code")))
+                .and_then(|c| c.as_str())
+                .unwrap_or("api error");
+            self.add_error_string(format!("{code}: {message}"));
+            return;
+        }
         self.items
             .push(MessageItem::OpenAIError(std::sync::Arc::new(openai_error)));
     }
@@ -223,6 +224,20 @@ impl Conversation {
         plan_prompt: Option<&str>,
         coauthor: Option<&str>,
     ) -> InputParam {
+        self.to_input_param_with_vision(current_model, skill_prompt, plan_prompt, coauthor, true)
+    }
+
+    /// Build API input while optionally omitting stored images. Disabling
+    /// vision is reversible: the original message items remain untouched and
+    /// are included again after `/vision on`.
+    pub fn to_input_param_with_vision(
+        &self,
+        current_model: &str,
+        skill_prompt: Option<&str>,
+        plan_prompt: Option<&str>,
+        coauthor: Option<&str>,
+        vision_enabled: bool,
+    ) -> InputParam {
         let mut system_prompt = format!(
             "{SYSTEM_PROMPT}\n\nYou are running as model: {current_model}\n\n{}",
             crate::tools::environment_info()
@@ -269,7 +284,9 @@ impl Conversation {
         let mut recorded_outputs: HashMap<&str, &FunctionCallOutputItemParam> = HashMap::new();
         for item in live_items {
             if let MessageItem::ToolOutput { output, .. } = item {
-                recorded_outputs.entry(output.call_id.as_str()).or_insert(output);
+                recorded_outputs
+                    .entry(output.call_id.as_str())
+                    .or_insert(output);
             }
         }
 
@@ -307,15 +324,19 @@ impl Conversation {
                 }
                 MessageItem::Input(input_item) => {
                     input_items.append(&mut pending_outputs);
-                    input_items.push(input_item.clone());
+                    input_items.push(input_for_vision(input_item, vision_enabled));
                 }
                 MessageItem::Meta { text, .. } => {
                     input_items.append(&mut pending_outputs);
-                    input_items.push(InputItem::from(Item::Message(ApiMessageItem::Input(InputMessage {
-                        content: vec![InputContent::InputText(InputTextContent { text: text.clone() })],
-                        role: InputRole::User,
-                        status: Some(OutputStatus::Completed),
-                    }))));
+                    input_items.push(InputItem::from(Item::Message(ApiMessageItem::Input(
+                        InputMessage {
+                            content: vec![InputContent::InputText(InputTextContent {
+                                text: text.clone(),
+                            })],
+                            role: InputRole::User,
+                            status: Some(OutputStatus::Completed),
+                        },
+                    ))));
                 }
                 MessageItem::Output(output_item) => {
                     // A non-call output (an assistant message or reasoning the
@@ -357,6 +378,69 @@ impl Conversation {
 
         InputParam::Items(input_items)
     }
+
+    /// Number of image parts retained in the full session history.
+    pub fn image_count(&self) -> usize {
+        self.items
+            .iter()
+            .map(|item| match item {
+                MessageItem::Input(input) => input_image_count(input),
+                _ => 0,
+            })
+            .sum()
+    }
+}
+
+fn input_for_vision(input: &InputItem, vision_enabled: bool) -> InputItem {
+    if vision_enabled {
+        return input.clone();
+    }
+    match input {
+        InputItem::Item(Item::Message(ApiMessageItem::Input(message))) => {
+            let mut message = message.clone();
+            message.content = omit_images(&message.content);
+            InputItem::from(Item::Message(ApiMessageItem::Input(message)))
+        }
+        InputItem::EasyMessage(message) => {
+            let mut message = message.clone();
+            if let EasyInputContent::ContentList(content) = &message.content {
+                message.content = EasyInputContent::ContentList(omit_images(content));
+            }
+            InputItem::EasyMessage(message)
+        }
+        _ => input.clone(),
+    }
+}
+
+fn omit_images(content: &[InputContent]) -> Vec<InputContent> {
+    content
+        .iter()
+        .map(|part| match part {
+            InputContent::InputImage(_) => InputContent::InputText(InputTextContent {
+                text: "[image omitted: vision is off]".to_string(),
+            }),
+            _ => part.clone(),
+        })
+        .collect()
+}
+
+fn input_image_count(input: &InputItem) -> usize {
+    let content = match input {
+        InputItem::Item(Item::Message(ApiMessageItem::Input(message))) => {
+            Some(message.content.as_slice())
+        }
+        InputItem::EasyMessage(message) => match &message.content {
+            EasyInputContent::ContentList(content) => Some(content.as_slice()),
+            EasyInputContent::Text(_) => None,
+        },
+        _ => None,
+    };
+    content.map_or(0, |parts| {
+        parts
+            .iter()
+            .filter(|part| matches!(part, InputContent::InputImage(_)))
+            .count()
+    })
 }
 
 #[cfg(test)]
@@ -519,6 +603,63 @@ mod tests {
                 "output:call_b",
             ]
         );
+    }
+
+    #[test]
+    fn vision_off_omits_but_retains_images() {
+        use async_openai::types::responses::{ImageDetail, InputImageContent};
+
+        let mut conv = Conversation::new();
+        conv.add_input_message(ApiMessageItem::Input(InputMessage {
+            content: vec![
+                InputContent::InputText("inspect @cat.png".into()),
+                InputContent::InputImage(InputImageContent {
+                    detail: ImageDetail::Auto,
+                    file_id: None,
+                    image_url: Some("data:image/png;base64,AAAA".to_string()),
+                }),
+            ],
+            role: InputRole::User,
+            status: Some(OutputStatus::Completed),
+        }));
+        assert_eq!(conv.image_count(), 1);
+
+        let InputParam::Items(off) =
+            conv.to_input_param_with_vision("test/model", None, None, None, false)
+        else {
+            panic!("expected items");
+        };
+        let off_content = off
+            .iter()
+            .find_map(|item| match item {
+                InputItem::Item(Item::Message(ApiMessageItem::Input(message)))
+                    if message.role == InputRole::User =>
+                {
+                    Some(&message.content)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !off_content
+                .iter()
+                .any(|part| matches!(part, InputContent::InputImage(_)))
+        );
+        assert!(off_content.iter().any(|part| matches!(
+            part,
+            InputContent::InputText(text) if text.text.contains("image omitted")
+        )));
+
+        let InputParam::Items(on) =
+            conv.to_input_param_with_vision("test/model", None, None, None, true)
+        else {
+            panic!("expected items");
+        };
+        assert!(on.iter().any(|item| matches!(
+            item,
+            InputItem::Item(Item::Message(ApiMessageItem::Input(message)))
+                if message.content.iter().any(|part| matches!(part, InputContent::InputImage(_)))
+        )));
     }
 
     #[test]

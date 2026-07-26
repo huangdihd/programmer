@@ -224,6 +224,8 @@ programmer
 | `/mode yolo` | Enter YOLO mode (requires `allow_yolo = true`) |
 | `/classifier [provider/model]` | Set/show the Auto-mode classifier model |
 | `/classifier clear` | Reset classifier to the chat model |
+| `/vision <on\|off>` | Enable/disable `@image` attachments for this session |
+| `/todo` `/t` | Open this session's todo list |
 | `/new` `/n` | Start a new session (auto-saves current) |
 | `/session` `/s` | Show current session UUID and info |
 | `/providers show` | List all configured providers and models |
@@ -269,9 +271,10 @@ Open with `/providers manage` or the `--providers` flag.
 
 `programmer` can also run as an [MCP](https://modelcontextprotocol.io) server,
 exposing its own local tools (`command`, `read_file`, `write_file`,
-`edit_file`, `grep`, `blob`, `fetch`, `diagnostics`, `todo`, `task`) to any MCP
+`edit_file`, `grep`, `blob`, `fetch`, `diagnostics`, `task`) to any MCP
 client — another agent, Claude Desktop, etc. It speaks JSON-RPC 2.0 over stdio;
-`ask_user` is not exposed (it needs the interactive UI).
+`ask_user` and `todo` are not exposed because they require an interactive
+session.
 
 ```sh
 programmer --mcp-server
@@ -319,7 +322,14 @@ the LLM classifier, `manual` waits for you at the console.
 
 ### Session management
 
-Sessions are saved to `~/.config/programmer/sessions/<uuid>.json`.
+Sessions are saved to `~/.config/programmer/sessions/<uuid>.json`. Conversation
+history, model/work mode, the `/vision` switch, and todos are restored
+independently for each session.
+
+With `/vision on`, referencing a local PNG, JPEG, WEBP, or non-animated GIF as
+`@path` attaches it as an image input. `/vision off` stops sending both new and
+historical images without deleting them from the session; turning it back on
+restores them.
 
 | Flag / command | Action |
 |---|---|

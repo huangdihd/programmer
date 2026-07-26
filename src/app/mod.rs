@@ -32,21 +32,19 @@ use crate::session::SessionManager;
 use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
 use crate::ui::components::footer::footer::Footer;
 use crate::ui::components::input_panel::input_panel::InputPanel;
+use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::provider_panel::ProviderPanel;
+use crate::ui::components::question_panel::QuestionPanel;
 use crate::ui::components::sidebar::Sidebar;
 use crate::ui::components::skills_panel::SkillsPanel;
-use crate::ui::components::mcp_panel::McpPanel;
-use crate::ui::components::question_panel::QuestionPanel;
 use crate::ui::components::todo_panel::TodoPanel;
 use crate::ui::event::{Event, EventHandler};
-use async_openai::types::responses::{
-    FunctionToolCall,
-};
+use async_openai::types::responses::FunctionToolCall;
 use crossterm::event::KeyEvent;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 /// A pending tool-call review request from the runner. Manual mode now gets
 /// per-call reviews (no batch), driven by the runner's `review()` callback.
@@ -105,6 +103,10 @@ pub struct App<'a> {
     pub provider_manager: ProviderManager,
     /// Currently active model in `provider/model` format.
     pub current_model: String,
+    /// Whether supported `@image` references are sent as multimodal inputs.
+    pub vision_enabled: bool,
+    /// Images belonging to the queued follow-up message while a turn is busy.
+    pub(crate) pending_images: Vec<async_openai::types::responses::InputImageContent>,
     /// Event handler.
     pub events: EventHandler,
     /// Application configuration.
@@ -133,8 +135,10 @@ pub struct App<'a> {
     /// The sidebar's screen area from the last render, used to route mouse
     /// scroll events to the correct panel.
     pub sidebar_area: Option<Rect>,
-    /// In-memory todo list synced with the global todos file and the session.
+    /// UI snapshot of the current session's todo list.
     pub todo_list: crate::todos::TodoList,
+    /// Shared per-session todo state used by the model's `todo` tool.
+    pub(crate) todo_store: Arc<Mutex<crate::todos::TodoList>>,
     /// Loaded agent skills, with activation state.
     pub(crate) skill_registry: crate::skills::SkillRegistry,
     /// MCP server manager (None if no servers configured).
@@ -198,22 +202,26 @@ impl App<'_> {
         let provider_manager = ProviderManager::new(&config).await;
         let mut current_model = provider_manager.default_model();
         let mut work_mode = WorkMode::default();
+        let mut vision_enabled = false;
 
         let mut saved_activated_skills: Vec<String> = Vec::new();
         if let Some(mgr) = &session_mgr
-            && let Some(saved) = mgr.load(&session_uuid) {
-                if let Some(wm) = saved.work_mode {
-                    work_mode = wm;
-                }
-                if let Some(model) = saved.current_model
-                    && provider_manager.resolve(&model).is_some() {
-                        current_model = model;
-                    }
-                if saved.classifier_model.is_some() {
-                    config.classifier_model = saved.classifier_model;
-                }
-                saved_activated_skills = saved.activated_skills;
+            && let Some(saved) = mgr.load(&session_uuid)
+        {
+            if let Some(wm) = saved.work_mode {
+                work_mode = wm;
             }
+            if let Some(model) = saved.current_model
+                && provider_manager.resolve(&model).is_some()
+            {
+                current_model = model;
+            }
+            vision_enabled = saved.vision_enabled;
+            if saved.classifier_model.is_some() {
+                config.classifier_model = saved.classifier_model;
+            }
+            saved_activated_skills = saved.activated_skills;
+        }
         let mut conversation_panel = ConversationPanel::new();
         conversation_panel.restore_items(saved_items);
         for msg in startup_messages {
@@ -230,10 +238,14 @@ impl App<'_> {
         }
         let mut input_panel = InputPanel::new();
         input_panel.history = saved_history;
+        let todo_list = crate::todos::TodoList { todos: saved_todos };
+        let todo_store = Arc::new(Mutex::new(todo_list.clone()));
         let mut app = Self {
             running: true,
             provider_manager,
             current_model,
+            vision_enabled,
+            pending_images: Vec::new(),
             events: EventHandler::new(),
             config,
             input_panel,
@@ -248,13 +260,8 @@ impl App<'_> {
             bang_watch: Vec::new(),
             sidebar: Some(Sidebar::new()),
             sidebar_area: None,
-            todo_list: {
-                let list = crate::todos::TodoList {
-                    todos: saved_todos,
-                };
-                let _ = list.save_to_file();
-                list
-            },
+            todo_list,
+            todo_store,
             work_mode,
             pending_review: None,
             classifier_no_logprobs: Arc::new(std::sync::Mutex::new(
@@ -285,8 +292,7 @@ impl App<'_> {
         };
 
         if !saved_activated_skills.is_empty() {
-            app.skill_registry
-                .set_activated(&saved_activated_skills);
+            app.skill_registry.set_activated(&saved_activated_skills);
         }
 
         if !app.config.mcp_servers.is_empty() {
@@ -307,22 +313,37 @@ impl App<'_> {
         app
     }
 
+    pub(crate) fn sync_todos_from_store(&mut self) {
+        if let Ok(list) = self.todo_store.lock() {
+            self.todo_list = list.clone();
+        }
+    }
+
+    pub(crate) fn sync_todos_to_store(&self) {
+        if let Ok(mut list) = self.todo_store.lock() {
+            *list = self.todo_list.clone();
+        }
+    }
+
     /// Build a fresh [`crate::runner::TurnRunner`] for the current app state.
     /// Called at the start of every turn; the runner is immutable during a turn
     /// and is dropped when the spawned task finishes.
     pub(crate) fn build_runner(&self) -> Option<crate::runner::TurnRunner> {
-        use crate::runner::hooks::{DiagnosticsHook, OverviewReminderHook};
-        use crate::runner::{TurnRunner, RunnerPolicy, LlmPolicy};
         use crate::consts::OVERVIEW_REMINDER_EVERY;
+        use crate::runner::hooks::{DiagnosticsHook, OverviewReminderHook};
+        use crate::runner::{LlmPolicy, RunnerPolicy, TurnRunner};
         use std::sync::Arc;
 
-        use crate::tools::provider::{LocalToolProvider, McpToolProvider, ToolProvider, ToolRegistry};
+        use crate::tools::provider::{
+            LocalToolProvider, McpToolProvider, ToolProvider, ToolRegistry,
+        };
 
         let (client, model_name) = self.provider_manager.resolve(&self.current_model)?;
         let model_str = self.current_model.clone();
         // Unify every tool source behind the registry: the local built-ins are
         // one provider, all connected MCP servers another.
-        let mut providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(LocalToolProvider)];
+        let mut providers: Vec<Arc<dyn ToolProvider>> =
+            vec![Arc::new(LocalToolProvider::new(self.todo_store.clone()))];
         if let Some(mcp) = &self.mcp_manager {
             providers.push(Arc::new(McpToolProvider {
                 manager: mcp.clone(),
@@ -343,9 +364,7 @@ impl App<'_> {
                     .classifier_model
                     .clone()
                     .unwrap_or_else(|| self.provider_manager.default_classifier_model());
-                let (c_client, c_model_name) = self
-                    .provider_manager
-                    .resolve(&model_str)?;
+                let (c_client, c_model_name) = self.provider_manager.resolve(&model_str)?;
                 RunnerPolicy::Llm(Box::new(LlmPolicy {
                     client: c_client.clone(),
                     model_name: c_model_name,
@@ -361,6 +380,7 @@ impl App<'_> {
             tools,
             policy,
             coauthor: self.config.git_coauthor.clone(),
+            vision_enabled: self.vision_enabled,
             hooks: vec![
                 Arc::new(DiagnosticsHook {
                     state: self.diagnostics_state.clone(),
@@ -430,7 +450,9 @@ impl App<'_> {
 }
 
 /// Build a map of MCP server name → [`crate::mcp::types::McpPolicy`] from the config.
-pub(crate) fn build_mcp_policy_map(app: &App<'_>) -> std::collections::HashMap<String, crate::mcp::types::McpPolicy> {
+pub(crate) fn build_mcp_policy_map(
+    app: &App<'_>,
+) -> std::collections::HashMap<String, crate::mcp::types::McpPolicy> {
     app.config
         .mcp_servers
         .iter()

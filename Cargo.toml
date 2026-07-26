@@ -39,6 +39,7 @@ vt100 = "0.15"
 # HTTP MCP server (`--mcp-http`): a plain-HTTP JSON-RPC endpoint served alongside
 # a ratatui approval console.
 axum = "0.8"
+base64 = "0.22.1"
 
 # Dependencies (dozens of tree-sitter grammars, aws-lc-sys, …) carry enough
 # debug info to blow past the MSVC PDB size limit (LNK1140). Strip debuginfo

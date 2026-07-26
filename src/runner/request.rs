@@ -31,6 +31,8 @@ pub(crate) struct SystemContext<'a> {
     pub plan_prompt: Option<&'a str>,
     /// Git commit co-author trailer to request, if configured.
     pub coauthor: Option<&'a str>,
+    /// Whether stored image input parts should be included in this request.
+    pub vision_enabled: bool,
 }
 
 /// Assemble a streaming [`CreateResponse`] for `conversation` under `ctx`,
@@ -43,11 +45,12 @@ pub(crate) fn build_request(
 ) -> CreateResponse {
     CreateResponse {
         stream: Some(true),
-        input: conversation.to_input_param(
+        input: conversation.to_input_param_with_vision(
             ctx.current_model,
             ctx.skill_prompt,
             ctx.plan_prompt,
             ctx.coauthor,
+            ctx.vision_enabled,
         ),
         model: Some(model_name),
         tools: Some(tools),
@@ -77,15 +80,19 @@ mod tests {
             skill_prompt: Some("SKILL-PROMPT-MARKER"),
             plan_prompt: None,
             coauthor: Some("Ada <ada@example.com>"),
+            vision_enabled: true,
         };
         let req = build_request(&conv, &ctx, "model-x".to_string(), {
             use crate::tools::provider::ToolProvider;
-            crate::tools::provider::LocalToolProvider.tools()
+            crate::tools::provider::LocalToolProvider::default().tools()
         });
 
         assert_eq!(req.stream, Some(true));
         assert_eq!(req.model.as_deref(), Some("model-x"));
-        assert!(req.tools.as_ref().is_some_and(|t| !t.is_empty()), "tool list present");
+        assert!(
+            req.tools.as_ref().is_some_and(|t| !t.is_empty()),
+            "tool list present"
+        );
 
         let InputParam::Items(items) = req.input else {
             panic!("expected an item list");
@@ -101,8 +108,14 @@ mod tests {
             _ => panic!("developer message should be text"),
         };
         assert!(dev_text.contains("prov/model-x"), "model banner");
-        assert!(dev_text.contains("SKILL-PROMPT-MARKER"), "skill prompt appended");
-        assert!(dev_text.contains("Ada <ada@example.com>"), "coauthor trailer");
+        assert!(
+            dev_text.contains("SKILL-PROMPT-MARKER"),
+            "skill prompt appended"
+        );
+        assert!(
+            dev_text.contains("Ada <ada@example.com>"),
+            "coauthor trailer"
+        );
         // The user message follows.
         assert!(matches!(
             &items[1],

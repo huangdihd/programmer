@@ -32,7 +32,7 @@ use crate::mcp::types::McpPolicy;
 use crate::ui::event::Event;
 use async_openai::types::responses::{FunctionToolCall, Tool};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// A provider's verdict on whether a call needs the work-mode classifier — the
@@ -88,7 +88,21 @@ pub(crate) trait ToolProvider: Send + Sync {
 
 /// The built-in local tools, exposed as one provider — the local analogue of an
 /// MCP server.
-pub(crate) struct LocalToolProvider;
+pub(crate) struct LocalToolProvider {
+    todos: Arc<Mutex<crate::todos::TodoList>>,
+}
+
+impl LocalToolProvider {
+    pub(crate) fn new(todos: Arc<Mutex<crate::todos::TodoList>>) -> Self {
+        Self { todos }
+    }
+}
+
+impl Default for LocalToolProvider {
+    fn default() -> Self {
+        Self::new(Arc::new(Mutex::new(crate::todos::TodoList::default())))
+    }
+}
 
 #[async_trait::async_trait]
 impl ToolProvider for LocalToolProvider {
@@ -138,6 +152,8 @@ impl ToolProvider for LocalToolProvider {
             // The command tool streams its output to the live registry (keyed by
             // call id) so the TUI can render it as it runs.
             command::run_with_live(&call.arguments, &call.call_id).await
+        } else if call.name == todo::NAME {
+            todo::run(&call.arguments, &self.todos).await
         } else {
             run_local_tool(&call.name, &call.arguments).await
         }
@@ -273,7 +289,7 @@ mod tests {
 
     #[test]
     fn local_provider_advertises_builtins_with_metadata() {
-        let p = LocalToolProvider;
+        let p = LocalToolProvider::default();
         let names: Vec<String> = p
             .tools()
             .iter()
@@ -294,7 +310,7 @@ mod tests {
 
     #[test]
     fn registry_aggregates_and_routes_metadata() {
-        let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider)]);
+        let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider::default())]);
         // The advertised list carries the built-ins.
         assert!(reg.tools().iter().any(|t| matches!(
             t, Tool::Function(f) if f.name == command::NAME
@@ -310,9 +326,12 @@ mod tests {
 
     #[test]
     fn local_provider_approval_gates_mutating_only() {
-        let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider)]);
+        let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider::default())]);
         // Read-only built-ins auto-approve (bypass the classifier)...
-        assert_eq!(reg.approval(read_file::NAME, "{}"), ToolApproval::AutoApprove);
+        assert_eq!(
+            reg.approval(read_file::NAME, "{}"),
+            ToolApproval::AutoApprove
+        );
         assert_eq!(reg.approval(grep::NAME, "{}"), ToolApproval::AutoApprove);
         // ...mutating ones are classified.
         assert_eq!(reg.approval(write_file::NAME, "{}"), ToolApproval::Classify);
@@ -335,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_dispatches_a_local_call_and_rejects_unknown() {
-        let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider)]);
+        let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider::default())]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = ToolCtx { sender: &tx };
 
@@ -345,7 +364,10 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let w = reg
             .call(
-                &call("write_file", &format!("{{\"path\":{path},\"content\":\"hello\"}}")),
+                &call(
+                    "write_file",
+                    &format!("{{\"path\":{path},\"content\":\"hello\"}}"),
+                ),
                 &ctx,
             )
             .await;

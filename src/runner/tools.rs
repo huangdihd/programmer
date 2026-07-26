@@ -131,7 +131,7 @@ mod tests {
     /// A registry with just the local built-ins — enough for the batch tests.
     fn local_registry() -> Arc<ToolRegistry> {
         Arc::new(ToolRegistry::new(vec![Arc::new(
-            crate::tools::provider::LocalToolProvider,
+            crate::tools::provider::LocalToolProvider::default(),
         )]))
     }
 
@@ -143,7 +143,10 @@ mod tests {
         let path = serde_json::to_string(&tmp.to_string_lossy()).unwrap();
         let allowed = vec![
             call("read_file", &format!("{{\"path\":{path}}}")),
-            call("write_file", &format!("{{\"path\":{path},\"content\":\"hi\"}}")),
+            call(
+                "write_file",
+                &format!("{{\"path\":{path},\"content\":\"hi\"}}"),
+            ),
             call("read_file", &format!("{{\"path\":{path}}}")),
         ];
         let denied = vec![crate::runner::classify::classifier_denied_output(
@@ -169,7 +172,11 @@ mod tests {
         assert!(outputs[2].param.call_id.starts_with("call_write_file"));
         assert!(outputs[3].param.call_id.starts_with("call_read_file"));
         // The trailing read observes the write (order preserved).
-        assert!(text_of(&outputs[3]).contains("hi"), "read after write: {}", text_of(&outputs[3]));
+        assert!(
+            text_of(&outputs[3]).contains("hi"),
+            "read after write: {}",
+            text_of(&outputs[3])
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }

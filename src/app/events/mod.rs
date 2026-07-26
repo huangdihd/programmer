@@ -54,14 +54,9 @@ async fn handle_crossterm(
     match event {
         crossterm::event::Event::FocusGained => {
             // Restore mouse capture explicitly on focus regain.
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::event::EnableMouseCapture
-            );
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
         }
-        crossterm::event::Event::Key(key_event)
-            if key_event.kind == KeyEventKind::Press =>
-        {
+        crossterm::event::Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
             handle_key_events(app, key_event).await?
         }
         crossterm::event::Event::Paste(data) => keys::handle_paste(app, data),
@@ -89,8 +84,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         }
         AppEvent::ResponseCommitted => {
             app.conversation_panel.commit_live();
-            // Reload in case the model ran a `todo` tool this iteration.
-            app.todo_list = crate::todos::TodoList::load();
+            app.sync_todos_from_store();
         }
         AppEvent::RunnerPhase(p) => {
             use crate::runner::RunnerPhase;
@@ -105,7 +99,12 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 RunnerPhase::Checking => ActivePhase::Checking,
             };
         }
-        AppEvent::ReviewRequest { call, reason, position, reply } => {
+        AppEvent::ReviewRequest {
+            call,
+            reason,
+            position,
+            reply,
+        } => {
             app.pending_review = Some(PendingReview {
                 call,
                 reason,
@@ -143,16 +142,14 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             {
                 app.plan_phase = crate::classifier::PlanPhase::Reviewing;
             }
-            app.todo_list = crate::todos::TodoList::load();
+            app.sync_todos_from_store();
             session::mark_dirty(app);
             // Restore mouse capture — external commands may disable it.
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::event::EnableMouseCapture
-            );
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
             // Start any queued follow-up request.
             if let Some(pending_request) = app.conversation_panel.pending_message.take() {
-                commands::start_request(app, pending_request).await;
+                let images = std::mem::take(&mut app.pending_images);
+                commands::start_request_with_images(app, pending_request, images).await;
             }
         }
         AppEvent::Start => {
@@ -192,7 +189,8 @@ async fn handle_cancel(app: &mut App<'_>) {
         .add_info_string("Request cancelled by user.".to_string());
     session::mark_dirty(app);
     if let Some(pending_request) = app.conversation_panel.pending_message.take() {
-        commands::start_request(app, pending_request).await;
+        let images = std::mem::take(&mut app.pending_images);
+        commands::start_request_with_images(app, pending_request, images).await;
     }
 }
 
@@ -275,10 +273,8 @@ async fn handle_providers_changed(app: &mut App<'_>) {
     }
     if app.provider_manager.resolve(&app.current_model).is_none() {
         app.current_model = app.provider_manager.default_model();
-        app.conversation_panel.add_info_string(format!(
-            "current model reset to: {}",
-            app.current_model
-        ));
+        app.conversation_panel
+            .add_info_string(format!("current model reset to: {}", app.current_model));
     }
 }
 

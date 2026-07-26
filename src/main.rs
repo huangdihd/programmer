@@ -167,7 +167,8 @@ async fn build_mcp_classifier() -> Option<(
         .classifier_model
         .clone()
         .unwrap_or_else(|| pm.default_classifier_model());
-    pm.resolve(&model).map(|(client, name)| (client.clone(), name))
+    pm.resolve(&model)
+        .map(|(client, name)| (client.clone(), name))
 }
 
 /// `-p/--print`: run a single headless turn and print the model's answer.
@@ -175,8 +176,11 @@ async fn build_mcp_classifier() -> Option<(
 /// No TUI and no session persistence. Only the non-interactive gating modes
 /// apply — `auto` (LLM classifier) or `yolo` — mirroring `--mcp-server`; a
 /// print run has no way to answer `ask_user` or a Manual approval prompt.
-async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> color_eyre::Result<()> {
-    use crate::runner::{TurnRunner, RunnerPolicy};
+async fn run_print_mode(
+    prompt: String,
+    mode: crate::classifier::WorkMode,
+) -> color_eyre::Result<()> {
+    use crate::runner::{RunnerPolicy, TurnRunner};
     use crate::tools::provider::{LocalToolProvider, ToolRegistry};
     use async_openai::types::responses::{
         InputContent, InputMessage, InputRole, MessageItem as ApiMessageItem, OutputStatus,
@@ -192,7 +196,8 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
     let (config, _) = load_config()?;
     let pm = crate::providers::ProviderManager::new(&config).await;
     let chat_model = pm.default_model();
-    let Some((chat_client, chat_name)) = pm.resolve(&chat_model).map(|(c, n)| (c.clone(), n)) else {
+    let Some((chat_client, chat_name)) = pm.resolve(&chat_model).map(|(c, n)| (c.clone(), n))
+    else {
         eprintln!("no usable provider/model configured; run `programmer --providers` to add one");
         std::process::exit(1);
     };
@@ -202,7 +207,7 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
     // runner pre-denies any ask_user call (via the provider's requires_interaction)
     // with a clear reason before it executes.
     let tools = std::sync::Arc::new(ToolRegistry::new(vec![std::sync::Arc::new(
-        LocalToolProvider,
+        LocalToolProvider::default(),
     )]));
 
     let policy = match mode {
@@ -214,8 +219,7 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
                 .classifier_model
                 .clone()
                 .unwrap_or_else(|| pm.default_classifier_model());
-            let Some((clf_client, clf_name)) =
-                pm.resolve(&clf_model).map(|(c, n)| (c.clone(), n))
+            let Some((clf_client, clf_name)) = pm.resolve(&clf_model).map(|(c, n)| (c.clone(), n))
             else {
                 eprintln!("classifier model '{clf_model}' not found");
                 std::process::exit(1);
@@ -239,6 +243,7 @@ async fn run_print_mode(prompt: String, mode: crate::classifier::WorkMode) -> co
         tools,
         policy,
         coauthor: config.git_coauthor.clone(),
+        vision_enabled: false,
         // Print mode stays lean: no turn hooks (post-edit diagnostics, reminders).
         hooks: Vec::new(),
         stream_retrying: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -288,9 +293,7 @@ struct SessionBootstrap {
     messages: Vec<String>,
 }
 
-fn resolve_session(
-    resume: Option<Option<String>>,
-) -> SessionBootstrap {
+fn resolve_session(resume: Option<Option<String>>) -> SessionBootstrap {
     let session_mgr = SessionManager::new();
     let mut startup_messages: Vec<String> = Vec::new();
 
@@ -304,8 +307,7 @@ fn resolve_session(
                 (uuid, items, history, todos)
             }
             None => {
-                startup_messages
-                    .push(format!("Session {uuid} not found, creating a new session."));
+                startup_messages.push(format!("Session {uuid} not found, creating a new session."));
                 let session = mgr.create();
                 (session.uuid, Vec::new(), Vec::new(), Vec::new())
             }
@@ -332,9 +334,9 @@ fn resolve_session(
                     },
                     None => {
                         if was_empty {
-                            startup_messages
-                                .push("No existing sessions found, creating a new one."
-                                    .to_string());
+                            startup_messages.push(
+                                "No existing sessions found, creating a new one.".to_string(),
+                            );
                         }
                         let session = mgr.create();
                         (session.uuid, Vec::new(), Vec::new(), Vec::new())
@@ -342,8 +344,9 @@ fn resolve_session(
                 }
             }
             Err(e) => {
-                startup_messages
-                    .push(format!("Failed to list sessions: {e}, creating new session."));
+                startup_messages.push(format!(
+                    "Failed to list sessions: {e}, creating new session."
+                ));
                 if let Some(mgr) = session_mgr.as_ref() {
                     let session = mgr.create();
                     (session.uuid, Vec::new(), Vec::new(), Vec::new())
@@ -357,8 +360,7 @@ fn resolve_session(
                 let session = mgr.create();
                 (session.uuid, Vec::new(), Vec::new(), Vec::new())
             } else {
-                startup_messages
-                    .push("Session persistence unavailable.".to_string());
+                startup_messages.push("Session persistence unavailable.".to_string());
                 (String::new(), Vec::new(), Vec::new(), Vec::new())
             }
         }
@@ -463,10 +465,7 @@ async fn main() -> color_eyre::Result<()> {
     // Derive a project name from the current directory for the terminal title.
     let project_name = std::env::current_dir()
         .ok()
-        .and_then(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "programmer".to_string());
 
     // ---- run the TUI ----
@@ -513,7 +512,9 @@ mod tests {
 
     #[test]
     fn mcp_mode_defaults_to_auto() {
-        assert!(matches!(parse_work_mode("something-unknown"), WorkMode::Auto));
+        assert!(matches!(
+            parse_work_mode("something-unknown"),
+            WorkMode::Auto
+        ));
     }
 }
-
