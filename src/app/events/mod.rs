@@ -61,9 +61,8 @@ async fn handle_crossterm(
         }
         crossterm::event::Event::Paste(data) => keys::handle_paste(app, data),
         crossterm::event::Event::Mouse(_) if app.provider_panel.is_some() => {}
-        // The interactive terminal owns the whole screen: forward the mouse to
-        // its PTY when grabbed (and the program wants it), otherwise swallow it
-        // so it doesn't scroll the hidden conversation beneath.
+        // The task viewer owns the whole screen. Interactive tasks can forward
+        // mouse input to their PTY; read-only tasks use the wheel to scroll.
         crossterm::event::Event::Mouse(mouse) if app.terminal_pane.is_some() => {
             keys::handle_terminal_mouse(app, mouse);
         }
@@ -330,8 +329,13 @@ fn poll_finished_terminals(app: &mut App<'_>) {
             .unwrap_or(false)
     };
 
-    // The open panel: auto-close once its task is gone.
-    if let Some(pane) = app.terminal_pane.as_mut() {
+    // Interactive panels auto-close once their task is gone. Read-only panels
+    // stay open so the final captured output remains inspectable.
+    if let Some(pane) = app
+        .terminal_pane
+        .as_mut()
+        .filter(|pane| pane.accepts_input())
+    {
         if is_running(pane.task_id) {
             pane.finished_ticks = 0;
         } else {

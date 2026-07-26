@@ -291,15 +291,33 @@ pub(crate) async fn handle_key_events(
     Ok(())
 }
 
-/// Handle a key while the interactive terminal panel is open. `Ctrl+O` toggles
-/// input grab. While grabbed, keys are translated to terminal bytes and written
-/// to the task's PTY; while released, `Esc`/`q` close the panel.
+/// Handle a key while the task panel is open. Pipe tasks are strictly read-only
+/// and use navigation keys for captured output. Interactive tasks retain the
+/// input-grab behavior.
 fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
     use crate::ui::components::terminal_panel::key_event_to_bytes;
 
     let Some(pane) = app.terminal_pane.as_mut() else {
         return;
     };
+
+    if !pane.accepts_input() {
+        let page = pane
+            .grid
+            .map(|grid| grid.height.max(1) as i32)
+            .unwrap_or(10);
+        match key_event.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.terminal_pane = None,
+            KeyCode::Up | KeyCode::Char('k') => pane.scroll_read_only(1),
+            KeyCode::Down | KeyCode::Char('j') => pane.scroll_read_only(-1),
+            KeyCode::PageUp => pane.scroll_read_only(page),
+            KeyCode::PageDown => pane.scroll_read_only(-page),
+            KeyCode::Home => pane.scroll_read_only_to_start(),
+            KeyCode::End => pane.scroll_read_only_to_end(),
+            _ => {}
+        }
+        return;
+    }
 
     // Ctrl+O is the escape hatch — never forwarded.
     if key_event.code == KeyCode::Char('o') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
@@ -334,9 +352,19 @@ pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::
     use crate::ui::components::terminal_panel::mouse_event_to_bytes;
     use crossterm::event::MouseEventKind;
 
-    let Some(pane) = app.terminal_pane.as_ref() else {
+    let Some(pane) = app.terminal_pane.as_mut() else {
         return;
     };
+
+    if !pane.accepts_input() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => pane.scroll_read_only(3),
+            MouseEventKind::ScrollDown => pane.scroll_read_only(-3),
+            _ => {}
+        }
+        return;
+    }
+
     let mode = crate::tasks::with_screen(pane.task_id, |s| s.mouse_protocol_mode())
         .unwrap_or(vt100::MouseProtocolMode::None);
 

@@ -324,9 +324,8 @@ impl Widget for &mut App<'_> {
             panel.render(&self.config, self.mcp_manager.as_deref(), area, buf);
             return;
         }
-        // The interactive terminal panel is modal and replaces the whole UI.
-        // Push the visible grid size to the PTY before painting so the child
-        // reflows to the panel.
+        // The task panel is modal and replaces the whole UI. Interactive tasks
+        // receive the visible grid size; pipe tasks render captured output.
         if let Some(pane) = &mut self.terminal_pane {
             use crate::ui::components::terminal_panel;
             let grid = terminal_panel::grid_area(area);

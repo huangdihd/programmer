@@ -311,34 +311,30 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
     });
 }
 
-/// Open the interactive terminal panel for a task. With no argument, opens the
-/// sole interactive task; with an id, opens that task if it is interactive.
+/// Open the full-screen task panel. Interactive tasks can grab input; pipe
+/// tasks use the same viewer in a read-only mode.
 fn open_terminal(app: &mut App<'_>, arg: &str) {
     use crate::ui::components::terminal_panel::TerminalPane;
 
     // Accept an id as the first token (completion may append the task name).
     let first = arg.split_whitespace().next().unwrap_or("");
     let id = if first.is_empty() {
-        // Auto-select the sole *running* interactive task.
+        // Auto-select the sole running task.
         let running: Vec<u64> = crate::tasks::snapshot_all()
             .iter()
-            .filter(|t| {
-                t.status == crate::tasks::TaskStatus::Running && crate::tasks::is_interactive(t.id)
-            })
+            .filter(|t| t.status == crate::tasks::TaskStatus::Running)
             .map(|t| t.id)
             .collect();
         match running.as_slice() {
             [only] => *only,
             [] => {
-                app.conversation_panel.add_warning_string(
-                    "no running interactive task — create one with the task tool (interactive: true)",
-                );
+                app.conversation_panel
+                    .add_warning_string("no running task — create one with the task tool");
                 return;
             }
             _ => {
-                app.conversation_panel.add_warning_string(
-                    "multiple running interactive tasks — specify one with /terminal <id>",
-                );
+                app.conversation_panel
+                    .add_warning_string("multiple running tasks — specify one with /terminal <id>");
                 return;
             }
         }
@@ -353,16 +349,12 @@ fn open_terminal(app: &mut App<'_>, arg: &str) {
         }
     };
 
-    if !crate::tasks::is_interactive(id) {
-        app.conversation_panel.add_warning_string(format!(
-            "task {id} is not interactive — only PTY tasks can be opened in the terminal"
-        ));
+    let Some(snapshot) = crate::tasks::snapshot(id) else {
+        app.conversation_panel
+            .add_warning_string(format!("task {id} was not found"));
         return;
-    }
-    let name = crate::tasks::snapshot(id)
-        .map(|s| s.name)
-        .unwrap_or_default();
-    app.terminal_pane = Some(TerminalPane::new(id, name));
+    };
+    app.terminal_pane = Some(TerminalPane::new(id, snapshot.name));
 }
 
 // ---------------------------------------------------------------------------
