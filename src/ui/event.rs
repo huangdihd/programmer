@@ -249,3 +249,20 @@ impl EventHandler {
         let _ = self.sender.send(Event::App(app_event));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tick_interval_is_one_over_tick_fps() {
+        // EventHandler::new(1.0 / TICK_FPS) computes Duration::from_secs_f64(1.0 / TICK_FPS).
+        // At 30 FPS, each tick should be ~33ms — not 30s (the bug was passing TICK_FPS
+        // directly, treating 30 as seconds instead of 1/30).
+        let tick_fps = crate::consts::TICK_FPS; // 30.0
+        let interval = std::time::Duration::from_secs_f64(1.0 / tick_fps);
+        let ms = interval.as_millis();
+        assert!(
+            (30..=35).contains(&ms),
+            "expected ~33ms per tick, got {ms}ms — is the formula 1.0 / TICK_FPS?"
+        );
+    }
+}

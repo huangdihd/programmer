@@ -29,11 +29,19 @@ pub(crate) async fn handle_key_events(
     app: &mut App<'_>,
     key_event: KeyEvent,
 ) -> color_eyre::Result<()> {
+    // ---- Esc while a turn is active: cancel before ANY panel grabs it ----
+    // (including the terminal panel and approval/question modals)
+    if key_event.code == KeyCode::Esc && app.cancel.active_id.is_some() {
+        app.events.send(AppEvent::Cancel);
+        return Ok(());
+    }
+
     // ---- interactive terminal panel (fully modal; grabs input) ----
     if app.terminal_pane.is_some() {
         handle_terminal_key(app, key_event);
         return Ok(());
     }
+
     // ---- tool-call approval (Manual mode) ----
     if app.pending_review.is_some() {
         return handle_approval_key(app, key_event);

@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::function_tool;
+use crate::cancel::CancellationToken;
 use crate::ui::event::{AnswerTx, AppEvent, Event};
 use tokio::sync::mpsc;
 
@@ -80,6 +81,7 @@ struct Args {
 pub async fn run(
     arguments: &str,
     sender: &mpsc::UnboundedSender<Event>,
+    cancel: &CancellationToken,
     operation_id: u64,
 ) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
@@ -134,7 +136,76 @@ pub async fn run(
         answer_tx: AnswerTx(answer_tx),
         operation_id,
     }));
-    Ok(answer_rx
-        .await
-        .unwrap_or_else(|_| "(no answer)".to_string()))
+    // Race the user's answer against Esc (cancel). If cancelled, the
+    // AnswerTx is dropped and answer_rx sees a closed channel.
+    match cancel.wait_or(answer_rx).await {
+        Some(Ok(answer)) => Ok(answer),
+        _ => Ok("(cancelled)".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn ask_user_returns_cancelled_when_token_fires() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+
+        // Spawn ask_user; it will block waiting for an answer.
+        let handle = tokio::spawn({
+            let args = r#"{"question":"test?","kind":"text"}"#.to_string();
+            let sender = tx.clone();
+            async move { run(&args, &sender, &cancel_for_task, 1).await }
+        });
+
+        // Wait for the QuestionPrompt to appear.
+        let ev = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("question prompt should be sent")
+            .expect("channel open");
+        assert!(matches!(ev, Event::App(AppEvent::QuestionPrompt { .. })));
+
+        // Cancel before answering — ask_user should wake up with "(cancelled)".
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("ask_user should complete")
+            .expect("task should not panic");
+
+        assert_eq!(result, Ok("(cancelled)".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ask_user_returns_answer_when_not_cancelled() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn({
+            let args = r#"{"question":"test?","kind":"text"}"#.to_string();
+            let sender = tx.clone();
+            let cancel_clone = cancel.clone();
+            async move { run(&args, &sender, &cancel_clone, 1).await }
+        });
+
+        // Pull the QuestionPrompt and send an answer.
+        let ev = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("question prompt should be sent")
+            .expect("channel open");
+        if let Event::App(AppEvent::QuestionPrompt { answer_tx, .. }) = ev {
+            answer_tx.send("hello".to_string());
+        }
+
+        let result = tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("ask_user should complete")
+            .expect("task should not panic");
+
+        assert_eq!(result, Ok("hello".to_string()));
+    }
 }

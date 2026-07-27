@@ -1306,4 +1306,60 @@ mod tests {
             .collect();
         assert_eq!(outputs.len(), 1, "should not duplicate outputs");
     }
+
+    #[tokio::test]
+    async fn review_can_be_interrupted_by_cancel_token() {
+        use crate::cancel::CancellationToken;
+        use crate::runner::AgentSurface;
+        use crate::ui::event::{AppEvent, Event};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let cancel = CancellationToken::new();
+        let surface = crate::app::surface::TuiSurface {
+            tx: tx.clone(),
+            skill_prompt: None,
+            plan_prompt: None,
+            approval_label: "test".into(),
+            operation_id: 1,
+            cancel: cancel.clone(),
+        };
+
+        // Spawn review() in a task — it will block waiting for a reply.
+        let review_handle = tokio::spawn({
+            let surface_call = FunctionToolCall {
+                arguments: "{}".into(),
+                call_id: "call_review".into(),
+                namespace: None,
+                name: "write_file".into(),
+                id: Some("fc_review".into()),
+                status: Some(async_openai::types::responses::OutputStatus::InProgress),
+            };
+            async move { surface.review(&surface_call, "test reason", (1, 3)).await }
+        });
+
+        // Wait for the ReviewRequest to arrive on the channel.
+        let ev = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("review request should be sent")
+            .expect("channel open");
+        assert!(
+            matches!(ev, Event::App(AppEvent::ReviewRequest { .. })),
+            "expected ReviewRequest event"
+        );
+
+        // Cancel before sending a reply — review() should unblock with Deny.
+        cancel.cancel();
+
+        let decision = tokio::time::timeout(Duration::from_millis(500), review_handle)
+            .await
+            .expect("review should complete")
+            .expect("review task should not panic");
+
+        assert!(
+            matches!(decision, crate::runner::ReviewDecision::Deny { .. }),
+            "cancelled review should return Deny"
+        );
+    }
 }

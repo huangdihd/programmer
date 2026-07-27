@@ -150,7 +150,7 @@ impl ToolProvider for LocalToolProvider {
     async fn call(&self, call: &FunctionToolCall, ctx: &ToolCtx<'_>) -> Result<String, String> {
         if call.name == ask_user::NAME {
             // ask_user needs the UI channel, so it isn't part of run_local_tool.
-            ask_user::run(&call.arguments, ctx.sender, ctx.operation_id).await
+            ask_user::run(&call.arguments, ctx.sender, ctx.cancel, ctx.operation_id).await
         } else if call.name == command::NAME {
             // The command tool streams its output to the live registry (keyed by
             // call id) so the TUI can render it as it runs.

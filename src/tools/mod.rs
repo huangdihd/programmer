@@ -182,7 +182,13 @@ pub(crate) async fn run_tool_call(
         mcp_bridge::run_mcp_call(call, mcp).await
     } else if call.name == ask_user::NAME {
         // ask_user needs the UI channel, so it isn't part of run_local_tool.
-        ask_user::run(&call.arguments, sender, 0).await
+        ask_user::run(
+            &call.arguments,
+            sender,
+            &crate::cancel::CancellationToken::new(),
+            0,
+        )
+        .await
     } else {
         run_local_tool(&call.name, &call.arguments).await
     };

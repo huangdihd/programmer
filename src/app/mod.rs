@@ -75,10 +75,16 @@ pub(crate) struct CancelState {
     /// in flight — including the post-stream pipeline whose own stream token is
     /// already gone by the time it runs.
     pub(crate) active: CancellationToken,
-    /// The monotonically increasing operation id assigned to the current turn
-    /// (0 = idle). Updated synchronously before the turn spawns so the UI never
-    /// has a race between "start" and "what is my id?".
-    pub(crate) operation_id: u64,
+    /// Monotonically increasing counter — every turn (including retries and
+    /// `/init`) bumps this by 1 so operation ids are never reused within a
+    /// single process lifetime. It wraps naturally on overflow, but two turns
+    /// always get distinct ids in practice.
+    pub(crate) next_id: u64,
+    /// The current turn's operation id, or `None` when idle. Set synchronously
+    /// before the turn spawns and cleared when [`AppEvent::TurnFinished`]
+    /// arrives, so the UI never races between "start" and "what is my id?" and
+    /// stale events from an earlier turn are always dropped.
+    pub(crate) active_id: Option<u64>,
     /// True while the stream task is backing off between connection retries.
     pub(crate) stream_retrying: Arc<AtomicBool>,
 }
@@ -250,7 +256,7 @@ impl App<'_> {
             current_model,
             vision_enabled,
             pending_images: Vec::new(),
-            events: EventHandler::new(crate::consts::TICK_FPS),
+            events: EventHandler::new(1.0 / crate::consts::TICK_FPS),
             config,
             input_panel,
             conversation_panel,
@@ -280,7 +286,8 @@ impl App<'_> {
             sidebar_click_active: false,
             cancel: CancelState {
                 active: CancellationToken::new(),
-                operation_id: 0,
+                next_id: 0,
+                active_id: None,
                 stream_retrying: Arc::new(AtomicBool::new(false)),
             },
             session: SessionState {

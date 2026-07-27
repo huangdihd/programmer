@@ -17,6 +17,7 @@
 //! (stream chunks, phase changes, review requests) into [`AppEvent`]s on the
 //! app's event channel. A fresh instance is built for each turn.
 
+use crate::cancel::CancellationToken;
 use crate::runner::{AgentSurface, ReviewDecision, RunnerEvent};
 use crate::ui::event::{AppEvent, Event, ReplyTx};
 use async_openai::types::responses::FunctionToolCall;
@@ -35,6 +36,9 @@ pub(crate) struct TuiSurface {
     pub approval_label: String,
     /// The monotonically increasing operation id assigned to this turn.
     pub operation_id: u64,
+    /// The turn's root cancellation token, so `review()` can race the
+    /// approval wait against an Esc press.
+    pub cancel: CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -64,9 +68,15 @@ impl AgentSurface for TuiSurface {
             reply: ReplyTx(reply_tx),
             operation_id: self.operation_id,
         }));
-        reply_rx.await.unwrap_or_else(|_| ReviewDecision::Deny {
-            output: crate::runner::classify::classifier_denied_output(call, "cancelled"),
-        })
+        // Race the user's approval against Esc (cancel). If the cancel token
+        // fires first, the ReplyTx is dropped and `reply_rx` sees a closed
+        // channel → denial.
+        match self.cancel.wait_or(reply_rx).await {
+            Some(Ok(decision)) => decision,
+            _ => ReviewDecision::Deny {
+                output: crate::runner::classify::classifier_denied_output(call, "cancelled"),
+            },
+        }
     }
 
     fn tool_event_sender(&self) -> Option<mpsc::UnboundedSender<Event>> {

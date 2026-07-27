@@ -45,7 +45,12 @@ async fn run_labeled_call(
         cancel: &cancel,
         operation_id,
     };
-    let result = registry.call(&call, &ctx).await;
+    // Race the tool execution against cancellation so MCP, fetch, task wait,
+    // and long-running commands don't leave the UI stuck in Cancelling.
+    let result = match cancel.wait_or(registry.call(&call, &ctx)).await {
+        Some(r) => r,
+        None => Err("cancelled".to_string()),
+    };
     let mut out = crate::tools::make_tool_output(&call.call_id, result);
     if out.approval_label.is_none() {
         out.approval_label = Some(label);
@@ -216,5 +221,44 @@ mod tests {
         // Cancelled before running anything allowed: only the denial remains.
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].failed);
+    }
+
+    #[tokio::test]
+    async fn long_running_tool_is_interrupted_by_cancel() {
+        // `command` with a long sleep: cancel fires after a short delay.
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Spawn a batch with one long command and cancel it after 50ms.
+        let allowed = vec![call("command", r#"{"command":"sleep 30","timeout":120}"#)];
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            run_tool_batch(
+                allowed,
+                vec![],
+                cancel_clone,
+                "test-label".to_string(),
+                tx,
+                local_registry(),
+                1,
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+
+        let outputs = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("batch should finish within 5s")
+            .expect("batch task should not panic");
+
+        assert!(!outputs.is_empty());
+        // The command should be marked failed because it was cancelled.
+        assert!(
+            outputs[0].failed,
+            "cancelled command should be failed: {:?}",
+            outputs[0].param.output
+        );
     }
 }

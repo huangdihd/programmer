@@ -512,7 +512,10 @@ impl ConversationPanel {
         self.receiving_response.is_some()
             || matches!(
                 self.phase,
-                ActivePhase::ToolRunning | ActivePhase::Classifying | ActivePhase::Compacting
+                ActivePhase::ToolRunning
+                    | ActivePhase::Classifying
+                    | ActivePhase::Compacting
+                    | ActivePhase::Cancelling
             )
     }
 
@@ -806,5 +809,22 @@ mod tests {
 
         assert!(panel.receiving_response.is_none());
         assert!(!panel.is_busy(), "aborting must clear the busy state");
+    }
+
+    #[test]
+    fn is_busy_when_cancelling() {
+        let mut panel = ConversationPanel::new();
+        // A fresh panel is idle.
+        assert!(!panel.is_busy());
+
+        // Enter the Cancelling phase — Esc was pressed but the runner hasn't
+        // finished yet. The panel must report busy so Enter queues rather than
+        // starting a new operation.
+        panel.phase = ActivePhase::Cancelling;
+        assert!(panel.is_busy(), "Cancelling must be treated as busy");
+
+        // After TurnFinished clears the phase, it goes back to idle.
+        panel.phase = ActivePhase::None;
+        assert!(!panel.is_busy());
     }
 }

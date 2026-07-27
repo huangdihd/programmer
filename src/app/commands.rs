@@ -57,6 +57,26 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     // reference for regular files or an image attachment when vision is on.
     app.input_panel.push_history(typed.clone());
     app.input_panel.clear();
+
+    // Check busy synchronously, before any .await. An async gap (e.g. in
+    // expand_file_references) gives TurnFinished a window to clear the
+    // phase, defeating the is_busy() check inside start_request_as_with_images.
+    if app.conversation_panel.is_busy() {
+        let is_at_bottom = app.conversation_panel.is_at_bottom();
+        match app.conversation_panel.pending_message.as_mut() {
+            Some(pending) => {
+                pending.push('\n');
+                pending.push_str(&typed);
+            }
+            None => app.conversation_panel.pending_message = Some(typed),
+        }
+        app.pending_images.clear();
+        if is_at_bottom {
+            app.conversation_panel.scroll_to_bottom()
+        }
+        return;
+    }
+
     let expanded = crate::commands::expand_file_references(&typed, app.vision_enabled).await;
     for notice in expanded.notices {
         app.conversation_panel.add_warning_string(notice);
@@ -131,10 +151,12 @@ async fn start_request_as_with_images(
     // doesn't carry over to this one. Bump the operation id synchronously
     // before spawning so the UI can tag all turn events and filter stale ones.
     app.cancel.active = crate::cancel::CancellationToken::new();
-    app.cancel.operation_id = app.cancel.operation_id.wrapping_add(1);
-    let operation_id = app.cancel.operation_id;
+    app.cancel.next_id = app.cancel.next_id.wrapping_add(1);
+    let operation_id = app.cancel.next_id;
+    app.cancel.active_id = Some(operation_id);
 
     let Some(runner) = app.build_runner() else {
+        app.cancel.active_id = None;
         app.conversation_panel
             .add_error_string(format!("unknown provider/model: {}", app.current_model));
         return;
@@ -149,6 +171,7 @@ async fn start_request_as_with_images(
             app.work_mode.label()
         ),
         operation_id,
+        cancel: app.cancel.active.clone(),
     };
     let shared = app.conversation_panel.shared_conversation();
     let cancel = app.cancel.active.clone();
@@ -273,8 +296,9 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
 
     app.conversation_panel.phase = ActivePhase::Compacting;
     app.cancel.active = crate::cancel::CancellationToken::new();
-    app.cancel.operation_id = app.cancel.operation_id.wrapping_add(1);
-    let operation_id = app.cancel.operation_id;
+    app.cancel.next_id = app.cancel.next_id.wrapping_add(1);
+    let operation_id = app.cancel.next_id;
+    app.cancel.active_id = Some(operation_id);
     let cancel_token = app.cancel.active.child();
     let sender = app.events.sender.clone();
     tokio::spawn(async move {
@@ -283,8 +307,13 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
             model: Some(model_name),
             ..Default::default()
         };
-        let result = match client.responses().create(request).await {
-            Ok(response) => {
+        // Race the model request against cancellation so Esc doesn't leave
+        // the UI stuck in Cancelling.
+        let result = match cancel_token
+            .wait_or(client.responses().create(request))
+            .await
+        {
+            Some(Ok(response)) => {
                 let text = response
                     .output
                     .iter()
@@ -306,15 +335,16 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
                     Ok(text)
                 }
             }
-            Err(e) => Err(e.to_string()),
+            Some(Err(e)) => Err(e.to_string()),
+            None => Err("cancelled".to_string()),
         };
-        if !cancel_token.is_cancelled() {
-            let _ = sender.send(Event::App(crate::ui::event::AppEvent::CompactFinished(
-                operation_id,
-                result,
-                cancel_token,
-            )));
-        }
+        // Always send CompactFinished — even when cancelled — so
+        // handle_compact_finished can clear active_id and reset the phase.
+        let _ = sender.send(Event::App(crate::ui::event::AppEvent::CompactFinished(
+            operation_id,
+            result,
+            cancel_token,
+        )));
     });
 }
 

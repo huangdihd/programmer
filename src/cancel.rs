@@ -87,23 +87,29 @@ impl CancellationToken {
 
     /// Resolves once this token (or any ancestor) is cancelled. If the token is
     /// already cancelled the future resolves immediately.
+    ///
+    /// The shared [`Notify`] means a sibling child's `cancel()` will wake us
+    /// spuriously — we loop back and re-check `is_cancelled()` each time so a
+    /// sibling cancel never resolves a peer's `wait()`.
     pub async fn wait(&self) {
-        if self.is_cancelled() {
-            return;
-        }
         // We must hold a clone of our own Arc<Notify> across the await so the
         // notified() future doesn't outlive self.
         let notify = self.notify.clone();
-        let notified = notify.notified();
-        // Pin the future so it stays put.
-        tokio::pin!(notified);
-        // Race: check once more after registering the waker but before awaiting,
-        // in case cancel() ran between our initial check and the Notified
-        // registration.
-        if self.is_cancelled() {
-            return;
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = notify.notified();
+            // Pin the future so it stays put.
+            tokio::pin!(notified);
+            // Race: check once more after registering the waker but before
+            // awaiting, in case cancel() ran between our initial check and the
+            // Notified registration.
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
         }
-        notified.await;
     }
 
     /// Returns a future that races the given future against cancellation: it
@@ -217,5 +223,70 @@ mod tests {
         });
         let result = t.wait_or(tokio::time::sleep(Duration::from_secs(5))).await;
         assert!(result.is_none(), "should be cancelled first");
+    }
+
+    #[tokio::test]
+    async fn sibling_cancel_does_not_wake_peer_wait() {
+        // Cancel child A: child B must keep blocking.
+        let parent = CancellationToken::new();
+        let child_a = parent.child();
+        let child_b = parent.child();
+
+        // Cancel child A after a short delay.
+        let a = child_a.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            a.cancel();
+        });
+
+        // child B's wait() must NOT resolve from child A's cancel.
+        let result = tokio::time::timeout(Duration::from_millis(200), child_b.wait()).await;
+        assert!(
+            result.is_err(),
+            "child B should still be waiting — sibling cancel woke it spuriously"
+        );
+
+        // Now cancel the parent — child B must resolve.
+        parent.cancel();
+        tokio::time::timeout(Duration::from_millis(100), child_b.wait())
+            .await
+            .expect("child B should resolve after parent cancel");
+    }
+
+    #[tokio::test]
+    async fn sibling_cancel_does_not_affect_peer_wait_or() {
+        // Cancel child A: child B's wait_or must keep waiting for its future.
+        let parent = CancellationToken::new();
+        let child_a = parent.child();
+        let child_b = parent.child();
+
+        // Cancel child A after a short delay.
+        let a = child_a.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            a.cancel();
+        });
+
+        // child B's wait_or should NOT resolve when child A cancels — it
+        // should keep waiting for its future (a slow sleep).
+        let result = child_b
+            .wait_or(tokio::time::sleep(Duration::from_millis(300)))
+            .await;
+        assert!(
+            result.is_some(),
+            "child B's wait_or should return Some (future completed), not be \
+             cancelled by sibling",
+        );
+
+        // Now cancel parent and verify child B's wait_or returns None.
+        let child_b2 = parent.child();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            parent.cancel();
+        });
+        let result = child_b2
+            .wait_or(tokio::time::sleep(Duration::from_secs(5)))
+            .await;
+        assert!(result.is_none(), "child B2 should be cancelled by parent");
     }
 }
