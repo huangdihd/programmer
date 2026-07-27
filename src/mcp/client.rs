@@ -103,9 +103,18 @@ impl McpClient {
             .spawn()
             .map_err(|e| format!("cannot spawn MCP server '{command}': {e}"))?;
 
-        let stdin = child.stdin.take().ok_or_else(|| "child has no stdin".to_string())?;
-        let stdout = child.stdout.take().ok_or_else(|| "child has no stdout".to_string())?;
-        let stderr = child.stderr.take().ok_or_else(|| "child has no stderr".to_string())?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "child has no stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "child has no stdout".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "child has no stderr".to_string())?;
 
         let stderr_buf: StderrBuffer = Arc::new(StdMutex::new(VecDeque::new()));
         let buf = stderr_buf.clone();
@@ -163,8 +172,14 @@ impl McpClient {
         };
         let line = serde_json::to_string(&req).map_err(|e| format!("MCP serialise: {e}"))?;
         let mut stdin = self.stdin.lock().await;
-        stdin.write_all(line.as_bytes()).await.map_err(|e| format!("MCP write: {e}"))?;
-        stdin.write_all(b"\n").await.map_err(|e| format!("MCP write newline: {e}"))?;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("MCP write: {e}"))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| format!("MCP write newline: {e}"))?;
         stdin.flush().await.map_err(|e| format!("MCP flush: {e}"))?;
         Ok(())
     }
@@ -178,8 +193,14 @@ impl McpClient {
         });
         let line = serde_json::to_string(&resp).map_err(|e| format!("MCP serialise: {e}"))?;
         let mut stdin = self.stdin.lock().await;
-        stdin.write_all(line.as_bytes()).await.map_err(|e| format!("MCP write: {e}"))?;
-        stdin.write_all(b"\n").await.map_err(|e| format!("MCP write newline: {e}"))?;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("MCP write: {e}"))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| format!("MCP write newline: {e}"))?;
         stdin.flush().await.map_err(|e| format!("MCP flush: {e}"))?;
         Ok(())
     }
@@ -200,15 +221,18 @@ impl McpClient {
             let mut line = String::new();
             {
                 let mut reader = self.stdout_lines.lock().await;
-                reader.read_line(&mut line).await.map_err(|e| format!("MCP read: {e}"))?;
+                reader
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| format!("MCP read: {e}"))?;
             }
 
             if line.trim().is_empty() {
                 continue;
             }
 
-            let raw: serde_json::Value = serde_json::from_str(line.trim())
-                .map_err(|e| format!("MCP parse JSON: {e}"))?;
+            let raw: serde_json::Value =
+                serde_json::from_str(line.trim()).map_err(|e| format!("MCP parse JSON: {e}"))?;
 
             // --- server→client request? (has `method` + `id`, no `result`/`error`) ---
             if raw.get("method").and_then(|v| v.as_str()).is_some()
@@ -230,11 +254,13 @@ impl McpClient {
             }
 
             // --- response to our request ---
-            let resp: JsonRpcResponse = serde_json::from_value(raw)
-                .map_err(|e| format!("MCP parse response: {e}"))?;
+            let resp: JsonRpcResponse =
+                serde_json::from_value(raw).map_err(|e| format!("MCP parse response: {e}"))?;
 
             match resp {
-                JsonRpcResponse::Success { id: rid, result, .. } if rid == id => return Ok(result),
+                JsonRpcResponse::Success {
+                    id: rid, result, ..
+                } if rid == id => return Ok(result),
                 JsonRpcResponse::Error { id: rid, error, .. } if rid == id => {
                     return Err(format!("MCP error: {}", error.message));
                 }
@@ -256,7 +282,9 @@ impl McpClient {
                     "uri": format!("file://{}", self.workspace_root.replace('\\', "/")),
                     "name": "project",
                 }]);
-                let _ = self.send_response(req_id, serde_json::json!({"roots": roots})).await;
+                let _ = self
+                    .send_response(req_id, serde_json::json!({"roots": roots}))
+                    .await;
             }
             _ => {
                 // Unknown request — respond with method-not-found error.
@@ -266,9 +294,7 @@ impl McpClient {
                         "message": format!("Method not found: {method}"),
                     }
                 });
-                let _ = self
-                    .send_response(req_id, err)
-                    .await;
+                let _ = self.send_response(req_id, err).await;
             }
         }
     }
@@ -296,9 +322,10 @@ impl McpClient {
             }
             "notifications/cancelled" => {
                 if let Some(p) = params
-                    && let Some(rid) = p.get("requestId").and_then(|v| v.as_u64()) {
-                        *self.cancelled_id.lock().unwrap() = Some(rid);
-                    }
+                    && let Some(rid) = p.get("requestId").and_then(|v| v.as_u64())
+                {
+                    *self.cancelled_id.lock().unwrap() = Some(rid);
+                }
             }
             "notifications/progress" => {
                 if let Some(p) = params {
@@ -310,7 +337,10 @@ impl McpClient {
                     let info = ProgressInfo {
                         progress: p.get("progress").and_then(|v| v.as_f64()).unwrap_or(0.0),
                         total: p.get("total").and_then(|v| v.as_f64()),
-                        message: p.get("message").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        message: p
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                     };
                     self.progress.lock().unwrap().insert(token, info);
                 }
@@ -372,8 +402,14 @@ impl McpClient {
         };
         let line = serde_json::to_string(&req).map_err(|e| format!("MCP serialise: {e}"))?;
         let mut stdin = self.stdin.lock().await;
-        stdin.write_all(line.as_bytes()).await.map_err(|e| format!("MCP write: {e}"))?;
-        stdin.write_all(b"\n").await.map_err(|e| format!("MCP write newline: {e}"))?;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("MCP write: {e}"))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| format!("MCP write newline: {e}"))?;
         stdin.flush().await.map_err(|e| format!("MCP flush: {e}"))?;
         Ok(())
     }

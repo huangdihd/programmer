@@ -74,7 +74,11 @@ impl Sidebar {
 
         // Build the click map for visible lines (skipping scroll offset).
         self.click_map.clear();
-        for target in click_targets.iter().skip(offset as usize).take(visible_height) {
+        for target in click_targets
+            .iter()
+            .skip(offset as usize)
+            .take(visible_height)
+        {
             self.click_map.push(target.clone());
         }
 
@@ -163,7 +167,14 @@ impl Sidebar {
             rendered_any = true;
 
             // Title line.
-            let title = self.section_title(section, diagnostics, lsp_configured, mcp_manager, todo_list, tasks);
+            let title = self.section_title(
+                section,
+                diagnostics,
+                lsp_configured,
+                mcp_manager,
+                todo_list,
+                tasks,
+            );
             let title_line = self.make_title_line(&title, section.key, section.collapsed);
             lines.push(title_line);
             targets.push(ClickTarget::Section(section.key));
@@ -317,9 +328,7 @@ impl Sidebar {
             SidebarSection::Tasks => Color::Cyan,
         };
 
-        let style = Style::default()
-            .fg(color)
-            .add_modifier(Modifier::BOLD);
+        let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
 
         Line::from(Span::styled(text, style))
     }
@@ -422,9 +431,10 @@ impl Sidebar {
             std::collections::HashMap::new();
         for (key, _) in &tools {
             if let Some(rest) = key.strip_prefix("mcp__")
-                && let Some((server, _)) = rest.split_once("__") {
-                    *tool_counts.entry(server.to_string()).or_default() += 1;
-                }
+                && let Some((server, _)) = rest.split_once("__")
+            {
+                *tool_counts.entry(server.to_string()).or_default() += 1;
+            }
         }
 
         let entries: Vec<(String, usize)> = tool_counts.into_iter().collect();
@@ -519,7 +529,10 @@ impl Sidebar {
 
             let prefix_spans: Vec<Span<'static>> = vec![
                 Span::raw("  "),
-                Span::styled(format!("[{icon}]"), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("[{icon}]"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" "),
             ];
             let prefix_width = spans_width(&prefix_spans);
@@ -622,10 +635,7 @@ impl Sidebar {
         let budget = (width.saturating_sub(6) as usize).max(8);
 
         if let Some(code) = task.exit_code {
-            lines.push(Line::from(Span::styled(
-                format!("     exit {code}"),
-                dim,
-            )));
+            lines.push(Line::from(Span::styled(format!("     exit {code}"), dim)));
             targets.push(ClickTarget::None);
         }
 
@@ -660,7 +670,6 @@ impl Sidebar {
         }
     }
 }
-
 
 // -- helpers --
 
@@ -766,10 +775,7 @@ mod tests {
         assert!(text.contains("1m15s"), "got:\n{text}");
         let tasks_pos = text.find("Tasks").expect("tasks section");
         let diag_pos = text.find("Diagnostics").expect("diagnostics section");
-        assert!(
-            tasks_pos < diag_pos,
-            "Tasks must render above Diagnostics"
-        );
+        assert!(tasks_pos < diag_pos, "Tasks must render above Diagnostics");
     }
 
     #[test]
@@ -778,9 +784,7 @@ mod tests {
         sidebar.toggle_task(3);
         let area = Rect::new(0, 0, 32, 40);
         let mut buf = Buffer::empty(area);
-        let output: String = (1..=13)
-            .map(|i| format!("line {i}\n"))
-            .collect();
+        let output: String = (1..=13).map(|i| format!("line {i}\n")).collect();
         let tasks = vec![TaskSnapshot {
             id: 3,
             name: "build".to_string(),

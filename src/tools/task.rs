@@ -266,8 +266,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
 
         "output" => {
             let id = require_id(args.id, "output")?;
-            let snap = tasks::snapshot(id)
-                .ok_or_else(|| format!("error: no task with id {id}"))?;
+            let snap = tasks::snapshot(id).ok_or_else(|| format!("error: no task with id {id}"))?;
             Ok(render_full(&snap, args.tail.unwrap_or(DEFAULT_TAIL_CHARS)))
         }
 
@@ -281,9 +280,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
             let eof = args.eof.unwrap_or(false);
             let mut input = args.input.unwrap_or_default();
             if input.is_empty() && !eof {
-                return Err(
-                    "error: 'input' (or eof=true) is required for write".to_string()
-                );
+                return Err("error: 'input' (or eof=true) is required for write".to_string());
             }
             // Line-based contract: prompts read whole lines, so make sure the
             // input is terminated.
@@ -307,12 +304,8 @@ pub async fn run(arguments: &str) -> Result<String, String> {
 
         "wait" => {
             let id = require_id(args.id, "wait")?;
-            let timeout = args
-                .timeout
-                .unwrap_or(DEFAULT_WAIT_SECS)
-                .min(MAX_WAIT_SECS);
-            let (snap, still_running) =
-                tasks::wait(id, Duration::from_secs(timeout)).await?;
+            let timeout = args.timeout.unwrap_or(DEFAULT_WAIT_SECS).min(MAX_WAIT_SECS);
+            let (snap, still_running) = tasks::wait(id, Duration::from_secs(timeout)).await?;
             let mut text = render_full(&snap, args.tail.unwrap_or(DEFAULT_TAIL_CHARS));
             if still_running {
                 text.push_str(&format!(
@@ -371,9 +364,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                 }
             }
             if bytes.is_empty() {
-                return Err(
-                    "error: 'text' and/or 'keys' is required for keys".to_string()
-                );
+                return Err("error: 'text' and/or 'keys' is required for keys".to_string());
             }
             let screen_text = tasks::write_bytes_and_wait(id, &bytes, 100, 5000).await?;
             Ok(format!(
@@ -447,10 +438,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                 .pattern
                 .as_deref()
                 .ok_or_else(|| "error: 'pattern' is required for expect_screen".to_string())?;
-            let timeout = args
-                .timeout
-                .unwrap_or(DEFAULT_WAIT_SECS)
-                .min(MAX_WAIT_SECS);
+            let timeout = args.timeout.unwrap_or(DEFAULT_WAIT_SECS).min(MAX_WAIT_SECS);
             let (snap, matched) =
                 tasks::expect_screen(id, pattern, Duration::from_secs(timeout)).await?;
             let mut msg = format!(
@@ -464,7 +452,10 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                 msg.push_str(", alt-screen");
             }
             if matched {
-                msg.push_str(&format!("\n✓ pattern '{pattern}' found\n--- screen ---\n{}", snap.text));
+                msg.push_str(&format!(
+                    "\n✓ pattern '{pattern}' found\n--- screen ---\n{}",
+                    snap.text
+                ));
             } else {
                 msg.push_str(&format!(
                     "\n✗ pattern '{pattern}' NOT found after {timeout}s\n--- screen ---\n{}",
@@ -572,7 +563,9 @@ mod tests {
     fn create_kill_write_are_mutating_but_views_are_not() {
         assert!(action_is_mutating(r#"{"action":"create","command":"x"}"#));
         assert!(action_is_mutating(r#"{"action":"kill","id":1}"#));
-        assert!(action_is_mutating(r#"{"action":"write","id":1,"input":"y"}"#));
+        assert!(action_is_mutating(
+            r#"{"action":"write","id":1,"input":"y"}"#
+        ));
         assert!(!action_is_mutating(r#"{"action":"list"}"#));
         assert!(!action_is_mutating(r#"{"action":"output","id":1}"#));
         assert!(!action_is_mutating(r#"{"action":"wait","id":1}"#));
@@ -583,9 +576,13 @@ mod tests {
     #[test]
     fn keys_action_is_mutating_screen_is_not() {
         assert!(action_is_mutating(r#"{"action":"keys","id":1,"text":"x"}"#));
-        assert!(action_is_mutating(r#"{"action":"send_mouse","id":1,"x":1,"y":1}"#));
+        assert!(action_is_mutating(
+            r#"{"action":"send_mouse","id":1,"x":1,"y":1}"#
+        ));
         assert!(!action_is_mutating(r#"{"action":"screen","id":1}"#));
-        assert!(!action_is_mutating(r#"{"action":"resize","id":1,"rows":30,"cols":100}"#));
+        assert!(!action_is_mutating(
+            r#"{"action":"resize","id":1,"rows":30,"cols":100}"#
+        ));
     }
 
     #[cfg(unix)]
@@ -600,9 +597,11 @@ mod tests {
             .nth(3)
             .and_then(|w| w.trim_end_matches(':').parse().ok())
             .expect("id");
-        let err = run(&format!(r#"{{"action":"send_mouse","id":{id},"x":1,"y":1}}"#))
-            .await
-            .expect_err("cat has no mouse reporting");
+        let err = run(&format!(
+            r#"{{"action":"send_mouse","id":{id},"x":1,"y":1}}"#
+        ))
+        .await
+        .expect_err("cat has no mouse reporting");
         assert!(err.contains("mouse reporting"), "got: {err}");
         let _ = run(&format!(r#"{{"action":"kill","id":{id}}}"#)).await;
     }

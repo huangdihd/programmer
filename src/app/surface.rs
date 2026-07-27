@@ -17,7 +17,7 @@
 //! (stream chunks, phase changes, review requests) into [`AppEvent`]s on the
 //! app's event channel. A fresh instance is built for each turn.
 
-use crate::runner::{AgentSurface, RunnerEvent, ReviewDecision};
+use crate::runner::{AgentSurface, ReviewDecision, RunnerEvent};
 use crate::ui::event::{AppEvent, Event, ReplyTx};
 use async_openai::types::responses::FunctionToolCall;
 use tokio::sync::mpsc;
@@ -33,15 +33,17 @@ pub(crate) struct TuiSurface {
     /// The label stamped on auto-approved tool outputs, e.g.
     /// "🤖 approved by Auto mode".
     pub approval_label: String,
+    /// The monotonically increasing operation id assigned to this turn.
+    pub operation_id: u64,
 }
 
 #[async_trait::async_trait]
 impl AgentSurface for TuiSurface {
     fn on_event(&self, ev: RunnerEvent<'_>) {
         let app_ev = match ev {
-            RunnerEvent::StreamChunk(b) => AppEvent::ChunkReceived(Box::new(*b)),
-            RunnerEvent::ResponseCommitted => AppEvent::ResponseCommitted,
-            RunnerEvent::Phase(p) => AppEvent::RunnerPhase(p),
+            RunnerEvent::StreamChunk(b) => AppEvent::ChunkReceived(self.operation_id, Box::new(*b)),
+            RunnerEvent::ResponseCommitted => AppEvent::ResponseCommitted(self.operation_id),
+            RunnerEvent::Phase(p) => AppEvent::RunnerPhase(self.operation_id, p),
             // These are read from the shared conversation directly.
             RunnerEvent::Assistant(_) | RunnerEvent::ToolCall { .. } => return,
         };
@@ -60,11 +62,10 @@ impl AgentSurface for TuiSurface {
             reason: reason.to_string(),
             position,
             reply: ReplyTx(reply_tx),
+            operation_id: self.operation_id,
         }));
-        reply_rx.await.unwrap_or_else(|_| {
-            ReviewDecision::Deny {
-                output: crate::runner::classify::classifier_denied_output(call, "cancelled"),
-            }
+        reply_rx.await.unwrap_or_else(|_| ReviewDecision::Deny {
+            output: crate::runner::classify::classifier_denied_output(call, "cancelled"),
         })
     }
 
@@ -82,5 +83,9 @@ impl AgentSurface for TuiSurface {
 
     fn approval_label(&self) -> String {
         self.approval_label.clone()
+    }
+
+    fn operation_id(&self) -> u64 {
+        self.operation_id
     }
 }

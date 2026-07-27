@@ -165,9 +165,10 @@ fn glob_matches(glob: &str, path: &str) -> bool {
         return true;
     }
     if !glob.contains('/')
-        && let Some(name) = path.rsplit('/').next() {
-            return glob_matches_exact(glob, name);
-        }
+        && let Some(name) = path.rsplit('/').next()
+    {
+        return glob_matches_exact(glob, name);
+    }
     false
 }
 
@@ -254,7 +255,10 @@ mod tests {
             command = "x"
             parser = "no-such-preset"
         "#;
-        let err = DiagnosticsProfile::from_toml(toml).unwrap().validate().unwrap_err();
+        let err = DiagnosticsProfile::from_toml(toml)
+            .unwrap()
+            .validate()
+            .unwrap_err();
         assert!(err.contains("unknown parser preset"));
     }
 
@@ -265,7 +269,10 @@ mod tests {
             name = "x"
             parser = "gnu"
         "#;
-        let err = DiagnosticsProfile::from_toml(toml).unwrap().validate().unwrap_err();
+        let err = DiagnosticsProfile::from_toml(toml)
+            .unwrap()
+            .validate()
+            .unwrap_err();
         assert!(err.contains("empty command"));
     }
 
@@ -292,7 +299,7 @@ mod tests {
                 parser: "rustc-json".into(),
                 pattern: None,
                 run_on: vec!["*.rs".into()],
-            lint: false,
+                lint: false,
             }],
         };
         let text = profile.to_toml().unwrap();

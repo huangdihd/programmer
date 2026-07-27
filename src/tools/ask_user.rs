@@ -77,7 +77,11 @@ struct Args {
     options: Vec<String>,
 }
 
-pub async fn run(arguments: &str, sender: &mpsc::UnboundedSender<Event>) -> Result<String, String> {
+pub async fn run(
+    arguments: &str,
+    sender: &mpsc::UnboundedSender<Event>,
+    operation_id: u64,
+) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return Err(format!("error: invalid arguments: {e}")),
@@ -120,7 +124,7 @@ pub async fn run(arguments: &str, sender: &mpsc::UnboundedSender<Event>) -> Resu
         other => {
             return Err(format!(
                 "error: unknown kind '{other}'; valid kinds: yes_no, multiple_choice, text"
-            ))
+            ));
         }
     };
 
@@ -128,6 +132,9 @@ pub async fn run(arguments: &str, sender: &mpsc::UnboundedSender<Event>) -> Resu
     let _ = sender.send(Event::App(AppEvent::QuestionPrompt {
         question,
         answer_tx: AnswerTx(answer_tx),
+        operation_id,
     }));
-    Ok(answer_rx.await.unwrap_or_else(|_| "(no answer)".to_string()))
+    Ok(answer_rx
+        .await
+        .unwrap_or_else(|_| "(no answer)".to_string()))
 }

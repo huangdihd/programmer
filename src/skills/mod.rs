@@ -219,8 +219,7 @@ mod tests {
     fn load_skills_from_disk() {
         use std::io::Write;
 
-        let dir = std::env::temp_dir()
-            .join(format!("programmer_skills_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("programmer_skills_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let skills_dir = dir.join("skills");
@@ -256,11 +255,12 @@ mod tests {
         assert_eq!(names, vec!["hello", "react-best-practices"]);
 
         assert!(reg.get("hello").unwrap().body.contains("Hello, world!"));
-        assert!(reg
-            .get("react-best-practices")
-            .unwrap()
-            .body
-            .contains("React.memo"));
+        assert!(
+            reg.get("react-best-practices")
+                .unwrap()
+                .body
+                .contains("React.memo")
+        );
 
         // Activate
         assert!(reg.activate("hello"));

@@ -30,7 +30,9 @@ impl TodoPanel {
             .border_style(Style::default().fg(Color::Cyan))
             .title(Span::styled(
                 " Todos ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         block.render(area, buf);
@@ -38,9 +40,7 @@ impl TodoPanel {
         match &self.add_mode {
             AddMode::Hidden => self.render_list(inner, buf),
             AddMode::Title { input } => self.render_add_title(inner, buf, input),
-            AddMode::Description { input, .. } => {
-                self.render_add_description(inner, buf, input)
-            }
+            AddMode::Description { input, .. } => self.render_add_description(inner, buf, input),
         }
     }
 
@@ -106,12 +106,10 @@ impl TodoPanel {
             };
 
             let line = if is_selected {
-                Line::from(vec![
-                    Span::styled(
-                        format!("{marker} [{icon}] {title}"),
-                        line_style,
-                    ),
-                ])
+                Line::from(vec![Span::styled(
+                    format!("{marker} [{icon}] {title}"),
+                    line_style,
+                )])
             } else {
                 Line::from(vec![
                     Span::raw(format!("{marker} [")),
@@ -181,7 +179,10 @@ impl TodoPanel {
 
         let hint = Line::from(vec![
             Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(" next (description)  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                " next (description)  ",
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
             Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
         ]);
@@ -236,4 +237,3 @@ impl TodoPanel {
         Paragraph::new(Line::from(hints)).render(area, buf);
     }
 }
-

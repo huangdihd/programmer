@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::function_tool;
-use crate::diagnostics::{run_checker, DiagnosticsProfile, PROFILE_PATH};
+use crate::diagnostics::{DiagnosticsProfile, PROFILE_PATH, run_checker};
 
 pub const NAME: &str = "configure_diagnostics";
 
@@ -93,16 +93,23 @@ async fn run_in(arguments: &str, cwd: &Path) -> Result<String, String> {
         return Err(format!("error: {e}\nThe profile was NOT saved."));
     }
     if profile.checkers.is_empty() {
-        return Err("error: the profile has no [[checkers]]. Add at least one, or \
+        return Err(
+            "error: the profile has no [[checkers]]. Add at least one, or \
                 skip diagnostics setup entirely."
-            .to_string());
+                .to_string(),
+        );
     }
 
     // Test-run each checker so a bad command or parser is caught now, not on
     // the first real edit. A checker that runs but finds nothing is fine.
     let mut report_lines = Vec::new();
     for checker in &profile.checkers {
-        match tokio::time::timeout(VERIFY_TIMEOUT, run_checker(checker, cwd)).await {
+        match tokio::time::timeout(
+            VERIFY_TIMEOUT,
+            run_checker(checker, cwd, &crate::cancel::CancellationToken::new()),
+        )
+        .await
+        {
             Ok(Ok(diags)) => {
                 report_lines.push(format!(
                     "  ✓ {} — ran ok, parsed {} diagnostic(s)",
@@ -137,9 +144,10 @@ async fn run_in(arguments: &str, cwd: &Path) -> Result<String, String> {
     };
     let path = cwd.join(PROFILE_PATH);
     if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent) {
-            return Err(format!("error: could not create {}: {e}", parent.display()));
-        }
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return Err(format!("error: could not create {}: {e}", parent.display()));
+    }
     if let Err(e) = std::fs::write(&path, toml) {
         return Err(format!("error: could not write {}: {e}", path.display()));
     }

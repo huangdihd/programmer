@@ -46,7 +46,9 @@ pub(crate) fn extend_with_mcp_tools(tools: &mut Vec<Tool>, mgr: &McpManager) {
         if !tools.iter().any(|t| tool_name(t) == Some(&list_fqn[..])) {
             tools.push(mcp_function_tool(
                 &list_fqn,
-                Some(format!("List all resources exposed by MCP server '{server_name}'.")),
+                Some(format!(
+                    "List all resources exposed by MCP server '{server_name}'."
+                )),
                 serde_json::json!({ "type": "object", "properties": {} }),
             ));
         }
@@ -77,10 +79,12 @@ pub(crate) fn extend_with_mcp_tools(tools: &mut Vec<Tool>, mgr: &McpManager) {
     for (_fqn, server_name, _prompt) in mgr.all_prompts() {
         let list_fqn = format!("mcp__{}__prompts_list", server_name);
         if !tools.iter().any(|t| tool_name(t) == Some(&list_fqn[..])) {
-            let desc = format!(
-                "List all prompt templates from MCP server '{server_name}'."
-            );
-            tools.push(mcp_function_tool(&list_fqn, Some(desc), serde_json::json!({ "type": "object", "properties": {} })));
+            let desc = format!("List all prompt templates from MCP server '{server_name}'.");
+            tools.push(mcp_function_tool(
+                &list_fqn,
+                Some(desc),
+                serde_json::json!({ "type": "object", "properties": {} }),
+            ));
         }
         let get_fqn = format!("mcp__{}__prompts_get", server_name);
         if !tools.iter().any(|t| tool_name(t) == Some(&get_fqn[..])) {
@@ -89,20 +93,24 @@ pub(crate) fn extend_with_mcp_tools(tools: &mut Vec<Tool>, mgr: &McpManager) {
                  Call prompts_list first to see available prompts, then \
                  pass the prompt name and any optional arguments."
             );
-            tools.push(mcp_function_tool(&get_fqn, Some(desc), serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "The prompt name (as returned by prompts_list)."
+            tools.push(mcp_function_tool(
+                &get_fqn,
+                Some(desc),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The prompt name (as returned by prompts_list)."
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "description": "Optional prompt arguments (key-value pairs)."
+                        }
                     },
-                    "arguments": {
-                        "type": "object",
-                        "description": "Optional prompt arguments (key-value pairs)."
-                    }
-                },
-                "required": ["name"]
-            })));
+                    "required": ["name"]
+                }),
+            ));
         }
     }
 }
@@ -181,12 +189,11 @@ fn suffixed_server<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
 
 fn resources_list(mgr: &McpManager, server: &str) -> Result<String, String> {
     let resources = mgr.all_resources();
-    let server_resources: Vec<_> = resources
-        .iter()
-        .filter(|(_, s, _)| s == server)
-        .collect();
+    let server_resources: Vec<_> = resources.iter().filter(|(_, s, _)| s == server).collect();
     if server_resources.is_empty() {
-        return Ok(format!("No resources available from MCP server '{server}'."));
+        return Ok(format!(
+            "No resources available from MCP server '{server}'."
+        ));
     }
     let lines: Vec<String> = server_resources
         .iter()
@@ -205,17 +212,13 @@ fn resources_list(mgr: &McpManager, server: &str) -> Result<String, String> {
     Ok(lines.join("\n\n"))
 }
 
-async fn resources_read(
-    mgr: &McpManager,
-    server: &str,
-    arguments: &str,
-) -> Result<String, String> {
+async fn resources_read(mgr: &McpManager, server: &str, arguments: &str) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct ReadArgs {
         uri: String,
     }
-    let args: ReadArgs = serde_json::from_str(arguments)
-        .map_err(|e| format!("error: invalid arguments: {e}"))?;
+    let args: ReadArgs =
+        serde_json::from_str(arguments).map_err(|e| format!("error: invalid arguments: {e}"))?;
     match mgr.read_resource(server, &args.uri).await {
         Ok(result) => Ok(result
             .contents
@@ -232,10 +235,7 @@ async fn resources_read(
 
 fn prompts_list(mgr: &McpManager, server: &str) -> Result<String, String> {
     let prompts = mgr.all_prompts();
-    let server_prompts: Vec<_> = prompts
-        .iter()
-        .filter(|(_, s, _)| s == server)
-        .collect();
+    let server_prompts: Vec<_> = prompts.iter().filter(|(_, s, _)| s == server).collect();
     if server_prompts.is_empty() {
         return Ok(format!("No prompts available from MCP server '{server}'."));
     }
@@ -253,11 +253,18 @@ fn prompts_list(mgr: &McpManager, server: &str) -> Result<String, String> {
             if let Some(args) = &p.arguments {
                 s.push_str("\n  arguments:");
                 for a in args {
-                    let req = if a.required == Some(true) { " (required)" } else { "" };
+                    let req = if a.required == Some(true) {
+                        " (required)"
+                    } else {
+                        ""
+                    };
                     s.push_str(&format!(
                         "\n    - {}:{}{}",
                         a.name,
-                        a.description.as_ref().map(|d| format!(" {d}")).unwrap_or_default(),
+                        a.description
+                            .as_ref()
+                            .map(|d| format!(" {d}"))
+                            .unwrap_or_default(),
                         req
                     ));
                 }
@@ -268,19 +275,15 @@ fn prompts_list(mgr: &McpManager, server: &str) -> Result<String, String> {
     Ok(lines.join("\n\n"))
 }
 
-async fn prompts_get(
-    mgr: &McpManager,
-    server: &str,
-    arguments: &str,
-) -> Result<String, String> {
+async fn prompts_get(mgr: &McpManager, server: &str, arguments: &str) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct PromptGetArgs {
         name: String,
         #[serde(default)]
         arguments: Option<serde_json::Value>,
     }
-    let args: PromptGetArgs = serde_json::from_str(arguments)
-        .map_err(|e| format!("error: invalid arguments: {e}"))?;
+    let args: PromptGetArgs =
+        serde_json::from_str(arguments).map_err(|e| format!("error: invalid arguments: {e}"))?;
     match mgr.get_prompt(server, &args.name, args.arguments).await {
         Ok(result) => {
             let mut lines = Vec::new();
@@ -301,11 +304,7 @@ async fn prompts_get(
     }
 }
 
-async fn call_tool(
-    mgr: &McpManager,
-    fqn: &str,
-    arguments: &str,
-) -> Result<String, String> {
+async fn call_tool(mgr: &McpManager, fqn: &str, arguments: &str) -> Result<String, String> {
     match mgr
         .call_tool(
             fqn,
@@ -338,24 +337,32 @@ mod tests {
             "properties": { "query": { "type": "string" } },
             "required": ["query"]
         });
-        let Tool::Function(f) =
-            mcp_function_tool("mcp__codegraph__search", Some("desc".into()), schema.clone())
-        else {
+        let Tool::Function(f) = mcp_function_tool(
+            "mcp__codegraph__search",
+            Some("desc".into()),
+            schema.clone(),
+        ) else {
             panic!("expected a function tool");
         };
         // Parameters must be the schema verbatim — NOT wrapped so that
         // `required` lands inside `properties` (which the API rejects).
         assert_eq!(f.parameters.as_ref().unwrap(), &schema);
-        assert_eq!(f.parameters.as_ref().unwrap()["required"], serde_json::json!(["query"]));
-        assert!(f.parameters.as_ref().unwrap()["properties"].get("required").is_none());
+        assert_eq!(
+            f.parameters.as_ref().unwrap()["required"],
+            serde_json::json!(["query"])
+        );
+        assert!(
+            f.parameters.as_ref().unwrap()["properties"]
+                .get("required")
+                .is_none()
+        );
         assert_eq!(f.strict, Some(false));
         assert_eq!(f.name, "mcp__codegraph__search");
     }
 
     #[test]
     fn mcp_non_object_schema_becomes_empty_object() {
-        let Tool::Function(f) =
-            mcp_function_tool("mcp__x__y", None, serde_json::Value::Null)
+        let Tool::Function(f) = mcp_function_tool("mcp__x__y", None, serde_json::Value::Null)
         else {
             panic!("expected a function tool");
         };
@@ -365,7 +372,10 @@ mod tests {
 
     #[test]
     fn suffixed_server_parses_operation_names() {
-        assert_eq!(suffixed_server("mcp__fs__resources_list", "__resources_list"), Some("fs"));
+        assert_eq!(
+            suffixed_server("mcp__fs__resources_list", "__resources_list"),
+            Some("fs")
+        );
         assert_eq!(suffixed_server("mcp__fs__read", "__resources_list"), None);
         assert_eq!(suffixed_server("not_mcp", "__resources_list"), None);
     }

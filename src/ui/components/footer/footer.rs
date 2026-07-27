@@ -40,5 +40,4 @@ impl Footer {
             active_skills: String::new(),
         }
     }
-
 }

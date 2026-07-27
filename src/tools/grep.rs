@@ -126,9 +126,10 @@ fn search(
         // Skip hidden directories and common non-source dirs.
         if path.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && (name.starts_with('.') || name == "target" || name == "node_modules") {
-                    continue;
-                }
+                && (name.starts_with('.') || name == "target" || name == "node_modules")
+            {
+                continue;
+            }
             // Recursively search subdirectories
             if search(&path_str, re, include, results, count).is_err() {
                 continue;
@@ -194,19 +195,20 @@ fn should_skip_file(file_name: &str, include: &Option<String>) -> bool {
 pub(crate) fn simple_glob_match(pattern: &str, name: &str) -> bool {
     // Handle {a,b} alternation by trying each alternative.
     if let Some(start) = pattern.find('{')
-        && let Some(end) = pattern[start..].find('}') {
-            let end = start + end;
-            let prefix = &pattern[..start];
-            let alts = &pattern[start + 1..end];
-            let suffix = &pattern[end + 1..];
-            for alt in alts.split(',') {
-                let candidate = format!("{prefix}{alt}{suffix}");
-                if simple_glob_match(&candidate, name) {
-                    return true;
-                }
+        && let Some(end) = pattern[start..].find('}')
+    {
+        let end = start + end;
+        let prefix = &pattern[..start];
+        let alts = &pattern[start + 1..end];
+        let suffix = &pattern[end + 1..];
+        for alt in alts.split(',') {
+            let candidate = format!("{prefix}{alt}{suffix}");
+            if simple_glob_match(&candidate, name) {
+                return true;
             }
-            return false;
         }
+        return false;
+    }
     // Simple wildcard matching: * matches anything.
     if pattern == "*" {
         return true;

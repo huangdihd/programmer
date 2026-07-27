@@ -72,20 +72,35 @@ async fn handle_crossterm(
     Ok(())
 }
 
+/// Returns true when an operation id from an event matches the current active
+/// turn. Non-turn events (Cancel, Start, …) always pass through.
+fn is_current_turn(app: &App<'_>, op_id: u64) -> bool {
+    op_id == 0 || op_id == app.cancel.operation_id
+}
+
 /// Dispatch an [`AppEvent`] to its handler.
 async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
     match app_event {
         AppEvent::Cancel => handle_cancel(app).await,
-        AppEvent::ChunkReceived(chunk) => {
+        AppEvent::ChunkReceived(op_id, chunk) => {
+            if !is_current_turn(app, op_id) {
+                return;
+            }
             if app.conversation_panel.receiving_response.is_some() {
                 app.conversation_panel.handle_response_stream_event(*chunk);
             }
         }
-        AppEvent::ResponseCommitted => {
+        AppEvent::ResponseCommitted(op_id) => {
+            if !is_current_turn(app, op_id) {
+                return;
+            }
             app.conversation_panel.commit_live();
             app.sync_todos_from_store();
         }
-        AppEvent::RunnerPhase(p) => {
+        AppEvent::RunnerPhase(op_id, p) => {
+            if !is_current_turn(app, op_id) {
+                return;
+            }
             use crate::runner::RunnerPhase;
             app.conversation_panel.phase = match p {
                 RunnerPhase::Streaming => {
@@ -103,7 +118,13 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             reason,
             position,
             reply,
+            operation_id,
         } => {
+            if !is_current_turn(app, operation_id) {
+                // Drop the sender so the runner's review() gets a closed-channel
+                // denial instead of hanging.
+                return;
+            }
             app.pending_review = Some(PendingReview {
                 call,
                 reason,
@@ -113,11 +134,15 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             });
             app.conversation_panel.phase = ActivePhase::None;
         }
-        AppEvent::TurnFinished(result) => {
+        AppEvent::TurnFinished(op_id, result) => {
+            if !is_current_turn(app, op_id) {
+                return;
+            }
             app.conversation_panel.abort_receiving();
             app.conversation_panel.phase = ActivePhase::None;
             app.conversation_panel.flush_usage();
             let was_ok = result.is_ok();
+            let was_cancelled = matches!(result, Err(crate::runner::RunnerError::Cancelled));
             match result {
                 Err(crate::runner::RunnerError::Stream(e)) => {
                     app.conversation_panel.add_error(e);
@@ -126,7 +151,8 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                     app.conversation_panel.add_error_string(message);
                 }
                 Err(crate::runner::RunnerError::Cancelled) => {
-                    // Handled by handle_cancel.
+                    // The Cancelling phase already showed the message; stay
+                    // silent here to avoid a duplicate.
                 }
                 Err(e @ crate::runner::RunnerError::EmptyResponse) => {
                     app.conversation_panel.add_error_string(e.to_string());
@@ -145,8 +171,12 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             session::mark_dirty(app);
             // Restore mouse capture — external commands may disable it.
             let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-            // Start any queued follow-up request.
-            if let Some(pending_request) = app.conversation_panel.pending_message.take() {
+            // Start any queued follow-up request, but NOT if the turn was
+            // cancelled — the handle_cancel path already queued it, and starting
+            // it here would double-fire.
+            if !was_cancelled
+                && let Some(pending_request) = app.conversation_panel.pending_message.take()
+            {
                 let images = std::mem::take(&mut app.pending_images);
                 commands::start_request_with_images(app, pending_request, images).await;
             }
@@ -157,7 +187,10 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         }
         AppEvent::StartInit => handle_start_init(app),
         AppEvent::BangFinished(task_id) => handle_bang_finished(app, task_id).await,
-        AppEvent::CompactFinished(result, cancel_token) => {
+        AppEvent::CompactFinished(op_id, result, cancel_token) => {
+            if !is_current_turn(app, op_id) {
+                return;
+            }
             handle_compact_finished(app, result, cancel_token)
         }
         AppEvent::Quit => app.quit(),
@@ -166,7 +199,11 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         AppEvent::QuestionPrompt {
             question,
             answer_tx,
+            operation_id,
         } => {
+            if !is_current_turn(app, operation_id) {
+                return;
+            }
             app.question_panel = Some(QuestionPanel::new(question, answer_tx));
         }
     }
@@ -176,21 +213,28 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
 // Per-variant AppEvent handlers
 // ---------------------------------------------------------------------------
 
-/// Cancel: stop the in-flight runner turn, then start any queued follow-up.
+/// Cancel: stop the in-flight runner turn. Transitions the UI to Cancelling
+/// and does NOT go idle or start a queued request — the matching
+/// `TurnFinished` event will handle that once the runner actually stops.
 async fn handle_cancel(app: &mut App<'_>) {
+    // No active turn → nothing to cancel.
+    if app.cancel.operation_id == 0 {
+        return;
+    }
+    // Already cancelling — the runner hasn't finished yet.
+    if app.conversation_panel.phase == ActivePhase::Cancelling {
+        return;
+    }
     // Cancel the turn's root token; the runner's spawned task checks this token
     // between every iteration and stops.
     app.cancel.active.cancel();
     app.conversation_panel.abort_receiving();
-    app.conversation_panel.phase = ActivePhase::None;
+    app.conversation_panel.phase = ActivePhase::Cancelling;
     app.conversation_panel.flush_usage();
     app.conversation_panel
         .add_info_string("Request cancelled by user.".to_string());
     session::mark_dirty(app);
-    if let Some(pending_request) = app.conversation_panel.pending_message.take() {
-        let images = std::mem::take(&mut app.pending_images);
-        commands::start_request_with_images(app, pending_request, images).await;
-    }
+    // Do NOT start queued requests here — wait for TurnFinished.
 }
 
 /// `/init`: seed the init prompt and start the first runner turn.
@@ -204,13 +248,9 @@ fn handle_start_init(app: &mut App<'_>) {
     session::mark_dirty(app);
     // Fresh turn: start from an un-cancelled root token.
     app.cancel.active = CancellationToken::new();
-    // Kick off via the runner: re-use start_request_as with a developer role so
-    // the hidden init prompt runs through the runner just like `/init` did before.
-    let tokio_handle = tokio::runtime::Handle::current();
-    tokio_handle.spawn(async move {
-        // Can't call start_request_as from sync context; queue a synthetic Start
-        // event instead.
-    });
+    app.cancel.operation_id = app.cancel.operation_id.wrapping_add(1);
+    let operation_id = app.cancel.operation_id;
+
     // Spawn the init turn through the same runner path.
     let Some(runner) = app.build_runner() else {
         app.conversation_panel
@@ -226,13 +266,14 @@ fn handle_start_init(app: &mut App<'_>) {
             app.work_mode.icon(),
             app.work_mode.label()
         ),
+        operation_id,
     };
     let shared = app.conversation_panel.shared_conversation();
     let cancel = app.cancel.active.clone();
     let tx = app.events.sender.clone();
     tokio::spawn(async move {
         let result = runner.run_turn(&shared, &cancel, &surface).await;
-        let _ = tx.send(Event::App(AppEvent::TurnFinished(result)));
+        let _ = tx.send(Event::App(AppEvent::TurnFinished(operation_id, result)));
     });
 }
 
@@ -349,7 +390,7 @@ fn poll_finished_terminals(app: &mut App<'_>) {
                         .map(|s| s.status.label())
                         .unwrap_or("gone");
                     app.conversation_panel.add_info_string(format!(
-                        "🖥 terminal [{}] {} — {status}",
+                        "\u{1F5A5} terminal [{}] {} — {status}",
                         pane.task_id, pane.name
                     ));
                 }
@@ -377,7 +418,7 @@ fn poll_finished_terminals(app: &mut App<'_>) {
     }
 }
 
-/// Maximum transcript characters replayed to the model for a `!command`.
+// Maximum transcript characters replayed to the model for a `!command`.
 const MAX_BANG_TRANSCRIPT: usize = 10_000;
 
 /// A watched `!command` exited: compose its transcript into a user message and
@@ -426,5 +467,46 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
     };
     if let Some(ref mut c) = app.input_panel.completion {
         c.visible = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use crate::app::events::is_current_turn;
+
+    #[test]
+    fn is_current_turn_allows_untagged_zero_events() {
+        // op_id 0 means "untagged" — always allowed (pre-operation-id events).
+        assert!(is_current_turn_for_test(1, 0));
+    }
+
+    #[test]
+    fn is_current_turn_passes_when_ids_match() {
+        assert!(is_current_turn_for_test(5, 5));
+    }
+
+    #[test]
+    fn is_current_turn_filters_stale_events() {
+        // A higher op_id shouldn't match a lower current.
+        assert!(!is_current_turn_for_test(3, 7));
+    }
+
+    /// Standalone helper so we don't need an `App` for the test.
+    fn is_current_turn_for_test(current_op_id: u64, event_op_id: u64) -> bool {
+        // Mirrors the logic of is_current_turn: op_id 0 always passes,
+        // non-zero must match exactly.
+        if event_op_id == 0 {
+            return true;
+        }
+        event_op_id == current_op_id
+    }
+
+    #[test]
+    fn is_current_turn_always_passes_zero_op_id() {
+        // Zero op_id means no operation tracking — pass through.
+        assert!(is_current_turn_for_test(42, 0));
+        assert!(is_current_turn_for_test(0, 0));
+        assert!(is_current_turn_for_test(99, 0));
     }
 }

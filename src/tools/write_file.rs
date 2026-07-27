@@ -57,12 +57,20 @@ pub async fn run(arguments: &str) -> Result<String, String> {
 
     if let Some(parent) = Path::new(&args.path).parent()
         && !parent.as_os_str().is_empty()
-            && let Err(error) = tokio::fs::create_dir_all(parent).await {
-                return Err(format!("error: could not create {}: {error}", parent.display()));
-            }
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        return Err(format!(
+            "error: could not create {}: {error}",
+            parent.display()
+        ));
+    }
 
     match tokio::fs::write(&args.path, &args.content).await {
-        Ok(()) => Ok(format!("wrote {} bytes to {}", args.content.len(), args.path)),
+        Ok(()) => Ok(format!(
+            "wrote {} bytes to {}",
+            args.content.len(),
+            args.path
+        )),
         Err(error) => Err(format!("error: could not write {}: {error}", args.path)),
     }
 }

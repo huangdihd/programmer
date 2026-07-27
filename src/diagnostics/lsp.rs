@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, Notify};
@@ -81,7 +81,10 @@ async fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Option<Valu
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await.map_err(|e| e.to_string())?;
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| e.to_string())?;
         if n == 0 {
             return Ok(None); // EOF
         }
@@ -95,8 +98,13 @@ async fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Option<Valu
     }
     let len = content_length.ok_or("LSP message missing Content-Length")?;
     let mut body = vec![0u8; len];
-    reader.read_exact(&mut body).await.map_err(|e| e.to_string())?;
-    serde_json::from_slice(&body).map(Some).map_err(|e| e.to_string())
+    reader
+        .read_exact(&mut body)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 fn request(id: u64, method: &str, params: Value) -> Value {
@@ -140,14 +148,15 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
             && let Ok(byte) =
                 u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
         out.push(bytes[i]);
         i += 1;
     }
@@ -187,7 +196,14 @@ pub fn diagnostic_from_lsp(value: &Value, file: &str) -> Diagnostic {
         .unwrap_or("")
         .trim()
         .to_string();
-    Diagnostic { file: file.to_string(), line, col, severity, code, message }
+    Diagnostic {
+        file: file.to_string(),
+        line,
+        col,
+        severity,
+        code,
+        message,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,16 +251,17 @@ impl LspServer {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("checker '{}': failed to start LSP server: {e}", checker.name))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "checker '{}': failed to start LSP server: {e}",
+                checker.name
+            )
+        })?;
 
-        let stdin = Arc::new(Mutex::new(
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| format!("checker '{}': no stdin", checker.name))?,
-        ));
+        let stdin =
+            Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {
+                format!("checker '{}': no stdin", checker.name)
+            })?));
         let mut reader = BufReader::new(
             child
                 .stdout
@@ -286,11 +303,19 @@ impl LspServer {
             Err(_) => return Err(format!("checker '{}': initialize timed out", checker.name)),
         }
 
-        send(&stdin, &notification("initialized", json!({}))).await.ok();
+        send(&stdin, &notification("initialized", json!({})))
+            .await
+            .ok();
 
         let state = Arc::new(Mutex::new(ServerState::default()));
         let updated = Arc::new(Notify::new());
-        spawn_reader(reader, stdin.clone(), state.clone(), updated.clone(), cwd.to_path_buf());
+        spawn_reader(
+            reader,
+            stdin.clone(),
+            state.clone(),
+            updated.clone(),
+            cwd.to_path_buf(),
+        );
 
         Ok(LspServer {
             child: Mutex::new(child),
@@ -344,14 +369,18 @@ impl LspServer {
         // Wait for diagnostics to settle. If nothing changed we still give the
         // server a brief window (it may still be finishing initial analysis).
         let start = Instant::now();
-        let quiet = if sent_change { QUIESCENCE } else { Duration::from_millis(300) };
+        let quiet = if sent_change {
+            QUIESCENCE
+        } else {
+            Duration::from_millis(300)
+        };
         loop {
             if start.elapsed() > SNAPSHOT_TIMEOUT {
                 break;
             }
             match tokio::time::timeout(quiet, self.updated.notified()).await {
-                Ok(_) => {}        // an update arrived; keep waiting for it to settle
-                Err(_) => break,   // quiet ⇒ settled
+                Ok(_) => {}      // an update arrived; keep waiting for it to settle
+                Err(_) => break, // quiet ⇒ settled
             }
         }
 
@@ -380,7 +409,9 @@ impl LspServer {
     }
 
     async fn did_change(&self, path: &Path, text: &str) {
-        let version = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let version = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = notification(
             "textDocument/didChange",
             json!({
@@ -393,8 +424,12 @@ impl LspServer {
     }
 
     async fn shutdown(&self) {
-        send(&self.stdin, &request(9999, "shutdown", json!(null))).await.ok();
-        send(&self.stdin, &notification("exit", json!(null))).await.ok();
+        send(&self.stdin, &request(9999, "shutdown", json!(null)))
+            .await
+            .ok();
+        send(&self.stdin, &notification("exit", json!(null)))
+            .await
+            .ok();
         let _ = self.child.lock().await.start_kill();
     }
 }
@@ -409,8 +444,7 @@ fn spawn_reader(
 ) {
     tokio::spawn(async move {
         while let Ok(Some(msg)) = read_message(&mut reader).await {
-            if msg.get("method").and_then(Value::as_str)
-                == Some("textDocument/publishDiagnostics")
+            if msg.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
             {
                 if let Some(params) = msg.get("params") {
                     let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
@@ -442,7 +476,9 @@ async fn answer_server_request(stdin: &Mutex<ChildStdin>, msg: &Value) {
 
 async fn send(stdin: &Mutex<ChildStdin>, value: &Value) -> Result<(), String> {
     let mut s = stdin.lock().await;
-    s.write_all(&encode_message(value)).await.map_err(|e| e.to_string())?;
+    s.write_all(&encode_message(value))
+        .await
+        .map_err(|e| e.to_string())?;
     s.flush().await.map_err(|e| e.to_string())
 }
 
@@ -500,7 +536,9 @@ struct LspManager {
 
 impl LspManager {
     fn global() -> &'static LspManager {
-        MANAGER.get_or_init(|| LspManager { servers: Mutex::new(HashMap::new()) })
+        MANAGER.get_or_init(|| LspManager {
+            servers: Mutex::new(HashMap::new()),
+        })
     }
 
     async fn snapshot(&self, checker: &Checker, cwd: &Path) -> Result<Vec<Diagnostic>, String> {
@@ -532,7 +570,8 @@ pub async fn collect_lsp(checker: &Checker, cwd: &Path) -> Result<Vec<Diagnostic
 /// Tear down every running server. Called when the app exits.
 pub async fn shutdown_all() {
     if let Some(mgr) = MANAGER.get() {
-        let servers: Vec<Arc<LspServer>> = mgr.servers.lock().await.drain().map(|(_, s)| s).collect();
+        let servers: Vec<Arc<LspServer>> =
+            mgr.servers.lock().await.drain().map(|(_, s)| s).collect();
         SERVER_COUNT.store(0, Ordering::Relaxed);
         for server in servers {
             server.shutdown().await;
@@ -577,8 +616,10 @@ fn workspace_files(checker: &Checker, cwd: &Path) -> Vec<PathBuf> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                if matches!(name.as_ref(), "target" | "node_modules" | ".git" | ".programmer")
-                    || name.starts_with('.')
+                if matches!(
+                    name.as_ref(),
+                    "target" | "node_modules" | ".git" | ".programmer"
+                ) || name.starts_with('.')
                 {
                     continue;
                 }
@@ -611,7 +652,10 @@ mod tests {
     fn header_parse_is_case_insensitive_and_selective() {
         assert_eq!(parse_header_content_length("Content-Length: 42"), Some(42));
         assert_eq!(parse_header_content_length("content-length:  7 "), Some(7));
-        assert_eq!(parse_header_content_length("Content-Type: application/json"), None);
+        assert_eq!(
+            parse_header_content_length("Content-Type: application/json"),
+            None
+        );
     }
 
     #[test]
@@ -648,7 +692,10 @@ mod tests {
     #[test]
     fn numeric_code_is_stringified() {
         let v = json!({ "range": { "start": { "line": 0, "character": 0 } }, "severity": 2, "code": 2322, "message": "x" });
-        assert_eq!(diagnostic_from_lsp(&v, "a.ts").code.as_deref(), Some("2322"));
+        assert_eq!(
+            diagnostic_from_lsp(&v, "a.ts").code.as_deref(),
+            Some("2322")
+        );
     }
 
     fn which(bin: &str) -> Option<String> {

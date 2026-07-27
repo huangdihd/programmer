@@ -36,7 +36,10 @@ pub struct ProgrammerConfig {
     /// co-author to show a GitHub avatar, the email must belong to a GitHub
     /// account — e.g. that account's `<id>+<username>@users.noreply.github.com`
     /// no-reply address. Set to omit/null to disable the trailer.
-    #[serde(default = "default_git_coauthor", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_git_coauthor",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub git_coauthor: Option<String>,
     /// Configured MCP (Model Context Protocol) servers. Each entry is spawned
     /// as a child process at startup; its tools are bridged into the tool list
@@ -155,7 +158,10 @@ mod tests {
         config.mcp_servers.push(McpServerConfig {
             name: "filesystem".into(),
             command: "npx".into(),
-            args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-filesystem".into(),
+            ],
             env: std::collections::HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
             url: None,
             auto_approve: Default::default(),

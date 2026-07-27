@@ -95,9 +95,10 @@ impl SkillsPanel {
             }
             KeyCode::Char(' ') | KeyCode::Enter => {
                 if let Some(name) = names.get(self.selected)
-                    && registry.toggle(name).is_some() {
-                        return PanelAction::Saved;
-                    }
+                    && registry.toggle(name).is_some()
+                {
+                    return PanelAction::Saved;
+                }
                 PanelAction::None
             }
             // Deactivate every skill at once.
@@ -172,7 +173,9 @@ impl SkillsPanel {
                     )),
                 ]
             };
-            Paragraph::new(message).block(list_block).render(chunks[1], buf);
+            Paragraph::new(message)
+                .block(list_block)
+                .render(chunks[1], buf);
         } else {
             let items: Vec<ListItem> = names
                 .iter()
@@ -269,7 +272,10 @@ mod tests {
         let mut panel = SkillsPanel::new();
         let mut reg = SkillRegistry::default();
         // With no skills, down does nothing and selection stays at 0.
-        assert_eq!(panel.handle_key(key(KeyCode::Down), &mut reg), PanelAction::None);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Down), &mut reg),
+            PanelAction::None
+        );
         assert_eq!(panel.selected, 0);
     }
 
@@ -277,13 +283,19 @@ mod tests {
     fn esc_closes() {
         let mut panel = SkillsPanel::new();
         let mut reg = SkillRegistry::default();
-        assert_eq!(panel.handle_key(key(KeyCode::Esc), &mut reg), PanelAction::Close);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Esc), &mut reg),
+            PanelAction::Close
+        );
     }
 
     #[test]
     fn toggle_empty_registry_is_noop() {
         let mut panel = SkillsPanel::new();
         let mut reg = SkillRegistry::default();
-        assert_eq!(panel.handle_key(key(KeyCode::Char(' ')), &mut reg), PanelAction::None);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char(' ')), &mut reg),
+            PanelAction::None
+        );
     }
 }

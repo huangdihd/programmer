@@ -148,29 +148,30 @@ impl McpPanel {
             }
             KeyCode::Char('e') => {
                 if let Some(name) = names.get(self.selected)
-                    && let Some(cfg) = config.mcp_servers.iter().find(|s| &s.name == name) {
-                        let policy_str = match cfg.auto_approve {
-                            McpPolicy::Trusted => "trusted",
-                            McpPolicy::Review => "review",
-                        };
-                        self.mode = Mode::Form(Form {
-                            original: Some(cfg.name.clone()),
-                            fields: [
-                                cfg.name.clone(),
-                                cfg.command.clone(),
-                                cfg.url.clone().unwrap_or_default(),
-                                cfg.args.join(" "),
-                                cfg.env
-                                    .iter()
-                                    .map(|(k, v)| format!("{k}={v}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" "),
-                                policy_str.to_string(),
-                            ],
-                            focus: 0,
-                            error: None,
-                        });
-                    }
+                    && let Some(cfg) = config.mcp_servers.iter().find(|s| &s.name == name)
+                {
+                    let policy_str = match cfg.auto_approve {
+                        McpPolicy::Trusted => "trusted",
+                        McpPolicy::Review => "review",
+                    };
+                    self.mode = Mode::Form(Form {
+                        original: Some(cfg.name.clone()),
+                        fields: [
+                            cfg.name.clone(),
+                            cfg.command.clone(),
+                            cfg.url.clone().unwrap_or_default(),
+                            cfg.args.join(" "),
+                            cfg.env
+                                .iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            policy_str.to_string(),
+                        ],
+                        focus: 0,
+                        error: None,
+                    });
+                }
             }
             KeyCode::Char('d') => {
                 if let Some(name) = names.get(self.selected) {
@@ -222,12 +223,11 @@ impl McpPanel {
                 }
                 KeyCode::Char(' ') | KeyCode::Enter => {
                     // Toggle: trusted ↔ review
-                    form.fields[POLICY_FIELD] =
-                        if form.fields[POLICY_FIELD].trim() == "review" {
-                            "trusted".to_string()
-                        } else {
-                            "review".to_string()
-                        };
+                    form.fields[POLICY_FIELD] = if form.fields[POLICY_FIELD].trim() == "review" {
+                        "trusted".to_string()
+                    } else {
+                        "review".to_string()
+                    };
                 }
                 _ => {}
             }
@@ -294,7 +294,10 @@ impl McpPanel {
             .collect();
         let env: std::collections::HashMap<String, String> = form.fields[4]
             .split_whitespace()
-            .filter_map(|pair| pair.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .filter_map(|pair| {
+                pair.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .collect();
         let auto_approve = match form.fields[POLICY_FIELD].trim() {
             "review" => McpPolicy::Review,
@@ -406,7 +409,9 @@ impl McpPanel {
                     )),
                 ]
             };
-            Paragraph::new(message).block(list_block).render(chunks[1], buf);
+            Paragraph::new(message)
+                .block(list_block)
+                .render(chunks[1], buf);
         } else {
             let items: Vec<ListItem> = filtered
                 .iter()
@@ -554,15 +559,9 @@ impl McpPanel {
                             Style::default().fg(Color::Gray)
                         };
                         let value = if form.fields[i].is_empty() {
-                            Span::styled(
-                                "(empty)",
-                                Style::default().fg(Color::DarkGray).italic(),
-                            )
+                            Span::styled("(empty)", Style::default().fg(Color::DarkGray).italic())
                         } else {
-                            Span::styled(
-                                form.fields[i].clone(),
-                                Style::default().fg(Color::White),
-                            )
+                            Span::styled(form.fields[i].clone(), Style::default().fg(Color::White))
                         };
                         let cursor = if focused { "▏" } else { "" };
                         Line::from(vec![
@@ -610,7 +609,6 @@ impl McpPanel {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -644,7 +642,10 @@ mod tests {
         for c in "-y server".chars() {
             panel.handle_key(ch(c), &mut config);
         }
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::Saved);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config),
+            PanelAction::Saved
+        );
         assert_eq!(config.mcp_servers.len(), 1);
         assert_eq!(config.mcp_servers[0].name, "fs");
         assert_eq!(config.mcp_servers[0].command, "npx");
@@ -665,8 +666,14 @@ mod tests {
         for c in "https://mcp.exa.ai/mcp".chars() {
             panel.handle_key(ch(c), &mut config);
         }
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::Saved);
-        assert_eq!(config.mcp_servers[0].url.as_deref(), Some("https://mcp.exa.ai/mcp"));
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config),
+            PanelAction::Saved
+        );
+        assert_eq!(
+            config.mcp_servers[0].url.as_deref(),
+            Some("https://mcp.exa.ai/mcp")
+        );
         assert!(config.mcp_servers[0].command.is_empty());
     }
 
@@ -683,7 +690,10 @@ mod tests {
         for c in "ftp://x".chars() {
             panel.handle_key(ch(c), &mut config);
         }
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::None);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config),
+            PanelAction::None
+        );
         assert!(config.mcp_servers.is_empty());
     }
 
@@ -692,7 +702,10 @@ mod tests {
         let mut panel = McpPanel::new();
         let mut config = ProgrammerConfig::default();
         panel.handle_key(ch('a'), &mut config);
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::None);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config),
+            PanelAction::None
+        );
         assert!(config.mcp_servers.is_empty());
     }
 
@@ -718,14 +731,23 @@ mod tests {
         let mut panel = McpPanel::new();
         let mut config = ProgrammerConfig::default();
         panel.handle_key(ch('a'), &mut config);
-        for c in "srv".chars() { panel.handle_key(ch(c), &mut config); }
+        for c in "srv".chars() {
+            panel.handle_key(ch(c), &mut config);
+        }
         panel.handle_key(key(KeyCode::Tab), &mut config);
-        for c in "cmd".chars() { panel.handle_key(ch(c), &mut config); }
+        for c in "cmd".chars() {
+            panel.handle_key(ch(c), &mut config);
+        }
         panel.handle_key(key(KeyCode::Tab), &mut config); // url
         panel.handle_key(key(KeyCode::Tab), &mut config); // args
         panel.handle_key(key(KeyCode::Tab), &mut config); // env
-        for c in "API_KEY=secret".chars() { panel.handle_key(ch(c), &mut config); }
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::Saved);
+        for c in "API_KEY=secret".chars() {
+            panel.handle_key(ch(c), &mut config);
+        }
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config),
+            PanelAction::Saved
+        );
         assert_eq!(config.mcp_servers[0].env.get("API_KEY").unwrap(), "secret");
     }
 
@@ -735,10 +757,14 @@ mod tests {
         let mut config = ProgrammerConfig::default();
         panel.handle_key(ch('a'), &mut config);
         // name
-        for c in "srv".chars() { panel.handle_key(ch(c), &mut config); }
+        for c in "srv".chars() {
+            panel.handle_key(ch(c), &mut config);
+        }
         panel.handle_key(key(KeyCode::Tab), &mut config);
         // command
-        for c in "cmd".chars() { panel.handle_key(ch(c), &mut config); }
+        for c in "cmd".chars() {
+            panel.handle_key(ch(c), &mut config);
+        }
         panel.handle_key(key(KeyCode::Tab), &mut config); // url
         panel.handle_key(key(KeyCode::Tab), &mut config); // args
         panel.handle_key(key(KeyCode::Tab), &mut config); // env
@@ -747,7 +773,10 @@ mod tests {
         panel.handle_key(ch(' '), &mut config);
         // Tab wraps to name, then Enter saves.
         panel.handle_key(key(KeyCode::Tab), &mut config);
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config), PanelAction::Saved);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config),
+            PanelAction::Saved
+        );
         assert_eq!(config.mcp_servers[0].name, "srv");
         assert!(matches!(
             config.mcp_servers[0].auto_approve,

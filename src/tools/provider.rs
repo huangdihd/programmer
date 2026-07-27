@@ -49,9 +49,12 @@ pub(crate) enum ToolApproval {
 }
 
 /// What a provider needs at call time beyond the call itself. Currently just the
-/// front-end event channel that interactive tools (`ask_user`) prompt through.
+/// front-end event channel that interactive tools (`ask_user`) prompt through,
+/// the operation id for event tagging, and the cancellation token.
 pub(crate) struct ToolCtx<'a> {
     pub sender: &'a UnboundedSender<Event>,
+    pub cancel: &'a crate::cancel::CancellationToken,
+    pub operation_id: u64,
 }
 
 /// A source of tools the agent can call. Implemented once for the local
@@ -147,11 +150,11 @@ impl ToolProvider for LocalToolProvider {
     async fn call(&self, call: &FunctionToolCall, ctx: &ToolCtx<'_>) -> Result<String, String> {
         if call.name == ask_user::NAME {
             // ask_user needs the UI channel, so it isn't part of run_local_tool.
-            ask_user::run(&call.arguments, ctx.sender).await
+            ask_user::run(&call.arguments, ctx.sender, ctx.operation_id).await
         } else if call.name == command::NAME {
             // The command tool streams its output to the live registry (keyed by
             // call id) so the TUI can render it as it runs.
-            command::run_with_live(&call.arguments, &call.call_id).await
+            command::run_with_live(&call.arguments, &call.call_id, ctx.cancel).await
         } else if call.name == todo::NAME {
             todo::run(&call.arguments, &self.todos).await
         } else {
@@ -356,7 +359,12 @@ mod tests {
     async fn registry_dispatches_a_local_call_and_rejects_unknown() {
         let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider::default())]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { sender: &tx };
+        let cancel = crate::cancel::CancellationToken::new();
+        let ctx = ToolCtx {
+            sender: &tx,
+            cancel: &cancel,
+            operation_id: 0,
+        };
 
         // A real local dispatch: write a temp file, then read it back.
         let tmp = std::env::temp_dir().join(format!("registry_dispatch_{}", std::process::id()));

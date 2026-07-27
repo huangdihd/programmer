@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::cancel::CancellationToken;
 use crate::response::response_finish_reason::ResponseFinishReason;
 use async_openai::types::responses::ResponseStreamEvent::{
     ResponseCodeInterpreterCallCodeDelta, ResponseCodeInterpreterCallCodeDone, ResponseCompleted,
@@ -30,7 +31,6 @@ use async_openai::types::responses::{
     Annotation, OutputContent, OutputItem, OutputMessageContent, ReasoningItemContent,
     ReasoningTextContent, Response, ResponseStreamEvent, SummaryPart, SummaryTextContent,
 };
-use crate::cancel::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FinalizeError {
@@ -125,14 +125,14 @@ impl PartialResponse {
                 if let OutputItem::Reasoning(incoming_reasoning) = &mut incoming
                     && let Some(Some(OutputItem::Reasoning(existing))) =
                         self.items.get(output_index)
-                    {
-                        if incoming_reasoning.content.is_none() && existing.content.is_some() {
-                            incoming_reasoning.content = existing.content.clone();
-                        }
-                        if incoming_reasoning.summary.is_empty() && !existing.summary.is_empty() {
-                            incoming_reasoning.summary = existing.summary.clone();
-                        }
+                {
+                    if incoming_reasoning.content.is_none() && existing.content.is_some() {
+                        incoming_reasoning.content = existing.content.clone();
                     }
+                    if incoming_reasoning.summary.is_empty() && !existing.summary.is_empty() {
+                        incoming_reasoning.summary = existing.summary.clone();
+                    }
+                }
 
                 self.set_item(incoming, item_done_event.output_index);
                 self.mark_finished(item_done_event.output_index);
@@ -162,10 +162,9 @@ impl PartialResponse {
                             if contents.len() <= content_index
                                 && let OutputContent::ReasoningText(reasoning_text) =
                                     part_added_event.part
-                                {
-                                    contents
-                                        .push(ReasoningItemContent::ReasoningText(reasoning_text));
-                                }
+                            {
+                                contents.push(ReasoningItemContent::ReasoningText(reasoning_text));
+                            }
                         }
                         _ => {}
                     }
@@ -240,9 +239,9 @@ impl PartialResponse {
                 if output_text.annotations.len() <= annotation_added_event.annotation_index as usize
                     && let Ok(annotation) =
                         serde_json::from_value::<Annotation>(annotation_added_event.annotation)
-                    {
-                        output_text.annotations.push(annotation);
-                    }
+                {
+                    output_text.annotations.push(annotation);
+                }
             }
 
             ResponseRefusalDelta(refusal_delta_event) => {
@@ -537,21 +536,17 @@ impl PartialResponse {
     /// `None` between items (or before the first), otherwise its coarse kind.
     /// Drives the status indicator during streaming.
     pub fn streaming_kind(&self) -> Option<StreamingKind> {
-        self.items
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, slot)| {
-                let item = slot.as_ref()?;
-                if self.finished_items.get(i).copied().unwrap_or(false) {
-                    return None;
-                }
-                Some(match item {
-                    OutputItem::Message(_) => StreamingKind::Message,
-                    OutputItem::Reasoning(_) => StreamingKind::Reasoning,
-                    _ => StreamingKind::ToolCall,
-                })
+        self.items.iter().enumerate().rev().find_map(|(i, slot)| {
+            let item = slot.as_ref()?;
+            if self.finished_items.get(i).copied().unwrap_or(false) {
+                return None;
+            }
+            Some(match item {
+                OutputItem::Message(_) => StreamingKind::Message,
+                OutputItem::Reasoning(_) => StreamingKind::Reasoning,
+                _ => StreamingKind::ToolCall,
             })
+        })
     }
 
     /// Returns true if any output item in this partial response is a function

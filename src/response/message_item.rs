@@ -37,13 +37,18 @@ pub enum MessageItem {
     Error(String),
     Warning(String),
     Info(String),
-    Meta { label: String, text: String },
+    Meta {
+        label: String,
+        text: String,
+    },
     Usage(u32, u32), // (input_tokens, output_tokens)
     /// A `/compact` boundary: everything before this item was summarized into
     /// `summary`, which is sent to the model in place of that history. The
     /// older items stay in the list for the UI scrollback but are no longer
     /// part of the API input.
-    Compacted { summary: String },
+    Compacted {
+        summary: String,
+    },
 }
 
 impl Clone for MessageItem {
@@ -51,7 +56,11 @@ impl Clone for MessageItem {
         match self {
             MessageItem::Input(i) => MessageItem::Input(i.clone()),
             MessageItem::Output(o) => MessageItem::Output(o.clone()),
-            MessageItem::ToolOutput { output, failed, approval_label } => MessageItem::ToolOutput {
+            MessageItem::ToolOutput {
+                output,
+                failed,
+                approval_label,
+            } => MessageItem::ToolOutput {
                 output: output.clone(),
                 failed: *failed,
                 approval_label: approval_label.clone(),

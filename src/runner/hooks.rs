@@ -54,7 +54,8 @@ pub(crate) enum HookPhase {
 
 /// Everything a hook is handed for one invocation: the shared conversation (read
 /// history, or mutate it directly for advanced use), the surface (to emit phase
-/// events), and the batch summary it self-gates on.
+/// events), the batch summary it self-gates on, and the turn's cancellation
+/// token so hooks can stop early when the user presses Esc.
 pub(crate) struct HookContext<'a> {
     /// The shared conversation. The built-in hooks report back via the returned
     /// feedback string, but this handle lets an advanced hook read history or
@@ -63,6 +64,10 @@ pub(crate) struct HookContext<'a> {
     pub conversation: &'a Mutex<Conversation>,
     pub surface: &'a dyn AgentSurface,
     pub batch: &'a BatchSummary,
+    /// The turn's root cancellation token. Hooks should check this between
+    /// expensive operations (diagnostics runs, network calls) so Esc promptly
+    /// interrupts post-edit checks.
+    pub cancel: &'a crate::cancel::CancellationToken,
 }
 
 /// A pluggable concept the runner runs around a tool batch. Attach any number to
@@ -114,7 +119,9 @@ impl TurnHook for DiagnosticsHook {
         let cwd =
             std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
         // No state lock held across this await — see the run_turn comment.
-        let snapshot = crate::diagnostics::collect(&cwd).await.unwrap_or_default();
+        let snapshot = crate::diagnostics::collect(&cwd, ctx.cancel)
+            .await
+            .unwrap_or_default();
 
         let mut parts: Vec<String> = Vec::new();
         let mut st = self.state.lock().unwrap();

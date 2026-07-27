@@ -38,6 +38,8 @@ pub enum StatusState {
     Checking,
     /// `/compact` is summarizing the conversation.
     Compacting,
+    /// The user pressed Esc and the runner is stopping.
+    Cancelling,
     /// The model called `ask_user` and is waiting for the user's response.
     WaitingAnswer,
     /// Tool calls are queued for approval in Manual mode.
@@ -57,6 +59,7 @@ impl StatusState {
                 | StatusState::ToolRunning
                 | StatusState::Classifying
                 | StatusState::Compacting
+                | StatusState::Cancelling
         )
     }
 
@@ -73,6 +76,7 @@ impl StatusState {
             StatusState::Classifying => "\u{25cd} Evaluating",
             StatusState::Checking => "\u{25c7} Checking diagnostics",
             StatusState::Compacting => "\u{29c9} Compacting",
+            StatusState::Cancelling => "\u{2716} Cancelling",
             StatusState::WaitingAnswer => "? Waiting for answer",
             StatusState::WaitingApproval => "\u{1f6e1} Waiting for approval",
         }
@@ -160,10 +164,6 @@ mod tests {
             StatusState::WaitingApproval,
         ];
         let labels: HashSet<&str> = variants.iter().map(|v| v.emoji_label()).collect();
-        assert_eq!(
-            labels.len(),
-            variants.len(),
-            "duplicate labels detected"
-        );
+        assert_eq!(labels.len(), variants.len(), "duplicate labels detected");
     }
 }

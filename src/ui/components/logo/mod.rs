@@ -36,8 +36,10 @@ impl Widget for Logo {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         );
-        let separator =
-            Line::styled("─".repeat(area.width as usize), Style::default().fg(Color::DarkGray));
+        let separator = Line::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(Color::DarkGray),
+        );
         Paragraph::new(vec![title, separator])
             .centered()
             .render(area, buf);

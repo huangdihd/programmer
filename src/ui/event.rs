@@ -22,8 +22,6 @@ use futures::{FutureExt, StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::consts::TICK_FPS;
-
 /// Representation of all possible events.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -49,31 +47,40 @@ pub enum Event {
 /// You can extend this enum with your own custom events.
 pub enum AppEvent {
     /// A raw streaming chunk of the runner's in-flight response, forwarded by
-    /// the TUI surface for live token rendering.
-    ChunkReceived(Box<ResponseStreamEvent>),
+    /// the TUI surface for live token rendering. Tagged with the operation id
+    /// of the turn that produced it.
+    ChunkReceived(u64, Box<ResponseStreamEvent>),
     /// The runner committed the streamed response's items to the shared
     /// conversation: drop the live in-progress view (the committed copy renders
-    /// from the conversation now).
-    ResponseCommitted,
+    /// from the conversation now). Tagged with the operation id.
+    ResponseCommitted(u64),
     /// The runner's turn moved to a new phase (classifying, running tools, …).
-    RunnerPhase(crate::runner::RunnerPhase),
+    /// Tagged with the operation id.
+    RunnerPhase(u64, crate::runner::RunnerPhase),
     /// The runner asks the user to review a tool call the classifier flagged
     /// (`Ask` verdict). Carries the call, the classifier's reason, the call's
     /// 1-based position and batch total, and the oneshot the decision goes
-    /// back on. Dropping the sender counts as a denial.
+    /// back on. Dropping the sender counts as a denial. Tagged with the
+    /// operation id.
     ReviewRequest {
         call: FunctionToolCall,
         reason: String,
         position: (usize, usize),
         reply: ReplyTx,
+        operation_id: u64,
     },
     /// The runner's turn ended, successfully or not. All end-of-turn bookkeeping
     /// (usage flush, session save, pending-message start) hangs off this.
-    TurnFinished(Result<crate::runner::TurnResult, crate::runner::RunnerError>),
+    /// Tagged with the operation id so stale turn-finishes are dropped.
+    TurnFinished(
+        u64,
+        Result<crate::runner::TurnResult, crate::runner::RunnerError>,
+    ),
     /// `/compact` finished: `Ok` carries the summary to install as the new
     /// context boundary, `Err` the error to surface. The token identifies the
-    /// run so a summary from a cancelled compaction is dropped.
-    CompactFinished(Result<String, String>, CancellationToken),
+    /// run so a summary from a cancelled compaction is dropped. Tagged with
+    /// the operation id.
+    CompactFinished(u64, Result<String, String>, CancellationToken),
     /// A `!command`'s interactive task exited: hand its transcript to the
     /// model so the agent responds to the outcome. Carries the task id.
     BangFinished(u64),
@@ -92,11 +99,13 @@ pub enum AppEvent {
     /// MCP manager from the current config.
     McpChanged,
     /// The `ask_user` tool is prompting the user. Carries the question and a
-    /// oneshot sender that the UI uses to send the answer back.
+    /// oneshot sender that the UI uses to send the answer back. Tagged with
+    /// the operation id so questions from stale turns are dropped.
     #[allow(missing_docs)]
     QuestionPrompt {
         question: Question,
         answer_tx: AnswerTx,
+        operation_id: u64,
     },
 }
 
@@ -124,19 +133,28 @@ impl std::fmt::Debug for ReplyTx {
 impl std::fmt::Debug for AppEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ChunkReceived(_) => f.debug_tuple("ChunkReceived").field(&"..").finish(),
-            Self::ResponseCommitted => write!(f, "ResponseCommitted"),
-            Self::RunnerPhase(_) => write!(f, "RunnerPhase"),
-            Self::ReviewRequest { call, .. } => f
+            Self::ChunkReceived(id, _) => f
+                .debug_tuple("ChunkReceived")
+                .field(id)
+                .field(&"..")
+                .finish(),
+            Self::ResponseCommitted(id) => f.debug_tuple("ResponseCommitted").field(id).finish(),
+            Self::RunnerPhase(id, _) => f.debug_tuple("RunnerPhase").field(id).finish(),
+            Self::ReviewRequest {
+                call, operation_id, ..
+            } => f
                 .debug_struct("ReviewRequest")
                 .field("call", &call.name)
+                .field("operation_id", operation_id)
                 .finish(),
-            Self::TurnFinished(r) => f
+            Self::TurnFinished(id, r) => f
                 .debug_tuple("TurnFinished")
+                .field(id)
                 .field(&r.as_ref().map(|_| "..").map_err(|e| e.to_string()))
                 .finish(),
-            Self::CompactFinished(r, _) => f
+            Self::CompactFinished(id, r, _) => f
                 .debug_tuple("CompactFinished")
+                .field(id)
                 .field(&r.as_ref().map(|_| ".."))
                 .finish(),
             Self::BangFinished(id) => f.debug_tuple("BangFinished").field(id).finish(),
@@ -146,55 +164,77 @@ impl std::fmt::Debug for AppEvent {
             Self::StartInit => write!(f, "StartInit"),
             Self::ProvidersChanged => write!(f, "ProvidersChanged"),
             Self::McpChanged => write!(f, "McpChanged"),
-            Self::QuestionPrompt { question, .. } => {
-                f.debug_struct("QuestionPrompt")
-                    .field("question", question)
-                    .finish()
-            }
+            Self::QuestionPrompt {
+                question,
+                operation_id,
+                ..
+            } => f
+                .debug_struct("QuestionPrompt")
+                .field("question", &question.text)
+                .field("operation_id", operation_id)
+                .finish(),
         }
     }
 }
 
-/// Terminal event handler.
+/// Application event handler.
 #[derive(Debug)]
 pub struct EventHandler {
     /// Event sender channel.
-    pub(crate) sender: mpsc::UnboundedSender<Event>,
+    pub sender: mpsc::UnboundedSender<Event>,
     /// Event receiver channel.
     receiver: mpsc::UnboundedReceiver<Event>,
+    /// The task that reads crossterm events and emits ticks.
+    _task: tokio::task::JoinHandle<()>,
 }
 
 impl EventHandler {
-    /// Constructs a new instance of [`EventHandler`] and spawns a new thread to handle events.
-    pub fn new() -> Self {
+    /// Constructs a new instance of [`EventHandler`].
+    pub fn new(tick_rate: f64) -> Self {
+        let tick_rate = Duration::from_secs_f64(tick_rate);
         let (sender, receiver) = mpsc::unbounded_channel();
-        let actor = EventTask::new(sender.clone());
-        tokio::spawn(async { actor.run().await });
-        Self { sender, receiver }
+        let _sender = sender.clone();
+        let _task = tokio::spawn(async move {
+            let mut reader = crossterm::event::EventStream::new();
+            let mut tick = tokio::time::interval(tick_rate);
+            loop {
+                let tick_delay = tick.tick();
+                let crossterm_event = reader.next().fuse();
+                tokio::select! {
+                  _ = _sender.closed() => {
+                    break;
+                  }
+                  _ = tick_delay => {
+                    let _ = _sender.send(Event::Tick);
+                  }
+                  Some(Ok(evt)) = crossterm_event => {
+                    let _ = _sender.send(Event::Crossterm(evt));
+                  }
+                }
+            }
+        });
+
+        Self {
+            sender,
+            receiver,
+            _task,
+        }
     }
 
-    /// Receives an event from the sender.
+    /// Receive the next event from the handler.
     ///
-    /// This function blocks until an event is received.
-    ///
-    /// # Errors
-    ///
-    /// This function returns an error if the sender channel is disconnected. This can happen if an
-    /// error occurs in the event thread. In practice, this should not happen unless there is a
-    /// problem with the underlying terminal.
+    /// This function will block the current thread until an event is received. The event can be a
+    /// tick event, a crossterm event, or an application event.
     pub async fn next(&mut self) -> color_eyre::Result<Event> {
         self.receiver
             .recv()
             .await
-            .ok_or_eyre("Failed to receive event")
+            .ok_or_eyre("application event channel closed unexpectedly")
     }
 
-    /// Returns an already-queued event without waiting, or `None` if the queue
-    /// is currently empty.
+    /// Attempt to receive an event without blocking.
     ///
-    /// Used to drain a burst of events (e.g. a flurry of streaming chunks) and
-    /// process them all before the next redraw, so the UI is drawn once per
-    /// batch instead of once per event.
+    /// This can be used to drain the event queue between frames.
     pub fn try_next(&mut self) -> Option<Event> {
         self.receiver.try_recv().ok()
     }
@@ -207,50 +247,5 @@ impl EventHandler {
         // Ignore the result as the reciever cannot be dropped while this struct still has a
         // reference to it
         let _ = self.sender.send(Event::App(app_event));
-    }
-}
-
-/// A thread that handles reading crossterm events and emitting tick events on a regular schedule.
-struct EventTask {
-    /// Event sender channel.
-    sender: mpsc::UnboundedSender<Event>,
-}
-
-impl EventTask {
-    /// Constructs a new instance of [`EventThread`].
-    fn new(sender: mpsc::UnboundedSender<Event>) -> Self {
-        Self { sender }
-    }
-
-    /// Runs the event thread.
-    ///
-    /// This function emits tick events at a fixed rate and polls for crossterm events in between.
-    async fn run(self) -> color_eyre::Result<()> {
-        let tick_rate = Duration::from_secs_f64(1.0 / TICK_FPS);
-        let mut reader = crossterm::event::EventStream::new();
-        let mut tick = tokio::time::interval(tick_rate);
-        loop {
-            let tick_delay = tick.tick();
-            let crossterm_event = reader.next().fuse();
-            tokio::select! {
-              _ = self.sender.closed() => {
-                break;
-              }
-              _ = tick_delay => {
-                self.send(Event::Tick);
-              }
-              Some(Ok(evt)) = crossterm_event => {
-                self.send(Event::Crossterm(evt));
-              }
-            }
-        }
-        Ok(())
-    }
-
-    /// Sends an event to the receiver.
-    fn send(&self, event: Event) {
-        // Ignores the result because shutting down the app drops the receiver, which causes the send
-        // operation to fail. This is expected behavior and should not panic.
-        let _ = self.sender.send(event);
     }
 }

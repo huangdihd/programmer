@@ -23,16 +23,23 @@
 
 use std::path::Path;
 
-use super::{parse_output, Checker, CheckerKind, Diagnostic};
+use super::{Checker, CheckerKind, Diagnostic, parse_output};
 
 /// Run one checker in `cwd` and return the diagnostics it reports.
 ///
 /// `Err` means the checker itself couldn't be run (bad command, unsupported
 /// backend) — distinct from "ran fine and found problems", which is `Ok` with a
 /// non-empty list.
-pub async fn run_checker(checker: &Checker, cwd: &Path) -> Result<Vec<Diagnostic>, String> {
+pub async fn run_checker(
+    checker: &Checker,
+    cwd: &Path,
+    cancel: &crate::cancel::CancellationToken,
+) -> Result<Vec<Diagnostic>, String> {
     if checker.kind == CheckerKind::Lsp {
-        return Ok(apply_lint(checker, super::lsp::collect_lsp(checker, cwd).await?));
+        return Ok(apply_lint(
+            checker,
+            super::lsp::collect_lsp(checker, cwd).await?,
+        ));
     }
 
     // Resolve the parser before spawning so a broken profile fails fast without
@@ -57,10 +64,16 @@ pub async fn run_checker(checker: &Checker, cwd: &Path) -> Result<Vec<Diagnostic
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("checker '{}': failed to run: {e}", checker.name))?;
+    // Race the checker against cancellation: Esc kills the child process
+    // promptly. `kill_on_drop(true)` is set above, so dropping the `Child`
+    // handle kills the process.
+    let output = match cancel.wait_or(cmd.output()).await {
+        Some(result) => result,
+        None => {
+            return Err(format!("checker '{}': cancelled", checker.name));
+        }
+    }
+    .map_err(|e| format!("checker '{}': failed to run: {e}", checker.name))?;
 
     // Compilers split diagnostics between stdout (rustc/tsc JSON) and stderr
     // (gcc/clang human output), so parse both together.
@@ -88,6 +101,7 @@ fn apply_lint(checker: &Checker, mut diags: Vec<Diagnostic>) -> Vec<Diagnostic> 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::cancel::CancellationToken;
     use crate::diagnostics::Severity;
 
     fn command_checker(cmd: &str, parser: &str) -> Checker {
@@ -105,9 +119,10 @@ mod tests {
     #[tokio::test]
     async fn runs_command_and_parses_stderr() {
         // gcc-style diagnostics conventionally go to stderr.
-        let checker =
-            command_checker(r"printf 'src/a.c:12:5: error: boom\n' 1>&2; exit 1", "gnu");
-        let diags = run_checker(&checker, Path::new(".")).await.unwrap();
+        let checker = command_checker(r"printf 'src/a.c:12:5: error: boom\n' 1>&2; exit 1", "gnu");
+        let diags = run_checker(&checker, Path::new("."), &CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].file, "src/a.c");
         assert_eq!(diags[0].line, 12);
@@ -117,7 +132,9 @@ mod tests {
     #[tokio::test]
     async fn clean_run_yields_no_diagnostics() {
         let checker = command_checker("true", "gnu");
-        let diags = run_checker(&checker, Path::new(".")).await.unwrap();
+        let diags = run_checker(&checker, Path::new("."), &CancellationToken::new())
+            .await
+            .unwrap();
         assert!(diags.is_empty());
     }
 
@@ -128,7 +145,9 @@ mod tests {
         // than pretending the project is clean.
         let mut checker = command_checker("true", "gnu");
         checker.kind = CheckerKind::Lsp;
-        let err = run_checker(&checker, Path::new(".")).await.unwrap_err();
+        let err = run_checker(&checker, Path::new("."), &CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(err.contains("initialize"), "got: {err}");
     }
 }

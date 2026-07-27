@@ -128,8 +128,11 @@ async fn start_request_as_with_images(
     diagnostics::maybe_seed_diagnostics_baseline(app);
     session::save_session(app);
     // Fresh turn: start from an un-cancelled root token so a prior turn's Esc
-    // doesn't carry over to this one.
+    // doesn't carry over to this one. Bump the operation id synchronously
+    // before spawning so the UI can tag all turn events and filter stale ones.
     app.cancel.active = crate::cancel::CancellationToken::new();
+    app.cancel.operation_id = app.cancel.operation_id.wrapping_add(1);
+    let operation_id = app.cancel.operation_id;
 
     let Some(runner) = app.build_runner() else {
         app.conversation_panel
@@ -145,13 +148,14 @@ async fn start_request_as_with_images(
             app.work_mode.icon(),
             app.work_mode.label()
         ),
+        operation_id,
     };
     let shared = app.conversation_panel.shared_conversation();
     let cancel = app.cancel.active.clone();
     let tx = app.events.sender.clone();
     tokio::spawn(async move {
         let result = runner.run_turn(&shared, &cancel, &surface).await;
-        let _ = tx.send(Event::App(AppEvent::TurnFinished(result)));
+        let _ = tx.send(Event::App(AppEvent::TurnFinished(operation_id, result)));
     });
 }
 
@@ -269,6 +273,8 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
 
     app.conversation_panel.phase = ActivePhase::Compacting;
     app.cancel.active = crate::cancel::CancellationToken::new();
+    app.cancel.operation_id = app.cancel.operation_id.wrapping_add(1);
+    let operation_id = app.cancel.operation_id;
     let cancel_token = app.cancel.active.child();
     let sender = app.events.sender.clone();
     tokio::spawn(async move {
@@ -304,6 +310,7 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
         };
         if !cancel_token.is_cancelled() {
             let _ = sender.send(Event::App(crate::ui::event::AppEvent::CompactFinished(
+                operation_id,
                 result,
                 cancel_token,
             )));

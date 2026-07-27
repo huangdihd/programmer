@@ -38,23 +38,23 @@ impl Widget for &StatusBar {
             StatusState::Classifying => ("◍", "Evaluating", ACCENT),
             StatusState::Checking => ("◇", "Checking diagnostics", ACCENT),
             StatusState::Compacting => ("⧉", "Compacting context", ACCENT),
+            StatusState::Cancelling => ("✖", "Cancelling", WARN),
             StatusState::WaitingAnswer => ("?", "Waiting for answer", ACCENT),
             StatusState::WaitingApproval => ("🛡", "Waiting for approval", WARN),
         };
 
         let busy = self.status.is_busy();
         let mut text = format!(" {} {} ", icon, label);
-        if busy
-            && let Some(dur) = self.elapsed() {
-                let secs = dur.as_secs_f64();
-                if secs < 60.0 {
-                    text.push_str(&format!("({:.1}s)", secs));
-                } else {
-                    let m = (secs / 60.0) as u64;
-                    let s = secs % 60.0;
-                    text.push_str(&format!("({}m {:.0}s)", m, s));
-                }
+        if busy && let Some(dur) = self.elapsed() {
+            let secs = dur.as_secs_f64();
+            if secs < 60.0 {
+                text.push_str(&format!("({:.1}s)", secs));
+            } else {
+                let m = (secs / 60.0) as u64;
+                let s = secs % 60.0;
+                text.push_str(&format!("({}m {:.0}s)", m, s));
             }
+        }
 
         let mut spans = vec![Span::styled(
             text,

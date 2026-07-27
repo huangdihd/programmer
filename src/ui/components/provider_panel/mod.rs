@@ -201,10 +201,11 @@ impl ProviderPanel {
             }
             KeyCode::Enter => {
                 if let Some(name) = names.get(self.selected)
-                    && config.default_provider != *name {
-                        config.default_provider = name.clone();
-                        return PanelAction::Saved;
-                    }
+                    && config.default_provider != *name
+                {
+                    config.default_provider = name.clone();
+                    return PanelAction::Saved;
+                }
             }
             _ => {}
         }
@@ -251,67 +252,68 @@ impl ProviderPanel {
 
         // --- When popup is visible (only for default_model field) ---
         if form.focus == 3
-            && let Some(comp) = form.completion.as_mut() {
-                match key.code {
-                    KeyCode::Esc => {
-                        form.completion = None;
-                        return PanelAction::None;
-                    }
-                    KeyCode::Tab => {
-                        if comp.candidates.len() <= 1 {
-                            form.completion = None;
-                            return PanelAction::None;
-                        }
-                        comp.selected = (comp.selected + 1) % comp.candidates.len();
-                        form.fields[3] = comp.candidates[comp.selected].clone();
-                        let visible = 10usize;
-                        if comp.selected < comp.scroll_offset {
-                            comp.scroll_offset = comp.selected;
-                        } else if comp.selected >= comp.scroll_offset + visible {
-                            comp.scroll_offset = comp.selected - visible + 1;
-                        }
-                        return PanelAction::None;
-                    }
-                    KeyCode::Up => {
-                        if comp.selected > 0 {
-                            comp.selected -= 1;
-                        } else {
-                            comp.selected = comp.candidates.len().saturating_sub(1);
-                        }
-                        if comp.selected < comp.scroll_offset {
-                            comp.scroll_offset = comp.selected;
-                        }
-                        form.fields[3] = comp.candidates[comp.selected].clone();
-                        return PanelAction::None;
-                    }
-                    KeyCode::Down => {
-                        comp.selected = (comp.selected + 1) % comp.candidates.len();
-                        let visible = 10usize;
-                        if comp.selected >= comp.scroll_offset + visible {
-                            comp.scroll_offset = comp.selected - visible + 1;
-                        }
-                        form.fields[3] = comp.candidates[comp.selected].clone();
-                        return PanelAction::None;
-                    }
-                    KeyCode::Enter => {
-                        // Accept the highlighted candidate, close popup.
-                        form.fields[3] = comp.candidates[comp.selected].clone();
-                        form.completion = None;
-                        return PanelAction::None;
-                    }
-                    KeyCode::Backspace => {
-                        form.fields[3].pop();
-                        form.completion = Self::build_completion(&form.fields[3], form, pm);
-                        return PanelAction::None;
-                    }
-                    KeyCode::Char(c) => {
-                        form.fields[3].push(c);
-                        form.completion = Self::build_completion(&form.fields[3], form, pm);
-                        return PanelAction::None;
-                    }
-                    _ => {}
+            && let Some(comp) = form.completion.as_mut()
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    form.completion = None;
+                    return PanelAction::None;
                 }
+                KeyCode::Tab => {
+                    if comp.candidates.len() <= 1 {
+                        form.completion = None;
+                        return PanelAction::None;
+                    }
+                    comp.selected = (comp.selected + 1) % comp.candidates.len();
+                    form.fields[3] = comp.candidates[comp.selected].clone();
+                    let visible = 10usize;
+                    if comp.selected < comp.scroll_offset {
+                        comp.scroll_offset = comp.selected;
+                    } else if comp.selected >= comp.scroll_offset + visible {
+                        comp.scroll_offset = comp.selected - visible + 1;
+                    }
+                    return PanelAction::None;
+                }
+                KeyCode::Up => {
+                    if comp.selected > 0 {
+                        comp.selected -= 1;
+                    } else {
+                        comp.selected = comp.candidates.len().saturating_sub(1);
+                    }
+                    if comp.selected < comp.scroll_offset {
+                        comp.scroll_offset = comp.selected;
+                    }
+                    form.fields[3] = comp.candidates[comp.selected].clone();
+                    return PanelAction::None;
+                }
+                KeyCode::Down => {
+                    comp.selected = (comp.selected + 1) % comp.candidates.len();
+                    let visible = 10usize;
+                    if comp.selected >= comp.scroll_offset + visible {
+                        comp.scroll_offset = comp.selected - visible + 1;
+                    }
+                    form.fields[3] = comp.candidates[comp.selected].clone();
+                    return PanelAction::None;
+                }
+                KeyCode::Enter => {
+                    // Accept the highlighted candidate, close popup.
+                    form.fields[3] = comp.candidates[comp.selected].clone();
+                    form.completion = None;
+                    return PanelAction::None;
+                }
+                KeyCode::Backspace => {
+                    form.fields[3].pop();
+                    form.completion = Self::build_completion(&form.fields[3], form, pm);
+                    return PanelAction::None;
+                }
+                KeyCode::Char(c) => {
+                    form.fields[3].push(c);
+                    form.completion = Self::build_completion(&form.fields[3], form, pm);
+                    return PanelAction::None;
+                }
+                _ => {}
             }
+        }
 
         match key.code {
             KeyCode::Esc => {
@@ -377,12 +379,13 @@ impl ProviderPanel {
                     return PanelAction::None;
                 }
                 if let Some(original) = &form.original
-                    && *original != name {
-                        config.providers.remove(original);
-                        if config.default_provider == *original {
-                            config.default_provider = name.clone();
-                        }
+                    && *original != name
+                {
+                    config.providers.remove(original);
+                    if config.default_provider == *original {
+                        config.default_provider = name.clone();
                     }
+                }
                 config.providers.insert(
                     name.clone(),
                     ProviderConfig {
@@ -725,18 +728,10 @@ impl ProviderPanel {
                     let field_line = 3u16;
                     // x offset: "  " (2) + "  default_model: " (18) = 20
                     let value_x = form_area.x + 20;
-                    let longest = comp
-                        .candidates
-                        .iter()
-                        .map(|c| c.len())
-                        .max()
-                        .unwrap_or(0) as u16;
+                    let longest = comp.candidates.iter().map(|c| c.len()).max().unwrap_or(0) as u16;
                     let popup_width = (longest + 2).clamp(14, form_area.width);
 
-                    let popup_y = form_area
-                        .y
-                        .saturating_add(field_line)
-                        .saturating_sub(count);
+                    let popup_y = form_area.y.saturating_add(field_line).saturating_sub(count);
                     let popup_area = Rect {
                         x: value_x.min(form_area.right().saturating_sub(popup_width)),
                         y: popup_y.min(form_area.bottom().saturating_sub(count)),
@@ -908,7 +903,10 @@ mod tests {
         let pm = pm_stub();
         let mut panel = ProviderPanel::new();
 
-        assert_eq!(panel.handle_key(key(KeyCode::Char('a')), &mut config, &pm), PanelAction::None);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char('a')), &mut config, &pm),
+            PanelAction::None
+        );
         // Type into name field, then move through the fields.
         for c in "zai".chars() {
             panel.handle_key(key(KeyCode::Char(c)), &mut config, &pm);
@@ -919,13 +917,19 @@ mod tests {
         }
         panel.handle_key(key(KeyCode::Tab), &mut config, &pm);
         panel.handle_paste("sk-secret");
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config, &pm), PanelAction::Saved);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config, &pm),
+            PanelAction::Saved
+        );
 
         let p = &config.providers["zai"];
         assert_eq!(p.base_url, "https://api.z.ai/v1");
         assert_eq!(p.api_key, "sk-secret");
         assert_eq!(p.default_model, None);
-        assert_eq!(config.default_provider, "zai", "first provider becomes default");
+        assert_eq!(
+            config.default_provider, "zai",
+            "first provider becomes default"
+        );
     }
 
     #[test]
@@ -934,7 +938,10 @@ mod tests {
         let pm = pm_stub();
         let mut panel = ProviderPanel::new();
         panel.handle_key(key(KeyCode::Char('a')), &mut config, &pm);
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config, &pm), PanelAction::None);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config, &pm),
+            PanelAction::None
+        );
         assert!(matches!(&panel.mode, Mode::Form(f) if f.error.is_some()));
         assert!(config.providers.is_empty());
     }
@@ -948,7 +955,10 @@ mod tests {
 
         // "alpha" sorts first and is selected; delete it and confirm.
         panel.handle_key(key(KeyCode::Char('d')), &mut config, &pm);
-        assert_eq!(panel.handle_key(key(KeyCode::Char('y')), &mut config, &pm), PanelAction::Saved);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char('y')), &mut config, &pm),
+            PanelAction::Saved
+        );
         assert!(!config.providers.contains_key("alpha"));
         assert_eq!(config.default_provider, "beta");
     }
@@ -960,7 +970,10 @@ mod tests {
         config.default_provider = "alpha".into();
         let mut panel = ProviderPanel::new();
         panel.handle_key(key(KeyCode::Down), &mut config, &pm);
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config, &pm), PanelAction::Saved);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config, &pm),
+            PanelAction::Saved
+        );
         assert_eq!(config.default_provider, "beta");
     }
 
@@ -974,7 +987,10 @@ mod tests {
         if let Mode::Form(form) = &mut panel.mode {
             form.fields[0] = "beta".into();
         }
-        assert_eq!(panel.handle_key(key(KeyCode::Enter), &mut config, &pm), PanelAction::None);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config, &pm),
+            PanelAction::None
+        );
         assert!(config.providers.contains_key("alpha"));
         assert!(matches!(&panel.mode, Mode::Form(f) if f.error.is_some()));
     }

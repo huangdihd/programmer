@@ -36,8 +36,7 @@ pub(crate) fn is_retryable(error: &OpenAIError) -> bool {
         OpenAIError::Reqwest(e) => match e.status() {
             None => true,
             Some(status) => {
-                status.as_u16() == 429
-                    || matches!(status.as_u16(), 500 | 502 | 503 | 504)
+                status.as_u16() == 429 || matches!(status.as_u16(), 500 | 502 | 503 | 504)
             }
         },
         _ => false,
@@ -48,7 +47,10 @@ pub(crate) fn is_retryable(error: &OpenAIError) -> bool {
 /// capped at 30s, plus up to ~500ms of jitter to avoid synchronized retries.
 pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
     const CAP_SECS: u64 = 30;
-    let base = 1u64.checked_shl(attempt - 1).unwrap_or(CAP_SECS).min(CAP_SECS);
+    let base = 1u64
+        .checked_shl(attempt - 1)
+        .unwrap_or(CAP_SECS)
+        .min(CAP_SECS);
     let jitter_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| (d.subsec_nanos() as u64) % 500)
@@ -84,7 +86,17 @@ pub(crate) async fn stream_with_retries(
                 }
                 attempt += 1;
                 retrying.store(true, Ordering::Relaxed);
-                tokio::time::sleep(backoff_delay(attempt)).await;
+                // Sleep with cancellation awareness — Esc cuts the backoff
+                // short instead of leaving the user waiting for a retry to
+                // expire.
+                if cancel
+                    .wait_or(tokio::time::sleep(backoff_delay(attempt)))
+                    .await
+                    .is_none()
+                {
+                    retrying.store(false, Ordering::Relaxed);
+                    return;
+                }
             }
             Err(e) => break Err(e),
         }

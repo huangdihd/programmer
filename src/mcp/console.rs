@@ -133,7 +133,10 @@ fn render(
             " \u{1F517} programmer MCP server ",
             Style::new().fg(palette::BLUE).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("http://{addr}/mcp   "), Style::new().fg(palette::MUTED)),
+        Span::styled(
+            format!("http://{addr}/mcp   "),
+            Style::new().fg(palette::MUTED),
+        ),
         Span::styled(
             format!("mode: {} {}", mode.icon(), mode.label()),
             Style::new().fg(palette::GREEN).add_modifier(Modifier::BOLD),
@@ -174,7 +177,9 @@ fn render(
     let footer = if let Some(req) = pending {
         let mut lines = vec![Line::from(Span::styled(
             format!(" Approve  {}  ?", req.tool),
-            Style::new().fg(palette::YELLOW).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD),
         ))];
         let preview: String = req.args.chars().take(120).collect();
         lines.push(Line::from(Span::styled(
@@ -182,9 +187,15 @@ fn render(
             Style::new().fg(palette::MUTED),
         )));
         lines.push(Line::from(vec![
-            Span::styled("   y", Style::new().fg(palette::GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "   y",
+                Style::new().fg(palette::GREEN).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" approve   ", Style::new().fg(palette::MUTED)),
-            Span::styled("n / Esc", Style::new().fg(palette::RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "n / Esc",
+                Style::new().fg(palette::RED).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" deny", Style::new().fg(palette::MUTED)),
         ]));
         Paragraph::new(lines).block(
@@ -194,9 +205,15 @@ fn render(
         )
     } else {
         let help = Line::from(vec![
-            Span::styled(" Ctrl+T", Style::new().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Ctrl+T",
+                Style::new().fg(palette::CYAN).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" cycle mode   ", Style::new().fg(palette::MUTED)),
-            Span::styled("q / Ctrl+C", Style::new().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "q / Ctrl+C",
+                Style::new().fg(palette::CYAN).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" quit", Style::new().fg(palette::MUTED)),
         ]);
         Paragraph::new(help).block(

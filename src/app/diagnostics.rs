@@ -34,9 +34,11 @@ pub(crate) fn maybe_seed_diagnostics_baseline(app: &mut App<'_>) {
     }
     let state = app.diagnostics_state.clone();
     tokio::spawn(async move {
-        let cwd = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
-        let snapshot = crate::diagnostics::collect(&cwd).await.unwrap_or_default();
+        let cwd =
+            std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
+        let snapshot = crate::diagnostics::collect(&cwd, &crate::cancel::CancellationToken::new())
+            .await
+            .unwrap_or_default();
         let mut state = state.lock().unwrap();
         if state.baseline.is_none() {
             state.baseline = Some(snapshot.diagnostics);

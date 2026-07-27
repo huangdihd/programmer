@@ -165,7 +165,8 @@ mod tests {
 
     #[test]
     fn parse_minimal_skill() {
-        let raw = "---\nname: test-skill\ndescription: A test skill\n---\n\n# Body\nSome body text.";
+        let raw =
+            "---\nname: test-skill\ndescription: A test skill\n---\n\n# Body\nSome body text.";
         let (front, body) = split_frontmatter(raw).unwrap();
         assert!(front.contains("name: test-skill"));
         assert_eq!(body, "\n# Body\nSome body text.");

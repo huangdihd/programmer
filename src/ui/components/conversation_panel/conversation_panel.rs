@@ -52,6 +52,10 @@ pub enum ActivePhase {
     Checking,
     /// `/compact` is summarizing the conversation to shrink the context.
     Compacting,
+    /// The user pressed Esc; the runner has been signalled to cancel but
+    /// hasn't finished yet. The UI stays in this state until the matching
+    /// `TurnFinished` event arrives.
+    Cancelling,
 }
 
 /// Number of rows scrolled per mouse-wheel notch.

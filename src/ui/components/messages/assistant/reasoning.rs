@@ -134,12 +134,13 @@ fn reasoning_text(item: &ReasoningItem) -> String {
         .collect();
 
     if parts.is_empty()
-        && let Some(contents) = &item.content {
-            parts = contents
-                .iter()
-                .map(|ReasoningItemContent::ReasoningText(content)| content.text.clone())
-                .collect();
-        }
+        && let Some(contents) = &item.content
+    {
+        parts = contents
+            .iter()
+            .map(|ReasoningItemContent::ReasoningText(content)| content.text.clone())
+            .collect();
+    }
 
     parts.join("\n")
 }

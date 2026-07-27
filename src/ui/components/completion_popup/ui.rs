@@ -53,9 +53,7 @@ impl Widget for &CompletionPopup<'_> {
             .take(visible_height)
             .map(|(i, text)| {
                 let style = if i == self.selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(ACCENT)
+                    Style::default().fg(Color::Black).bg(ACCENT)
                 } else {
                     Style::default().fg(FG).bg(BG)
                 };

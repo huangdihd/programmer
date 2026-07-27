@@ -244,9 +244,7 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
         use tokio::io::AsyncWriteExt;
         let Some(mut stdin) = child_stdin else { return };
         while let Some(chunk) = stdin_rx.recv().await {
-            if stdin.write_all(chunk.as_bytes()).await.is_err()
-                || stdin.flush().await.is_err()
-            {
+            if stdin.write_all(chunk.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
                 break;
             }
         }
@@ -528,7 +526,10 @@ pub fn write_bytes(id: u64, bytes: &[u8]) -> Result<(), String> {
         ));
     };
     if status != TaskStatus::Running {
-        return Err(format!("error: task {id} already finished ({})", status.label()));
+        return Err(format!(
+            "error: task {id} already finished ({})",
+            status.label()
+        ));
     }
     let mut writer = pty.writer.lock().unwrap();
     writer
@@ -798,11 +799,12 @@ pub fn scroll_screen(id: u64, delta: i32) {
     let reg = registry().lock().unwrap();
     if let Some(entry) = reg.iter().find(|e| e.id == id)
         && let Some(pty) = &entry.pty
-            && let Ok(mut parser) = pty.parser.lock() {
-                let current = parser.screen().scrollback() as i64;
-                let next = (current + delta as i64).max(0) as usize;
-                parser.set_scrollback(next);
-            }
+        && let Ok(mut parser) = pty.parser.lock()
+    {
+        let current = parser.screen().scrollback() as i64;
+        let next = (current + delta as i64).max(0) as usize;
+        parser.set_scrollback(next);
+    }
 }
 
 /// Encode one SGR (1006) mouse report. `code` is the button/motion/wheel code
@@ -1184,7 +1186,11 @@ mod tests {
 
     #[tokio::test]
     async fn kill_terminates_a_running_task() {
-        let long = if cfg!(windows) { "ping -n 30 127.0.0.1" } else { "sleep 30" };
+        let long = if cfg!(windows) {
+            "ping -n 30 127.0.0.1"
+        } else {
+            "sleep 30"
+        };
         let id = spawn(long, None, None).expect("spawn");
         kill(id).expect("kill should succeed while running");
         let (snap, still_running) = wait(id, Duration::from_secs(10)).await.expect("wait");
@@ -1221,7 +1227,11 @@ mod tests {
         restore(&saved);
 
         let running = snapshot(900_001).expect("restored task");
-        assert_eq!(running.status, TaskStatus::Killed, "running → killed on restore");
+        assert_eq!(
+            running.status,
+            TaskStatus::Killed,
+            "running → killed on restore"
+        );
         assert_eq!(running.elapsed.as_secs(), 90);
         assert!(running.output.contains("listening"));
 
@@ -1234,15 +1244,16 @@ mod tests {
 
         // Restoring again must not duplicate entries.
         restore(&saved);
-        let dupes = snapshot_all()
-            .iter()
-            .filter(|t| t.id == 900_001)
-            .count();
+        let dupes = snapshot_all().iter().filter(|t| t.id == 900_001).count();
         assert_eq!(dupes, 1);
 
         // Round trip: the restored tasks serialize back out.
         let persisted = persist_all();
-        assert!(persisted.iter().any(|t| t.id == 900_001 && t.status == "killed"));
+        assert!(
+            persisted
+                .iter()
+                .any(|t| t.id == 900_001 && t.status == "killed")
+        );
     }
 
     #[tokio::test]
@@ -1348,10 +1359,13 @@ mod tests {
 
     #[tokio::test]
     async fn wait_times_out_on_running_task() {
-        let long = if cfg!(windows) { "ping -n 30 127.0.0.1" } else { "sleep 30" };
+        let long = if cfg!(windows) {
+            "ping -n 30 127.0.0.1"
+        } else {
+            "sleep 30"
+        };
         let id = spawn(long, None, None).expect("spawn");
-        let (snap, still_running) =
-            wait(id, Duration::from_millis(300)).await.expect("wait");
+        let (snap, still_running) = wait(id, Duration::from_millis(300)).await.expect("wait");
         assert!(still_running);
         assert_eq!(snap.status, TaskStatus::Running);
         let _ = kill(id);

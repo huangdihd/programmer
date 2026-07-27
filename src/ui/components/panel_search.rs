@@ -141,9 +141,18 @@ mod tests {
     #[test]
     fn slash_opens_and_typing_filters() {
         let mut s = PanelSearch::default();
-        assert_eq!(s.handle_key(key(KeyCode::Char('/'))), SearchKey::Consumed { changed: false });
-        assert_eq!(s.handle_key(key(KeyCode::Char('n'))), SearchKey::Consumed { changed: true });
-        assert_eq!(s.handle_key(key(KeyCode::Char('P'))), SearchKey::Consumed { changed: true });
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('/'))),
+            SearchKey::Consumed { changed: false }
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('n'))),
+            SearchKey::Consumed { changed: true }
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('P'))),
+            SearchKey::Consumed { changed: true }
+        );
         assert!(s.matches(&["npm-server"]));
         assert!(s.matches(&["other", "runs NPm stuff"]));
         assert!(!s.matches(&["unrelated"]));
@@ -155,11 +164,17 @@ mod tests {
         s.handle_key(key(KeyCode::Char('/')));
         s.handle_key(key(KeyCode::Char('x')));
         // Enter: filter stays applied, keys return to the panel.
-        assert_eq!(s.handle_key(key(KeyCode::Enter)), SearchKey::Consumed { changed: false });
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            SearchKey::Consumed { changed: false }
+        );
         assert!(s.is_filtering());
         assert_eq!(s.handle_key(key(KeyCode::Char('a'))), SearchKey::Ignored);
         // Esc with a filter applied clears it instead of reaching the panel.
-        assert_eq!(s.handle_key(key(KeyCode::Esc)), SearchKey::Consumed { changed: true });
+        assert_eq!(
+            s.handle_key(key(KeyCode::Esc)),
+            SearchKey::Consumed { changed: true }
+        );
         assert!(!s.is_filtering());
         // A second Esc is the panel's to handle (close).
         assert_eq!(s.handle_key(key(KeyCode::Esc)), SearchKey::Ignored);

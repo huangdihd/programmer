@@ -69,7 +69,11 @@ pub(crate) fn format_tool_details(tool_name: &str, arguments: &str) -> Vec<Strin
             }
             if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
                 let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n");
-                let tail = if content.lines().count() > 5 { "…" } else { "" };
+                let tail = if content.lines().count() > 5 {
+                    "…"
+                } else {
+                    ""
+                };
                 lines.push(format!(
                     "content: {preview}{tail} ({len} bytes)",
                     len = content.len()

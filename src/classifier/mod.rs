@@ -66,8 +66,12 @@ pub trait Classifier: Send + Sync {
 /// [`classify_mcp_policy`] first, which resolves per-server policies.
 /// A [`McpPolicy::Trusted`] tool is allowed immediately; a [`McpPolicy::Review`]
 /// tool falls through to the normal classifier.
-const DANGEROUS_TOOLS: &[&str] =
-    &["command", "write_file", "edit_file", "configure_diagnostics"];
+const DANGEROUS_TOOLS: &[&str] = &[
+    "command",
+    "write_file",
+    "edit_file",
+    "configure_diagnostics",
+];
 
 /// The `task` tool is action-dependent: `create` runs an arbitrary command and
 /// `kill` terminates a process (gated like `command`), while `list`/`output`/
@@ -264,9 +268,18 @@ mod tests {
 
     #[test]
     fn yolo_allows_everything() {
-        assert!(matches!(classify(WorkMode::Yolo, "command"), Verdict::Allow));
-        assert!(matches!(classify(WorkMode::Yolo, "write_file"), Verdict::Allow));
-        assert!(matches!(classify(WorkMode::Yolo, "read_file"), Verdict::Allow));
+        assert!(matches!(
+            classify(WorkMode::Yolo, "command"),
+            Verdict::Allow
+        ));
+        assert!(matches!(
+            classify(WorkMode::Yolo, "write_file"),
+            Verdict::Allow
+        ));
+        assert!(matches!(
+            classify(WorkMode::Yolo, "read_file"),
+            Verdict::Allow
+        ));
     }
 
     #[test]
@@ -274,18 +287,36 @@ mod tests {
         // The provider front gate has already auto-approved the safe calls
         // (read-only built-ins, trusted MCP), so Manual asks about the rest —
         // whatever the tool.
-        assert!(matches!(classify(WorkMode::Manual, "command"), Verdict::Ask { .. }));
-        assert!(matches!(classify(WorkMode::Manual, "write_file"), Verdict::Ask { .. }));
-        assert!(matches!(classify(WorkMode::Manual, "mcp__db__query"), Verdict::Ask { .. }));
+        assert!(matches!(
+            classify(WorkMode::Manual, "command"),
+            Verdict::Ask { .. }
+        ));
+        assert!(matches!(
+            classify(WorkMode::Manual, "write_file"),
+            Verdict::Ask { .. }
+        ));
+        assert!(matches!(
+            classify(WorkMode::Manual, "mcp__db__query"),
+            Verdict::Ask { .. }
+        ));
     }
 
     #[test]
     fn plan_denies_every_call_it_receives() {
         // Read-only calls never reach the Plan classifier (the front gate clears
         // them); everything that does is state-mutating and gets denied.
-        assert!(matches!(classify(WorkMode::Plan, "command"), Verdict::Deny { .. }));
-        assert!(matches!(classify(WorkMode::Plan, "write_file"), Verdict::Deny { .. }));
-        assert!(matches!(classify(WorkMode::Plan, "edit_file"), Verdict::Deny { .. }));
+        assert!(matches!(
+            classify(WorkMode::Plan, "command"),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            classify(WorkMode::Plan, "write_file"),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            classify(WorkMode::Plan, "edit_file"),
+            Verdict::Deny { .. }
+        ));
     }
 
     #[test]

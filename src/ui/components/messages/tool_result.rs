@@ -74,7 +74,10 @@ impl<'a> ToolResultMessage<'a> {
             let first = all.first().copied().unwrap_or("[no output]");
             let caret = if multiline { "\u{25B8} " } else { "" };
             let suffix = if multiline { "..." } else { "" };
-            let line = Line::from(Span::styled(format!("{caret}\u{23BF} {first}{suffix}"), result_style));
+            let line = Line::from(Span::styled(
+                format!("{caret}\u{23BF} {first}{suffix}"),
+                result_style,
+            ));
             return Paragraph::new(Text::from(line)).block(block);
         }
 
@@ -84,14 +87,20 @@ impl<'a> ToolResultMessage<'a> {
             .map(|(index, line)| {
                 if index == 0 {
                     let caret = if multiline { "\u{25BE} " } else { "" };
-                    Line::from(Span::styled(format!("{caret}\u{23BF} {line}"), result_style))
+                    Line::from(Span::styled(
+                        format!("{caret}\u{23BF} {line}"),
+                        result_style,
+                    ))
                 } else {
                     Line::from(Span::styled(format!("  {line}"), result_style))
                 }
             })
             .collect();
         if lines.is_empty() {
-            lines.push(Line::from(Span::styled("\u{23BF} [no output]", result_style)));
+            lines.push(Line::from(Span::styled(
+                "\u{23BF} [no output]",
+                result_style,
+            )));
         }
 
         Paragraph::new(Text::from(lines))

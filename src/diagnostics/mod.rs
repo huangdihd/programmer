@@ -28,7 +28,7 @@ mod profile;
 mod runner;
 
 pub use lsp::{shutdown_all as shutdown_lsp, status as lsp_status};
-pub use parse::{parse_output, Parser};
+pub use parse::{Parser, parse_output};
 pub use profile::{Checker, CheckerKind, DiagnosticsProfile, PROFILE_PATH};
 pub use runner::run_checker;
 
@@ -187,7 +187,7 @@ pub struct Snapshot {
 /// Returns `None` when the project has no profile (`/init` hasn't configured
 /// one) — the caller then simply skips diagnostics. LSP checkers are recognized
 /// but skipped until that backend lands.
-pub async fn collect(cwd: &Path) -> Option<Snapshot> {
+pub async fn collect(cwd: &Path, cancel: &crate::cancel::CancellationToken) -> Option<Snapshot> {
     let profile = match DiagnosticsProfile::load(cwd)? {
         Ok(p) => p,
         Err(e) => {
@@ -202,7 +202,7 @@ pub async fn collect(cwd: &Path) -> Option<Snapshot> {
     let mut errors = Vec::new();
     for checker in &profile.checkers {
         // `run_checker` dispatches to the command or LSP backend by kind.
-        match run_checker(checker, cwd).await {
+        match run_checker(checker, cwd, cancel).await {
             Ok(mut ds) => diagnostics.append(&mut ds),
             Err(e) => errors.push(e),
         }
@@ -212,7 +212,10 @@ pub async fn collect(cwd: &Path) -> Option<Snapshot> {
     let mut seen = HashSet::new();
     diagnostics.retain(|d| seen.insert(d.clone()));
 
-    Some(Snapshot { diagnostics, errors })
+    Some(Snapshot {
+        diagnostics,
+        errors,
+    })
 }
 
 impl Snapshot {
@@ -350,7 +353,10 @@ mod tests {
         let summary = diff(&old, &new).summary().unwrap();
         let err_pos = summary.find("big").unwrap();
         let warn_pos = summary.find("small").unwrap();
-        assert!(err_pos < warn_pos, "errors should be listed before warnings");
+        assert!(
+            err_pos < warn_pos,
+            "errors should be listed before warnings"
+        );
         assert!(summary.contains("+2 new, -0 resolved"));
     }
 
@@ -376,15 +382,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn collect_none_without_profile_and_runs_with_one() {
-        let dir = std::env::temp_dir().join(format!(
-            "programmer-collect-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("programmer-collect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         // No profile yet → None.
-        assert!(collect(&dir).await.is_none());
+        assert!(
+            collect(&dir, &crate::cancel::CancellationToken::new())
+                .await
+                .is_none()
+        );
 
         // Write a profile whose checker prints one gnu-style diagnostic.
         let prog = dir.join(PROFILE_PATH);
@@ -395,7 +402,9 @@ mod tests {
         )
         .unwrap();
 
-        let snap = collect(&dir).await.unwrap();
+        let snap = collect(&dir, &crate::cancel::CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(snap.diagnostics.len(), 1);
         assert_eq!(snap.diagnostics[0].message, "boom");
         assert!(snap.errors.is_empty());
@@ -422,10 +431,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn end_to_end_rustc_json_with_cargo_check() {
-        let dir = std::env::temp_dir().join(format!(
-            "programmer-e2e-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("programmer-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -466,9 +472,13 @@ run_on = ["*.rs"]
         profile.validate().expect("profile should be valid");
 
         // Run the checker.
-        let diags = run_checker(&profile.checkers[0], &dir)
-            .await
-            .expect("checker should run");
+        let diags = run_checker(
+            &profile.checkers[0],
+            &dir,
+            &crate::cancel::CancellationToken::new(),
+        )
+        .await
+        .expect("checker should run");
 
         assert_eq!(diags.len(), 1, "should find exactly one error");
         assert_eq!(diags[0].file, "src/main.rs");
@@ -482,7 +492,9 @@ run_on = ["*.rs"]
         );
 
         // Full collect should also work.
-        let snap = collect(&dir).await.expect("collect should succeed");
+        let snap = collect(&dir, &crate::cancel::CancellationToken::new())
+            .await
+            .expect("collect should succeed");
         assert_eq!(snap.diagnostics.len(), 1);
         assert!(snap.errors.is_empty());
 

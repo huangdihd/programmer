@@ -44,10 +44,7 @@ impl WarningMessage {
         ))];
 
         for line in self.message.lines() {
-            lines.push(Line::styled(
-                line.to_string(),
-                Style::new().fg(body),
-            ));
+            lines.push(Line::styled(line.to_string(), Style::new().fg(body)));
         }
 
         Paragraph::new(Text::from(lines))

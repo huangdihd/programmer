@@ -30,7 +30,11 @@ impl Widget for &InputPanel<'_> {
         // prompt, and a title saying where the command will run.
         let bang = self.get_content().starts_with('!');
         let (title, accent, prompt) = if bang {
-            (" ! Shell — runs in the interactive terminal ", BANG_ACCENT, "$ ")
+            (
+                " ! Shell — runs in the interactive terminal ",
+                BANG_ACCENT,
+                "$ ",
+            )
         } else {
             (" Input ", ACCENT, "❯ ")
         };

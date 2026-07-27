@@ -109,8 +109,8 @@ pub(crate) async fn classify_llm(
         Deny(crate::tools::ToolOutput),
     }
 
-    let decisions: Vec<Option<Decision>> = futures::stream::iter(calls.into_iter().map(|call| {
-        async move {
+    let decisions: Vec<Option<Decision>> =
+        futures::stream::iter(calls.into_iter().map(|call| async move {
             if cancel.is_cancelled() {
                 return None;
             }
@@ -135,11 +135,10 @@ pub(crate) async fn classify_llm(
                     Decision::Deny(classifier_denied_output(&call, &reason))
                 }
             })
-        }
-    }))
-    .buffered(MAX_CONCURRENT_CLASSIFICATIONS)
-    .collect()
-    .await;
+        }))
+        .buffered(MAX_CONCURRENT_CLASSIFICATIONS)
+        .collect()
+        .await;
 
     if cancel.is_cancelled() {
         return None;
@@ -341,7 +340,9 @@ pub(crate) fn build_classifier_context(items: &[&MessageItem]) -> (String, Strin
                 // Token usage counters — not useful for classification.
             }
             MessageItem::Compacted { summary } => {
-                full_ctx.push(format!("\n[Conversation before this point was compacted; its summary]\n{summary}"));
+                full_ctx.push(format!(
+                    "\n[Conversation before this point was compacted; its summary]\n{summary}"
+                ));
             }
         }
     }
@@ -374,8 +375,12 @@ mod tests {
         fn classify(&self, name: &str, _args: &str) -> Verdict {
             match name {
                 "allow_me" => Verdict::Allow,
-                "deny_me" => Verdict::Deny { reason: "nope".into() },
-                _ => Verdict::Ask { reason: "confirm?".into() },
+                "deny_me" => Verdict::Deny {
+                    reason: "nope".into(),
+                },
+                _ => Verdict::Ask {
+                    reason: "confirm?".into(),
+                },
             }
         }
     }
@@ -413,12 +418,18 @@ mod tests {
                 status: Some(OutputStatus::Completed),
             })),
         ));
-        let tool_call = MessageItem::Output(OutputItem::FunctionCall(call("command", "{\"cmd\":\"make\"}")));
+        let tool_call = MessageItem::Output(OutputItem::FunctionCall(call(
+            "command",
+            "{\"cmd\":\"make\"}",
+        )));
         let items: Vec<&MessageItem> = vec![&user, &tool_call];
         let (light, full) = build_classifier_context(&items);
         assert!(light.contains("please build it"), "light: {light}");
         assert!(full.contains("[User]"), "full has user: {full}");
-        assert!(full.contains("[Tool call: command]"), "full has call: {full}");
+        assert!(
+            full.contains("[Tool call: command]"),
+            "full has call: {full}"
+        );
         assert!(full.contains("make"), "full has args: {full}");
     }
 }

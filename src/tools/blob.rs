@@ -121,9 +121,10 @@ fn walk(
 
         if path.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && (name.starts_with('.') || name == "target" || name == "node_modules") {
-                    continue;
-                }
+                && (name.starts_with('.') || name == "target" || name == "node_modules")
+            {
+                continue;
+            }
             if walk(&path_str, pattern, results, count).is_err() {
                 continue;
             }
@@ -179,9 +180,11 @@ mod tests {
         assert!(!star.contains("config.toml"), "got: {star}");
 
         // A `**/` prefix is tolerated and matches at any depth.
-        let deep = run(&format!(r#"{{"pattern":"**/*.toml","path":"{json_path}"}}"#))
-            .await
-            .expect("**/ prefix should succeed");
+        let deep = run(&format!(
+            r#"{{"pattern":"**/*.toml","path":"{json_path}"}}"#
+        ))
+        .await
+        .expect("**/ prefix should succeed");
         assert!(deep.contains("config.toml"), "got: {deep}");
 
         let _ = std::fs::remove_dir_all(&dir);

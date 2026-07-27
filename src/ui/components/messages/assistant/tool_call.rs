@@ -87,9 +87,7 @@ impl<'a> ToolCallMessage<'a> {
 
         let status_color = if failed { palette::RED } else { palette::GREEN };
         let status_char = if failed { "\u{2717}" } else { "\u{2713}" };
-        let accent = Style::new()
-            .fg(status_color)
-            .add_modifier(Modifier::BOLD);
+        let accent = Style::new().fg(status_color).add_modifier(Modifier::BOLD);
         let muted = Style::new().fg(palette::MUTED);
         let value = serde_json::from_str::<serde_json::Value>(&self.call.arguments).ok();
 
@@ -107,10 +105,7 @@ impl<'a> ToolCallMessage<'a> {
             // Approval label (collapsed): subtle line below the tool name.
             if let Some(label) = self.approval_label {
                 let label_style = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
-                lines.push(Line::from(Span::styled(
-                    format!("  {label}"),
-                    label_style,
-                )));
+                lines.push(Line::from(Span::styled(format!("  {label}"), label_style)));
             }
             if let Some(text) = &result_text {
                 let dim = if failed {
@@ -120,7 +115,11 @@ impl<'a> ToolCallMessage<'a> {
                 };
                 let mut result_lines = text.lines();
                 let first = result_lines.next().unwrap_or("[no output]");
-                let suffix = if result_lines.next().is_some() { "..." } else { "" };
+                let suffix = if result_lines.next().is_some() {
+                    "..."
+                } else {
+                    ""
+                };
                 lines.push(Line::from(Span::styled(
                     format!("  \u{23BF} {first}{suffix}"),
                     dim,
@@ -180,10 +179,7 @@ impl<'a> ToolCallMessage<'a> {
         // Approval label (expanded): subtle line below the arguments.
         if let Some(label) = self.approval_label {
             let label_style = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
-            lines.push(Line::from(Span::styled(
-                format!("  {label}"),
-                label_style,
-            )));
+            lines.push(Line::from(Span::styled(format!("  {label}"), label_style)));
         }
 
         if let Some(text) = &result_text {
@@ -202,7 +198,10 @@ impl<'a> ToolCallMessage<'a> {
                 first = false;
             }
             if first {
-                lines.push(Line::from(Span::styled("  \u{23BF} [no output]", detail_style())));
+                lines.push(Line::from(Span::styled(
+                    "  \u{23BF} [no output]",
+                    detail_style(),
+                )));
             }
         } else if let Some(live) = self.live_output {
             push_live_tail(&mut lines, live, muted);
@@ -387,7 +386,10 @@ fn diff_lines(old: &str, new: &str, base: usize) -> Vec<Line<'static>> {
         // before the very first rendered row.
         if pending_gap && !lines.is_empty() {
             let blank = " ".repeat(num_w);
-            lines.push(Line::from(Span::styled(format!("    {blank}\u{22EF}"), context)));
+            lines.push(Line::from(Span::styled(
+                format!("    {blank}\u{22EF}"),
+                context,
+            )));
         }
         pending_gap = false;
         let line = match *op {
@@ -458,22 +460,38 @@ mod tests {
         assert!(rendered.iter().any(|l| l.contains("CHANGED_A")));
         assert!(rendered.iter().any(|l| l.contains("CHANGED_B")));
         // Context preserved on the inner side of each hunk...
-        assert!(rendered.iter().any(|l| l.contains("line5")), "context after hunk A");
-        assert!(rendered.iter().any(|l| l.contains("line24")), "context before hunk B");
+        assert!(
+            rendered.iter().any(|l| l.contains("line5")),
+            "context after hunk A"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("line24")),
+            "context before hunk B"
+        );
         // ...while the distant middle is hidden.
-        assert!(!rendered.iter().any(|l| l.contains("line15")), "middle hidden");
+        assert!(
+            !rendered.iter().any(|l| l.contains("line15")),
+            "middle hidden"
+        );
     }
 
     #[test]
     fn diff_lines_collapses_distant_context() {
         // A long unchanged head with a single trailing change should collapse
         // the far context into one separator row.
-        let old = (0..20).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let old = (0..20)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut new_v: Vec<String> = (0..20).map(|i| i.to_string()).collect();
         *new_v.last_mut().unwrap() = "changed".into();
         let new = new_v.join("\n");
         let rendered = diff_lines(&old, &new, 1);
         // Far fewer than 20 rows survive once distant context is collapsed.
-        assert!(rendered.len() < 12, "distant context should collapse, got {}", rendered.len());
+        assert!(
+            rendered.len() < 12,
+            "distant context should collapse, got {}",
+            rendered.len()
+        );
     }
 }

@@ -25,11 +25,7 @@ const ACCENT: Color = Color::LightBlue;
 
 impl Widget for &Footer {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let mode_text = format!(
-            "  {} {} ",
-            self.work_mode.icon(),
-            self.work_mode.label()
-        );
+        let mode_text = format!("  {} {} ", self.work_mode.icon(), self.work_mode.label());
         let mode_len = mode_text.len() as u16;
         let model_len = self.current_model.len() as u16;
 
@@ -47,10 +43,16 @@ impl Widget for &Footer {
         let lsp = crate::diagnostics::lsp_status();
         let (lsp_text, lsp_style) = if lsp.checking {
             // Running a check.
-            (" \u{25c8} LSP \u{27f3} ".to_string(), Style::default().fg(Color::LightYellow))
+            (
+                " \u{25c8} LSP \u{27f3} ".to_string(),
+                Style::default().fg(Color::LightYellow),
+            )
         } else if lsp.failed {
             // Last attempt failed (server wouldn't start / snapshot errored).
-            (" \u{25c8} LSP \u{2717} ".to_string(), Style::default().fg(Color::LightRed))
+            (
+                " \u{25c8} LSP \u{2717} ".to_string(),
+                Style::default().fg(Color::LightRed),
+            )
         } else if lsp.servers > 0 {
             // One or more warm servers.
             (

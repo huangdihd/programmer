@@ -160,7 +160,10 @@ impl McpServer {
             .get("name")
             .and_then(|n| n.as_str())
             .ok_or((-32602i64, "missing tool name".to_string()))?;
-        let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let args_str = arguments.to_string();
 
         // UI-bound and passthrough tools aren't exposed over MCP.
@@ -177,7 +180,10 @@ impl McpServer {
             Gate::Allow => None,
             Gate::Deny(reason) => Some(reason),
             Gate::Llm => self.llm_approve(name, &args_str).await.err(),
-            Gate::Elicit => self.elicit_approve(name, &args_str, lines, stdout).await.err(),
+            Gate::Elicit => self
+                .elicit_approve(name, &args_str, lines, stdout)
+                .await
+                .err(),
         };
         if let Some(reason) = denial {
             return Ok(tool_content(format!("error: {reason}"), true));
@@ -352,29 +358,47 @@ mod tests {
 
     #[test]
     fn gate_read_only_always_allows() {
-        assert!(matches!(server(WorkMode::Auto).gate("read_file", "{}"), Gate::Allow));
-        assert!(matches!(server(WorkMode::Manual).gate("grep", "{}"), Gate::Allow));
+        assert!(matches!(
+            server(WorkMode::Auto).gate("read_file", "{}"),
+            Gate::Allow
+        ));
+        assert!(matches!(
+            server(WorkMode::Manual).gate("grep", "{}"),
+            Gate::Allow
+        ));
     }
 
     #[test]
     fn gate_yolo_allows_dangerous() {
-        assert!(matches!(server(WorkMode::Yolo).gate("command", "{}"), Gate::Allow));
+        assert!(matches!(
+            server(WorkMode::Yolo).gate("command", "{}"),
+            Gate::Allow
+        ));
     }
 
     #[test]
     fn gate_plan_denies_mutating() {
-        assert!(matches!(server(WorkMode::Plan).gate("write_file", "{}"), Gate::Deny(_)));
+        assert!(matches!(
+            server(WorkMode::Plan).gate("write_file", "{}"),
+            Gate::Deny(_)
+        ));
     }
 
     #[test]
     fn gate_auto_defers_to_llm() {
-        assert!(matches!(server(WorkMode::Auto).gate("command", "{}"), Gate::Llm));
+        assert!(matches!(
+            server(WorkMode::Auto).gate("command", "{}"),
+            Gate::Llm
+        ));
     }
 
     #[test]
     fn gate_manual_elicits_when_supported_else_denies() {
         // No elicitation capability → deny.
-        assert!(matches!(server(WorkMode::Manual).gate("command", "{}"), Gate::Deny(_)));
+        assert!(matches!(
+            server(WorkMode::Manual).gate("command", "{}"),
+            Gate::Deny(_)
+        ));
         // With capability → elicit.
         let mut s = server(WorkMode::Manual);
         s.client_elicitation = true;

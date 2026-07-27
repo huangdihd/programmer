@@ -75,6 +75,10 @@ pub(crate) struct CancelState {
     /// in flight — including the post-stream pipeline whose own stream token is
     /// already gone by the time it runs.
     pub(crate) active: CancellationToken,
+    /// The monotonically increasing operation id assigned to the current turn
+    /// (0 = idle). Updated synchronously before the turn spawns so the UI never
+    /// has a race between "start" and "what is my id?".
+    pub(crate) operation_id: u64,
     /// True while the stream task is backing off between connection retries.
     pub(crate) stream_retrying: Arc<AtomicBool>,
 }
@@ -246,7 +250,7 @@ impl App<'_> {
             current_model,
             vision_enabled,
             pending_images: Vec::new(),
-            events: EventHandler::new(),
+            events: EventHandler::new(crate::consts::TICK_FPS),
             config,
             input_panel,
             conversation_panel,
@@ -276,6 +280,7 @@ impl App<'_> {
             sidebar_click_active: false,
             cancel: CancelState {
                 active: CancellationToken::new(),
+                operation_id: 0,
                 stream_retrying: Arc::new(AtomicBool::new(false)),
             },
             session: SessionState {

@@ -29,12 +29,12 @@ use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
 use crate::ui::markdown_theme::palette;
 use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem};
-use std::collections::{HashMap, HashSet};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui_widgets::paragraph::Paragraph;
+use std::collections::{HashMap, HashSet};
 use tui_scrollview::ScrollView;
 
 /// Rough height estimate for an item, used to avoid expensive markdown rendering
@@ -52,15 +52,16 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
             OutputItem::FunctionCall(_) => 2,
             _ => 1,
         },
-        MessageItem::ToolOutput { output, .. } => {
-            match &output.output {
-                async_openai::types::responses::FunctionCallOutput::Text(t) =>
-                    rough_line_count(t, w).min(20),
-                _ => 1,
+        MessageItem::ToolOutput { output, .. } => match &output.output {
+            async_openai::types::responses::FunctionCallOutput::Text(t) => {
+                rough_line_count(t, w).min(20)
             }
-        }
-        MessageItem::OpenAIError(_) | MessageItem::Error(_)
-        | MessageItem::Warning(_) | MessageItem::Info(_) => 1,
+            _ => 1,
+        },
+        MessageItem::OpenAIError(_)
+        | MessageItem::Error(_)
+        | MessageItem::Warning(_)
+        | MessageItem::Info(_) => 1,
         MessageItem::Meta { .. } => 1,
         MessageItem::Usage(_, _) => 1,
         // Usually collapsed to its one-line divider (like Reasoning, the
@@ -73,7 +74,8 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
 /// Rough line count: chars / width, plus explicit newlines.
 fn rough_line_count(text: &str, width: usize) -> u16 {
     let lines: u16 = text.lines().count() as u16;
-    let wrapped: u16 = text.lines()
+    let wrapped: u16 = text
+        .lines()
         .map(|l| (l.chars().count().max(1) / width.max(1)).max(1) as u16)
         .sum();
     lines.max(wrapped).max(1)
@@ -100,7 +102,9 @@ fn build_item_paragraph(
                 Vec::new(),
             )
         }
-        MessageItem::Input(input_item) => (UserMessage::new(input_item).into_paragraph(), Vec::new()),
+        MessageItem::Input(input_item) => {
+            (UserMessage::new(input_item).into_paragraph(), Vec::new())
+        }
         MessageItem::Output(output_item) => AssistantMessage::new(output_item, content_width)
             .expanded(expanded)
             .tool_output(tool_output)
@@ -110,18 +114,22 @@ fn build_item_paragraph(
             ErrorMessage::new(error.to_string()).into_paragraph(),
             Vec::new(),
         ),
-        MessageItem::Error(message) => {
-            (ErrorMessage::new(message.clone()).into_paragraph(), Vec::new())
-        }
-        MessageItem::Info(message) => {
-            (InfoMessage::new(message.clone()).into_paragraph(), Vec::new())
-        }
-        MessageItem::Meta { label, .. } => {
-            (InfoMessage::new(format!("\u{25B8} {}", label)).into_paragraph(), Vec::new())
-        }
-        MessageItem::Warning(message) => {
-            (WarningMessage::new(message.clone()).into_paragraph(), Vec::new())
-        }
+        MessageItem::Error(message) => (
+            ErrorMessage::new(message.clone()).into_paragraph(),
+            Vec::new(),
+        ),
+        MessageItem::Info(message) => (
+            InfoMessage::new(message.clone()).into_paragraph(),
+            Vec::new(),
+        ),
+        MessageItem::Meta { label, .. } => (
+            InfoMessage::new(format!("\u{25B8} {}", label)).into_paragraph(),
+            Vec::new(),
+        ),
+        MessageItem::Warning(message) => (
+            WarningMessage::new(message.clone()).into_paragraph(),
+            Vec::new(),
+        ),
         MessageItem::Usage(input, output) => (
             UsageMessage::new(*input, *output).into_paragraph(),
             Vec::new(),
@@ -172,7 +180,12 @@ impl Widget for &mut ConversationPanel {
         let mut outputs_by_call: HashMap<&str, (&FunctionCallOutputItemParam, bool, Option<&str>)> =
             HashMap::new();
         for item in &conv.items {
-            if let MessageItem::ToolOutput { output, failed, approval_label } = item {
+            if let MessageItem::ToolOutput {
+                output,
+                failed,
+                approval_label,
+            } = item
+            {
                 outputs_by_call.insert(
                     output.call_id.as_str(),
                     (output, *failed, approval_label.as_deref()),
@@ -183,9 +196,7 @@ impl Widget for &mut ConversationPanel {
             .items
             .iter()
             .filter_map(|item| match item {
-                MessageItem::Output(OutputItem::FunctionCall(call)) => {
-                    Some(call.call_id.as_str())
-                }
+                MessageItem::Output(OutputItem::FunctionCall(call)) => Some(call.call_id.as_str()),
                 _ => None,
             })
             .collect();
@@ -270,10 +281,9 @@ impl Widget for &mut ConversationPanel {
                 MessageItem::ToolOutput { output, .. } => {
                     (call_ids.contains(output.call_id.as_str()), None)
                 }
-                MessageItem::Output(OutputItem::FunctionCall(call)) => (
-                    false,
-                    outputs_by_call.get(call.call_id.as_str()).copied(),
-                ),
+                MessageItem::Output(OutputItem::FunctionCall(call)) => {
+                    (false, outputs_by_call.get(call.call_id.as_str()).copied())
+                }
                 _ => (false, None),
             };
             let has_output = tool_output.is_some();
@@ -291,14 +301,11 @@ impl Widget for &mut ConversationPanel {
             };
             let in_viewport = index >= build_from || in_window[index];
             let needs_build = live_output.is_some()
-                || cache
-                    .entries
-                    .get(index)
-                    .is_none_or(|entry| {
-                        entry.expanded != expanded
-                            || entry.has_output != has_output
-                            || (entry.lazy && in_viewport)
-                    });
+                || cache.entries.get(index).is_none_or(|entry| {
+                    entry.expanded != expanded
+                        || entry.has_output != has_output
+                        || (entry.lazy && in_viewport)
+                });
             if needs_build {
                 let entry = if hidden {
                     CachedParagraph {
@@ -437,9 +444,10 @@ impl Widget for &mut ConversationPanel {
         }
         self.pending_layout = pending.as_ref().map(|(_, height)| (y, *height));
         if let Some((paragraph, height)) = &pending
-            && visible(y, *height) {
-                scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
-            }
+            && visible(y, *height)
+        {
+            scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
+        }
         scroll_view.render(area, buf, &mut self.scroll_view_state);
 
         // The scroll view has now clamped the offset to its real value; store it
@@ -478,7 +486,12 @@ impl Widget for &mut ConversationPanel {
                         .bg(palette::SURFACE)
                         .add_modifier(Modifier::BOLD),
                 );
-                self.set_jump_button(Some(Rect { x, y, width: w, height: 1 }));
+                self.set_jump_button(Some(Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: 1,
+                }));
             } else {
                 self.set_jump_button(None);
             }

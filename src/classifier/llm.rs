@@ -21,12 +21,12 @@
 
 use super::Verdict;
 use crate::prompts::CLASSIFIER_INSTRUCTIONS;
+use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
     CreateResponse, IncludeEnum, InputParam, OutputItem, OutputMessageContent,
 };
-use async_openai::Client;
 
 /// Minimum share `P(yes) / (P(yes) + P(no))` the fast (logprob) path requires
 /// before it auto-approves — the "safety margin". Anything below falls through
@@ -152,7 +152,9 @@ fn base_request(model: &str, prompt: String) -> CreateResponse {
 }
 
 /// Pull the first assistant text out of a response, with its logprobs.
-fn first_text(response: &async_openai::types::responses::Response) -> Option<&OutputMessageContent> {
+fn first_text(
+    response: &async_openai::types::responses::Response,
+) -> Option<&OutputMessageContent> {
     response.output.iter().find_map(|item| match item {
         OutputItem::Message(msg) => msg.content.first(),
         _ => None,
@@ -312,7 +314,10 @@ mod tests {
     #[test]
     fn parse_reasoned_verdicts() {
         assert!(matches!(parse_reasoned("APPROVE"), Verdict::Allow));
-        assert!(matches!(parse_reasoned("DENY: too risky"), Verdict::Deny { .. }));
+        assert!(matches!(
+            parse_reasoned("DENY: too risky"),
+            Verdict::Deny { .. }
+        ));
         let reason = match parse_reasoned("DENY: too risky") {
             Verdict::Deny { reason } => reason,
             _ => panic!(),

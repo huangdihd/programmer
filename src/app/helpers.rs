@@ -15,11 +15,8 @@
 
 //! Standalone helper functions and constants that don't depend on `App`.
 
-use async_openai::types::responses::{
-    InputContent, InputItem,
-    MessageItem as ApiMessageItem,
-};
 use crate::response::message_item::MessageItem;
+use async_openai::types::responses::{InputContent, InputItem, MessageItem as ApiMessageItem};
 
 // ---------------------------------------------------------------------------
 // PROJECT.md overview reminder
@@ -99,7 +96,7 @@ pub(crate) fn extract_input_text(input: &InputItem) -> Option<String> {
                 InputContent::InputText(t) => Some(t.text.clone()),
                 _ => None,
             })
-        },
+        }
         InputItem::EasyMessage(msg) => match &msg.content {
             async_openai::types::responses::EasyInputContent::Text(t) => Some(t.clone()),
             async_openai::types::responses::EasyInputContent::ContentList(parts) => {

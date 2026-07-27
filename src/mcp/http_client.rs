@@ -29,8 +29,8 @@
 use super::client::ProgressInfo;
 use super::types::{JsonRpcRequest, JsonRpcResponse};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Transport-level log lines shown in the MCP panel where a child process's
 /// stderr would otherwise appear.
@@ -59,10 +59,7 @@ pub(crate) struct McpHttpClient {
 }
 
 impl McpHttpClient {
-    pub(crate) fn new(
-        url: &str,
-        headers: &HashMap<String, String>,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(url: &str, headers: &HashMap<String, String>) -> Result<Self, String> {
         let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL '{url}': {e}"))?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(format!("unsupported URL scheme '{}'", parsed.scheme()));
@@ -89,7 +86,10 @@ impl McpHttpClient {
             .map_err(|e| format!("cannot build HTTP client: {e}"))?;
         Ok(McpHttpClient {
             url: url.to_string(),
-            headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             client,
             next_id: AtomicU64::new(1),
             session_id: StdMutex::new(None),
@@ -117,7 +117,10 @@ impl McpHttpClient {
             .client
             .post(&self.url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
             .body(body);
         if let Some(sid) = self.session_id.lock().unwrap().as_deref() {
             req = req.header("Mcp-Session-Id", sid);
@@ -190,9 +193,10 @@ impl McpHttpClient {
         // Remember the negotiated protocol version for subsequent requests.
         if method == "initialize"
             && let Ok(v) = &result
-                && let Some(ver) = v.get("protocolVersion").and_then(|v| v.as_str()) {
-                    *self.protocol_version.lock().unwrap() = Some(ver.to_string());
-                }
+            && let Some(ver) = v.get("protocolVersion").and_then(|v| v.as_str())
+        {
+            *self.protocol_version.lock().unwrap() = Some(ver.to_string());
+        }
         if let Err(e) = &result {
             self.log_line(e.clone());
         }
@@ -204,7 +208,9 @@ impl McpHttpClient {
         let resp: JsonRpcResponse =
             serde_json::from_str(body).map_err(|e| format!("MCP parse response: {e}"))?;
         match resp {
-            JsonRpcResponse::Success { id: rid, result, .. } if rid == id => Ok(result),
+            JsonRpcResponse::Success {
+                id: rid, result, ..
+            } if rid == id => Ok(result),
             JsonRpcResponse::Error { id: rid, error, .. } if rid == id => {
                 Err(format!("MCP error: {}", error.message))
             }
@@ -234,9 +240,10 @@ impl McpHttpClient {
         }
         // Stream ended: flush any unterminated final event.
         if let Some(data) = parser.finish()
-            && let Some(result) = self.dispatch_sse_message(&data, id)? {
-                return Ok(result);
-            }
+            && let Some(result) = self.dispatch_sse_message(&data, id)?
+        {
+            return Ok(result);
+        }
         Err("MCP SSE stream ended without a response".to_string())
     }
 
@@ -259,7 +266,9 @@ impl McpHttpClient {
         // Response to our request?
         if let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(raw) {
             match resp {
-                JsonRpcResponse::Success { id: rid, result, .. } if rid == id => {
+                JsonRpcResponse::Success {
+                    id: rid, result, ..
+                } if rid == id => {
                     return Ok(Some(result));
                 }
                 JsonRpcResponse::Error { id: rid, error, .. } if rid == id => {
@@ -411,7 +420,8 @@ impl SseParser {
                     self.data.clear();
                 }
             } else if let Some(rest) = line.strip_prefix("data:") {
-                self.data.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+                self.data
+                    .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
             }
             // Other fields and `:` comments are ignored.
         }

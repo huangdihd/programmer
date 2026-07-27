@@ -40,6 +40,7 @@ impl App<'_> {
             ActivePhase::Classifying => StatusState::Classifying,
             ActivePhase::Checking => StatusState::Checking,
             ActivePhase::Compacting => StatusState::Compacting,
+            ActivePhase::Cancelling => StatusState::Cancelling,
             ActivePhase::ToolRunning => StatusState::ToolRunning,
             ActivePhase::CreatingToolCall => StatusState::CreatingToolCall,
             ActivePhase::Outputting => StatusState::Outputting,
@@ -47,7 +48,11 @@ impl App<'_> {
                 // Request in flight but nothing has streamed back yet: either
                 // still connecting, or backing off between retries.
                 Some(partial) if !partial.started() => {
-                    if self.cancel.stream_retrying.load(std::sync::atomic::Ordering::Relaxed) {
+                    if self
+                        .cancel
+                        .stream_retrying
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         StatusState::Retrying
                     } else {
                         StatusState::Connecting
@@ -101,16 +106,42 @@ impl App<'_> {
 
         // ---- compact todo bar (inline, above the input area) ----
         if has_todo_bar {
-            let pending = self.todo_list.todos.iter().filter(|t| t.status == crate::todos::TodoStatus::Pending).count();
-            let in_progress = self.todo_list.todos.iter().filter(|t| t.status == crate::todos::TodoStatus::InProgress).count();
-            let completed = self.todo_list.todos.iter().filter(|t| t.status == crate::todos::TodoStatus::Completed).count();
+            let pending = self
+                .todo_list
+                .todos
+                .iter()
+                .filter(|t| t.status == crate::todos::TodoStatus::Pending)
+                .count();
+            let in_progress = self
+                .todo_list
+                .todos
+                .iter()
+                .filter(|t| t.status == crate::todos::TodoStatus::InProgress)
+                .count();
+            let completed = self
+                .todo_list
+                .todos
+                .iter()
+                .filter(|t| t.status == crate::todos::TodoStatus::Completed)
+                .count();
             let mut parts = Vec::new();
-            if pending > 0 { parts.push(format!("{} pending", pending)); }
-            if in_progress > 0 { parts.push(format!("{} in progress", in_progress)); }
-            if completed > 0 { parts.push(format!("{} completed", completed)); }
+            if pending > 0 {
+                parts.push(format!("{} pending", pending));
+            }
+            if in_progress > 0 {
+                parts.push(format!("{} in progress", in_progress));
+            }
+            if completed > 0 {
+                parts.push(format!("{} completed", completed));
+            }
             let summary = parts.join(", ");
             let line = Line::from(vec![
-                Span::styled(" ☐ Todos: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " ☐ Todos: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(summary, Style::default().fg(Color::Gray)),
                 Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("/todo", Style::default().fg(Color::Cyan)),
@@ -123,22 +154,32 @@ impl App<'_> {
             panel.render(chunks[POS_BOTTOM], buf);
         } else if let Some(ref review) = self.pending_review {
             let (current, total) = review.position;
-            let detail_lines = crate::ui::tool_details::format_tool_details(&review.call.name, &review.call.arguments);
+            let detail_lines = crate::ui::tool_details::format_tool_details(
+                &review.call.name,
+                &review.call.arguments,
+            );
 
             let labels = ["Approve", "Deny"];
             let sel = review.selected;
-            let option_lines: Vec<Line> = labels.iter().enumerate().map(|(i, label)| {
-                let marker = if i == sel { "❯" } else { " " };
-                let style = if i == sel {
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(format!("{marker} {label}"), style),
-                ])
-            }).collect();
+            let option_lines: Vec<Line> = labels
+                .iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    let marker = if i == sel { "❯" } else { " " };
+                    let style = if i == sel {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(format!("{marker} {label}"), style),
+                    ])
+                })
+                .collect();
 
             let mut lines: Vec<Line> = vec![
                 Line::from(vec![
@@ -156,7 +197,10 @@ impl App<'_> {
                 ]),
             ];
             for line in &detail_lines {
-                lines.push(Line::from(Span::styled(format!("  {line}"), Style::default().fg(Color::Gray))));
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(Color::Gray),
+                )));
             }
             lines.extend(option_lines);
             Paragraph::new(lines)
@@ -206,14 +250,12 @@ impl App<'_> {
                 .collect();
 
             let mut lines: Vec<Line> = vec![
-                Line::from(vec![
-                    Span::styled(
-                        "\u{1f4cb}  Plan received. Choose how to execute:",
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
+                Line::from(vec![Span::styled(
+                    "\u{1f4cb}  Plan received. Choose how to execute:",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )]),
                 Line::from(vec![Span::styled(
                     "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
                     Style::default().fg(Color::DarkGray),
@@ -244,34 +286,35 @@ impl App<'_> {
 
         // ---- completion popup (floats above the input panel) ----
         if let Some(ref completion) = self.input_panel.completion
-            && completion.visible {
-                let max_visible = 10u16;
-                let count = (completion.candidates.len() as u16).min(max_visible);
-                let popup_height = count;
+            && completion.visible
+        {
+            let max_visible = 10u16;
+            let count = (completion.candidates.len() as u16).min(max_visible);
+            let popup_height = count;
 
-                let token_x = chunks[POS_BOTTOM].x + 2 + completion.prefix.len() as u16;
-                let longest = completion
-                    .candidates
-                    .iter()
-                    .map(|c| c.len())
-                    .max()
-                    .unwrap_or(0) as u16;
-                let popup_width = (longest + 2).clamp(10, chunks[POS_BOTTOM].width);
+            let token_x = chunks[POS_BOTTOM].x + 2 + completion.prefix.len() as u16;
+            let longest = completion
+                .candidates
+                .iter()
+                .map(|c| c.len())
+                .max()
+                .unwrap_or(0) as u16;
+            let popup_width = (longest + 2).clamp(10, chunks[POS_BOTTOM].width);
 
-                let popup_area = Rect {
-                    x: token_x.min(chunks[POS_BOTTOM].right().saturating_sub(popup_width)),
-                    y: chunks[POS_BOTTOM].y.saturating_sub(popup_height),
-                    width: popup_width,
-                    height: popup_height.min(chunks[POS_BOTTOM].y),
-                };
+            let popup_area = Rect {
+                x: token_x.min(chunks[POS_BOTTOM].right().saturating_sub(popup_width)),
+                y: chunks[POS_BOTTOM].y.saturating_sub(popup_height),
+                width: popup_width,
+                height: popup_height.min(chunks[POS_BOTTOM].y),
+            };
 
-                let popup = CompletionPopup {
-                    candidates: &completion.candidates,
-                    selected: completion.selected,
-                    scroll_offset: completion.scroll_offset,
-                };
-                popup.render(popup_area, buf);
-            }
+            let popup = CompletionPopup {
+                candidates: &completion.candidates,
+                selected: completion.selected,
+                scroll_offset: completion.scroll_offset,
+            };
+            popup.render(popup_area, buf);
+        }
 
         // ---- todo panel (floating overlay, centered) ----
         if let Some(panel) = &self.todo_panel {
@@ -293,13 +336,13 @@ impl App<'_> {
                             || col >= panel_area.x + panel_area.width
                             || row < panel_area.y
                             || row >= panel_area.y + panel_area.height)
-                        {
-                            cell.set_style(
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::DIM),
-                            );
-                        }
+                    {
+                        cell.set_style(
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        );
+                    }
                 }
             }
             panel.render(panel_area, buf);
@@ -367,10 +410,7 @@ impl Widget for &mut App<'_> {
         self.footer.work_mode = self.work_mode;
         self.footer.current_model = self.current_model.clone();
         self.footer.lsp_configured = self.diag.lsp_configured;
-        self.footer.active_skills = self
-            .skill_registry
-            .activated_names()
-            .join(",");
+        self.footer.active_skills = self.skill_registry.activated_names().join(",");
 
         // When the model is asking a question or waiting for approval,
         // the bottom area grows; the conversation panel shrinks.
@@ -383,7 +423,8 @@ impl Widget for &mut App<'_> {
             let detail_count = crate::ui::tool_details::format_tool_details(
                 &review.call.name,
                 &review.call.arguments,
-            ).len() as u16;
+            )
+            .len() as u16;
             4 + detail_count + 2 // title + reason + details + options (2: approve/deny)
         } else {
             3
@@ -417,8 +458,8 @@ impl Widget for &mut App<'_> {
         let vert = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),  // logo
-                Constraint::Min(1),     // content area
+                Constraint::Length(2), // logo
+                Constraint::Min(1),    // content area
             ])
             .split(area);
         let logo = Logo::new();
@@ -439,19 +480,29 @@ impl Widget for &mut App<'_> {
 
             self.render_main(horiz[0], buf, has_todo_bar, todo_bar_height, bottom_height);
 
-            self.sidebar.as_mut().unwrap()
-                .render(
-                    horiz[1],
-                    buf,
-                    self.diagnostics_state.lock().unwrap().baseline.as_deref().unwrap_or(&[]),
-                    self.diag.lsp_configured,
-                    self.mcp_manager.as_deref(),
-                    &self.todo_list,
-                    &crate::tasks::snapshot_all(),
-                );
+            self.sidebar.as_mut().unwrap().render(
+                horiz[1],
+                buf,
+                self.diagnostics_state
+                    .lock()
+                    .unwrap()
+                    .baseline
+                    .as_deref()
+                    .unwrap_or(&[]),
+                self.diag.lsp_configured,
+                self.mcp_manager.as_deref(),
+                &self.todo_list,
+                &crate::tasks::snapshot_all(),
+            );
         } else {
             self.sidebar_area = None;
-            self.render_main(content_area, buf, has_todo_bar, todo_bar_height, bottom_height);
+            self.render_main(
+                content_area,
+                buf,
+                has_todo_bar,
+                todo_bar_height,
+                bottom_height,
+            );
         }
     }
 }

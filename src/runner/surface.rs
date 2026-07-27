@@ -96,6 +96,13 @@ pub(crate) trait AgentSurface: Send + Sync {
             crate::classifier::WorkMode::Auto.icon()
         )
     }
+
+    /// The operation id of this turn, for tagging progress events so a
+    /// front-end can drop events from stale turns. Defaults to 0 for headless
+    /// (where no event channel exists to receive them).
+    fn operation_id(&self) -> u64 {
+        0
+    }
 }
 
 /// The surface for non-interactive runs (the `-p` print mode): progress events

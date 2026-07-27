@@ -139,29 +139,47 @@ struct McpServer {
 
 impl McpServer {
     async fn refresh_if_stale(&self) {
-        if !self.client.take_tools_list_changed() { return; }
-        if let Ok(raw) = self.client.call_with_timeout("tools/list", None, HANDSHAKE_TIMEOUT_SECS).await
-            && let Ok(r) = serde_json::from_value::<types::ListToolsResult>(raw) {
-                *self.tools.lock().unwrap() = r.tools;
-            }
+        if !self.client.take_tools_list_changed() {
+            return;
+        }
+        if let Ok(raw) = self
+            .client
+            .call_with_timeout("tools/list", None, HANDSHAKE_TIMEOUT_SECS)
+            .await
+            && let Ok(r) = serde_json::from_value::<types::ListToolsResult>(raw)
+        {
+            *self.tools.lock().unwrap() = r.tools;
+        }
     }
 
     async fn refresh_resources_if_stale(&self) {
         let changed = self.client.take_resources_list_changed();
         let _upd = self.client.take_resources_updated();
-        if !changed && !_upd { return; }
-        if let Ok(raw) = self.client.call_with_timeout("resources/list", None, HANDSHAKE_TIMEOUT_SECS).await
-            && let Ok(r) = serde_json::from_value::<types::ListResourcesResult>(raw) {
-                *self.resources.lock().unwrap() = r.resources;
-            }
+        if !changed && !_upd {
+            return;
+        }
+        if let Ok(raw) = self
+            .client
+            .call_with_timeout("resources/list", None, HANDSHAKE_TIMEOUT_SECS)
+            .await
+            && let Ok(r) = serde_json::from_value::<types::ListResourcesResult>(raw)
+        {
+            *self.resources.lock().unwrap() = r.resources;
+        }
     }
 
     async fn refresh_prompts_if_stale(&self) {
-        if !self.client.take_prompts_list_changed() { return; }
-        if let Ok(raw) = self.client.call_with_timeout("prompts/list", None, HANDSHAKE_TIMEOUT_SECS).await
-            && let Ok(r) = serde_json::from_value::<types::ListPromptsResult>(raw) {
-                *self.prompts.lock().unwrap() = r.prompts;
-            }
+        if !self.client.take_prompts_list_changed() {
+            return;
+        }
+        if let Ok(raw) = self
+            .client
+            .call_with_timeout("prompts/list", None, HANDSHAKE_TIMEOUT_SECS)
+            .await
+            && let Ok(r) = serde_json::from_value::<types::ListPromptsResult>(raw)
+        {
+            *self.prompts.lock().unwrap() = r.prompts;
+        }
     }
 
     fn stderr_snapshot(&self) -> Vec<String> {
@@ -189,12 +207,19 @@ impl McpManager {
         for cfg in configs {
             let name = cfg.name.clone();
             match Self::connect_one(cfg, workspace_root).await {
-                Ok(server) => { servers.insert(name.clone(), server); }
-                Err(e) => { startup_errors.push(format!("MCP server '{name}': {e}")); }
+                Ok(server) => {
+                    servers.insert(name.clone(), server);
+                }
+                Err(e) => {
+                    startup_errors.push(format!("MCP server '{name}': {e}"));
+                }
             }
         }
 
-        McpManager { servers, startup_errors }
+        McpManager {
+            servers,
+            startup_errors,
+        }
     }
 
     async fn connect_one(cfg: &McpServerConfig, workspace_root: &str) -> Result<McpServer, String> {
@@ -222,29 +247,46 @@ impl McpManager {
             }
         });
         let _ = serde_json::from_value::<types::InitializeResult>(
-            client.call_with_timeout("initialize", Some(init_params), HANDSHAKE_TIMEOUT_SECS)
-                .await.map_err(|e| format!("initialize failed: {e}"))?,
-        ).map_err(|e| format!("bad initialize result: {e}"))?;
+            client
+                .call_with_timeout("initialize", Some(init_params), HANDSHAKE_TIMEOUT_SECS)
+                .await
+                .map_err(|e| format!("initialize failed: {e}"))?,
+        )
+        .map_err(|e| format!("bad initialize result: {e}"))?;
 
-        let _ = client.send_notification("notifications/initialized", None).await;
+        let _ = client
+            .send_notification("notifications/initialized", None)
+            .await;
 
         // Step 2: tools/list
         let tools = serde_json::from_value::<types::ListToolsResult>(
-            client.call_with_timeout("tools/list", None, HANDSHAKE_TIMEOUT_SECS)
-                .await.map_err(|e| format!("tools/list failed: {e}"))?,
-        ).map_err(|e| format!("bad tools/list result: {e}"))?.tools;
+            client
+                .call_with_timeout("tools/list", None, HANDSHAKE_TIMEOUT_SECS)
+                .await
+                .map_err(|e| format!("tools/list failed: {e}"))?,
+        )
+        .map_err(|e| format!("bad tools/list result: {e}"))?
+        .tools;
 
         // Step 3: resources/list (best-effort)
-        let resources = match client.call_with_timeout("resources/list", None, HANDSHAKE_TIMEOUT_SECS).await {
+        let resources = match client
+            .call_with_timeout("resources/list", None, HANDSHAKE_TIMEOUT_SECS)
+            .await
+        {
             Ok(raw) => serde_json::from_value::<types::ListResourcesResult>(raw)
-                .map(|r| r.resources).unwrap_or_default(),
+                .map(|r| r.resources)
+                .unwrap_or_default(),
             Err(_) => Vec::new(),
         };
 
         // Step 4: prompts/list (best-effort)
-        let prompts = match client.call_with_timeout("prompts/list", None, HANDSHAKE_TIMEOUT_SECS).await {
+        let prompts = match client
+            .call_with_timeout("prompts/list", None, HANDSHAKE_TIMEOUT_SECS)
+            .await
+        {
             Ok(raw) => serde_json::from_value::<types::ListPromptsResult>(raw)
-                .map(|r| r.prompts).unwrap_or_default(),
+                .map(|r| r.prompts)
+                .unwrap_or_default(),
             Err(_) => Vec::new(),
         };
 
@@ -258,8 +300,12 @@ impl McpManager {
 
     // -- queries --
 
-    pub(crate) fn is_connected(&self) -> bool { !self.servers.is_empty() }
-    pub(crate) fn server_count(&self) -> usize { self.servers.len() }
+    pub(crate) fn is_connected(&self) -> bool {
+        !self.servers.is_empty()
+    }
+    pub(crate) fn server_count(&self) -> usize {
+        self.servers.len()
+    }
 
     pub(crate) fn all_tools(&self) -> Vec<(String, McpTool)> {
         let mut out = Vec::new();
@@ -311,61 +357,82 @@ impl McpManager {
     // -- resource / prompt access --
 
     pub(crate) async fn read_resource(
-        &self, server_name: &str, uri: &str,
+        &self,
+        server_name: &str,
+        uri: &str,
     ) -> Result<types::ReadResourceResult, String> {
-        let s = self.servers.get(server_name)
+        let s = self
+            .servers
+            .get(server_name)
             .ok_or_else(|| format!("MCP server '{server_name}' not found"))?;
         s.refresh_resources_if_stale().await;
-        let raw = s.client.call_with_timeout(
-            "resources/read", Some(serde_json::json!({"uri": uri})), TOOL_CALL_TIMEOUT_SECS,
-        ).await?;
+        let raw = s
+            .client
+            .call_with_timeout(
+                "resources/read",
+                Some(serde_json::json!({"uri": uri})),
+                TOOL_CALL_TIMEOUT_SECS,
+            )
+            .await?;
         serde_json::from_value(raw).map_err(|e| format!("bad resources/read result: {e}"))
     }
 
     pub(crate) async fn get_prompt(
-        &self, server_name: &str, prompt_name: &str, arguments: Option<serde_json::Value>,
+        &self,
+        server_name: &str,
+        prompt_name: &str,
+        arguments: Option<serde_json::Value>,
     ) -> Result<types::GetPromptResult, String> {
-        let s = self.servers.get(server_name)
+        let s = self
+            .servers
+            .get(server_name)
             .ok_or_else(|| format!("MCP server '{server_name}' not found"))?;
         s.refresh_prompts_if_stale().await;
         let params = match arguments {
             Some(a) => serde_json::json!({"name": prompt_name, "arguments": a}),
             None => serde_json::json!({"name": prompt_name}),
         };
-        let raw = s.client.call_with_timeout(
-            "prompts/get", Some(params), TOOL_CALL_TIMEOUT_SECS,
-        ).await?;
+        let raw = s
+            .client
+            .call_with_timeout("prompts/get", Some(params), TOOL_CALL_TIMEOUT_SECS)
+            .await?;
         serde_json::from_value(raw).map_err(|e| format!("bad prompts/get result: {e}"))
     }
 
     // -- tool call --
 
     pub(crate) async fn call_tool(
-        &self, fqn: &str, arguments: serde_json::Value,
+        &self,
+        fqn: &str,
+        arguments: serde_json::Value,
     ) -> Result<CallToolResult, String> {
-        let (server_name, tool_name) = parse_fqn(fqn)
-            .ok_or_else(|| format!("invalid MCP tool name: {fqn}"))?;
-        let s = self.servers.get(server_name)
+        let (server_name, tool_name) =
+            parse_fqn(fqn).ok_or_else(|| format!("invalid MCP tool name: {fqn}"))?;
+        let s = self
+            .servers
+            .get(server_name)
             .ok_or_else(|| format!("MCP server '{server_name}' not found"))?;
 
         // Attach a progress token so servers that support
         // `notifications/progress` can report progress; the sidebar shows it
         // while the call runs.
-        static PROGRESS_SEQ: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1);
+        static PROGRESS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let token = format!(
             "call-{}",
             PROGRESS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let raw = s.client.call_with_timeout(
-            "tools/call",
-            Some(serde_json::json!({
-                "name": tool_name,
-                "arguments": arguments,
-                "_meta": { "progressToken": token },
-            })),
-            TOOL_CALL_TIMEOUT_SECS,
-        ).await;
+        let raw = s
+            .client
+            .call_with_timeout(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": tool_name,
+                    "arguments": arguments,
+                    "_meta": { "progressToken": token },
+                })),
+                TOOL_CALL_TIMEOUT_SECS,
+            )
+            .await;
         // The call is over either way — drop progress state so the UI never
         // shows stale progress (also covers servers that report under a
         // token of their own instead of the one we attached).
@@ -394,20 +461,26 @@ mod tests {
 
     #[test]
     fn parse_fqn_valid() {
-        assert_eq!(parse_fqn("mcp__filesystem__read_file"), Some(("filesystem", "read_file")));
+        assert_eq!(
+            parse_fqn("mcp__filesystem__read_file"),
+            Some(("filesystem", "read_file"))
+        );
     }
     #[test]
-    fn parse_fqn_no_prefix() { assert_eq!(parse_fqn("command"), None); }
+    fn parse_fqn_no_prefix() {
+        assert_eq!(parse_fqn("command"), None);
+    }
     #[test]
-    fn parse_fqn_partial() { assert_eq!(parse_fqn("mcp__filesystem"), None); }
+    fn parse_fqn_partial() {
+        assert_eq!(parse_fqn("mcp__filesystem"), None);
+    }
 
     #[test]
     fn server_config_without_url_deserializes() {
         // Configs written before HTTP support have no `url` key.
-        let cfg: McpServerConfig = toml::from_str(
-            "name = \"old\"\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\n",
-        )
-        .expect("old config must still parse");
+        let cfg: McpServerConfig =
+            toml::from_str("name = \"old\"\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\n")
+                .expect("old config must still parse");
         assert!(cfg.url.is_none());
         assert_eq!(cfg.command, "npx");
     }
@@ -428,7 +501,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     // Serve requests on this connection until the client
@@ -523,7 +598,10 @@ mod tests {
             }
             // The session issued at initialize must be echoed back.
             "tools/call" => {
-                if headers.to_ascii_lowercase().contains("mcp-session-id: sess-1") {
+                if headers
+                    .to_ascii_lowercase()
+                    .contains("mcp-session-id: sess-1")
+                {
                     http_json(
                         "",
                         &reply(serde_json::json!({
@@ -592,9 +670,15 @@ mod tests {
 
     fn python_exe() -> Option<String> {
         for c in &["python3", "python"] {
-            if std::process::Command::new(c).arg("--version")
-                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-                .status().is_ok() { return Some(c.to_string()); }
+            if std::process::Command::new(c)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+            {
+                return Some(c.to_string());
+            }
         }
         None
     }
@@ -630,37 +714,74 @@ while True:
 
     #[tokio::test]
     async fn mcp_call_with_timeout_normal_path() {
-        let py = match python_exe() { Some(p) => p, None => return };
+        let py = match python_exe() {
+            Some(p) => p,
+            None => return,
+        };
         let scr = write_temp_script("normal", TEST_SERVER_SCRIPT);
-        let client = McpClient::spawn(&py, &[scr.to_str().unwrap().to_string()], &HashMap::new(), ".").unwrap();
+        let client = McpClient::spawn(
+            &py,
+            &[scr.to_str().unwrap().to_string()],
+            &HashMap::new(),
+            ".",
+        )
+        .unwrap();
         let _: types::InitializeResult = serde_json::from_value(
             client.call_with_timeout("initialize", Some(serde_json::json!({
                 "protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}
             })), 5).await.unwrap(),
         ).unwrap();
         let _: types::ListToolsResult = serde_json::from_value(
-            client.call_with_timeout("tools/list", None, 5).await.unwrap(),
-        ).unwrap();
-        let echo = client.call_with_timeout("tools/call",
-            Some(serde_json::json!({"name":"echo","arguments":{"msg":"hi"}})), 5,
-        ).await.unwrap();
+            client
+                .call_with_timeout("tools/list", None, 5)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let echo = client
+            .call_with_timeout(
+                "tools/call",
+                Some(serde_json::json!({"name":"echo","arguments":{"msg":"hi"}})),
+                5,
+            )
+            .await
+            .unwrap();
         let r: types::CallToolResult = serde_json::from_value(echo).unwrap();
-        if let types::ToolContent::Text { text } = &r.content[0] { assert_eq!(text, "echo: hi"); }
-        else { panic!("expected text"); }
+        if let types::ToolContent::Text { text } = &r.content[0] {
+            assert_eq!(text, "echo: hi");
+        } else {
+            panic!("expected text");
+        }
     }
 
     #[tokio::test]
     async fn mcp_call_times_out_on_hanging_server() {
-        let py = match python_exe() { Some(p) => p, None => return };
+        let py = match python_exe() {
+            Some(p) => p,
+            None => return,
+        };
         let scr = write_temp_script("hang", TEST_SERVER_SCRIPT);
-        let client = McpClient::spawn(&py, &[scr.to_str().unwrap().to_string()], &HashMap::new(), ".").unwrap();
+        let client = McpClient::spawn(
+            &py,
+            &[scr.to_str().unwrap().to_string()],
+            &HashMap::new(),
+            ".",
+        )
+        .unwrap();
         let _ = client.call_with_timeout("initialize", Some(serde_json::json!({
             "protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}
         })), 5).await.unwrap();
-        let _ = client.call_with_timeout("tools/list", None, 5).await.unwrap();
-        let r = client.call_with_timeout("tools/call",
-            Some(serde_json::json!({"name":"hang","arguments":{}})), 2,
-        ).await;
+        let _ = client
+            .call_with_timeout("tools/list", None, 5)
+            .await
+            .unwrap();
+        let r = client
+            .call_with_timeout(
+                "tools/call",
+                Some(serde_json::json!({"name":"hang","arguments":{}})),
+                2,
+            )
+            .await;
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("timed out"));
     }
@@ -702,16 +823,32 @@ while True:
     #[tokio::test]
     async fn mcp_tools_list_changed_notification_refreshes_tools() {
         use types::McpPolicy;
-        let py = match python_exe() { Some(p) => p, None => return };
+        let py = match python_exe() {
+            Some(p) => p,
+            None => return,
+        };
         let scr = write_temp_script("notify", NOTIFY_SERVER);
-        let cfg = McpServerConfig { name: "t".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig {
+            name: "t".into(),
+            command: py,
+            args: vec![scr.to_str().unwrap().into()],
+            env: HashMap::new(),
+            url: None,
+            auto_approve: McpPolicy::Trusted,
+        };
         let mgr = McpManager::from_config(&[cfg], ".").await;
-        assert!(mgr.startup_errors.is_empty(), "startup: {:?}", mgr.startup_errors);
-        let v1: Vec<_> = mgr.all_tools().iter().map(|(n,_)| n.clone()).collect();
+        assert!(
+            mgr.startup_errors.is_empty(),
+            "startup: {:?}",
+            mgr.startup_errors
+        );
+        let v1: Vec<_> = mgr.all_tools().iter().map(|(n, _)| n.clone()).collect();
         assert!(v1.contains(&"mcp__t__trigger".into()));
         assert_eq!(v1.len(), 3);
-        mgr.call_tool("mcp__t__trigger", serde_json::json!({})).await.unwrap();
-        let v2: Vec<_> = mgr.all_tools().iter().map(|(n,_)| n.clone()).collect();
+        mgr.call_tool("mcp__t__trigger", serde_json::json!({}))
+            .await
+            .unwrap();
+        let v2: Vec<_> = mgr.all_tools().iter().map(|(n, _)| n.clone()).collect();
         assert!(!v2.contains(&"mcp__t__hang".into()));
         assert!(v2.contains(&"mcp__t__new_tool".into()));
     }
@@ -751,19 +888,41 @@ while True:
     #[tokio::test]
     async fn mcp_resource_list_and_read() {
         use types::McpPolicy;
-        let py = match python_exe() { Some(p) => p, None => return };
+        let py = match python_exe() {
+            Some(p) => p,
+            None => return,
+        };
         let scr = write_temp_script("resource", RESOURCE_SERVER);
-        let cfg = McpServerConfig { name: "r".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig {
+            name: "r".into(),
+            command: py,
+            args: vec![scr.to_str().unwrap().into()],
+            env: HashMap::new(),
+            url: None,
+            auto_approve: McpPolicy::Trusted,
+        };
         let mgr = McpManager::from_config(&[cfg], ".").await;
         assert!(mgr.startup_errors.is_empty());
-        let res: Vec<_> = mgr.all_resources().iter().map(|(f,_,_)| f.clone()).collect();
+        let res: Vec<_> = mgr
+            .all_resources()
+            .iter()
+            .map(|(f, _, _)| f.clone())
+            .collect();
         assert!(res.contains(&"mcp__r__doc://r".into()));
         assert_eq!(res.len(), 2);
         let r = mgr.read_resource("r", "doc://r").await.unwrap();
-        if let types::ResourceContent::Text { text, .. } = &r.contents[0] { assert_eq!(text, "# Hello"); }
-        mgr.call_tool("mcp__r__add", serde_json::json!({})).await.unwrap();
+        if let types::ResourceContent::Text { text, .. } = &r.contents[0] {
+            assert_eq!(text, "# Hello");
+        }
+        mgr.call_tool("mcp__r__add", serde_json::json!({}))
+            .await
+            .unwrap();
         let _ = mgr.read_resource("r", "doc://r").await;
-        let res2: Vec<_> = mgr.all_resources().iter().map(|(f,_,_)| f.clone()).collect();
+        let res2: Vec<_> = mgr
+            .all_resources()
+            .iter()
+            .map(|(f, _, _)| f.clone())
+            .collect();
         assert_eq!(res2.len(), 3);
         assert!(res2.iter().any(|r| r.contains("n")));
     }
@@ -794,16 +953,35 @@ while True:
     #[tokio::test]
     async fn mcp_prompt_list_and_get() {
         use types::McpPolicy;
-        let py = match python_exe() { Some(p) => p, None => return };
+        let py = match python_exe() {
+            Some(p) => p,
+            None => return,
+        };
         let scr = write_temp_script("prompt", PROMPT_SERVER);
-        let cfg = McpServerConfig { name: "p".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig {
+            name: "p".into(),
+            command: py,
+            args: vec![scr.to_str().unwrap().into()],
+            env: HashMap::new(),
+            url: None,
+            auto_approve: McpPolicy::Trusted,
+        };
         let mgr = McpManager::from_config(&[cfg], ".").await;
         assert!(mgr.startup_errors.is_empty());
-        let ps: Vec<_> = mgr.all_prompts().iter().map(|(f,_,_)| f.clone()).collect();
+        let ps: Vec<_> = mgr
+            .all_prompts()
+            .iter()
+            .map(|(f, _, _)| f.clone())
+            .collect();
         assert!(ps.contains(&"mcp__p__g".into()));
         assert!(ps.contains(&"mcp__p__f".into()));
-        let r = mgr.get_prompt("p", "g", Some(serde_json::json!({"u":"Alice"}))).await.unwrap();
-        if let types::PromptContent::Text { text } = &r.messages[0].content { assert!(text.contains("Alice")); }
+        let r = mgr
+            .get_prompt("p", "g", Some(serde_json::json!({"u":"Alice"})))
+            .await
+            .unwrap();
+        if let types::PromptContent::Text { text } = &r.messages[0].content {
+            assert!(text.contains("Alice"));
+        }
         let r2 = mgr.get_prompt("p", "f", None).await.unwrap();
         assert_eq!(r2.messages.len(), 1);
     }
@@ -837,9 +1015,19 @@ while True:
     #[tokio::test]
     async fn mcp_stderr_capture() {
         use types::McpPolicy;
-        let py = match python_exe() { Some(p) => p, None => return };
+        let py = match python_exe() {
+            Some(p) => p,
+            None => return,
+        };
         let scr = write_temp_script("stderr", STDERR_SERVER);
-        let cfg = McpServerConfig { name: "s".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig {
+            name: "s".into(),
+            command: py,
+            args: vec![scr.to_str().unwrap().into()],
+            env: HashMap::new(),
+            url: None,
+            auto_approve: McpPolicy::Trusted,
+        };
         let mgr = McpManager::from_config(&[cfg], ".").await;
         // stderr is drained by a background task, so poll briefly instead of
         // asserting on the instantaneous snapshot.
@@ -848,15 +1036,21 @@ while True:
             lines.iter().any(|l| l.contains(needle))
         };
         for _ in 0..200 {
-            if wait_for_line(&mgr, "start") { break; }
+            if wait_for_line(&mgr, "start") {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(wait_for_line(&mgr, "start"));
         // Snapshots are non-destructive — the UI polls this every frame.
         assert!(wait_for_line(&mgr, "start"));
-        mgr.call_tool("mcp__s__e", serde_json::json!({"msg":"hi"})).await.unwrap();
+        mgr.call_tool("mcp__s__e", serde_json::json!({"msg":"hi"}))
+            .await
+            .unwrap();
         for _ in 0..200 {
-            if wait_for_line(&mgr, "echo: hi") { break; }
+            if wait_for_line(&mgr, "echo: hi") {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(wait_for_line(&mgr, "echo: hi"));
@@ -913,9 +1107,19 @@ while True:
     #[tokio::test]
     async fn mcp_cancellation_progress_and_roots() {
         use types::McpPolicy;
-        let py = match python_exe() { Some(p) => p, None => return };
+        let py = match python_exe() {
+            Some(p) => p,
+            None => return,
+        };
         let scr = write_temp_script("advanced", ADVANCED_SERVER);
-        let cfg = McpServerConfig { name: "a".into(), command: py, args: vec![scr.to_str().unwrap().into()], env: HashMap::new(), url: None, auto_approve: McpPolicy::Trusted };
+        let cfg = McpServerConfig {
+            name: "a".into(),
+            command: py,
+            args: vec![scr.to_str().unwrap().into()],
+            env: HashMap::new(),
+            url: None,
+            auto_approve: McpPolicy::Trusted,
+        };
         let mgr = McpManager::from_config(&[cfg], ".").await;
         assert!(mgr.startup_errors.is_empty());
 
@@ -945,13 +1149,23 @@ while True:
 
         // --- Roots ---
         // roots_probe sends roots/list to client, reads response.
-        let r = mgr.call_tool("mcp__a__roots_probe", serde_json::json!({})).await.unwrap();
-        let text: Vec<_> = r.content.iter().filter_map(|c| match c {
-            types::ToolContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        }).collect();
+        let r = mgr
+            .call_tool("mcp__a__roots_probe", serde_json::json!({}))
+            .await
+            .unwrap();
+        let text: Vec<_> = r
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                types::ToolContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
         let joined = text.join("");
         assert!(joined.contains("file://"), "roots response: {joined}");
-        assert!(joined.contains("roots"), "response should mention roots: {joined}");
+        assert!(
+            joined.contains("roots"),
+            "response should mention roots: {joined}"
+        );
     }
 }

@@ -104,22 +104,30 @@ struct Args {
 }
 
 pub async fn run(arguments: &str) -> Result<String, String> {
-    run_inner(arguments, None).await
+    run_inner(arguments, None, &crate::cancel::CancellationToken::new()).await
 }
 
 /// Like [`run`], but streams the command's output to the live registry under
 /// `call_id` while it runs, so the TUI can render it in real time. Used by the
 /// agent's tool path (which has a call id); the plain [`run`] is used by the
 /// MCP server and headless callers that have nowhere to show live output.
-pub async fn run_with_live(arguments: &str, call_id: &str) -> Result<String, String> {
-    let result = run_inner(arguments, Some(call_id)).await;
+pub async fn run_with_live(
+    arguments: &str,
+    call_id: &str,
+    cancel: &crate::cancel::CancellationToken,
+) -> Result<String, String> {
+    let result = run_inner(arguments, Some(call_id), cancel).await;
     // Always drop the live buffer — success, failure, or timeout — so the
     // committed result takes over and the registry never leaks an entry.
     finish_live(call_id);
     result
 }
 
-async fn run_inner(arguments: &str, live_id: Option<&str>) -> Result<String, String> {
+async fn run_inner(
+    arguments: &str,
+    live_id: Option<&str>,
+    cancel: &crate::cancel::CancellationToken,
+) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
         Err(error) => return Err(format!("error: invalid arguments: {error}")),
@@ -130,6 +138,7 @@ async fn run_inner(arguments: &str, live_id: Option<&str>) -> Result<String, Str
         args.dir.as_deref(),
         Some(args.timeout.unwrap_or(120)),
         live_id,
+        cancel,
     )
     .await
     {
@@ -156,6 +165,7 @@ async fn execute(
     dir: Option<&str>,
     timeout_secs: Option<u64>,
     live_id: Option<&str>,
+    cancel: &crate::cancel::CancellationToken,
 ) -> std::io::Result<(Option<i32>, String, String)> {
     let (program, flag) = shell();
     let mut cmd = Command::new(program);
@@ -197,20 +207,38 @@ async fn execute(
     // a pipe and deadlock, and the live buffer keeps updating while we wait.
     let combined = async { tokio::join!(out_fut, err_fut, child.wait()) };
 
+    // Race: cancellation kills the child promptly, even during a long-running
+    // command. `kill_on_drop(true)` is set, so dropping `child` kills it.
     let (stdout, stderr, status) = match timeout_secs {
-        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), combined).await {
-            Ok(triple) => triple,
-            Err(_elapsed) => {
-                // The `combined` future (holding the `child.wait()` borrow) is
-                // dropped here; returning drops `child` itself, and
-                // `kill_on_drop(true)` kills the process.
+        Some(secs) => {
+            match tokio::time::timeout(Duration::from_secs(secs), cancel.wait_or(combined)).await {
+                Ok(Some(triple)) => triple,
+                Ok(None) => {
+                    // Cancelled before timeout or completion.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled",
+                    ));
+                }
+                Err(_elapsed) => {
+                    // Timeout elapsed first.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("command timed out after {secs}s"),
+                    ));
+                }
+            }
+        }
+        None => match cancel.wait_or(combined).await {
+            Some(triple) => triple,
+            None => {
+                // Cancelled. Dropping `child` kills it via kill_on_drop.
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("command timed out after {secs}s"),
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled",
                 ));
             }
         },
-        None => combined.await,
     };
 
     Ok((status?.code(), stdout, stderr))
@@ -446,7 +474,8 @@ mod live_tests {
             r#"{"command":"echo streaming-marker && sleep 1"}"#
         };
 
-        let handle = tokio::spawn(async move { run_with_live(args, call_id).await });
+        let cancel = crate::cancel::CancellationToken::new();
+        let handle = tokio::spawn(async move { run_with_live(args, call_id, &cancel).await });
 
         // Poll for the marker to appear in the live buffer while running.
         let mut seen = false;
@@ -459,7 +488,10 @@ mod live_tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(seen, "live output should show the marker while the command runs");
+        assert!(
+            seen,
+            "live output should show the marker while the command runs"
+        );
 
         let result = handle.await.unwrap();
         assert!(result.unwrap().contains("streaming-marker"));

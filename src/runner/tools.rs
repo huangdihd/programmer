@@ -37,8 +37,15 @@ async fn run_labeled_call(
     sender: tokio::sync::mpsc::UnboundedSender<Event>,
     registry: Arc<ToolRegistry>,
     label: String,
+    cancel: CancellationToken,
+    operation_id: u64,
 ) -> crate::tools::ToolOutput {
-    let result = registry.call(&call, &ToolCtx { sender: &sender }).await;
+    let ctx = ToolCtx {
+        sender: &sender,
+        cancel: &cancel,
+        operation_id,
+    };
+    let result = registry.call(&call, &ctx).await;
     let mut out = crate::tools::make_tool_output(&call.call_id, result);
     if out.approval_label.is_none() {
         out.approval_label = Some(label);
@@ -61,6 +68,7 @@ pub(crate) async fn run_tool_batch(
     approval_label: String,
     sender: tokio::sync::mpsc::UnboundedSender<Event>,
     registry: Arc<ToolRegistry>,
+    operation_id: u64,
 ) -> Vec<crate::tools::ToolOutput> {
     let mut outputs = denied;
     let mut i = 0;
@@ -83,6 +91,8 @@ pub(crate) async fn run_tool_batch(
                         sender.clone(),
                         registry.clone(),
                         approval_label.clone(),
+                        cancel.clone(),
+                        operation_id,
                     )
                 })
                 .collect();
@@ -97,6 +107,8 @@ pub(crate) async fn run_tool_batch(
                 sender.clone(),
                 registry.clone(),
                 approval_label.clone(),
+                cancel.clone(),
+                operation_id,
             )
             .await;
             outputs.push(out);
@@ -161,6 +173,7 @@ mod tests {
             "test-label".to_string(),
             tx,
             local_registry(),
+            0,
         )
         .await;
 
@@ -197,6 +210,7 @@ mod tests {
             "test-label".to_string(),
             tx,
             local_registry(),
+            0,
         )
         .await;
         // Cancelled before running anything allowed: only the denial remains.

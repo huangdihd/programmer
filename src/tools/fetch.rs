@@ -276,7 +276,13 @@ fn is_forbidden_ip(ip: IpAddr) -> bool {
 
 /// Slice `text` by characters for paging and append a footer with the final
 /// URL and, when there is more content, the next `start_index` to request.
-fn page(text: &str, start: usize, max_length: usize, url: &reqwest::Url, body_truncated: bool) -> String {
+fn page(
+    text: &str,
+    start: usize,
+    max_length: usize,
+    url: &reqwest::Url,
+    body_truncated: bool,
+) -> String {
     let total = text.chars().count();
     if total == 0 {
         return format!("(empty response)\n[fetched {url}]");
@@ -289,7 +295,9 @@ fn page(text: &str, start: usize, max_length: usize, url: &reqwest::Url, body_tr
     let slice: String = text.chars().skip(start).take(max_length).collect();
     let end = start + slice.chars().count();
     let mut out = slice;
-    out.push_str(&format!("\n[fetched {url}; chars {start}..{end} of {total}"));
+    out.push_str(&format!(
+        "\n[fetched {url}; chars {start}..{end} of {total}"
+    ));
     if end < total {
         out.push_str(&format!("; continue with start_index={end}"));
     }
@@ -306,7 +314,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_and_non_http_urls() {
-        let err = run(r#"{"url":"not a url"}"#).await.expect_err("invalid URL");
+        let err = run(r#"{"url":"not a url"}"#)
+            .await
+            .expect_err("invalid URL");
         assert!(err.starts_with("error: invalid URL"), "got: {err}");
 
         for url in ["file:///etc/passwd", "ftp://example.com/x"] {
@@ -330,10 +340,7 @@ mod tests {
             let err = run(&format!(r#"{{"url":"{url}"}}"#))
                 .await
                 .expect_err("private address must be refused");
-            assert!(
-                err.contains("private/internal"),
-                "url {url} got: {err}"
-            );
+            assert!(err.contains("private/internal"), "url {url} got: {err}");
         }
     }
 
@@ -352,10 +359,16 @@ mod tests {
             "fe80::1",
             "::ffff:127.0.0.1",
         ] {
-            assert!(is_forbidden_ip(ip.parse().unwrap()), "{ip} should be forbidden");
+            assert!(
+                is_forbidden_ip(ip.parse().unwrap()),
+                "{ip} should be forbidden"
+            );
         }
         for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "100.128.0.1"] {
-            assert!(!is_forbidden_ip(ip.parse().unwrap()), "{ip} should be allowed");
+            assert!(
+                !is_forbidden_ip(ip.parse().unwrap()),
+                "{ip} should be allowed"
+            );
         }
     }
 

@@ -112,10 +112,7 @@ fn diagnostic_from_rustc_message(msg: &Value) -> Option<Diagnostic> {
         .or_else(|| spans.first())?;
 
     let file = span.get("file_name").and_then(Value::as_str)?.to_string();
-    let line = span
-        .get("line_start")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+    let line = span.get("line_start").and_then(Value::as_u64).unwrap_or(0) as u32;
     let col = span
         .get("column_start")
         .and_then(Value::as_u64)

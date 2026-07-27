@@ -170,6 +170,47 @@ pub(crate) enum RunnerEvent<'a> {
     Phase(RunnerPhase),
 }
 
+/// When a turn is cancelled after assistant function calls have already been
+/// committed to the conversation, add exactly one synthetic "cancelled" tool
+/// output per unmatched call so the API message ordering stays valid (every
+/// function-call item must be followed by a matching tool-output item before
+/// the next request).
+fn ensure_tool_output_pairing(conversation: &Mutex<Conversation>) {
+    use async_openai::types::responses::{FunctionCallOutput, OutputItem};
+    use std::collections::HashSet;
+
+    let mut conv = conversation.lock().unwrap();
+    // Collect call_ids from committed function-call items.
+    let call_ids: HashSet<String> = conv
+        .items()
+        .filter_map(|item| match item {
+            MessageItem::Output(OutputItem::FunctionCall(c)) => Some(c.call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    // Collect call_ids that already have a tool output.
+    let matched: HashSet<String> = conv
+        .items()
+        .filter_map(|item| match item {
+            MessageItem::ToolOutput { output, .. } => Some(output.call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    // For each unmatched call, inject a synthetic cancelled output.
+    for call_id in call_ids.difference(&matched) {
+        conv.add_tool_output(crate::tools::ToolOutput {
+            param: async_openai::types::responses::FunctionCallOutputItemParam {
+                call_id: call_id.clone(),
+                output: FunctionCallOutput::Text("cancelled".to_string()),
+                id: None,
+                status: None,
+            },
+            failed: true,
+            approval_label: Some("\u{2716} cancelled by user".to_string()),
+        });
+    }
+}
+
 impl TurnRunner {
     /// Run a full turn: stream a response, run any tool calls it requests, and
     /// loop until the model answers with no tool calls (returning its text) or
@@ -185,6 +226,7 @@ impl TurnRunner {
 
         loop {
             if cancel.is_cancelled() {
+                ensure_tool_output_pairing(conversation);
                 return Err(RunnerError::Cancelled);
             }
 
@@ -223,6 +265,7 @@ impl TurnRunner {
             .await;
 
             if cancel.is_cancelled() {
+                ensure_tool_output_pairing(conversation);
                 return Err(RunnerError::Cancelled);
             }
             if let Some(e) = stream_err {
@@ -306,8 +349,14 @@ impl TurnRunner {
                     tool_names: tool_names.clone(),
                     edited: false,
                 };
-                self.run_hooks(hooks::HookPhase::Before, conversation, &summary, surface)
-                    .await;
+                self.run_hooks(
+                    hooks::HookPhase::Before,
+                    conversation,
+                    &summary,
+                    surface,
+                    cancel,
+                )
+                .await;
             }
 
             let outputs = self.run_calls(conversation, calls, cancel, surface).await;
@@ -330,11 +379,20 @@ impl TurnRunner {
                     // bow out when nothing was edited.
                     if let Some((tool_names, _)) = hook_meta {
                         let summary = hooks::BatchSummary { tool_names, edited };
-                        self.run_hooks(hooks::HookPhase::After, conversation, &summary, surface)
-                            .await;
+                        self.run_hooks(
+                            hooks::HookPhase::After,
+                            conversation,
+                            &summary,
+                            surface,
+                            cancel,
+                        )
+                        .await;
                     }
                 }
-                None => return Err(RunnerError::Cancelled),
+                None => {
+                    ensure_tool_output_pairing(conversation);
+                    return Err(RunnerError::Cancelled);
+                }
             }
         }
     }
@@ -432,6 +490,7 @@ impl TurnRunner {
         // task updates reach the UI); otherwise a throwaway channel with a
         // dropped receiver — safe because ask_user is already pre-denied there.
         let sender = tool_sender.unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().0);
+        let op_id = surface.operation_id();
         let outputs = tools::run_tool_batch(
             allowed,
             denied,
@@ -439,6 +498,7 @@ impl TurnRunner {
             surface.approval_label(),
             sender,
             self.tools.clone(),
+            op_id,
         )
         .await;
         Some(outputs)
@@ -456,11 +516,13 @@ impl TurnRunner {
         conversation: &Mutex<Conversation>,
         summary: &hooks::BatchSummary,
         surface: &dyn AgentSurface,
+        cancel: &CancellationToken,
     ) {
         let ctx = hooks::HookContext {
             conversation,
             surface,
             batch: summary,
+            cancel,
         };
         let mut parts: Vec<String> = Vec::new();
         for hook in &self.hooks {
@@ -468,10 +530,10 @@ impl TurnRunner {
                 hooks::HookPhase::Before => hook.before_tool_batch(&ctx).await,
                 hooks::HookPhase::After => hook.after_tool_batch(&ctx).await,
             };
-            if let Some(text) = out {
-                if !text.is_empty() {
-                    parts.push(text);
-                }
+            if let Some(text) = out
+                && !text.is_empty()
+            {
+                parts.push(text);
             }
         }
         if parts.is_empty() {
@@ -1126,5 +1188,122 @@ mod tests {
             .unwrap_or_default();
         assert!(!out.contains("Post-edit check"), "nothing appended: {out}");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn ensure_tool_output_pairing_adds_synthetic_outputs() {
+        use async_openai::types::responses::{FunctionCallOutput, OutputItem, OutputStatus};
+        let conv = Mutex::new(Conversation::new());
+
+        // Simulate: two function calls committed, only one has an output.
+        conv.lock()
+            .unwrap()
+            .add_output(OutputItem::FunctionCall(FunctionToolCall {
+                arguments: "{}".into(),
+                call_id: "call_1".into(),
+                namespace: None,
+                name: "read_file".into(),
+                id: Some("fc_1".into()),
+                status: Some(OutputStatus::Completed),
+            }));
+        conv.lock()
+            .unwrap()
+            .add_output(OutputItem::FunctionCall(FunctionToolCall {
+                arguments: "{}".into(),
+                call_id: "call_2".into(),
+                namespace: None,
+                name: "write_file".into(),
+                id: Some("fc_2".into()),
+                status: Some(OutputStatus::Completed),
+            }));
+        conv.lock()
+            .unwrap()
+            .add_tool_output(crate::tools::ToolOutput {
+                param: async_openai::types::responses::FunctionCallOutputItemParam {
+                    call_id: "call_1".into(),
+                    output: FunctionCallOutput::Text("ok".into()),
+                    id: None,
+                    status: None,
+                },
+                failed: false,
+                approval_label: None,
+            });
+
+        ensure_tool_output_pairing(&conv);
+
+        // Now both call_ids should have outputs.
+        let items: Vec<_> = conv.lock().unwrap().items().cloned().collect();
+        let outputs: Vec<_> = items
+            .iter()
+            .filter_map(|it| match it {
+                MessageItem::ToolOutput { output, .. } => Some(output.call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.contains(&"call_1".to_string()));
+        assert!(outputs.contains(&"call_2".to_string()));
+        // The synthetic output for call_2 should be marked failed and cancelled.
+        let syn: Vec<_> = items
+            .iter()
+            .filter_map(|it| match it {
+                MessageItem::ToolOutput {
+                    output,
+                    failed,
+                    approval_label,
+                } if output.call_id == "call_2" => Some((*failed, approval_label.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(syn.len(), 1);
+        assert!(syn[0].0, "synthetic output is failed");
+        assert!(
+            syn[0].1.as_deref().is_some_and(|l| l.contains("cancelled")),
+            "synthetic output label mentions cancellation"
+        );
+    }
+
+    #[test]
+    fn ensure_tool_output_pairing_is_idempotent() {
+        use async_openai::types::responses::{FunctionCallOutput, OutputItem, OutputStatus};
+        let conv = Mutex::new(Conversation::new());
+
+        conv.lock()
+            .unwrap()
+            .add_output(OutputItem::FunctionCall(FunctionToolCall {
+                arguments: "{}".into(),
+                call_id: "c1".into(),
+                namespace: None,
+                name: "read_file".into(),
+                id: Some("fc_1".into()),
+                status: Some(OutputStatus::Completed),
+            }));
+        conv.lock()
+            .unwrap()
+            .add_tool_output(crate::tools::ToolOutput {
+                param: async_openai::types::responses::FunctionCallOutputItemParam {
+                    call_id: "c1".into(),
+                    output: FunctionCallOutput::Text("ok".into()),
+                    id: None,
+                    status: None,
+                },
+                failed: false,
+                approval_label: None,
+            });
+
+        // Called twice; should not add duplicates.
+        ensure_tool_output_pairing(&conv);
+        ensure_tool_output_pairing(&conv);
+
+        let outputs: Vec<_> = conv
+            .lock()
+            .unwrap()
+            .items()
+            .filter_map(|it| match it {
+                MessageItem::ToolOutput { output, .. } => Some(output.call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 1, "should not duplicate outputs");
     }
 }
