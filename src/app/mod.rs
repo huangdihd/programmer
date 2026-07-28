@@ -16,6 +16,7 @@
 //! Application core: struct definition, lifecycle, and method dispatch to
 //! focused submodules.
 
+mod command_handlers;
 pub(crate) mod commands;
 pub(crate) mod diagnostics;
 pub(crate) mod events;

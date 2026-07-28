@@ -22,7 +22,7 @@ use tokio::io::AsyncReadExt;
 // Command parsing
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Quit,
     Clear,
@@ -63,6 +63,313 @@ pub enum Command {
     Vision(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandKind {
+    Quit,
+    Clear,
+    New,
+    Model,
+    Providers,
+    Mode,
+    Classifier,
+    Init,
+    Help,
+    Session,
+    Todo,
+    Skill,
+    Mcp,
+    Plan,
+    Terminal,
+    Compact,
+    Thinking,
+    Vision,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompletionKind {
+    None,
+    Model,
+    Fixed(&'static [&'static str]),
+    Skill,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HelpEntry {
+    order: u8,
+    usage: &'static str,
+    description: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommandSpec {
+    kind: CommandKind,
+    name: &'static str,
+    aliases: &'static [&'static str],
+    completion: CompletionKind,
+    help: &'static [HelpEntry],
+}
+
+impl CommandKind {
+    fn command(self, args: String) -> Command {
+        match self {
+            Self::Quit => Command::Quit,
+            Self::Clear => Command::Clear,
+            Self::New => Command::New,
+            Self::Model => Command::Model(args),
+            Self::Providers => Command::Providers(args),
+            Self::Mode => Command::Mode(args),
+            Self::Classifier => Command::Classifier(args),
+            Self::Init => Command::Init,
+            Self::Help => Command::Help,
+            Self::Session => Command::Session,
+            Self::Todo => Command::Todo,
+            Self::Skill => Command::Skill(args),
+            Self::Mcp => Command::Mcp(args),
+            Self::Plan => Command::Plan(args),
+            Self::Terminal => Command::Terminal(args),
+            Self::Compact => Command::Compact(args),
+            Self::Thinking => Command::Thinking(args),
+            Self::Vision => Command::Vision(args),
+        }
+    }
+}
+
+impl CommandSpec {
+    fn matches(&self, name: &str) -> bool {
+        self.name == name || self.aliases.contains(&name)
+    }
+}
+
+const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        kind: CommandKind::Model,
+        name: "model",
+        aliases: &["m"],
+        completion: CompletionKind::Model,
+        help: &[HelpEntry {
+            order: 0,
+            usage: "/model <provider/model>",
+            description: "Switch to a different model",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::New,
+        name: "new",
+        aliases: &["n"],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 15,
+            usage: "/new | /n",
+            description: "Start a new session (saves current)",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Providers,
+        name: "providers",
+        aliases: &["provider"],
+        completion: CompletionKind::Fixed(&["show", "manage"]),
+        help: &[
+            HelpEntry {
+                order: 16,
+                usage: "/providers show",
+                description: "List all configured providers and models",
+            },
+            HelpEntry {
+                order: 17,
+                usage: "/providers manage",
+                description: "Open the provider management panel",
+            },
+        ],
+    },
+    CommandSpec {
+        kind: CommandKind::Session,
+        name: "session",
+        aliases: &["s"],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 18,
+            usage: "/session | /s",
+            description: "Show current session info",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Mode,
+        name: "mode",
+        aliases: &[],
+        completion: CompletionKind::Fixed(&["manual", "edits", "auto"]),
+        help: &[HelpEntry {
+            order: 1,
+            usage: "/mode <manual|auto|plan|yolo>",
+            description: "Set work mode (or cycle with Ctrl+T)",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Classifier,
+        name: "classifier",
+        aliases: &[],
+        completion: CompletionKind::Model,
+        help: &[HelpEntry {
+            order: 2,
+            usage: "/classifier [provider/model]",
+            description: "Set/show the Auto-mode classifier model",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Init,
+        name: "init",
+        aliases: &[],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 3,
+            usage: "/init",
+            description: "Explore the project, write PROGRAMMER.md, set up diagnostics",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Todo,
+        name: "todo",
+        aliases: &["todos", "t"],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 14,
+            usage: "/todo | /t",
+            description: "Open the todo list panel",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Skill,
+        name: "skill",
+        aliases: &["skills"],
+        completion: CompletionKind::Skill,
+        help: &[
+            HelpEntry {
+                order: 6,
+                usage: "/skill <name|list|off>",
+                description: "Activate, list, or clear agent skills",
+            },
+            HelpEntry {
+                order: 7,
+                usage: "/skill manage",
+                description: "Open the skills management panel",
+            },
+        ],
+    },
+    CommandSpec {
+        kind: CommandKind::Mcp,
+        name: "mcp",
+        aliases: &[],
+        completion: CompletionKind::Fixed(&["show", "manage"]),
+        help: &[
+            HelpEntry {
+                order: 8,
+                usage: "/mcp show",
+                description: "List configured MCP servers and their status",
+            },
+            HelpEntry {
+                order: 9,
+                usage: "/mcp manage",
+                description: "Open the MCP server management panel",
+            },
+        ],
+    },
+    CommandSpec {
+        kind: CommandKind::Plan,
+        name: "plan",
+        aliases: &[],
+        completion: CompletionKind::None,
+        help: &[
+            HelpEntry {
+                order: 4,
+                usage: "/plan approve",
+                description: "Approve the current plan (Plan mode)",
+            },
+            HelpEntry {
+                order: 5,
+                usage: "/plan cancel",
+                description: "Cancel plan and return to Auto mode",
+            },
+        ],
+    },
+    CommandSpec {
+        kind: CommandKind::Terminal,
+        name: "terminal",
+        aliases: &["term"],
+        completion: CompletionKind::Terminal,
+        help: &[HelpEntry {
+            order: 10,
+            usage: "/terminal [id]",
+            description: "Open the interactive terminal for a PTY task",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Compact,
+        name: "compact",
+        aliases: &[],
+        completion: CompletionKind::Model,
+        help: &[HelpEntry {
+            order: 11,
+            usage: "/compact [provider/model]",
+            description: "Summarize older history to shrink the model's context",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Thinking,
+        name: "thinking",
+        aliases: &[],
+        completion: CompletionKind::Fixed(crate::thinking::ThinkingLevel::COMPLETIONS),
+        help: &[HelpEntry {
+            order: 12,
+            usage: "/thinking [auto|none|minimal|low|medium|high|xhigh]",
+            description: "Set/show reasoning effort for chat and compaction",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Vision,
+        name: "vision",
+        aliases: &[],
+        completion: CompletionKind::Fixed(&["on", "off"]),
+        help: &[HelpEntry {
+            order: 13,
+            usage: "/vision <on|off>",
+            description: "Enable or disable image attachments for this session",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Clear,
+        name: "clear",
+        aliases: &["c"],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 19,
+            usage: "/clear | /c",
+            description: "Clear the conversation history",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Quit,
+        name: "quit",
+        aliases: &["q", "exit"],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 20,
+            usage: "/quit | /q",
+            description: "Exit the application",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Help,
+        name: "help",
+        aliases: &["?"],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 21,
+            usage: "/help | /?",
+            description: "Show this help",
+        }],
+    },
+];
+
 impl Command {
     /// Parse a slash-command from user input. Returns `None` if the input does
     /// not start with `/` or if the command name is not recognised (in which
@@ -79,106 +386,25 @@ impl Command {
             (&input[1..], String::new())
         };
 
-        match cmd {
-            "q" | "quit" | "exit" => Some(Command::Quit),
-            "c" | "clear" => Some(Command::Clear),
-            "new" | "n" => Some(Command::New),
-            "model" | "m" => Some(Command::Model(args)),
-            "providers" | "provider" => Some(Command::Providers(args)),
-            "mode" => Some(Command::Mode(args)),
-            "classifier" => Some(Command::Classifier(args)),
-            "init" => Some(Command::Init),
-            "help" | "?" => Some(Command::Help),
-            "session" | "s" => Some(Command::Session),
-            "todo" | "todos" | "t" => Some(Command::Todo),
-            "skill" | "skills" => Some(Command::Skill(args)),
-            "mcp" => Some(Command::Mcp(args)),
-            "plan" => Some(Command::Plan(args)),
-            "terminal" | "term" => Some(Command::Terminal(args)),
-            "compact" => Some(Command::Compact(args)),
-            "thinking" => Some(Command::Thinking(args)),
-            "vision" => Some(Command::Vision(args)),
-            _ => None,
-        }
+        COMMAND_SPECS
+            .iter()
+            .find(|spec| spec.matches(cmd))
+            .map(|spec| spec.kind.command(args))
     }
 
     /// All command names (without leading `/`), for completion.
-    pub fn all_commands() -> &'static [&'static str] {
-        &[
-            "model",
-            "new",
-            "providers",
-            "session",
-            "mode",
-            "classifier",
-            "init",
-            "todo",
-            "skill",
-            "mcp",
-            "plan",
-            "terminal",
-            "compact",
-            "thinking",
-            "vision",
-            "clear",
-            "quit",
-            "help",
-        ]
+    pub fn all_commands() -> impl Iterator<Item = &'static str> {
+        COMMAND_SPECS.iter().map(|spec| spec.name)
     }
 
     /// Human-readable descriptions for the help text.
-    pub fn descriptions() -> &'static [(&'static str, &'static str)] {
-        &[
-            ("/model <provider/model>", "Switch to a different model"),
-            (
-                "/mode <manual|auto|plan|yolo>",
-                "Set work mode (or cycle with Ctrl+T)",
-            ),
-            (
-                "/classifier [provider/model]",
-                "Set/show the Auto-mode classifier model",
-            ),
-            (
-                "/init",
-                "Explore the project, write PROGRAMMER.md, set up diagnostics",
-            ),
-            ("/plan approve", "Approve the current plan (Plan mode)"),
-            ("/plan cancel", "Cancel plan and return to Auto mode"),
-            (
-                "/skill <name|list|off>",
-                "Activate, list, or clear agent skills",
-            ),
-            ("/skill manage", "Open the skills management panel"),
-            ("/mcp show", "List configured MCP servers and their status"),
-            ("/mcp manage", "Open the MCP server management panel"),
-            (
-                "/terminal [id]",
-                "Open the interactive terminal for a PTY task",
-            ),
-            (
-                "/compact [provider/model]",
-                "Summarize older history to shrink the model's context",
-            ),
-            (
-                "/thinking [auto|none|minimal|low|medium|high|xhigh]",
-                "Set/show reasoning effort for chat and compaction",
-            ),
-            (
-                "/vision <on|off>",
-                "Enable or disable image attachments for this session",
-            ),
-            ("/todo | /t", "Open the todo list panel"),
-            ("/new | /n", "Start a new session (saves current)"),
-            (
-                "/providers show",
-                "List all configured providers and models",
-            ),
-            ("/providers manage", "Open the provider management panel"),
-            ("/session | /s", "Show current session info"),
-            ("/clear | /c", "Clear the conversation history"),
-            ("/quit | /q", "Exit the application"),
-            ("/help | /?", "Show this help"),
-        ]
+    pub fn descriptions() -> Vec<(&'static str, &'static str)> {
+        let mut entries: Vec<_> = COMMAND_SPECS.iter().flat_map(|spec| spec.help).collect();
+        entries.sort_by_key(|entry| entry.order);
+        entries
+            .into_iter()
+            .map(|entry| (entry.usage, entry.description))
+            .collect()
     }
 }
 
@@ -247,7 +473,6 @@ impl CompletionEngine {
             // Completing the command name itself.
             let typed = parts.first().copied().unwrap_or("");
             let candidates: Vec<String> = Command::all_commands()
-                .iter()
                 .filter(|c| c.starts_with(typed))
                 .map(|c| format!("/{}", c))
                 .collect();
@@ -255,20 +480,13 @@ impl CompletionEngine {
         }
 
         let cmd = parts[0];
-        match cmd {
-            "model" | "m" => Self::complete_model(text, cmd, pm),
-            "classifier" => Self::complete_model(text, cmd, pm),
-            "compact" => Self::complete_model(text, cmd, pm),
-            "thinking" => {
-                Self::complete_subcommand(text, cmd, crate::thinking::ThinkingLevel::COMPLETIONS)
-            }
-            "vision" => Self::complete_subcommand(text, cmd, &["on", "off"]),
-            "mode" => Self::complete_subcommand(text, cmd, &["manual", "edits", "auto"]),
-            "providers" | "provider" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
-            "skill" | "skills" => Self::complete_skill(text, cmd, skill_registry),
-            "mcp" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
-            "terminal" | "term" => Self::complete_terminal(text, cmd),
-            _ => None,
+        let spec = COMMAND_SPECS.iter().find(|spec| spec.matches(cmd))?;
+        match spec.completion {
+            CompletionKind::None => None,
+            CompletionKind::Model => Self::complete_model(text, cmd, pm),
+            CompletionKind::Fixed(values) => Self::complete_subcommand(text, cmd, values),
+            CompletionKind::Skill => Self::complete_skill(text, cmd, skill_registry),
+            CompletionKind::Terminal => Self::complete_terminal(text, cmd),
         }
     }
 
@@ -739,7 +957,7 @@ mod tests {
             Command::parse("/thinking high"),
             Some(Command::Thinking(level)) if level == "high"
         ));
-        assert!(Command::all_commands().contains(&"thinking"));
+        assert!(Command::all_commands().any(|name| name == "thinking"));
         assert_eq!(crate::thinking::ThinkingLevel::parse("off"), None);
 
         let state = CompletionEngine::complete_subcommand(
@@ -749,6 +967,161 @@ mod tests {
         )
         .expect("thinking level completion");
         assert_eq!(state.candidates, vec!["high"]);
+    }
+
+    #[test]
+    fn command_catalog_preserves_names_aliases_and_argument_parsing() {
+        let expected_names = [
+            "model",
+            "new",
+            "providers",
+            "session",
+            "mode",
+            "classifier",
+            "init",
+            "todo",
+            "skill",
+            "mcp",
+            "plan",
+            "terminal",
+            "compact",
+            "thinking",
+            "vision",
+            "clear",
+            "quit",
+            "help",
+        ];
+        assert_eq!(Command::all_commands().collect::<Vec<_>>(), expected_names);
+
+        for spec in COMMAND_SPECS {
+            for name in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
+                let input = format!("  /{name}   test argument  ");
+                assert_eq!(
+                    Command::parse(&input),
+                    Some(spec.kind.command("test argument".to_string())),
+                    "failed to parse /{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_slash_commands_still_fall_through() {
+        assert_eq!(Command::parse("/not-a-programmer-command value"), None);
+        assert_eq!(Command::parse("not a slash command"), None);
+        assert_eq!(Command::parse("/"), None);
+    }
+
+    #[test]
+    fn command_catalog_preserves_help_order_and_text() {
+        let expected = vec![
+            ("/model <provider/model>", "Switch to a different model"),
+            (
+                "/mode <manual|auto|plan|yolo>",
+                "Set work mode (or cycle with Ctrl+T)",
+            ),
+            (
+                "/classifier [provider/model]",
+                "Set/show the Auto-mode classifier model",
+            ),
+            (
+                "/init",
+                "Explore the project, write PROGRAMMER.md, set up diagnostics",
+            ),
+            ("/plan approve", "Approve the current plan (Plan mode)"),
+            ("/plan cancel", "Cancel plan and return to Auto mode"),
+            (
+                "/skill <name|list|off>",
+                "Activate, list, or clear agent skills",
+            ),
+            ("/skill manage", "Open the skills management panel"),
+            ("/mcp show", "List configured MCP servers and their status"),
+            ("/mcp manage", "Open the MCP server management panel"),
+            (
+                "/terminal [id]",
+                "Open the interactive terminal for a PTY task",
+            ),
+            (
+                "/compact [provider/model]",
+                "Summarize older history to shrink the model's context",
+            ),
+            (
+                "/thinking [auto|none|minimal|low|medium|high|xhigh]",
+                "Set/show reasoning effort for chat and compaction",
+            ),
+            (
+                "/vision <on|off>",
+                "Enable or disable image attachments for this session",
+            ),
+            ("/todo | /t", "Open the todo list panel"),
+            ("/new | /n", "Start a new session (saves current)"),
+            (
+                "/providers show",
+                "List all configured providers and models",
+            ),
+            ("/providers manage", "Open the provider management panel"),
+            ("/session | /s", "Show current session info"),
+            ("/clear | /c", "Clear the conversation history"),
+            ("/quit | /q", "Exit the application"),
+            ("/help | /?", "Show this help"),
+        ];
+        assert_eq!(Command::descriptions(), expected);
+    }
+
+    #[test]
+    fn command_catalog_has_unique_names_aliases_and_help_order() {
+        let mut names = std::collections::HashSet::new();
+        let mut help_orders = std::collections::HashSet::new();
+
+        for spec in COMMAND_SPECS {
+            assert!(
+                names.insert(spec.name),
+                "duplicate command name: {}",
+                spec.name
+            );
+            for alias in spec.aliases {
+                assert!(names.insert(*alias), "duplicate command alias: {alias}");
+            }
+            assert!(!spec.help.is_empty(), "{} has no help entry", spec.name);
+            for entry in spec.help {
+                assert!(
+                    help_orders.insert(entry.order),
+                    "duplicate help order: {}",
+                    entry.order
+                );
+            }
+        }
+
+        assert_eq!(help_orders.len(), Command::descriptions().len());
+        assert_eq!(
+            help_orders.iter().copied().max().map(usize::from),
+            Some(help_orders.len() - 1)
+        );
+    }
+
+    #[test]
+    fn catalog_drives_fixed_and_alias_completions() {
+        let providers = COMMAND_SPECS
+            .iter()
+            .find(|spec| spec.name == "providers")
+            .expect("providers spec");
+        assert!(providers.matches("provider"));
+        let CompletionKind::Fixed(values) = providers.completion else {
+            panic!("providers should use fixed completions");
+        };
+        let state = CompletionEngine::complete_subcommand("provider m", "provider", values)
+            .expect("provider alias completion");
+        assert_eq!(state.prefix, "/provider ");
+        assert_eq!(state.candidates, vec!["manage"]);
+
+        let mode = COMMAND_SPECS
+            .iter()
+            .find(|spec| spec.name == "mode")
+            .expect("mode spec");
+        let CompletionKind::Fixed(values) = mode.completion else {
+            panic!("mode should use fixed completions");
+        };
+        assert_eq!(values, &["manual", "edits", "auto"]);
     }
 
     #[test]
