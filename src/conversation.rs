@@ -55,6 +55,20 @@ pub struct Conversation {
     pub(crate) mutation_version: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageSummary {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub turns: usize,
+    pub last_turn: Option<(u32, u32)>,
+}
+
+impl UsageSummary {
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
 impl Conversation {
     pub fn new() -> Self {
         Conversation::default()
@@ -174,6 +188,27 @@ impl Conversation {
     pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
         self.accumulated_usage.0 += input_tokens;
         self.accumulated_usage.1 += output_tokens;
+    }
+
+    pub fn usage_summary(&self) -> UsageSummary {
+        let mut summary = UsageSummary::default();
+        for item in &self.items {
+            if let MessageItem::Usage(input, output) = item {
+                summary.input_tokens += u64::from(*input);
+                summary.output_tokens += u64::from(*output);
+                summary.turns += 1;
+                summary.last_turn = Some((*input, *output));
+            }
+        }
+
+        let (input, output) = self.accumulated_usage;
+        if input > 0 || output > 0 {
+            summary.input_tokens += u64::from(input);
+            summary.output_tokens += u64::from(output);
+            summary.turns += 1;
+            summary.last_turn = Some((input, output));
+        }
+        summary
     }
 
     /// Flush the accumulated usage as a [`MessageItem::Usage`] and reset the
@@ -673,5 +708,24 @@ mod tests {
         assert!(matches!(conv.items.last(), Some(MessageItem::Usage(13, 7))));
         // A second flush with nothing accumulated pushes nothing.
         assert!(!conv.flush_usage());
+    }
+
+    #[test]
+    fn usage_summary_includes_finished_and_current_turns() {
+        let mut conv = Conversation::new();
+        conv.add_usage(10, 5);
+        assert!(conv.flush_usage());
+        conv.add_usage(3, 2);
+
+        assert_eq!(
+            conv.usage_summary(),
+            UsageSummary {
+                input_tokens: 13,
+                output_tokens: 7,
+                turns: 2,
+                last_turn: Some((3, 2)),
+            }
+        );
+        assert_eq!(conv.usage_summary().total_tokens(), 20);
     }
 }

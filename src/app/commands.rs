@@ -425,6 +425,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         | Command::Clear
         | Command::New
         | Command::Session
+        | Command::Usage
         | Command::Todo
         | Command::Terminal(_)
         | Command::Help) => command_handlers::session::execute(app, command),

@@ -624,6 +624,10 @@ impl ConversationPanel {
         self.conversation.lock().unwrap().items.clone()
     }
 
+    pub fn usage_summary(&self) -> crate::conversation::UsageSummary {
+        self.conversation.lock().unwrap().usage_summary()
+    }
+
     /// The runner committed the streamed response to the shared conversation:
     /// drop the live in-progress view so the same content isn't rendered twice,
     /// transferring live expanded state onto the now-committed items (which sit

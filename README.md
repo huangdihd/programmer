@@ -340,6 +340,7 @@ not copied into the request context.
 | `programmer --resume <uuid>` | Resume a specific session |
 | `/new` `/n` | Save current session and start fresh |
 | `/session` `/s` | Show current session UUID |
+| `/usage` | Show session and most recent turn token usage |
 
 ## Project structure
 

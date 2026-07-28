@@ -20,6 +20,7 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::Clear => clear(app),
         Command::New => new(app),
         Command::Session => CommandOutcome::handled(true),
+        Command::Usage => usage(app),
         Command::Todo => {
             app.sync_todos_from_store();
             app.todo_panel = Some(TodoPanel::new(app.todo_list.clone()));
@@ -31,6 +32,34 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         }
         Command::Help => help(app),
         _ => unreachable!("session handler received a command from another domain"),
+    }
+}
+
+fn usage(app: &mut App<'_>) -> CommandOutcome {
+    let summary = app.conversation_panel.usage_summary();
+    app.conversation_panel
+        .add_info_string(format_usage(summary));
+    CommandOutcome::handled(true)
+}
+
+fn format_usage(summary: crate::conversation::UsageSummary) -> String {
+    match summary.last_turn {
+        Some((last_input, last_output)) => format!(
+            "Token usage for this session:\n\
+             \u{20} input: {} tokens\n\
+             \u{20} output: {} tokens\n\
+             \u{20} total: {} tokens\n\
+             \u{20} recorded turns: {}\n\
+             Last turn: {} input + {} output = {} tokens",
+            summary.input_tokens,
+            summary.output_tokens,
+            summary.total_tokens(),
+            summary.turns,
+            last_input,
+            last_output,
+            u64::from(last_input) + u64::from(last_output),
+        ),
+        None => "No token usage recorded for this session.".to_string(),
     }
 }
 
@@ -74,4 +103,34 @@ fn help(app: &mut App<'_>) -> CommandOutcome {
     lines.insert(0, "Available commands:".to_string());
     app.conversation_panel.add_info_string(lines.join("\n"));
     CommandOutcome::handled(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_usage;
+    use crate::conversation::UsageSummary;
+
+    #[test]
+    fn usage_message_reports_session_and_last_turn_totals() {
+        let message = format_usage(UsageSummary {
+            input_tokens: 13,
+            output_tokens: 7,
+            turns: 2,
+            last_turn: Some((3, 2)),
+        });
+
+        assert!(message.contains("input: 13 tokens"));
+        assert!(message.contains("output: 7 tokens"));
+        assert!(message.contains("total: 20 tokens"));
+        assert!(message.contains("recorded turns: 2"));
+        assert!(message.contains("Last turn: 3 input + 2 output = 5 tokens"));
+    }
+
+    #[test]
+    fn usage_message_handles_empty_sessions() {
+        assert_eq!(
+            format_usage(UsageSummary::default()),
+            "No token usage recorded for this session."
+        );
+    }
 }

@@ -19,7 +19,7 @@
 - ~~after switch sessions using /new, task can't be cleaned and todos can't update as expectations~~
 - fix intermittent failure where Esc does not interrupt the active operation
 - ~~thinking level adjustment~~
-- /usage
+- ~~/usage~~
 - clear finished tasks
 - fix sidebar scrolling lag
 - method to refetch models from providers
