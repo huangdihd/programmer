@@ -31,7 +31,7 @@ pub enum Command {
     /// `/providers <subcommand>` — carries the raw argument string
     /// ("show", "manage", or anything else for the usage hint).
     Providers(String),
-    /// `/mode <manual|edits|auto|yolo>` — cycle/set work mode.
+    /// `/mode <manual|auto|plan|yolo>` — cycle/set work mode.
     Mode(String),
     /// `/classifier [provider/model]` — set or show the Auto-mode classifier
     /// model. Empty argument shows the current setting; "clear"/"default"
@@ -197,7 +197,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         kind: CommandKind::Mode,
         name: "mode",
         aliases: &[],
-        completion: CompletionKind::Fixed(&["manual", "edits", "auto"]),
+        completion: CompletionKind::Fixed(&["manual", "auto", "plan", "yolo"]),
         help: &[HelpEntry {
             order: 1,
             usage: "/mode <manual|auto|plan|yolo>",
@@ -277,7 +277,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         kind: CommandKind::Plan,
         name: "plan",
         aliases: &[],
-        completion: CompletionKind::None,
+        completion: CompletionKind::Fixed(&["approve", "cancel"]),
         help: &[
             HelpEntry {
                 order: 4,
@@ -1121,7 +1121,22 @@ mod tests {
         let CompletionKind::Fixed(values) = mode.completion else {
             panic!("mode should use fixed completions");
         };
-        assert_eq!(values, &["manual", "edits", "auto"]);
+        assert_eq!(values, &["manual", "auto", "plan", "yolo"]);
+        let state = CompletionEngine::complete_subcommand("mode p", "mode", values)
+            .expect("mode plan completion");
+        assert_eq!(state.candidates, vec!["plan"]);
+
+        let plan = COMMAND_SPECS
+            .iter()
+            .find(|spec| spec.name == "plan")
+            .expect("plan spec");
+        let CompletionKind::Fixed(values) = plan.completion else {
+            panic!("plan should use fixed completions");
+        };
+        assert_eq!(values, &["approve", "cancel"]);
+        let state = CompletionEngine::complete_subcommand("plan c", "plan", values)
+            .expect("plan cancel completion");
+        assert_eq!(state.candidates, vec!["cancel"]);
     }
 
     #[test]
