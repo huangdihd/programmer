@@ -13,13 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Background task system: shell commands running detached from the
-//! conversation turn.
+//! Task process system: shell commands tracked independently from the
+//! conversation renderer.
 //!
-//! Tasks are created through the `task` tool, live for the duration of the
-//! process (children are killed on exit via `kill_on_drop`), and are shown in
-//! the sidebar. State lives in a process-global registry because tools only
-//! receive their JSON arguments — there is no `App` handle in the tool path.
+//! Background tasks are created through the `task` tool. Foreground `command`
+//! calls use the same process lifecycle and output capture, but remain hidden
+//! from the task UI until that integration explicitly opts them in. State lives
+//! in a process-global registry because tools only receive their JSON arguments
+//! — there is no `App` handle in the tool path.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -36,6 +37,9 @@ const PTY_SCROLLBACK: usize = 1000;
 /// Cap on the output buffer kept per task. When exceeded, the oldest half is
 /// dropped so the tail (usually the interesting part) is always available.
 const MAX_TASK_OUTPUT: usize = 200_000;
+
+/// Live command output only needs a bounded tail in the conversation panel.
+const MAX_LIVE_OUTPUT: usize = 16_384;
 
 /// Cap on the output persisted per task in the session file.
 const MAX_PERSISTED_OUTPUT: usize = 10_000;
@@ -63,6 +67,13 @@ impl TaskStatus {
             TaskStatus::Killed => "killed",
         }
     }
+}
+
+/// The caller that owns a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Background,
+    Command,
 }
 
 /// Interactive-task state: a child running in a real PTY, its output parsed
@@ -97,6 +108,10 @@ struct PtyState {
 /// One background task's bookkeeping entry.
 struct TaskEntry {
     id: u64,
+    kind: TaskKind,
+    /// Tool-call id for a foreground `command`, used by live conversation
+    /// rendering. Background tasks leave this unset.
+    call_id: Option<String>,
     /// Short label shown in the sidebar; defaults to the command itself.
     name: String,
     command: String,
@@ -108,6 +123,8 @@ struct TaskEntry {
     output: String,
     /// Stderr captured separately (pipe tasks only).
     stderr_output: String,
+    /// Interleaved tail used while a foreground command is still running.
+    live_output: String,
     /// Per-task output cap in chars. Defaults to [`MAX_TASK_OUTPUT`]; can be
     /// overridden with [`set_max_output`].
     max_output: usize,
@@ -210,7 +227,11 @@ fn entry_output(e: &TaskEntry) -> String {
 /// Snapshot every task, newest first.
 pub fn snapshot_all() -> Vec<TaskSnapshot> {
     let reg = registry().lock().unwrap();
-    reg.iter().rev().map(snapshot_entry).collect()
+    reg.iter()
+        .rev()
+        .filter(|entry| entry.kind == TaskKind::Background)
+        .map(snapshot_entry)
+        .collect()
 }
 
 pub fn task_ids() -> HashSet<u64> {
@@ -218,6 +239,7 @@ pub fn task_ids() -> HashSet<u64> {
         .lock()
         .unwrap()
         .iter()
+        .filter(|entry| entry.kind == TaskKind::Background)
         .map(|entry| entry.id)
         .collect()
 }
@@ -232,6 +254,7 @@ pub fn snapshot_for_sidebar(expanded_ids: &HashSet<u64>) -> Vec<SidebarTaskSnaps
     let reg = registry().lock().unwrap();
     reg.iter()
         .rev()
+        .filter(|entry| entry.kind == TaskKind::Background)
         .map(|entry| SidebarTaskSnapshot {
             id: entry.id,
             name: entry.name.clone(),
@@ -292,6 +315,35 @@ pub fn clear_finished() -> usize {
 /// its id immediately. Output is captured incrementally; completion is
 /// recorded by a detached reader task.
 pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64, String> {
+    spawn_pipe(command, dir, name, TaskKind::Background, None, true)
+}
+
+/// Spawn a foreground command tool call through the shared task process
+/// implementation. Its stdin is closed immediately, matching the old command
+/// runner, while stdout and stderr remain available until the caller finishes.
+pub fn spawn_command(
+    command: &str,
+    dir: Option<&str>,
+    call_id: Option<&str>,
+) -> Result<u64, String> {
+    spawn_pipe(
+        command,
+        dir,
+        Some(command),
+        TaskKind::Command,
+        call_id,
+        false,
+    )
+}
+
+fn spawn_pipe(
+    command: &str,
+    dir: Option<&str>,
+    name: Option<&str>,
+    kind: TaskKind,
+    call_id: Option<&str>,
+    keep_stdin_open: bool,
+) -> Result<u64, String> {
     let (program, flag) = crate::tools::shell();
     let mut cmd = tokio::process::Command::new(program);
     cmd.arg(flag);
@@ -304,10 +356,14 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+    cmd.stdin(if keep_stdin_open {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    })
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true);
 
     // Own (windowless) console on Windows so the child can't reset the TUI's
     // mouse capture.
@@ -328,22 +384,32 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
     // `write_stdin` stays synchronous (no lock held across an await). When the
     // channel closes — `eof`, task finish, or a write error — stdin drops and
     // the child sees EOF.
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let child_stdin = child.stdin.take();
-    tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        let Some(mut stdin) = child_stdin else { return };
-        while let Some(chunk) = stdin_rx.recv().await {
-            if stdin.write_all(chunk.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
-                break;
+    let stdin_tx = if keep_stdin_open {
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let child_stdin = child.stdin.take();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let Some(mut stdin) = child_stdin else {
+                return;
+            };
+            while let Some(chunk) = stdin_rx.recv().await {
+                if stdin.write_all(chunk.as_bytes()).await.is_err() || stdin.flush().await.is_err()
+                {
+                    break;
+                }
             }
-        }
-    });
+        });
+        Some(stdin_tx)
+    } else {
+        None
+    };
 
     {
         let mut reg = registry().lock().unwrap();
         reg.push(TaskEntry {
             id,
+            kind,
+            call_id: call_id.map(str::to_string),
             name: name
                 .filter(|n| !n.trim().is_empty())
                 .unwrap_or(command)
@@ -355,9 +421,16 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
             finished: None,
             output: String::new(),
             stderr_output: String::new(),
-            max_output: MAX_TASK_OUTPUT,
+            live_output: String::new(),
+            // Preserve the old command tool's complete capture. The generic
+            // tool-output layer archives long results after the call returns.
+            max_output: if kind == TaskKind::Command {
+                usize::MAX
+            } else {
+                MAX_TASK_OUTPUT
+            },
             kill: Some(kill_tx),
-            stdin_tx: Some(stdin_tx),
+            stdin_tx,
             pty: None,
         });
     }
@@ -390,12 +463,23 @@ pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64
             }
             _ = kill_rx => {
                 let _ = child.kill().await;
+                let _ = tokio::join!(out_task, err_task);
                 finish(id, TaskStatus::Killed, None);
             }
         }
     });
 
     Ok(id)
+}
+
+/// Return the interleaved live output for a running foreground command.
+pub fn command_live_output(call_id: &str) -> Option<String> {
+    let reg = registry().lock().unwrap();
+    reg.iter()
+        .find(|entry| {
+            entry.status == TaskStatus::Running && entry.call_id.as_deref() == Some(call_id)
+        })
+        .map(|entry| entry.live_output.clone())
 }
 
 /// Restrict `LoadLibrary`'s search to the application and system directories.
@@ -491,6 +575,8 @@ pub fn spawn_interactive(
         let mut reg = registry().lock().unwrap();
         reg.push(TaskEntry {
             id,
+            kind: TaskKind::Background,
+            call_id: None,
             name: name
                 .filter(|n| !n.trim().is_empty())
                 .unwrap_or(command)
@@ -502,6 +588,7 @@ pub fn spawn_interactive(
             finished: None,
             output: String::new(),
             stderr_output: String::new(),
+            live_output: String::new(),
             max_output: MAX_TASK_OUTPUT,
             kill: None,
             stdin_tx: None,
@@ -1037,6 +1124,18 @@ pub async fn wait(id: u64, timeout: Duration) -> Result<(TaskSnapshot, bool), St
     }
 }
 
+/// Wait without imposing a second timeout. Callers that need timeout or
+/// cancellation semantics can race this future and then terminate the task.
+pub async fn wait_until_finished(id: u64) -> Result<TaskSnapshot, String> {
+    loop {
+        let snap = snapshot(id).ok_or_else(|| format!("error: no task with id {id}"))?;
+        if snap.status != TaskStatus::Running {
+            return Ok(snap);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session persistence
 // ---------------------------------------------------------------------------
@@ -1059,6 +1158,7 @@ pub struct PersistedTask {
 pub fn persist_all() -> Vec<PersistedTask> {
     let reg = registry().lock().unwrap();
     reg.iter()
+        .filter(|entry| entry.kind == TaskKind::Background)
         .map(|e| {
             let full = entry_output(e);
             let output = if full.chars().count() > MAX_PERSISTED_OUTPUT {
@@ -1106,6 +1206,8 @@ pub fn restore(saved: &[PersistedTask]) {
             .unwrap_or(now);
         reg.push(TaskEntry {
             id: t.id,
+            kind: TaskKind::Background,
+            call_id: None,
             name: t.name.clone(),
             command: t.command.clone(),
             status,
@@ -1114,6 +1216,7 @@ pub fn restore(saved: &[PersistedTask]) {
             finished: Some(now),
             output: t.output.clone(),
             stderr_output: String::new(),
+            live_output: String::new(),
             max_output: MAX_TASK_OUTPUT,
             kill: None,
             stdin_tx: None,
@@ -1128,6 +1231,7 @@ fn append_output(id: u64, chunk: &str) {
     let mut reg = registry().lock().unwrap();
     if let Some(entry) = reg.iter_mut().find(|e| e.id == id) {
         entry.output.push_str(chunk);
+        append_live_output(entry, chunk);
         let max = entry.max_output;
         cap_buffer(&mut entry.output, max);
     }
@@ -1137,9 +1241,18 @@ fn append_stderr(id: u64, chunk: &str) {
     let mut reg = registry().lock().unwrap();
     if let Some(entry) = reg.iter_mut().find(|e| e.id == id) {
         entry.stderr_output.push_str(chunk);
+        append_live_output(entry, chunk);
         let max = entry.max_output;
         cap_buffer(&mut entry.stderr_output, max);
     }
+}
+
+fn append_live_output(entry: &mut TaskEntry, chunk: &str) {
+    if entry.call_id.is_none() {
+        return;
+    }
+    entry.live_output.push_str(chunk);
+    cap_buffer(&mut entry.live_output, MAX_LIVE_OUTPUT);
 }
 
 /// Append a raw PTY chunk to an interactive task's transcript buffer.
@@ -1276,6 +1389,48 @@ mod tests {
         assert_eq!(snap.status, TaskStatus::Completed);
         assert!(snap.output.contains("task-out"), "output: {}", snap.output);
         assert_eq!(snap.name, "echo test");
+    }
+
+    #[tokio::test]
+    async fn command_task_is_hidden_and_closes_stdin() {
+        let command = if cfg!(windows) { "findstr ." } else { "cat" };
+        let id = spawn_command(command, None, Some("command-hidden")).expect("spawn command");
+        let snap = wait_until_finished(id).await.expect("closed stdin exits");
+        assert_eq!(snap.status, TaskStatus::Completed);
+        assert!(
+            !snapshot_all().iter().any(|task| task.id == id),
+            "command tasks stay out of the public task list during stage one"
+        );
+        assert!(
+            persist_all().iter().all(|task| task.id != id),
+            "command output is already persisted in the conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_live_output_is_keyed_by_call_id() {
+        let command = if cfg!(windows) {
+            "echo command-live && ping -n 3 127.0.0.1 > NUL"
+        } else {
+            "echo command-live && sleep 1"
+        };
+        let id = spawn_command(command, None, Some("command-live-id")).expect("spawn command");
+        let mut seen = false;
+        for _ in 0..60 {
+            if command_live_output("command-live-id")
+                .is_some_and(|text| text.contains("command-live"))
+            {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            seen,
+            "live output should be readable while the command runs"
+        );
+        let _ = wait_until_finished(id).await.expect("command finishes");
+        assert!(command_live_output("command-live-id").is_none());
     }
 
     #[tokio::test]
