@@ -110,6 +110,8 @@ pub(crate) struct SessionState {
 pub struct App<'a> {
     /// Is the application running?
     pub running: bool,
+    /// Time of the first Ctrl+C press while waiting for exit confirmation.
+    pub(crate) quit_requested_at: Option<std::time::Instant>,
     /// Multi-provider manager (replaces the single OpenAI client).
     pub provider_manager: ProviderManager,
     /// Currently active model in `provider/model` format.
@@ -257,6 +259,7 @@ impl App<'_> {
         let todo_store = Arc::new(Mutex::new(todo_list.clone()));
         let mut app = Self {
             running: true,
+            quit_requested_at: None,
             provider_manager,
             current_model,
             vision_enabled,

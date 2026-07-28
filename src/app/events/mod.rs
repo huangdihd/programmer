@@ -233,7 +233,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 commands::start_request_with_images(app, pending_request, images).await;
             }
         }
-        AppEvent::Quit => app.quit(),
+        AppEvent::Quit => handle_quit_request(app),
         AppEvent::ProvidersChanged => reload_provider_manager(app).await,
         AppEvent::RefreshProviderModels => handle_provider_models_refresh(app).await,
         AppEvent::McpChanged => handle_mcp_changed(app).await,
@@ -248,6 +248,24 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             app.question_panel = Some(QuestionPanel::new(question, answer_tx));
         }
     }
+}
+
+const QUIT_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn handle_quit_request(app: &mut App<'_>) {
+    let now = std::time::Instant::now();
+    if quit_is_confirmed(app.quit_requested_at, now) {
+        app.quit();
+        return;
+    }
+
+    app.quit_requested_at = Some(now);
+    app.conversation_panel
+        .add_warning_string("Press Ctrl+C again within 2 seconds to exit.".to_string());
+}
+
+fn quit_is_confirmed(previous: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    previous.is_some_and(|pressed_at| now.duration_since(pressed_at) <= QUIT_CONFIRM_TIMEOUT)
 }
 
 fn take_pending_request(
@@ -553,7 +571,26 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConversationPanel, is_current_turn_id, is_live_turn_id, take_pending_request};
+    use super::{
+        ConversationPanel, QUIT_CONFIRM_TIMEOUT, is_current_turn_id, is_live_turn_id,
+        quit_is_confirmed, take_pending_request,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn quit_requires_a_second_request_within_timeout() {
+        let first_press = Instant::now();
+
+        assert!(!quit_is_confirmed(None, first_press));
+        assert!(quit_is_confirmed(
+            Some(first_press),
+            first_press + QUIT_CONFIRM_TIMEOUT
+        ));
+        assert!(!quit_is_confirmed(
+            Some(first_press),
+            first_press + QUIT_CONFIRM_TIMEOUT + Duration::from_millis(1)
+        ));
+    }
 
     #[test]
     fn is_current_turn_allows_untagged_zero_events() {

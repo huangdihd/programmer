@@ -18,6 +18,7 @@
 - monitor local file changes and prevent modifications after changes before read
 - ~~after switch sessions using /new, task can't be cleaned and todos can't update as expectations~~
 - fix intermittent failure where Esc does not interrupt the active operation
+- ~~require Ctrl+C twice to exit~~
 - ~~thinking level adjustment~~
 - ~~/usage~~
 - clear finished tasks
