@@ -32,6 +32,8 @@ use crate::consts::MAX_OUTPUT_LENGTH;
 use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, Tool,
 };
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The host shell used by the `command` tool: `(program, flag)`.
 pub fn shell() -> (&'static str, &'static str) {
@@ -193,18 +195,28 @@ pub(crate) async fn run_tool_call(
         run_local_tool(&call.name, &call.arguments).await
     };
 
-    make_tool_output(&call.call_id, result)
+    make_tool_output_for_call(call, result)
 }
 
-/// Wrap a raw tool result into a [`ToolOutput`]: the `failed` flag comes straight
-/// from `Ok`/`Err` (the authoritative source, never sniffed from the text), and
-/// the text is truncated to the output budget.
-pub(crate) fn make_tool_output(call_id: &str, result: Result<String, String>) -> ToolOutput {
+/// Wrap a call result into a [`ToolOutput`], archiving it first when it exceeds
+/// the inline output budget.
+pub(crate) fn make_tool_output_for_call(
+    call: &FunctionToolCall,
+    result: Result<String, String>,
+) -> ToolOutput {
+    make_tool_output_named(&call.name, &call.call_id, result)
+}
+
+fn make_tool_output_named(
+    tool_name: &str,
+    call_id: &str,
+    result: Result<String, String>,
+) -> ToolOutput {
     let (text, failed) = match result {
         Ok(text) => (text, false),
         Err(text) => (text, true),
     };
-    let text = truncate_output(text);
+    let text = archive_and_truncate(tool_name, call_id, text);
 
     ToolOutput {
         param: FunctionCallOutputItemParam {
@@ -256,15 +268,25 @@ pub(crate) fn mcp_server_tools() -> Vec<Tool> {
     ]
 }
 
-/// Truncates `output` to at most [`MAX_OUTPUT_LENGTH`] characters. When the
-/// output exceeds the limit the first half and the last quarter are preserved,
-/// with a truncation marker in between so the model sees both the beginning and
-/// the tail of a long result (the middle is often the least interesting part).
-fn truncate_output(output: String) -> String {
+/// Archive long output before returning a bounded head/tail excerpt.
+fn archive_and_truncate(tool_name: &str, call_id: &str, output: String) -> String {
     let len = output.chars().count();
     if len <= MAX_OUTPUT_LENGTH {
         return output;
     }
+
+    let archive_note = match std::env::current_dir()
+        .map_err(|error| error.to_string())
+        .and_then(|root| archive_output_in(&root, tool_name, call_id, &output))
+    {
+        Ok(path) => format!("full output saved to {}", path.display()),
+        Err(error) => format!("full output could not be saved: {error}"),
+    };
+    truncate_output(output, &archive_note)
+}
+
+fn truncate_output(output: String, archive_note: &str) -> String {
+    let len = output.chars().count();
     let head_keep = MAX_OUTPUT_LENGTH * 3 / 4;
     let tail_keep = MAX_OUTPUT_LENGTH - head_keep;
 
@@ -279,10 +301,66 @@ fn truncate_output(output: String) -> String {
         .collect();
 
     format!(
-        "{head}\n\n... [truncated: {total} chars total, {skipped} chars skipped] ...\n\n{tail}",
+        "{head}\n\n... [truncated: {total} chars total, {skipped} chars skipped; {archive_note}] ...\n\n{tail}",
         total = len,
         skipped = len - head_keep - tail_keep,
     )
+}
+
+fn archive_output_in(
+    root: &Path,
+    tool_name: &str,
+    call_id: &str,
+    output: &str,
+) -> Result<PathBuf, String> {
+    static NEXT_ARCHIVE_ID: AtomicU64 = AtomicU64::new(1);
+
+    let relative_dir = Path::new(".programmer").join("outputs");
+    let output_dir = root.join(&relative_dir);
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("create {}: {error}", output_dir.display()))?;
+
+    let sequence = NEXT_ARCHIVE_ID.fetch_add(1, Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let filename = format!(
+        "{}-{}-{timestamp}-{}-{sequence}.txt",
+        safe_filename_part(tool_name),
+        safe_filename_part(call_id),
+        std::process::id(),
+    );
+    let relative_path = relative_dir.join(&filename);
+    let path = root.join(&relative_path);
+    let temporary = output_dir.join(format!(".{filename}.tmp"));
+
+    std::fs::write(&temporary, output)
+        .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("rename to {}: {error}", path.display()));
+    }
+    Ok(relative_path)
+}
+
+fn safe_filename_part(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .take(48)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "output".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// A `Tool::Function` definition with a strict JSON-schema object for parameters.
@@ -320,6 +398,46 @@ mod tests {
             .await
             .expect("echo should succeed");
         assert!(out.contains("hello"), "unexpected output: {out}");
+    }
+
+    #[test]
+    fn archives_long_output_without_losing_content() {
+        let root = std::env::temp_dir().join(format!(
+            "programmer-output-archive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let original = "你好-output\n".repeat(MAX_OUTPUT_LENGTH);
+        let relative =
+            archive_output_in(&root, "mcp/unsafe", "../call", &original).expect("archive");
+        assert!(relative.starts_with(".programmer/outputs"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(relative)).unwrap(),
+            original
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn safe_filename_part_removes_path_separators() {
+        assert_eq!(safe_filename_part("../mcp/tool"), "___mcp_tool");
+        assert_eq!(safe_filename_part(""), "output");
+    }
+
+    #[test]
+    fn truncated_output_keeps_unicode_head_tail_and_archive_path() {
+        let original = "始".repeat(MAX_OUTPUT_LENGTH) + &"终".repeat(20);
+        let text = truncate_output(
+            original,
+            "full output saved to .programmer/outputs/command-call.txt",
+        );
+        assert!(text.starts_with('始'));
+        assert!(text.ends_with('终'));
+        assert!(text.contains(".programmer/outputs/command-call.txt"));
+        assert!(text.contains("8020 chars total"));
     }
 
     /// `run_tool_call` must set `failed` from the tool's own `Result`, not by

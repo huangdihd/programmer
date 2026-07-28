@@ -50,7 +50,7 @@ pub enum Command {
     Mcp(String),
     /// `/plan <approve|cancel>` — plan mode control.
     Plan(String),
-    /// `/terminal [id]` — open the interactive terminal panel for a task.
+    /// `/terminal [id|clear]` — open a task or clear finished tasks.
     Terminal(String),
     /// `/compact [provider/model]` — summarize the conversation so far and
     /// shrink the context the model sees to that summary plus everything
@@ -162,7 +162,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["n"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 15,
+            order: 16,
             usage: "/new | /n",
             description: "Start a new session (saves current)",
         }],
@@ -174,17 +174,17 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Fixed(&["show", "manage", "refresh"]),
         help: &[
             HelpEntry {
-                order: 16,
+                order: 17,
                 usage: "/providers show",
                 description: "List all configured providers and models",
             },
             HelpEntry {
-                order: 17,
+                order: 18,
                 usage: "/providers manage",
                 description: "Open the provider management panel",
             },
             HelpEntry {
-                order: 18,
+                order: 19,
                 usage: "/providers refresh",
                 description: "Refetch auto-discovered provider models",
             },
@@ -196,7 +196,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["s"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 19,
+            order: 20,
             usage: "/session | /s",
             description: "Show current session info",
         }],
@@ -207,7 +207,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 20,
+            order: 21,
             usage: "/usage",
             description: "Show token usage for the current session",
         }],
@@ -251,7 +251,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["todos", "t"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 14,
+            order: 15,
             usage: "/todo | /t",
             description: "Open the todo list panel",
         }],
@@ -315,11 +315,18 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         name: "terminal",
         aliases: &["term"],
         completion: CompletionKind::Terminal,
-        help: &[HelpEntry {
-            order: 10,
-            usage: "/terminal [id]",
-            description: "Open the interactive terminal for a PTY task",
-        }],
+        help: &[
+            HelpEntry {
+                order: 10,
+                usage: "/terminal [id]",
+                description: "Open the terminal viewer for a task",
+            },
+            HelpEntry {
+                order: 11,
+                usage: "/terminal clear",
+                description: "Clear completed, failed, and killed tasks",
+            },
+        ],
     },
     CommandSpec {
         kind: CommandKind::Compact,
@@ -327,7 +334,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::Model,
         help: &[HelpEntry {
-            order: 11,
+            order: 12,
             usage: "/compact [provider/model]",
             description: "Summarize older history to shrink the model's context",
         }],
@@ -338,7 +345,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::Fixed(crate::thinking::ThinkingLevel::COMPLETIONS),
         help: &[HelpEntry {
-            order: 12,
+            order: 13,
             usage: "/thinking [auto|none|minimal|low|medium|high|xhigh]",
             description: "Set/show reasoning effort for chat and compaction",
         }],
@@ -349,7 +356,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::Fixed(&["on", "off"]),
         help: &[HelpEntry {
-            order: 13,
+            order: 14,
             usage: "/vision <on|off>",
             description: "Enable or disable image attachments for this session",
         }],
@@ -360,7 +367,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["c"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 21,
+            order: 22,
             usage: "/clear | /c",
             description: "Clear the conversation history",
         }],
@@ -371,7 +378,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["q", "exit"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 22,
+            order: 23,
             usage: "/quit | /q",
             description: "Exit the application",
         }],
@@ -382,7 +389,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["?"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 23,
+            order: 24,
             usage: "/help | /?",
             description: "Show this help",
         }],
@@ -515,12 +522,14 @@ impl CompletionEngine {
     fn complete_terminal(text: &str, cmd: &str) -> Option<CompletionState> {
         let after_cmd = text[cmd.len()..].trim_start();
         let prefix = format!("/{} ", cmd);
-        let candidates: Vec<String> = crate::tasks::snapshot_all()
-            .iter()
-            .filter(|t| t.status == crate::tasks::TaskStatus::Running)
-            .map(|t| format!("{}  {}", t.id, t.name))
-            .filter(|c| c.starts_with(after_cmd))
-            .collect();
+        let mut candidates = vec!["clear".to_string()];
+        candidates.extend(
+            crate::tasks::snapshot_all()
+                .iter()
+                .filter(|t| t.status == crate::tasks::TaskStatus::Running)
+                .map(|t| format!("{}  {}", t.id, t.name)),
+        );
+        candidates.retain(|candidate| candidate.starts_with(after_cmd));
         CompletionState::new(prefix, candidates)
     }
 
@@ -1057,9 +1066,10 @@ mod tests {
             ("/skill manage", "Open the skills management panel"),
             ("/mcp show", "List configured MCP servers and their status"),
             ("/mcp manage", "Open the MCP server management panel"),
+            ("/terminal [id]", "Open the terminal viewer for a task"),
             (
-                "/terminal [id]",
-                "Open the interactive terminal for a PTY task",
+                "/terminal clear",
+                "Clear completed, failed, and killed tasks",
             ),
             (
                 "/compact [provider/model]",
@@ -1257,6 +1267,12 @@ mod tests {
         let pipe_id = crate::tasks::spawn("sleep 5", None, Some("sleep")).expect("spawn");
         let state = CompletionEngine::complete_terminal("terminal ", "terminal")
             .expect("candidates for running tasks");
+        assert!(
+            state
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "clear")
+        );
         for id in [interactive_id, pipe_id] {
             assert!(
                 state

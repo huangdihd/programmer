@@ -22,6 +22,7 @@
 pub mod ui;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use std::collections::HashSet;
 
 /// Identifies one collapsible section within the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,19 +130,38 @@ impl Sidebar {
         self.expanded_tasks.contains(&id)
     }
 
+    pub(crate) fn expanded_task_ids(&self) -> &HashSet<u64> {
+        &self.expanded_tasks
+    }
+
+    pub(crate) fn retain_existing_tasks(&mut self) {
+        let existing = crate::tasks::task_ids();
+        self.expanded_tasks.retain(|id| existing.contains(id));
+    }
+
     // -- scrolling --
 
     pub fn scroll_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_add(1);
+        self.scroll_by(1);
     }
 
     pub fn scroll_up(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
 
+    pub fn scroll_by(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_add(lines);
+    }
+
+    pub fn scroll_up_by(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
     /// Clamp scroll_offset so it doesn't exceed available content.
-    pub fn clamp_scroll(&mut self, total_lines: u16, visible_lines: u16) {
-        let max_scroll = total_lines.saturating_sub(visible_lines);
+    pub fn clamp_scroll(&mut self, total_lines: usize, visible_lines: usize) {
+        let max_scroll = total_lines
+            .saturating_sub(visible_lines)
+            .min(usize::from(u16::MAX)) as u16;
         if self.scroll_offset > max_scroll {
             self.scroll_offset = max_scroll;
         }
@@ -149,15 +169,44 @@ impl Sidebar {
 
     // -- keyboard (minimal) --
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, key: KeyEvent, visible_lines: u16) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                self.scroll_up();
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                self.scroll_down();
             }
+            KeyCode::PageUp => self.scroll_up_by(visible_lines),
+            KeyCode::PageDown => self.scroll_by(visible_lines),
+            KeyCode::Home => self.scroll_offset = 0,
+            KeyCode::End => self.scroll_offset = u16::MAX,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    #[test]
+    fn keyboard_scroll_supports_lines_pages_and_boundaries() {
+        let mut sidebar = Sidebar::new();
+        sidebar.handle_key(key(KeyCode::Down), 10);
+        sidebar.handle_key(key(KeyCode::PageDown), 10);
+        assert_eq!(sidebar.scroll_offset(), 11);
+
+        sidebar.handle_key(key(KeyCode::PageUp), 10);
+        assert_eq!(sidebar.scroll_offset(), 1);
+        sidebar.handle_key(key(KeyCode::Home), 10);
+        assert_eq!(sidebar.scroll_offset(), 0);
+        sidebar.handle_key(key(KeyCode::End), 10);
+        sidebar.clamp_scroll(30, 10);
+        assert_eq!(sidebar.scroll_offset(), 20);
     }
 }

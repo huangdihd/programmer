@@ -51,7 +51,7 @@ async fn run_labeled_call(
         Some(r) => r,
         None => Err("cancelled".to_string()),
     };
-    let mut out = crate::tools::make_tool_output(&call.call_id, result);
+    let mut out = crate::tools::make_tool_output_for_call(&call, result);
     if out.approval_label.is_none() {
         out.approval_label = Some(label);
     }

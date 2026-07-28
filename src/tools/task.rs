@@ -45,6 +45,7 @@ pub fn tool() -> Tool {
          close stdin — do this when the task reads input to end-of-stream), \
          `wait` (block until a task finishes or the timeout elapses), \
          `kill` (terminate a running task), \
+         `clear` (forget all completed, failed, and killed tasks), \
          `transcript` (full raw session text of an interactive task). \
          Tasks start with stdin open, so a command that reads input will wait \
          for `write`/eof rather than seeing an empty stream. \
@@ -64,7 +65,7 @@ pub fn tool() -> Tool {
             "action": {
                 "type": "string",
                 "description": "The action to perform.",
-                "enum": ["create", "list", "output", "write", "wait", "kill", "screen", "keys", "send_mouse", "resize", "expect_screen", "screen_diff", "transcript"]
+                "enum": ["create", "list", "output", "write", "wait", "kill", "clear", "screen", "keys", "send_mouse", "resize", "expect_screen", "screen_diff", "transcript"]
             },
             "interactive": {
                 "type": "boolean",
@@ -205,7 +206,7 @@ pub fn action_is_mutating(arguments: &str) -> bool {
     match serde_json::from_str::<ActionOnly>(arguments) {
         Ok(a) => matches!(
             a.action.as_str(),
-            "create" | "kill" | "write" | "keys" | "send_mouse"
+            "create" | "kill" | "clear" | "write" | "keys" | "send_mouse"
         ),
         // Unparseable arguments: assume the worst.
         Err(_) => true,
@@ -320,6 +321,11 @@ pub async fn run(arguments: &str) -> Result<String, String> {
             let id = require_id(args.id, "kill")?;
             tasks::kill(id)?;
             Ok(format!("kill signal sent to task {id}"))
+        }
+
+        "clear" => {
+            let cleared = tasks::clear_finished();
+            Ok(format!("cleared {cleared} finished task(s)"))
         }
 
         "screen" => {
@@ -493,7 +499,7 @@ pub async fn run(arguments: &str) -> Result<String, String> {
 
         other => Err(format!(
             "error: unknown action '{other}' — use create, list, output, write, wait, \
-             kill, screen, keys, send_mouse, resize, expect_screen, screen_diff, or transcript"
+             kill, clear, screen, keys, send_mouse, resize, expect_screen, screen_diff, or transcript"
         )),
     }
 }
@@ -560,9 +566,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_kill_write_are_mutating_but_views_are_not() {
+    fn process_mutations_are_gated_but_views_are_not() {
         assert!(action_is_mutating(r#"{"action":"create","command":"x"}"#));
         assert!(action_is_mutating(r#"{"action":"kill","id":1}"#));
+        assert!(action_is_mutating(r#"{"action":"clear"}"#));
         assert!(action_is_mutating(
             r#"{"action":"write","id":1,"input":"y"}"#
         ));

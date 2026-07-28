@@ -91,7 +91,10 @@ pub(crate) async fn handle_key_events(
             return Ok(());
         }
         if let Some(ref mut s) = app.sidebar {
-            s.handle_key(key_event);
+            let visible_lines = app
+                .sidebar_area
+                .map_or(1, |area| area.height.saturating_sub(1).max(1));
+            s.handle_key(key_event, visible_lines);
         }
         return Ok(());
     }

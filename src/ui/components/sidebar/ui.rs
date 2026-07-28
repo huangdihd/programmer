@@ -16,7 +16,7 @@
 use super::{ClickTarget, Sidebar, SidebarSection};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::mcp::McpManager;
-use crate::tasks::{TaskSnapshot, TaskStatus};
+use crate::tasks::{SidebarTaskSnapshot, TaskStatus};
 use crate::todos::{TodoList, TodoStatus};
 use crate::ui::text::{format_duration_secs, truncate_to_width, wrap_to_width};
 use ratatui::buffer::Buffer;
@@ -43,7 +43,7 @@ impl Sidebar {
         lsp_configured: bool,
         mcp_manager: Option<&McpManager>,
         todo_list: &TodoList,
-        tasks: &[TaskSnapshot],
+        tasks: &[SidebarTaskSnapshot],
     ) {
         let block = Block::default()
             .borders(Borders::LEFT)
@@ -69,8 +69,11 @@ impl Sidebar {
         // Clamp scroll.
         let visible_height = inner.height as usize;
         let total_lines = all_lines.len();
-        let max_scroll = total_lines.saturating_sub(visible_height) as u16;
-        let offset = self.scroll_offset.min(max_scroll);
+        let max_scroll = total_lines
+            .saturating_sub(visible_height)
+            .min(usize::from(u16::MAX)) as u16;
+        self.clamp_scroll(total_lines, visible_height);
+        let offset = self.scroll_offset;
 
         // Build the click map for visible lines (skipping scroll offset).
         self.click_map.clear();
@@ -135,7 +138,7 @@ impl Sidebar {
         lsp_configured: bool,
         mcp_manager: Option<&McpManager>,
         todo_list: &TodoList,
-        tasks: &[TaskSnapshot],
+        tasks: &[SidebarTaskSnapshot],
     ) -> (Vec<Line<'static>>, Vec<ClickTarget>) {
         let mut lines: Vec<Line> = Vec::new();
         let mut targets: Vec<ClickTarget> = Vec::new();
@@ -225,7 +228,7 @@ impl Sidebar {
         lsp_configured: bool,
         mcp_manager: Option<&McpManager>,
         todo_list: &TodoList,
-        tasks: &[TaskSnapshot],
+        tasks: &[SidebarTaskSnapshot],
     ) -> bool {
         match key {
             // Show when diagnostics exist or a live LSP is configured.
@@ -245,7 +248,7 @@ impl Sidebar {
         lsp_configured: bool,
         mcp_manager: Option<&McpManager>,
         todo_list: &TodoList,
-        tasks: &[TaskSnapshot],
+        tasks: &[SidebarTaskSnapshot],
     ) -> String {
         match section.key {
             SidebarSection::Tasks => {
@@ -560,7 +563,7 @@ impl Sidebar {
         lines: &mut Vec<Line<'static>>,
         targets: &mut Vec<ClickTarget>,
         width: u16,
-        tasks: &[TaskSnapshot],
+        tasks: &[SidebarTaskSnapshot],
     ) {
         if tasks.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -627,9 +630,8 @@ impl Sidebar {
         lines: &mut Vec<Line<'static>>,
         targets: &mut Vec<ClickTarget>,
         width: u16,
-        task: &TaskSnapshot,
+        task: &SidebarTaskSnapshot,
     ) {
-        const OUTPUT_TAIL_LINES: usize = 10;
         let dim = Style::default().fg(Color::DarkGray);
         let text_style = Style::default().fg(Color::Gray);
         let budget = (width.saturating_sub(6) as usize).max(8);
@@ -639,29 +641,22 @@ impl Sidebar {
             targets.push(ClickTarget::None);
         }
 
-        let tail: Vec<&str> = task
-            .output
-            .lines()
-            .rev()
-            .take(OUTPUT_TAIL_LINES)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        if tail.is_empty() {
+        let Some(output) = &task.output else {
+            return;
+        };
+        if output.lines.is_empty() {
             lines.push(Line::from(Span::styled("     (no output)", dim)));
             targets.push(ClickTarget::None);
             return;
         }
-        let total = task.output.lines().count();
-        if total > tail.len() {
+        if output.omitted_lines > 0 {
             lines.push(Line::from(Span::styled(
-                format!("     … {} earlier lines", total - tail.len()),
+                format!("     … {} earlier lines", output.omitted_lines),
                 dim,
             )));
             targets.push(ClickTarget::None);
         }
-        for out_line in tail {
+        for out_line in &output.lines {
             lines.push(Line::from(vec![
                 Span::raw("     "),
                 Span::styled(truncate_to_width(out_line, budget), text_style),
@@ -727,7 +722,7 @@ pub(crate) fn todo_status_order(s: &TodoStatus) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::TaskSnapshot;
+    use crate::tasks::{SidebarTaskOutput, SidebarTaskSnapshot};
     use std::time::Duration;
 
     fn buffer_text(buf: &Buffer) -> String {
@@ -746,15 +741,13 @@ mod tests {
         let mut sidebar = Sidebar::new();
         let area = Rect::new(0, 0, 32, 40);
         let mut buf = Buffer::empty(area);
-        let tasks = vec![TaskSnapshot {
+        let tasks = vec![SidebarTaskSnapshot {
             id: 7,
             name: "cargo watch 构建监听".to_string(),
-            command: "cargo watch".to_string(),
             status: crate::tasks::TaskStatus::Running,
             exit_code: None,
             elapsed: Duration::from_secs(75),
-            output: String::new(),
-            stderr: String::new(),
+            output: None,
         }];
 
         // `lsp_configured: true` keeps the (otherwise empty) diagnostics
@@ -784,16 +777,16 @@ mod tests {
         sidebar.toggle_task(3);
         let area = Rect::new(0, 0, 32, 40);
         let mut buf = Buffer::empty(area);
-        let output: String = (1..=13).map(|i| format!("line {i}\n")).collect();
-        let tasks = vec![TaskSnapshot {
+        let tasks = vec![SidebarTaskSnapshot {
             id: 3,
             name: "build".to_string(),
-            command: "cargo build".to_string(),
             status: crate::tasks::TaskStatus::Failed,
             exit_code: Some(101),
             elapsed: Duration::from_secs(9),
-            output,
-            stderr: String::new(),
+            output: Some(SidebarTaskOutput {
+                lines: (4..=13).map(|i| format!("line {i}")).collect(),
+                omitted_lines: 3,
+            }),
         }];
 
         sidebar.render(

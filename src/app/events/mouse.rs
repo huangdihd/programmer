@@ -27,7 +27,7 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
         MouseEventKind::ScrollDown => {
             if app.sidebar_area.is_some_and(|a| mouse.column >= a.x) {
                 if let Some(ref mut s) = app.sidebar {
-                    s.scroll_down();
+                    s.scroll_by(3);
                 }
             } else {
                 app.conversation_panel.scroll_down();
@@ -36,7 +36,7 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
         MouseEventKind::ScrollUp => {
             if app.sidebar_area.is_some_and(|a| mouse.column >= a.x) {
                 if let Some(ref mut s) = app.sidebar {
-                    s.scroll_up();
+                    s.scroll_up_by(3);
                 }
             } else {
                 app.conversation_panel.scroll_up();

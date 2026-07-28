@@ -22,6 +22,7 @@
 //! receive their JSON arguments — there is no `App` handle in the tool path.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -148,6 +149,26 @@ pub struct TaskSnapshot {
     pub stderr: String,
 }
 
+/// Lightweight task data used by the sidebar. Output is populated only for
+/// expanded tasks and is already reduced to the few lines the sidebar renders.
+#[derive(Debug, Clone)]
+pub struct SidebarTaskSnapshot {
+    pub id: u64,
+    pub name: String,
+    pub status: TaskStatus,
+    pub exit_code: Option<i32>,
+    pub elapsed: Duration,
+    pub output: Option<SidebarTaskOutput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SidebarTaskOutput {
+    /// The already-bounded tail rendered under an expanded task.
+    pub lines: Vec<String>,
+    /// Number of lines omitted before `lines`.
+    pub omitted_lines: usize,
+}
+
 fn registry() -> &'static Mutex<Vec<TaskEntry>> {
     static REGISTRY: OnceLock<Mutex<Vec<TaskEntry>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
@@ -192,10 +213,79 @@ pub fn snapshot_all() -> Vec<TaskSnapshot> {
     reg.iter().rev().map(snapshot_entry).collect()
 }
 
+pub fn task_ids() -> HashSet<u64> {
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.id)
+        .collect()
+}
+
+/// Snapshot task metadata for sidebar rendering. Only tasks in `expanded_ids`
+/// include output, capped to the visible tail so collapsed tasks never copy
+/// their potentially large output buffers on every frame.
+pub fn snapshot_for_sidebar(expanded_ids: &HashSet<u64>) -> Vec<SidebarTaskSnapshot> {
+    const OUTPUT_TAIL_LINES: usize = 10;
+    const MAX_LINE_CHARS: usize = 512;
+
+    let reg = registry().lock().unwrap();
+    reg.iter()
+        .rev()
+        .map(|entry| SidebarTaskSnapshot {
+            id: entry.id,
+            name: entry.name.clone(),
+            status: entry.status,
+            exit_code: entry.exit_code,
+            elapsed: entry
+                .finished
+                .map(|finished| finished - entry.started)
+                .unwrap_or_else(|| entry.started.elapsed()),
+            output: expanded_ids
+                .contains(&entry.id)
+                .then(|| sidebar_output(entry, OUTPUT_TAIL_LINES, MAX_LINE_CHARS)),
+        })
+        .collect()
+}
+
+fn sidebar_output(
+    entry: &TaskEntry,
+    tail_lines: usize,
+    max_line_chars: usize,
+) -> SidebarTaskOutput {
+    let text = entry_output(entry);
+    sidebar_output_text(&text, tail_lines, max_line_chars)
+}
+
+fn sidebar_output_text(text: &str, tail_lines: usize, max_line_chars: usize) -> SidebarTaskOutput {
+    let total_lines = text.lines().count();
+    let lines = text
+        .lines()
+        .rev()
+        .take(tail_lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| line.chars().take(max_line_chars).collect())
+        .collect::<Vec<_>>();
+    SidebarTaskOutput {
+        omitted_lines: total_lines.saturating_sub(lines.len()),
+        lines,
+    }
+}
+
 /// Snapshot a single task by id.
 pub fn snapshot(id: u64) -> Option<TaskSnapshot> {
     let reg = registry().lock().unwrap();
     reg.iter().find(|e| e.id == id).map(snapshot_entry)
+}
+
+/// Remove every task that is no longer running, returning the number removed.
+pub fn clear_finished() -> usize {
+    let mut reg = registry().lock().unwrap();
+    let before = reg.len();
+    reg.retain(|entry| entry.status == TaskStatus::Running);
+    before - reg.len()
 }
 
 /// Spawn `command` through the platform shell as a background task and return
@@ -1164,6 +1254,18 @@ mod tests {
 
     fn echo_cmd() -> &'static str {
         "echo task-out"
+    }
+
+    #[test]
+    fn sidebar_output_keeps_only_a_bounded_tail() {
+        let text: String = (1..=13)
+            .map(|line| format!("line {line} with extra text\n"))
+            .collect();
+        let preview = sidebar_output_text(&text, 10, 8);
+        assert_eq!(preview.omitted_lines, 3);
+        assert_eq!(preview.lines.len(), 10);
+        assert_eq!(preview.lines.first().unwrap(), "line 4 w");
+        assert_eq!(preview.lines.last().unwrap(), "line 13 ");
     }
 
     #[tokio::test]

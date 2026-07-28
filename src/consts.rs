@@ -16,9 +16,8 @@
 //! Project-wide tunable constants, gathered in one place so the values that
 //! shape runtime behaviour are easy to find and adjust.
 
-/// Maximum characters of a single tool's output kept before truncation. The
-/// rest is discarded and a truncation notice is appended so the model knows the
-/// output was cut short.
+/// Maximum characters of a single tool's output sent inline. Longer output is
+/// archived under `.programmer/outputs/` before the inline copy is truncated.
 pub(crate) const MAX_OUTPUT_LENGTH: usize = 8000;
 
 /// Maximum number of Auto-mode classifier LLM requests in flight at once.

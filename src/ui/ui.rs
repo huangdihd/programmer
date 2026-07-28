@@ -481,6 +481,12 @@ impl Widget for &mut App<'_> {
 
             self.render_main(horiz[0], buf, has_todo_bar, todo_bar_height, bottom_height);
 
+            let expanded_task_ids = self
+                .sidebar
+                .as_ref()
+                .map(|sidebar| sidebar.expanded_task_ids().clone())
+                .unwrap_or_default();
+            let sidebar_tasks = crate::tasks::snapshot_for_sidebar(&expanded_task_ids);
             self.sidebar.as_mut().unwrap().render(
                 horiz[1],
                 buf,
@@ -493,7 +499,7 @@ impl Widget for &mut App<'_> {
                 self.diag.lsp_configured,
                 self.mcp_manager.as_deref(),
                 &self.todo_list,
-                &crate::tasks::snapshot_all(),
+                &sidebar_tasks,
             );
         } else {
             self.sidebar_area = None;

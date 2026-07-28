@@ -367,6 +367,16 @@ pub(super) fn open_terminal(app: &mut App<'_>, arg: &str) {
 
     // Accept an id as the first token (completion may append the task name).
     let first = arg.split_whitespace().next().unwrap_or("");
+    if first.eq_ignore_ascii_case("clear") {
+        let cleared = crate::tasks::clear_finished();
+        if let Some(sidebar) = app.sidebar.as_mut() {
+            sidebar.retain_existing_tasks();
+        }
+        app.conversation_panel
+            .add_info_string(format!("Cleared {cleared} finished task(s)."));
+        session::mark_dirty(app);
+        return;
+    }
     let id = if first.is_empty() {
         // Auto-select the sole running task.
         let running: Vec<u64> = crate::tasks::snapshot_all()

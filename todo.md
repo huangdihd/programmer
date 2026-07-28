@@ -12,17 +12,17 @@
 - configurable restricted access control rule system
 - multi agents(traditional sub agents or use interactive background task system to launch itself again?)
 - sandbox
-- store too long outputs as files
+- ~~store too long outputs as files~~
 - display full output when commands are running
 - ~~default classifier model~~
 - monitor local file changes and prevent modifications after changes before read
 - ~~after switch sessions using /new, task can't be cleaned and todos can't update as expectations~~
-- fix intermittent failure where Esc does not interrupt the active operation
+- ~~fix intermittent failure where Esc does not interrupt the active operation~~
 - ~~require Ctrl+C twice to exit~~
 - ~~thinking level adjustment~~
 - ~~/usage~~
-- clear finished tasks
-- fix sidebar scrolling lag
+- ~~clear finished tasks~~
+- ~~fix sidebar scrolling lag~~
 - ~~method to refetch models from providers~~
 - ~~title on terminal~~
 - ~~/compact [model]~~
