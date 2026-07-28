@@ -19,6 +19,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
+use unicode_width::UnicodeWidthStr;
 
 const DIM: Color = Color::DarkGray;
 const ACCENT: Color = Color::LightBlue;
@@ -27,7 +28,8 @@ impl Widget for &Footer {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let mode_text = format!("  {} {} ", self.work_mode.icon(), self.work_mode.label());
         let mode_len = mode_text.len() as u16;
-        let model_len = self.current_model.len() as u16;
+        let model_text = self.model_and_thinking_text();
+        let model_len = model_text.width() as u16;
 
         // Active skills indicator — only shown when skills are active.
         let skill_text = if self.active_skills.is_empty() {
@@ -73,7 +75,7 @@ impl Widget for &Footer {
                 Constraint::Length(mode_len),  // work mode (leftmost)
                 Constraint::Length(skill_len), // active skills
                 Constraint::Min(1),            // status
-                Constraint::Length(if model_len > 0 { model_len + 2 } else { 0 }), // model
+                Constraint::Length(model_len), // model and thinking level
                 Constraint::Length(lsp_len),   // LSP status
                 Constraint::Length(28),        // "GPL-3.0-or-later · © 2026"
             ])
@@ -100,9 +102,9 @@ impl Widget for &Footer {
         // Status indicator
         (&self.status).render(chunks[2], buf);
 
-        // Model name
-        if !self.current_model.is_empty() {
-            ratatui::widgets::Paragraph::new(format!(" {} ", self.current_model))
+        // Model name and thinking level
+        if !model_text.is_empty() {
+            ratatui::widgets::Paragraph::new(model_text)
                 .style(Style::default().fg(ACCENT))
                 .render(chunks[3], buf);
         }

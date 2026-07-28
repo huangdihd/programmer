@@ -409,6 +409,7 @@ impl Widget for &mut App<'_> {
             });
         self.footer.work_mode = self.work_mode;
         self.footer.current_model = self.current_model.clone();
+        self.footer.thinking_level = self.thinking_level;
         self.footer.lsp_configured = self.diag.lsp_configured;
         self.footer.active_skills = self.skill_registry.activated_names().join(",");
 
