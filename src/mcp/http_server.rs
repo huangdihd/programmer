@@ -22,6 +22,7 @@
 //! the same classifier as the TUI.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_openai::Client;
@@ -40,22 +41,35 @@ use crate::classifier::{Verdict, WorkMode};
 /// A pending `manual`-mode approval, handed to the console; it replies with the
 /// operator's decision over `respond`.
 pub(crate) struct ApprovalRequest {
+    pub(crate) id: u64,
     pub(crate) tool: String,
-    pub(crate) args: String,
     pub(crate) respond: oneshot::Sender<bool>,
 }
 
-/// How a log line is styled in the console.
+/// Final state of a tool call shown by the console.
 #[derive(Clone, Copy)]
-pub(crate) enum LogKind {
-    Info,
-    Allowed,
+pub(crate) enum CallOutcome {
+    Succeeded,
+    Failed,
     Denied,
 }
 
-pub(crate) struct LogEntry {
-    pub(crate) kind: LogKind,
-    pub(crate) text: String,
+/// Structured updates sent from the HTTP handler to the console.
+pub(crate) enum ConsoleEvent {
+    Started {
+        id: u64,
+        tool: String,
+        args: String,
+    },
+    ApprovalRequested(ApprovalRequest),
+    Running {
+        id: u64,
+    },
+    Finished {
+        id: u64,
+        outcome: CallOutcome,
+        detail: String,
+    },
 }
 
 /// Shared state between the HTTP handler and the console.
@@ -64,8 +78,8 @@ pub(crate) struct ServerState {
     pub(crate) mode: Arc<Mutex<WorkMode>>,
     /// Classifier client for `auto` mode (None → auto refuses dangerous tools).
     classifier: Option<(Client<OpenAIConfig>, String)>,
-    log_tx: mpsc::UnboundedSender<LogEntry>,
-    approval_tx: mpsc::UnboundedSender<ApprovalRequest>,
+    event_tx: mpsc::UnboundedSender<ConsoleEvent>,
+    next_call_id: AtomicU64,
 }
 
 /// Serve MCP over HTTP at `addr` with a ratatui approval console. Returns when
@@ -77,13 +91,12 @@ pub async fn serve(
     allow_yolo: bool,
 ) -> color_eyre::Result<()> {
     let mode = Arc::new(Mutex::new(mode));
-    let (log_tx, log_rx) = mpsc::unbounded_channel();
-    let (approval_tx, approval_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
     let state = Arc::new(ServerState {
         mode: Arc::clone(&mode),
         classifier,
-        log_tx,
-        approval_tx,
+        event_tx,
+        next_call_id: AtomicU64::new(1),
     });
 
     let app = Router::new()
@@ -98,7 +111,7 @@ pub async fn serve(
     });
 
     // The console owns the terminal and blocks until the operator quits.
-    let result = super::console::run(mode, log_rx, approval_rx, bound, allow_yolo).await;
+    let result = super::console::run(mode, event_rx, bound, allow_yolo).await;
     server.abort();
     result
 }
@@ -141,6 +154,7 @@ impl ServerState {
             .cloned()
             .unwrap_or_else(|| json!({}))
             .to_string();
+        let id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
 
         if name == crate::tools::ask_user::NAME || name.starts_with("mcp__") {
             return Ok(tool_content(
@@ -149,25 +163,42 @@ impl ServerState {
             ));
         }
 
-        self.log(LogKind::Info, format!("→ {name}"));
-        match self.decide(&name, &args).await {
+        self.emit(ConsoleEvent::Started {
+            id,
+            tool: name.clone(),
+            args: args.clone(),
+        });
+        match self.decide(id, &name, &args).await {
             Ok(()) => {
+                self.emit(ConsoleEvent::Running { id });
                 let (text, is_error) = match crate::tools::run_local_tool(&name, &args).await {
                     Ok(text) => (text, false),
                     Err(text) => (text, true),
                 };
-                self.log(LogKind::Allowed, format!("ran {name}"));
+                self.emit(ConsoleEvent::Finished {
+                    id,
+                    outcome: if is_error {
+                        CallOutcome::Failed
+                    } else {
+                        CallOutcome::Succeeded
+                    },
+                    detail: text.clone(),
+                });
                 Ok(tool_content(text, is_error))
             }
             Err(reason) => {
-                self.log(LogKind::Denied, format!("{name}: {reason}"));
+                self.emit(ConsoleEvent::Finished {
+                    id,
+                    outcome: CallOutcome::Denied,
+                    detail: reason.clone(),
+                });
                 Ok(tool_content(format!("error: {reason}"), true))
             }
         }
     }
 
     /// Gate a tool call by the current mode. Read-only tools always run.
-    async fn decide(&self, name: &str, args: &str) -> Result<(), String> {
+    async fn decide(&self, id: u64, name: &str, args: &str) -> Result<(), String> {
         if !crate::classifier::needs_review(name, args) {
             return Ok(());
         }
@@ -178,7 +209,7 @@ impl ServerState {
                 "plan mode refuses state-mutating tools like {name}; switch mode with Ctrl+T"
             )),
             WorkMode::Auto => self.llm_approve(name, args).await,
-            WorkMode::Manual => self.ask_operator(name, args).await,
+            WorkMode::Manual => self.ask_operator(id, name).await,
         }
     }
 
@@ -197,14 +228,18 @@ impl ServerState {
     }
 
     /// Manual mode: hand the call to the console and wait for the operator.
-    async fn ask_operator(&self, name: &str, args: &str) -> Result<(), String> {
+    async fn ask_operator(&self, id: u64, name: &str) -> Result<(), String> {
         let (respond, rx) = oneshot::channel();
         let req = ApprovalRequest {
+            id,
             tool: name.to_string(),
-            args: args.to_string(),
             respond,
         };
-        if self.approval_tx.send(req).is_err() {
+        if self
+            .event_tx
+            .send(ConsoleEvent::ApprovalRequested(req))
+            .is_err()
+        {
             return Err("approval console is unavailable".to_string());
         }
         match rx.await {
@@ -214,7 +249,7 @@ impl ServerState {
         }
     }
 
-    fn log(&self, kind: LogKind, text: String) {
-        let _ = self.log_tx.send(LogEntry { kind, text });
+    fn emit(&self, event: ConsoleEvent) {
+        let _ = self.event_tx.send(event);
     }
 }

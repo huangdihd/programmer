@@ -316,9 +316,11 @@ programmer --mcp-http 0.0.0.0:9000 --mcp-mode manual
 
 `--mcp-http` serves the same tools over plain-HTTP JSON-RPC (`POST /mcp`) and,
 because the transport isn't stdio, keeps the terminal for a small **ratatui
-approval console**. There you watch tool calls stream in, approve `manual`-mode
-calls (`y`/`n`), and switch the work mode live (`Ctrl+T`) — `auto` still uses
-the LLM classifier, `manual` waits for you at the console.
+approval console**. The dashboard keeps a selectable call history with full
+arguments, results, and approval status. Use `↑`/`↓` or `j`/`k` to inspect
+calls, `PgUp`/`PgDn` to scroll details, `y`/`n` to resolve `manual`-mode
+approvals, and `Ctrl+T` to switch the work mode live. `auto` still uses the LLM
+classifier, while `manual` waits for you at the console.
 
 ### Session management
 

@@ -1,7 +1,7 @@
 - ~~multimodal support(use /vision on/off to switch support)~~
 - ~~jump to bottom button~~
 - ~~http mcp~~
-- redesign the `--mcp-http` mode UI
+- ~~redesign the `--mcp-http` mode UI~~
 - ~~edit_file tool diff-style message~~
 - ~~lint~~
 - remote control(?)
