@@ -171,7 +171,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         kind: CommandKind::Providers,
         name: "providers",
         aliases: &["provider"],
-        completion: CompletionKind::Fixed(&["show", "manage"]),
+        completion: CompletionKind::Fixed(&["show", "manage", "refresh"]),
         help: &[
             HelpEntry {
                 order: 16,
@@ -183,6 +183,11 @@ const COMMAND_SPECS: &[CommandSpec] = &[
                 usage: "/providers manage",
                 description: "Open the provider management panel",
             },
+            HelpEntry {
+                order: 18,
+                usage: "/providers refresh",
+                description: "Refetch auto-discovered provider models",
+            },
         ],
     },
     CommandSpec {
@@ -191,7 +196,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["s"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 18,
+            order: 19,
             usage: "/session | /s",
             description: "Show current session info",
         }],
@@ -202,7 +207,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 19,
+            order: 20,
             usage: "/usage",
             description: "Show token usage for the current session",
         }],
@@ -355,7 +360,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["c"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 20,
+            order: 21,
             usage: "/clear | /c",
             description: "Clear the conversation history",
         }],
@@ -366,7 +371,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["q", "exit"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 21,
+            order: 22,
             usage: "/quit | /q",
             description: "Exit the application",
         }],
@@ -377,7 +382,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["?"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 22,
+            order: 23,
             usage: "/help | /?",
             description: "Show this help",
         }],
@@ -1075,6 +1080,10 @@ mod tests {
                 "List all configured providers and models",
             ),
             ("/providers manage", "Open the provider management panel"),
+            (
+                "/providers refresh",
+                "Refetch auto-discovered provider models",
+            ),
             ("/session | /s", "Show current session info"),
             ("/usage", "Show token usage for the current session"),
             ("/clear | /c", "Clear the conversation history"),
@@ -1125,6 +1134,7 @@ mod tests {
         let CompletionKind::Fixed(values) = providers.completion else {
             panic!("providers should use fixed completions");
         };
+        assert_eq!(values, &["show", "manage", "refresh"]);
         let state = CompletionEngine::complete_subcommand("provider m", "provider", values)
             .expect("provider alias completion");
         assert_eq!(state.prefix, "/provider ");

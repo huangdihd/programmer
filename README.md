@@ -230,6 +230,7 @@ programmer
 | `/session` `/s` | Show current session UUID and info |
 | `/providers show` | List all configured providers and models |
 | `/providers manage` | Open the provider management panel |
+| `/providers refresh` | Refetch auto-discovered model lists |
 | `/clear` `/c` | Clear the conversation history |
 | `/quit` `/q` | Exit the application |
 | `/help` `/?` | Show all commands |

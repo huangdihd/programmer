@@ -234,7 +234,8 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             }
         }
         AppEvent::Quit => app.quit(),
-        AppEvent::ProvidersChanged => handle_providers_changed(app).await,
+        AppEvent::ProvidersChanged => reload_provider_manager(app).await,
+        AppEvent::RefreshProviderModels => handle_provider_models_refresh(app).await,
         AppEvent::McpChanged => handle_mcp_changed(app).await,
         AppEvent::QuestionPrompt {
             question,
@@ -373,7 +374,7 @@ fn handle_compact_finished(
 }
 
 /// Providers changed: rebuild the manager and reset the model if it vanished.
-async fn handle_providers_changed(app: &mut App<'_>) {
+async fn reload_provider_manager(app: &mut App<'_>) {
     app.provider_manager = crate::providers::ProviderManager::new(&app.config).await;
     for msg in &app.provider_manager.startup_errors {
         app.conversation_panel.add_error_string(msg.clone());
@@ -383,6 +384,19 @@ async fn handle_providers_changed(app: &mut App<'_>) {
         app.conversation_panel
             .add_info_string(format!("current model reset to: {}", app.current_model));
     }
+}
+
+async fn handle_provider_models_refresh(app: &mut App<'_>) {
+    reload_provider_manager(app).await;
+    let provider_names = app.provider_manager.provider_names();
+    let provider_count = provider_names.len();
+    let model_count = provider_names
+        .into_iter()
+        .map(|name| app.provider_manager.models_for(name).len())
+        .sum::<usize>();
+    app.conversation_panel.add_info_string(format!(
+        "Provider models refreshed: {model_count} model(s) across {provider_count} provider(s)."
+    ));
 }
 
 /// MCP config changed: reload the servers (or clear them).

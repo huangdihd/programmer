@@ -40,6 +40,8 @@ pub enum PanelAction {
     Close,
     /// The config was modified: persist it and rebuild the provider manager.
     Saved,
+    /// Re-fetch auto-discovered model lists without changing config.
+    RefreshModels,
 }
 
 /// Editable fields of the add/edit form, in focus order.
@@ -177,6 +179,7 @@ impl ProviderPanel {
                     };
                 }
             }
+            KeyCode::Char('r') => return PanelAction::RefreshModels,
             KeyCode::Char('e') => {
                 if let Some(name) = names.get(self.selected) {
                     let p = &config.providers[name];
@@ -609,6 +612,8 @@ impl ProviderPanel {
                     Span::styled(" edit  ", Style::default().fg(Color::Gray)),
                     Span::styled("m", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" models  ", Style::default().fg(Color::Gray)),
+                    Span::styled("r", Style::default().fg(Color::Cyan).bold()),
+                    Span::styled(" refresh  ", Style::default().fg(Color::Gray)),
                 ];
                 help.extend(PanelSearch::help_spans());
                 help.extend([
@@ -975,6 +980,20 @@ mod tests {
             PanelAction::Saved
         );
         assert_eq!(config.default_provider, "beta");
+    }
+
+    #[test]
+    fn refresh_requests_model_reload_without_changing_config() {
+        let mut config = config_with(&["alpha"]);
+        let pm = pm_stub();
+        let mut panel = ProviderPanel::new();
+
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char('r')), &mut config, &pm),
+            PanelAction::RefreshModels
+        );
+        assert_eq!(config.default_provider, "alpha");
+        assert_eq!(config.providers.len(), 1);
     }
 
     #[test]

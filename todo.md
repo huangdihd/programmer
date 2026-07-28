@@ -22,7 +22,7 @@
 - ~~/usage~~
 - clear finished tasks
 - fix sidebar scrolling lag
-- method to refetch models from providers
+- ~~method to refetch models from providers~~
 - ~~title on terminal~~
 - ~~/compact [model]~~
 - ~~/compact~~

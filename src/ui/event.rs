@@ -95,6 +95,8 @@ pub enum AppEvent {
     /// Provider config changed (via the management panel): rebuild the
     /// provider manager from the current config.
     ProvidersChanged,
+    /// Re-fetch auto-discovered model lists for all configured providers.
+    RefreshProviderModels,
     /// MCP server config changed (via the management panel): re-spawn the
     /// MCP manager from the current config.
     McpChanged,
@@ -163,6 +165,7 @@ impl std::fmt::Debug for AppEvent {
             Self::Start => write!(f, "Start"),
             Self::StartInit => write!(f, "StartInit"),
             Self::ProvidersChanged => write!(f, "ProvidersChanged"),
+            Self::RefreshProviderModels => write!(f, "RefreshProviderModels"),
             Self::McpChanged => write!(f, "McpChanged"),
             Self::QuestionPrompt {
                 question,

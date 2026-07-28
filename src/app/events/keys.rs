@@ -127,6 +127,9 @@ pub(crate) async fn handle_key_events(
                 session::persist_config(app);
                 app.events.send(AppEvent::ProvidersChanged);
             }
+            PanelAction::RefreshModels => {
+                app.events.send(AppEvent::RefreshProviderModels);
+            }
             PanelAction::None => {}
         }
         return Ok(());

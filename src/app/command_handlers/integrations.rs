@@ -11,6 +11,7 @@ use crate::commands::Command;
 use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::provider_panel::ProviderPanel;
 use crate::ui::components::skills_panel::SkillsPanel;
+use crate::ui::event::AppEvent;
 
 pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOutcome {
     app.input_panel.clear();
@@ -48,9 +49,15 @@ fn providers(app: &mut App<'_>, arg: &str) {
             app.conversation_panel.add_info_string(lines.join("\n"));
         }
         "manage" => app.provider_panel = Some(ProviderPanel::new()),
+        "refresh" => {
+            app.conversation_panel
+                .add_info_string("Refreshing provider model lists...");
+            app.events.send(AppEvent::RefreshProviderModels);
+        }
         _ => app.conversation_panel.add_info_string(
             "usage: /providers show — list configured providers\n\
-             \u{20}      /providers manage — open the management panel",
+             \u{20}      /providers manage — open the management panel\n\
+             \u{20}      /providers refresh — refetch auto-discovered model lists",
         ),
     }
 }
