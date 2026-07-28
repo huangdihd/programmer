@@ -81,9 +81,10 @@ pub enum AppEvent {
     /// run so a summary from a cancelled compaction is dropped. Tagged with
     /// the operation id.
     CompactFinished(u64, Result<String, String>, CancellationToken),
-    /// A `!command`'s interactive task exited: hand its transcript to the
-    /// model so the agent responds to the outcome. Carries the task id.
-    BangFinished(u64),
+    /// A background process entered a terminal state.
+    TaskStateChanged(crate::tasks::TaskLifecycleEvent),
+    /// Debounced request to hand accumulated task updates to the agent.
+    FlushTaskNotifications(u64),
     /// Cancel the current in-flight request (streaming or tool calls).
     Cancel,
     /// Quit the application.
@@ -159,7 +160,15 @@ impl std::fmt::Debug for AppEvent {
                 .field(id)
                 .field(&r.as_ref().map(|_| ".."))
                 .finish(),
-            Self::BangFinished(id) => f.debug_tuple("BangFinished").field(id).finish(),
+            Self::TaskStateChanged(event) => f
+                .debug_tuple("TaskStateChanged")
+                .field(&event.task_id)
+                .field(&event.new_status)
+                .finish(),
+            Self::FlushTaskNotifications(token) => f
+                .debug_tuple("FlushTaskNotifications")
+                .field(token)
+                .finish(),
             Self::Cancel => write!(f, "Cancel"),
             Self::Quit => write!(f, "Quit"),
             Self::Start => write!(f, "Start"),

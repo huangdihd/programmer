@@ -44,8 +44,10 @@ use async_openai::types::responses::FunctionToolCall;
 use crossterm::event::KeyEvent;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// A pending tool-call review request from the runner. Manual mode now gets
 /// per-call reviews (no batch), driven by the runner's `review()` callback.
@@ -106,6 +108,45 @@ pub(crate) struct SessionState {
     pub(crate) dirty: bool,
 }
 
+pub(crate) struct TaskNotificationState {
+    pub(crate) pending: VecDeque<crate::tasks::TaskLifecycleEvent>,
+    seen: HashSet<(u64, u64)>,
+    pub(crate) ready_at: Option<Instant>,
+    pub(crate) flush_token: u64,
+    pub(crate) flush_requested: bool,
+}
+
+impl TaskNotificationState {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            seen: HashSet::new(),
+            ready_at: None,
+            flush_token: 0,
+            flush_requested: false,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.pending.clear();
+        self.seen.clear();
+        self.ready_at = None;
+        self.flush_token = self.flush_token.wrapping_add(1);
+        self.flush_requested = false;
+    }
+
+    pub(crate) fn push(&mut self, event: crate::tasks::TaskLifecycleEvent) -> bool {
+        if !self.seen.insert((event.generation, event.sequence)) {
+            return false;
+        }
+        self.pending.push_back(event);
+        self.ready_at = Some(Instant::now() + std::time::Duration::from_millis(200));
+        self.flush_token = self.flush_token.wrapping_add(1);
+        self.flush_requested = false;
+        true
+    }
+}
+
 /// Application.
 pub struct App<'a> {
     /// Is the application running?
@@ -141,10 +182,8 @@ pub struct App<'a> {
     pub todo_panel: Option<TodoPanel>,
     /// Full-screen interactive terminal panel, when open (`/terminal`).
     pub terminal_pane: Option<crate::ui::components::terminal_panel::TerminalPane>,
-    /// `!command` tasks whose exit should hand the transcript to the agent:
-    /// `(task id, consecutive ticks observed finished)`. The tick counter is a
-    /// short grace period so the PTY reader can flush the tail of the output.
-    pub(crate) bang_watch: Vec<(u64, u8)>,
+    /// Terminal task events waiting to be delivered to the agent.
+    pub(crate) task_notifications: TaskNotificationState,
     /// Right-hand sidebar panel (toggled with Ctrl+B).
     pub sidebar: Option<Sidebar>,
     /// The sidebar's screen area from the last render, used to route mouse
@@ -276,7 +315,7 @@ impl App<'_> {
             question_panel: None,
             todo_panel: None,
             terminal_pane: None,
-            bang_watch: Vec::new(),
+            task_notifications: TaskNotificationState::new(),
             sidebar: Some(Sidebar::new()),
             sidebar_area: None,
             todo_list,
@@ -330,6 +369,22 @@ impl App<'_> {
             }
             app.mcp_manager = Some(Arc::new(mcp));
         }
+
+        let (task_event_tx, mut task_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::tasks::install_event_sink(task_event_tx);
+        let app_event_tx = app.events.sender.clone();
+        tokio::spawn(async move {
+            while let Some(event) = task_event_rx.recv().await {
+                if app_event_tx
+                    .send(Event::App(crate::ui::event::AppEvent::TaskStateChanged(
+                        event,
+                    )))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         app
     }
@@ -480,4 +535,42 @@ pub(crate) fn build_mcp_policy_map(
         .iter()
         .map(|s| (s.name.clone(), s.auto_approve))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskNotificationState;
+    use std::time::Duration;
+
+    fn event(sequence: u64) -> crate::tasks::TaskLifecycleEvent {
+        crate::tasks::TaskLifecycleEvent {
+            sequence,
+            generation: 3,
+            task_id: sequence,
+            origin: crate::tasks::TaskOrigin::TaskTool,
+            old_status: crate::tasks::TaskStatus::Running,
+            new_status: crate::tasks::TaskStatus::Completed,
+            name: "test".to_string(),
+            command: "true".to_string(),
+            exit_code: Some(0),
+            elapsed: Duration::ZERO,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            transcript_tail: String::new(),
+        }
+    }
+
+    #[test]
+    fn task_notifications_are_deduplicated_and_clear_resets_delivery() {
+        let mut state = TaskNotificationState::new();
+        assert!(state.push(event(1)));
+        assert!(!state.push(event(1)));
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.ready_at.is_some());
+
+        state.clear();
+        assert!(state.pending.is_empty());
+        assert!(state.ready_at.is_none());
+        assert!(state.push(event(1)));
+    }
 }

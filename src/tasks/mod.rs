@@ -45,6 +45,8 @@ const MAX_LIVE_OUTPUT: usize = 16_384;
 const MAX_PERSISTED_OUTPUT: usize = 10_000;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static TASK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Lifecycle state of one background task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +76,43 @@ impl TaskStatus {
 pub enum TaskKind {
     Background,
     Command,
+}
+
+/// How a process entered the task system. Unlike [`TaskKind`], this remains
+/// stable when a foreground command is promoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOrigin {
+    TaskTool,
+    Command,
+    PromotedCommand,
+    BangCommand,
+    Restored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskNotificationPolicy {
+    Agent,
+    Silent,
+}
+
+/// A terminal state transition delivered to the application. The output is
+/// copied into the event after the process readers have drained, so clearing a
+/// finished task cannot erase a notification that is already in flight.
+#[derive(Debug, Clone)]
+pub struct TaskLifecycleEvent {
+    pub sequence: u64,
+    pub generation: u64,
+    pub task_id: u64,
+    pub origin: TaskOrigin,
+    pub old_status: TaskStatus,
+    pub new_status: TaskStatus,
+    pub name: String,
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub elapsed: Duration,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub transcript_tail: String,
 }
 
 /// Interactive-task state: a child running in a real PTY, its output parsed
@@ -109,6 +148,9 @@ struct PtyState {
 struct TaskEntry {
     id: u64,
     kind: TaskKind,
+    origin: TaskOrigin,
+    notification_policy: TaskNotificationPolicy,
+    generation: u64,
     /// Tool-call id for a foreground `command`, used by live conversation
     /// rendering. Background tasks leave this unset.
     call_id: Option<String>,
@@ -189,6 +231,28 @@ pub struct SidebarTaskOutput {
 fn registry() -> &'static Mutex<Vec<TaskEntry>> {
     static REGISTRY: OnceLock<Mutex<Vec<TaskEntry>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn event_sink() -> &'static Mutex<Option<tokio::sync::mpsc::UnboundedSender<TaskLifecycleEvent>>> {
+    static SINK: OnceLock<Mutex<Option<tokio::sync::mpsc::UnboundedSender<TaskLifecycleEvent>>>> =
+        OnceLock::new();
+    SINK.get_or_init(|| Mutex::new(None))
+}
+
+/// Install the single application consumer for lifecycle events.
+pub fn install_event_sink(sender: tokio::sync::mpsc::UnboundedSender<TaskLifecycleEvent>) {
+    *event_sink().lock().unwrap() = Some(sender);
+}
+
+pub fn current_generation() -> u64 {
+    TASK_GENERATION.load(Ordering::Relaxed)
+}
+
+fn publish_event(event: TaskLifecycleEvent) {
+    let sender = event_sink().lock().unwrap().clone();
+    if let Some(sender) = sender {
+        let _ = sender.send(event);
+    }
 }
 
 fn next_id() -> u64 {
@@ -413,10 +477,17 @@ fn spawn_pipe(
     };
 
     {
+        let (origin, notification_policy) = match kind {
+            TaskKind::Background => (TaskOrigin::TaskTool, TaskNotificationPolicy::Agent),
+            TaskKind::Command => (TaskOrigin::Command, TaskNotificationPolicy::Silent),
+        };
         let mut reg = registry().lock().unwrap();
         reg.push(TaskEntry {
             id,
             kind,
+            origin,
+            notification_policy,
+            generation: current_generation(),
             call_id: call_id.map(str::to_string),
             name: name
                 .filter(|n| !n.trim().is_empty())
@@ -509,6 +580,8 @@ pub fn promote_command(id: u64) -> Result<(), String> {
     }
 
     entry.kind = TaskKind::Background;
+    entry.origin = TaskOrigin::PromotedCommand;
+    entry.notification_policy = TaskNotificationPolicy::Agent;
     entry.call_id = None;
     entry.max_output = MAX_TASK_OUTPUT;
     cap_buffer(&mut entry.output, MAX_TASK_OUTPUT);
@@ -629,6 +702,28 @@ pub fn spawn_interactive(
     rows: u16,
     cols: u16,
 ) -> Result<u64, String> {
+    spawn_interactive_with_origin(command, dir, name, rows, cols, TaskOrigin::TaskTool)
+}
+
+/// Spawn an interactive command entered directly by the user with `!command`.
+pub fn spawn_bang(
+    command: &str,
+    dir: Option<&str>,
+    name: Option<&str>,
+    rows: u16,
+    cols: u16,
+) -> Result<u64, String> {
+    spawn_interactive_with_origin(command, dir, name, rows, cols, TaskOrigin::BangCommand)
+}
+
+fn spawn_interactive_with_origin(
+    command: &str,
+    dir: Option<&str>,
+    name: Option<&str>,
+    rows: u16,
+    cols: u16,
+    origin: TaskOrigin,
+) -> Result<u64, String> {
     #[cfg(windows)]
     harden_dll_search();
     let pty_system = native_pty_system();
@@ -688,6 +783,9 @@ pub fn spawn_interactive(
         reg.push(TaskEntry {
             id,
             kind: TaskKind::Background,
+            origin,
+            notification_policy: TaskNotificationPolicy::Agent,
+            generation: current_generation(),
             call_id: None,
             name: name
                 .filter(|n| !n.trim().is_empty())
@@ -725,6 +823,7 @@ pub fn spawn_interactive(
     // (`ESC[6n`) are answered here from the vt100 grid. Windows ConPTY makes
     // this load-bearing: it is created with INHERIT_CURSOR and blocks the
     // child's startup on exactly that query until a report arrives.
+    let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
     {
         let parser = Arc::clone(&parser);
         let writer = Arc::clone(&writer);
@@ -764,6 +863,7 @@ pub fn spawn_interactive(
                     }
                 }
             }
+            let _ = reader_done_tx.send(());
         });
     }
 
@@ -783,6 +883,9 @@ pub fn spawn_interactive(
                 }
                 Err(_) => (TaskStatus::Failed, None),
             };
+            // PTY output is read on a separate blocking thread. Wait for EOF so
+            // the lifecycle event includes the final screen/transcript tail.
+            let _ = reader_done_rx.recv_timeout(Duration::from_secs(1));
             finish(id, status, code);
         });
     }
@@ -1200,6 +1303,7 @@ pub fn kill(id: u64) -> Result<(), String> {
 /// Kill every running task and clear the registry so the next session starts
 /// clean.
 pub fn kill_all() -> usize {
+    TASK_GENERATION.fetch_add(1, Ordering::Relaxed);
     let mut reg = registry().lock().unwrap();
     let mut count = 0;
     for entry in reg.iter_mut() {
@@ -1347,6 +1451,9 @@ pub fn restore(saved: &[PersistedTask]) {
         reg.push(TaskEntry {
             id: t.id,
             kind: TaskKind::Background,
+            origin: TaskOrigin::Restored,
+            notification_policy: TaskNotificationPolicy::Silent,
+            generation: current_generation(),
             call_id: None,
             name: t.name.clone(),
             command: t.command.clone(),
@@ -1492,13 +1599,69 @@ pub fn strip_ansi(raw: &str) -> String {
 
 fn finish(id: u64, status: TaskStatus, exit_code: Option<i32>) {
     let mut reg = registry().lock().unwrap();
-    if let Some(entry) = reg.iter_mut().find(|e| e.id == id) {
-        entry.status = status;
-        entry.exit_code = exit_code;
-        entry.finished = Some(Instant::now());
-        entry.kill = None;
-        entry.stdin_tx = None;
+    let Some(entry) = reg.iter_mut().find(|e| e.id == id) else {
+        return;
+    };
+    if entry.status != TaskStatus::Running {
+        return;
     }
+
+    let old_status = entry.status;
+    let finished = Instant::now();
+    entry.status = status;
+    entry.exit_code = exit_code;
+    entry.finished = Some(finished);
+    entry.kill = None;
+    entry.stdin_tx = None;
+
+    let event = lifecycle_event(entry, old_status, status, exit_code, finished);
+    drop(reg);
+
+    if let Some(event) = event {
+        publish_event(event);
+    }
+}
+
+fn lifecycle_event(
+    entry: &TaskEntry,
+    old_status: TaskStatus,
+    new_status: TaskStatus,
+    exit_code: Option<i32>,
+    finished: Instant,
+) -> Option<TaskLifecycleEvent> {
+    if entry.kind != TaskKind::Background
+        || entry.notification_policy != TaskNotificationPolicy::Agent
+    {
+        return None;
+    }
+    let transcript = entry
+        .pty
+        .as_ref()
+        .map(|pty| strip_ansi(&pty.transcript))
+        .unwrap_or_default();
+    Some(TaskLifecycleEvent {
+        sequence: NEXT_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        generation: entry.generation,
+        task_id: entry.id,
+        origin: entry.origin,
+        old_status,
+        new_status,
+        name: entry.name.clone(),
+        command: entry.command.clone(),
+        exit_code,
+        elapsed: finished - entry.started,
+        stdout_tail: tail_chars(&strip_ansi(&entry.output), 8_000),
+        stderr_tail: tail_chars(&strip_ansi(&entry.stderr_output), 4_000),
+        transcript_tail: tail_chars(&transcript, 8_000),
+    })
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    text.chars().skip(count - max_chars).collect()
 }
 
 #[cfg(test)]
@@ -1519,6 +1682,69 @@ mod tests {
         assert_eq!(preview.lines.len(), 10);
         assert_eq!(preview.lines.first().unwrap(), "line 4 w");
         assert_eq!(preview.lines.last().unwrap(), "line 13 ");
+    }
+
+    #[test]
+    fn lifecycle_event_is_emitted_only_for_agent_owned_background_tasks() {
+        let started = Instant::now();
+        let mut entry = TaskEntry {
+            id: 41,
+            kind: TaskKind::Background,
+            origin: TaskOrigin::TaskTool,
+            notification_policy: TaskNotificationPolicy::Agent,
+            generation: 7,
+            call_id: None,
+            name: "tests".to_string(),
+            command: "cargo test".to_string(),
+            status: TaskStatus::Completed,
+            exit_code: Some(0),
+            started,
+            finished: Some(started),
+            output: "\u{1b}[32mok\u{1b}[0m\n".to_string(),
+            stderr_output: String::new(),
+            live_output: String::new(),
+            max_output: MAX_TASK_OUTPUT,
+            kill: None,
+            stdin_tx: None,
+            pty: None,
+        };
+
+        let event = lifecycle_event(
+            &entry,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            Some(0),
+            started,
+        )
+        .expect("background task should notify");
+        assert_eq!(event.task_id, 41);
+        assert_eq!(event.generation, 7);
+        assert_eq!(event.new_status, TaskStatus::Completed);
+        assert_eq!(event.stdout_tail, "ok\n");
+
+        entry.kind = TaskKind::Command;
+        assert!(
+            lifecycle_event(
+                &entry,
+                TaskStatus::Running,
+                TaskStatus::Completed,
+                Some(0),
+                started,
+            )
+            .is_none()
+        );
+        entry.kind = TaskKind::Background;
+        entry.notification_policy = TaskNotificationPolicy::Silent;
+        assert!(
+            lifecycle_event(
+                &entry,
+                TaskStatus::Running,
+                TaskStatus::Killed,
+                None,
+                started,
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]

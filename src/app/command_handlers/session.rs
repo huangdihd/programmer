@@ -79,6 +79,7 @@ fn new(app: &mut App<'_>) -> CommandOutcome {
     diagnostics::reset_diagnostics_state(app);
     app.pending_images.clear();
     let killed = crate::tasks::kill_all();
+    app.task_notifications.clear();
     if let Some(manager) = &app.session.mgr {
         let new_session = manager.create();
         app.session.uuid = new_session.uuid;

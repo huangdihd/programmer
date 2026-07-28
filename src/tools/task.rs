@@ -59,6 +59,9 @@ pub fn tool() -> Tool {
          Note: PTY tasks merge stdout and stderr (this is how terminals work); \
          use pipe tasks if you need them separated, or `transcript` to see the \
          full raw session. \
+         The agent is notified automatically when a background task completes, \
+         fails, or is killed. Do not repeatedly poll with `output` or `wait` \
+         unless the current step must block for the result. \
          Prefer the `command` tool for anything that finishes quickly — use \
          background tasks only when the command should outlive the current step.",
         json!({

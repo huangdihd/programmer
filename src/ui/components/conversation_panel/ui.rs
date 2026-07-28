@@ -28,7 +28,10 @@ use crate::ui::components::messages::warning_message::WarningMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
 use crate::ui::markdown_theme::palette;
-use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem};
+use async_openai::types::responses::{
+    FunctionCallOutputItemParam, InputItem, InputRole, Item, MessageItem as ApiMessageItem,
+    OutputItem,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
 use ratatui::style::{Modifier, Style};
@@ -42,6 +45,7 @@ use tui_scrollview::ScrollView;
 fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
     let w = width.max(40) as usize;
     match item {
+        MessageItem::Input(input) if is_hidden_developer_input(input) => 0,
         MessageItem::Input(input) => {
             let text = crate::app::helpers::extract_input_text(input).unwrap_or_default();
             rough_line_count(&text, w)
@@ -69,6 +73,14 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
         // built paragraph).
         MessageItem::Compacted { .. } => 1,
     }
+}
+
+fn is_hidden_developer_input(input: &InputItem) -> bool {
+    matches!(
+        input,
+        InputItem::Item(Item::Message(ApiMessageItem::Input(message)))
+            if message.role == InputRole::Developer
+    )
 }
 
 /// Rough line count: chars / width, plus explicit newlines.
@@ -284,6 +296,7 @@ impl Widget for &mut ConversationPanel {
                 MessageItem::Output(OutputItem::FunctionCall(call)) => {
                     (false, outputs_by_call.get(call.call_id.as_str()).copied())
                 }
+                MessageItem::Input(input) => (is_hidden_developer_input(input), None),
                 _ => (false, None),
             };
             let has_output = tool_output.is_some();
@@ -500,5 +513,27 @@ impl Widget for &mut ConversationPanel {
         }
 
         self.set_layout(area, offset, layout, live_layout);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_hidden_developer_input;
+    use async_openai::types::responses::{
+        InputContent, InputMessage, InputRole, InputTextContent, Item,
+        MessageItem as ApiMessageItem, OutputStatus,
+    };
+
+    #[test]
+    fn developer_runtime_inputs_are_hidden_from_chat_rendering() {
+        let input = Item::Message(ApiMessageItem::Input(InputMessage {
+            content: vec![InputContent::InputText(InputTextContent {
+                text: "runtime notification".to_string(),
+            })],
+            role: InputRole::Developer,
+            status: Some(OutputStatus::Completed),
+        }))
+        .into();
+        assert!(is_hidden_developer_input(&input));
     }
 }

@@ -204,21 +204,17 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             session::mark_dirty(app);
             // Restore mouse capture — external commands may disable it.
             let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-            // Start any queued follow-up request. handle_cancel deliberately
-            // does NOT start it (it waits for us), so we start it for both
-            // normal completion and cancellation — exactly once per turn.
-            if let Some((pending_request, images)) =
-                take_pending_request(&mut app.conversation_panel, &mut app.pending_images)
-            {
-                commands::start_request_with_images(app, pending_request, images).await;
-            }
+            start_queued_work(app).await;
         }
         AppEvent::Start => {
             diagnostics::maybe_seed_diagnostics_baseline(app);
             commands::send_message(app).await;
         }
         AppEvent::StartInit => handle_start_init(app),
-        AppEvent::BangFinished(task_id) => handle_bang_finished(app, task_id).await,
+        AppEvent::TaskStateChanged(event) => handle_task_state_changed(app, event),
+        AppEvent::FlushTaskNotifications(token) => {
+            flush_task_notifications(app, token).await;
+        }
         AppEvent::CompactFinished(op_id, result, cancel_token) => {
             if !is_current_turn(app, op_id) {
                 return;
@@ -227,11 +223,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             // handle_compact_finished clears active_id and resets the phase
             // back to idle. If the user queued a message while compacting,
             // start it now — just like TurnFinished does for normal turns.
-            if let Some((pending_request, images)) =
-                take_pending_request(&mut app.conversation_panel, &mut app.pending_images)
-            {
-                commands::start_request_with_images(app, pending_request, images).await;
-            }
+            start_queued_work(app).await;
         }
         AppEvent::Quit => handle_quit_request(app),
         AppEvent::ProvidersChanged => reload_provider_manager(app).await,
@@ -276,6 +268,63 @@ fn take_pending_request(
         .pending_message
         .take()
         .map(|text| (text, std::mem::take(pending_images)))
+}
+
+async fn start_queued_work(app: &mut App<'_>) {
+    let pending_user = take_pending_request(&mut app.conversation_panel, &mut app.pending_images);
+    if app.task_notifications.pending.is_empty() {
+        if let Some((text, images)) = pending_user {
+            commands::start_request_with_images(app, text, images).await;
+        }
+        return;
+    }
+
+    let events: Vec<_> = app.task_notifications.pending.drain(..).collect();
+    app.task_notifications.ready_at = None;
+    app.task_notifications.flush_requested = false;
+    for event in &events {
+        app.conversation_panel.add_info_string(format!(
+            "Task #{} {} {} — notifying agent.",
+            event.task_id,
+            event.name,
+            event.new_status.label()
+        ));
+    }
+    session::mark_dirty(app);
+    commands::start_task_update_request(app, events, pending_user).await;
+}
+
+fn handle_task_state_changed(app: &mut App<'_>, event: crate::tasks::TaskLifecycleEvent) {
+    if event.generation != crate::tasks::current_generation() {
+        return;
+    }
+    app.task_notifications.push(event);
+}
+
+async fn flush_task_notifications(app: &mut App<'_>, token: u64) {
+    if token != app.task_notifications.flush_token {
+        return;
+    }
+    app.task_notifications.flush_requested = false;
+    if app.cancel.active_id.is_some()
+        || app.task_notifications.pending.is_empty()
+        || has_blocking_surface(app)
+    {
+        return;
+    }
+    start_queued_work(app).await;
+}
+
+fn has_blocking_surface(app: &App<'_>) -> bool {
+    app.pending_review.is_some()
+        || app.question_panel.is_some()
+        || app.provider_panel.is_some()
+        || app.skills_panel.is_some()
+        || app.mcp_panel.is_some()
+        || app.todo_panel.is_some()
+        || app.terminal_pane.is_some()
+        || (app.work_mode == WorkMode::Plan
+            && app.plan_phase == crate::classifier::PlanPhase::Reviewing)
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +500,20 @@ async fn handle_mcp_changed(app: &mut App<'_>) {
 pub(crate) fn tick(app: &mut App<'_>) {
     session::flush_if_dirty(app);
     poll_finished_terminals(app);
+    if app.cancel.active_id.is_none()
+        && !app.task_notifications.pending.is_empty()
+        && !app.task_notifications.flush_requested
+        && !has_blocking_surface(app)
+        && app
+            .task_notifications
+            .ready_at
+            .is_some_and(|ready| std::time::Instant::now() >= ready)
+    {
+        app.task_notifications.flush_requested = true;
+        app.events.send(AppEvent::FlushTaskNotifications(
+            app.task_notifications.flush_token,
+        ));
+    }
 }
 
 /// Consecutive ticks a task must be seen finished before acting on it. At
@@ -458,8 +521,8 @@ pub(crate) fn tick(app: &mut App<'_>) {
 /// reader thread to flush the tail of the output after the child exits.
 const TASK_EXIT_GRACE_TICKS: u8 = 3;
 
-/// Watch interactive tasks for exit: close the terminal panel (returning focus
-/// to the input) and fire [`AppEvent::BangFinished`] for watched `!` commands.
+/// Watch interactive tasks for exit and close their terminal panel after the
+/// reader has had a brief chance to flush the final screen.
 fn poll_finished_terminals(app: &mut App<'_>) {
     use crate::tasks::TaskStatus;
 
@@ -482,74 +545,16 @@ fn poll_finished_terminals(app: &mut App<'_>) {
             pane.finished_ticks += 1;
             if pane.finished_ticks >= TASK_EXIT_GRACE_TICKS {
                 let pane = app.terminal_pane.take().unwrap();
-                // `!` tasks get their record via BangFinished below; announce
-                // the close only for plain `/terminal` panes.
-                if !app.bang_watch.iter().any(|(id, _)| *id == pane.task_id) {
-                    let status = crate::tasks::snapshot(pane.task_id)
-                        .map(|s| s.status.label())
-                        .unwrap_or("gone");
-                    app.conversation_panel.add_info_string(format!(
-                        "\u{1F5A5} terminal [{}] {} — {status}",
-                        pane.task_id, pane.name
-                    ));
-                }
+                let status = crate::tasks::snapshot(pane.task_id)
+                    .map(|s| s.status.label())
+                    .unwrap_or("gone");
+                app.conversation_panel.add_info_string(format!(
+                    "\u{1F5A5} terminal [{}] {} — {status}",
+                    pane.task_id, pane.name
+                ));
             }
         }
     }
-
-    // Watched `!` commands: exited tasks go to the agent (even if the user
-    // closed the panel early and the command finished in the background).
-    let mut i = 0;
-    while i < app.bang_watch.len() {
-        let (id, ref mut ticks) = app.bang_watch[i];
-        if is_running(id) {
-            *ticks = 0;
-            i += 1;
-        } else {
-            *ticks += 1;
-            if *ticks >= TASK_EXIT_GRACE_TICKS {
-                app.bang_watch.remove(i);
-                app.events.send(AppEvent::BangFinished(id));
-            } else {
-                i += 1;
-            }
-        }
-    }
-}
-
-// Maximum transcript characters replayed to the model for a `!command`.
-const MAX_BANG_TRANSCRIPT: usize = 10_000;
-
-/// A watched `!command` exited: compose its transcript into a user message and
-/// start a turn so the agent responds to the outcome.
-async fn handle_bang_finished(app: &mut App<'_>, task_id: u64) {
-    use crate::tasks::TaskStatus;
-
-    let Some(snap) = crate::tasks::snapshot(task_id) else {
-        return;
-    };
-    let status = match (snap.status, snap.exit_code) {
-        (TaskStatus::Killed, _) => "killed".to_string(),
-        (_, Some(code)) => format!("exited with code {code}"),
-        (s, None) => s.label().to_string(),
-    };
-    let transcript = crate::tasks::transcript(task_id).unwrap_or_default();
-    let transcript = transcript.trim();
-    let body = if transcript.is_empty() {
-        "(no output)"
-    } else {
-        // Keep the tail — the interesting part — under the cap.
-        let mut start = transcript.len().saturating_sub(MAX_BANG_TRANSCRIPT);
-        while !transcript.is_char_boundary(start) {
-            start += 1;
-        }
-        &transcript[start..]
-    };
-    let text = format!(
-        "!{}\n[interactive terminal session {status}]\n```\n{body}\n```",
-        snap.command
-    );
-    commands::start_request(app, text).await;
 }
 
 /// Recompute tab-completion candidates from the current input text.
