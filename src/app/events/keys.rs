@@ -36,6 +36,13 @@ pub(crate) async fn handle_key_events(
         return Ok(());
     }
 
+    // ---- Ctrl+Z while a command tool is running: keep its process alive as
+    // a background task. Do this before modal routing so the foreground turn
+    // can finish and the promoted task can appear in the sidebar immediately.
+    if is_promote_shortcut(key_event) && crate::tasks::promote_running_command().is_some() {
+        return Ok(());
+    }
+
     // ---- interactive terminal panel (fully modal; grabs input) ----
     if app.terminal_pane.is_some() {
         handle_terminal_key(app, key_event);
@@ -303,6 +310,10 @@ pub(crate) async fn handle_key_events(
         }
     }
     Ok(())
+}
+
+fn is_promote_shortcut(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('z') && key.modifiers == KeyModifiers::CONTROL
 }
 
 /// Handle a key while the task panel is open. Pipe tasks are strictly read-only
@@ -590,4 +601,21 @@ fn propose_plan_changes(app: &mut App<'_>) {
     app.conversation_panel
         .add_info_string("Enter your feedback in the input panel.");
     session::save_session(app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_z_is_the_command_promotion_shortcut() {
+        assert!(is_promote_shortcut(KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_promote_shortcut(KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::NONE
+        )));
+    }
 }

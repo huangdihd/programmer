@@ -44,7 +44,12 @@ pub fn tool() -> Tool {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Optional timeout in seconds. If the command runs longer, it will be killed. Default: 120."
+                "description": "Optional timeout in seconds. Default: 120."
+            },
+            "timeout_action": {
+                "type": "string",
+                "enum": ["kill", "background"],
+                "description": "What to do when timeout elapses: kill the command (default), or keep it running as a background task."
             },
             "dir": {
                 "type": "string",
@@ -61,7 +66,17 @@ struct Args {
     #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
+    timeout_action: TimeoutAction,
+    #[serde(default)]
     dir: Option<String>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum TimeoutAction {
+    #[default]
+    Kill,
+    Background,
 }
 
 pub async fn run(arguments: &str) -> Result<String, String> {
@@ -93,33 +108,85 @@ async fn run_inner(
     let id = crate::tasks::spawn_command(&args.command, args.dir.as_deref(), live_id)
         .map_err(|error| command_spawn_error(&error))?;
     let timeout_secs = args.timeout.unwrap_or(120);
-    let wait = crate::tasks::wait_until_finished(id);
-    let outcome =
-        tokio::time::timeout(Duration::from_secs(timeout_secs), cancel.wait_or(wait)).await;
+    let wait = wait_for_finish_or_promotion(id);
+    let wait_or_cancel = async {
+        tokio::select! {
+            biased;
+            result = wait => Some(result),
+            _ = cancel.wait() => None,
+        }
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), wait_or_cancel).await;
 
     match outcome {
-        Ok(Some(Ok(snapshot))) => {
-            // The exit code is the authoritative success signal — a non-zero
-            // status means the command failed, regardless of what it printed.
-            let output = format_output(snapshot.exit_code, &snapshot.output, &snapshot.stderr);
-            if snapshot.exit_code.unwrap_or(-1) != 0 {
-                Err(output)
-            } else {
-                Ok(output)
-            }
+        Ok(Some(Ok(CommandOutcome::Finished(snapshot)))) => completed_result(id, snapshot),
+        Ok(Some(Ok(CommandOutcome::Promoted))) => Ok(background_result(id)),
+        Ok(Some(Err(error))) => {
+            crate::tasks::forget_command(id);
+            Err(error)
         }
-        Ok(Some(Err(error))) => Err(error),
+        Ok(None) if crate::tasks::is_background(id) => Ok(background_result(id)),
         Ok(None) => {
             stop_command(id).await;
+            crate::tasks::forget_command(id);
             Err("error: failed to run command: cancelled".to_string())
         }
+        Err(_) if args.timeout_action == TimeoutAction::Background => {
+            match crate::tasks::promote_command(id) {
+                Ok(()) => Ok(background_result(id)),
+                Err(_) => completed_result(id, crate::tasks::wait_until_finished(id).await?),
+            }
+        }
+        Err(_) if crate::tasks::is_background(id) => Ok(background_result(id)),
         Err(_) => {
             stop_command(id).await;
+            crate::tasks::forget_command(id);
             Err(format!(
                 "error: failed to run command: command timed out after {timeout_secs}s"
             ))
         }
     }
+}
+
+enum CommandOutcome {
+    Finished(crate::tasks::TaskSnapshot),
+    Promoted,
+}
+
+async fn wait_for_finish_or_promotion(id: u64) -> Result<CommandOutcome, String> {
+    tokio::select! {
+        biased;
+        result = crate::tasks::wait_until_finished(id) => {
+            result.map(CommandOutcome::Finished)
+        }
+        result = crate::tasks::wait_until_promoted(id) => {
+            match result? {
+                true => Ok(CommandOutcome::Promoted),
+                false => crate::tasks::wait_until_finished(id)
+                    .await
+                    .map(CommandOutcome::Finished),
+            }
+        }
+    }
+}
+
+fn completed_result(id: u64, snapshot: crate::tasks::TaskSnapshot) -> Result<String, String> {
+    // The exit code is the authoritative success signal — a non-zero status
+    // means the command failed, regardless of what it printed.
+    let output = format_output(snapshot.exit_code, &snapshot.output, &snapshot.stderr);
+    crate::tasks::forget_command(id);
+    if snapshot.exit_code.unwrap_or(-1) == 0 {
+        Ok(output)
+    } else {
+        Err(output)
+    }
+}
+
+fn background_result(id: u64) -> String {
+    format!(
+        "Command is still running as background task {id}.\n\
+         Its stdin is closed. Use the task tool or /terminal {id} to inspect or stop it."
+    )
 }
 
 fn command_spawn_error(error: &str) -> String {
@@ -400,5 +467,75 @@ mod live_tests {
             .expect_err("command should be cancelled");
         assert!(error.contains("cancelled"), "unexpected error: {error}");
         assert!(live_output("cancel-command-test").is_none());
+    }
+
+    #[tokio::test]
+    async fn timeout_can_promote_instead_of_kill() {
+        let args = format!(
+            r#"{{"command":{},"timeout":0,"timeout_action":"background"}}"#,
+            json!(long_command())
+        );
+        let result = run(&args).await.expect("command should move to background");
+        let id = background_task_id(&result);
+        let snapshot = crate::tasks::snapshot_all()
+            .into_iter()
+            .find(|task| task.id == id)
+            .expect("promoted task should be listed");
+        assert_eq!(snapshot.status, crate::tasks::TaskStatus::Running);
+
+        crate::tasks::kill(id).expect("kill promoted task");
+        let _ = crate::tasks::wait_until_finished(id)
+            .await
+            .expect("task stops");
+    }
+
+    #[tokio::test]
+    async fn manual_promotion_completes_the_tool_call_without_killing() {
+        let call_id = "manual-promote-command";
+        let command = if cfg!(windows) {
+            "echo manual-ready && ping -n 30 127.0.0.1 > NUL"
+        } else {
+            "echo manual-ready && sleep 30"
+        };
+        let args = format!(r#"{{"command":{}}}"#, json!(command));
+        let cancel = crate::cancel::CancellationToken::new();
+        let child = cancel.child();
+        let handle = tokio::spawn(async move { run_with_live(&args, call_id, &child).await });
+
+        let mut ready = false;
+        for _ in 0..60 {
+            if live_output(call_id).is_some_and(|output| output.contains("manual-ready")) {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ready, "command should be running before manual promotion");
+        let id = crate::tasks::promote_command_for_call(call_id).expect("manual promotion");
+        // Once ownership changes, cancelling the foreground turn must not
+        // reclaim and kill the promoted process.
+        cancel.cancel();
+        let result = handle
+            .await
+            .expect("join")
+            .expect("promotion is a successful tool result");
+        assert_eq!(background_task_id(&result), id);
+        assert_eq!(
+            crate::tasks::snapshot(id).expect("same task").status,
+            crate::tasks::TaskStatus::Running
+        );
+
+        crate::tasks::kill(id).expect("kill promoted task");
+        let _ = crate::tasks::wait_until_finished(id)
+            .await
+            .expect("task stops");
+    }
+
+    fn background_task_id(result: &str) -> u64 {
+        result
+            .strip_prefix("Command is still running as background task ")
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_else(|| panic!("missing background task id in: {result}"))
     }
 }

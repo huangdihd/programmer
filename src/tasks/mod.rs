@@ -17,10 +17,10 @@
 //! conversation renderer.
 //!
 //! Background tasks are created through the `task` tool. Foreground `command`
-//! calls use the same process lifecycle and output capture, but remain hidden
-//! from the task UI until that integration explicitly opts them in. State lives
-//! in a process-global registry because tools only receive their JSON arguments
-//! — there is no `App` handle in the tool path.
+//! calls use the same process lifecycle and output capture, remain hidden while
+//! foreground, and enter the task UI if promoted. State lives in a
+//! process-global registry because tools only receive their JSON arguments —
+//! there is no `App` handle in the tool path.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -353,6 +353,14 @@ fn spawn_pipe(
     cmd.raw_arg(command);
     #[cfg(not(windows))]
     cmd.arg(command);
+    // Put the shell and its descendants in a dedicated process group so kill,
+    // timeout, and cancellation terminate the whole command tree rather than
+    // leaving grandchildren alive with stdout/stderr pipes held open.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
@@ -462,7 +470,7 @@ fn spawn_pipe(
                 finish(id, status, code);
             }
             _ = kill_rx => {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
                 let _ = tokio::join!(out_task, err_task);
                 finish(id, TaskStatus::Killed, None);
             }
@@ -480,6 +488,110 @@ pub fn command_live_output(call_id: &str) -> Option<String> {
             entry.status == TaskStatus::Running && entry.call_id.as_deref() == Some(call_id)
         })
         .map(|entry| entry.live_output.clone())
+}
+
+/// Promote a running foreground command into a normal background task without
+/// restarting or interrupting its process.
+pub fn promote_command(id: u64) -> Result<(), String> {
+    let mut reg = registry().lock().unwrap();
+    let entry = reg
+        .iter_mut()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| format!("error: no task with id {id}"))?;
+    if entry.kind != TaskKind::Command {
+        return Err(format!("error: task {id} is already a background task"));
+    }
+    if entry.status != TaskStatus::Running {
+        return Err(format!(
+            "error: command {id} already finished ({})",
+            entry.status.label()
+        ));
+    }
+
+    entry.kind = TaskKind::Background;
+    entry.call_id = None;
+    entry.max_output = MAX_TASK_OUTPUT;
+    cap_buffer(&mut entry.output, MAX_TASK_OUTPUT);
+    cap_buffer(&mut entry.stderr_output, MAX_TASK_OUTPUT);
+    Ok(())
+}
+
+/// Promote the running foreground command associated with one tool call.
+#[cfg(test)]
+pub fn promote_command_for_call(call_id: &str) -> Result<u64, String> {
+    let id = {
+        let reg = registry().lock().unwrap();
+        reg.iter()
+            .find(|entry| {
+                entry.kind == TaskKind::Command
+                    && entry.status == TaskStatus::Running
+                    && entry.call_id.as_deref() == Some(call_id)
+            })
+            .map(|entry| entry.id)
+            .ok_or_else(|| format!("error: no running command for call {call_id}"))?
+    };
+    promote_command(id)?;
+    Ok(id)
+}
+
+/// Promote the newest running foreground command, used by the global Ctrl+Z
+/// shortcut. Mutating tools execute serially, so normally there is only one.
+pub fn promote_running_command() -> Option<u64> {
+    let id = {
+        let reg = registry().lock().unwrap();
+        reg.iter()
+            .rev()
+            .find(|entry| entry.kind == TaskKind::Command && entry.status == TaskStatus::Running)
+            .map(|entry| entry.id)
+    }?;
+    promote_command(id).ok()?;
+    Some(id)
+}
+
+async fn kill_process_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        // A negative pid addresses the process group created in `spawn_pipe`.
+        unsafe {
+            kill(-(pid as i32), SIGKILL);
+        }
+    }
+
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let pid = pid.to_string();
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/PID", pid.as_str(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .await;
+    }
+
+    let _ = child.kill().await;
+}
+
+/// Whether a command has already handed ownership to the background task
+/// system. Cancellation and hard-timeout paths use this to avoid killing a
+/// process after the user has pressed Ctrl+Z.
+pub fn is_background(id: u64) -> bool {
+    let reg = registry().lock().unwrap();
+    reg.iter()
+        .find(|entry| entry.id == id)
+        .is_some_and(|entry| entry.kind == TaskKind::Background)
+}
+
+/// Drop a completed foreground command after its result has been copied into
+/// the conversation. Promoted background tasks are deliberately retained.
+pub fn forget_command(id: u64) {
+    let mut reg = registry().lock().unwrap();
+    reg.retain(|entry| {
+        entry.id != id || entry.kind != TaskKind::Command || entry.status == TaskStatus::Running
+    });
 }
 
 /// Restrict `LoadLibrary`'s search to the application and system directories.
@@ -1128,9 +1240,37 @@ pub async fn wait(id: u64, timeout: Duration) -> Result<(TaskSnapshot, bool), St
 /// cancellation semantics can race this future and then terminate the task.
 pub async fn wait_until_finished(id: u64) -> Result<TaskSnapshot, String> {
     loop {
-        let snap = snapshot(id).ok_or_else(|| format!("error: no task with id {id}"))?;
-        if snap.status != TaskStatus::Running {
-            return Ok(snap);
+        let status = {
+            let reg = registry().lock().unwrap();
+            reg.iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.status)
+                .ok_or_else(|| format!("error: no task with id {id}"))?
+        };
+        if status != TaskStatus::Running {
+            return snapshot(id).ok_or_else(|| format!("error: no task with id {id}"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait until a foreground command is promoted. Returns `false` if the process
+/// finishes before promotion, so the caller can collect its normal result.
+pub async fn wait_until_promoted(id: u64) -> Result<bool, String> {
+    loop {
+        let state = {
+            let reg = registry().lock().unwrap();
+            let entry = reg
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| format!("error: no task with id {id}"))?;
+            (entry.kind, entry.status)
+        };
+        if state.0 == TaskKind::Background {
+            return Ok(true);
+        }
+        if state.1 != TaskStatus::Running {
+            return Ok(false);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1431,6 +1571,30 @@ mod tests {
         );
         let _ = wait_until_finished(id).await.expect("command finishes");
         assert!(command_live_output("command-live-id").is_none());
+    }
+
+    #[tokio::test]
+    async fn promoting_command_exposes_the_same_running_task() {
+        let command = if cfg!(windows) {
+            "echo before-promote && ping -n 30 127.0.0.1 > NUL"
+        } else {
+            "echo before-promote && sleep 30"
+        };
+        let id = spawn_command(command, None, Some("promote-command")).expect("spawn command");
+
+        promote_command(id).expect("promote");
+        assert!(wait_until_promoted(id).await.expect("promotion state"));
+        let snapshot = snapshot_all()
+            .into_iter()
+            .find(|task| task.id == id)
+            .expect("promoted task is visible");
+        assert_eq!(snapshot.status, TaskStatus::Running);
+        assert!(task_ids().contains(&id));
+        assert!(persist_all().iter().any(|task| task.id == id));
+        assert!(command_live_output("promote-command").is_none());
+
+        kill(id).expect("kill promoted task");
+        let _ = wait_until_finished(id).await.expect("task stops");
     }
 
     #[tokio::test]

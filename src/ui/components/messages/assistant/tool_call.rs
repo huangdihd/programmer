@@ -129,6 +129,9 @@ impl<'a> ToolCallMessage<'a> {
             } else if !failed {
                 lines.push(Line::from(Span::styled("  \u{23BF} \u{2026}", muted)));
             }
+            if result_text.is_none() && !failed && self.call.name == crate::tools::command::NAME {
+                lines.push(background_hint());
+            }
             return Text::from(lines);
         }
 
@@ -206,9 +209,19 @@ impl<'a> ToolCallMessage<'a> {
         } else if let Some(live) = self.live_output {
             push_live_tail(&mut lines, live, muted);
         }
+        if result_text.is_none() && !failed && self.call.name == crate::tools::command::NAME {
+            lines.push(background_hint());
+        }
 
         Text::from(lines)
     }
+}
+
+fn background_hint() -> Line<'static> {
+    Line::from(Span::styled(
+        "  Ctrl+Z move to background",
+        Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM),
+    ))
 }
 
 /// Lines of live command output shown while it runs. Only the tail matters for
@@ -437,6 +450,12 @@ mod tests {
             .filter(|op| matches!(op, DiffOp::Equal(..)))
             .count();
         assert_eq!(equals, 1, "the shared middle line should match");
+    }
+
+    #[test]
+    fn command_background_hint_shows_the_shortcut() {
+        let hint = plain(&[background_hint()]);
+        assert_eq!(hint, ["  Ctrl+Z move to background"]);
     }
 
     fn plain(lines: &[Line<'static>]) -> Vec<String> {

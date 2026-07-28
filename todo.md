@@ -8,7 +8,7 @@
 - improve command and task system
   - ~~stream command output in the TUI while it is running~~
   - ~~view interactive and non-interactive tasks with `/terminal`~~
-- convert a command into a task
+- ~~convert a command into a task~~
 - configurable restricted access control rule system
 - multi agents(traditional sub agents or use interactive background task system to launch itself again?)
 - sandbox
