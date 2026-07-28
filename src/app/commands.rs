@@ -237,11 +237,24 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
 /// instead of the summarized history, while the UI keeps everything visible.
 /// An argument picks a different model for the summarization request only; the
 /// chat model is unchanged.
+fn build_compact_request(
+    input_items: Vec<async_openai::types::responses::InputItem>,
+    model_name: String,
+    thinking_level: crate::thinking::ThinkingLevel,
+) -> async_openai::types::responses::CreateResponse {
+    async_openai::types::responses::CreateResponse {
+        input: async_openai::types::responses::InputParam::Items(input_items),
+        model: Some(model_name),
+        reasoning: thinking_level.reasoning(),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
     use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
     use crate::ui::event::Event;
     use async_openai::types::responses::{
-        CreateResponse, InputItem, InputParam, Item, OutputItem, OutputMessageContent,
+        InputItem, InputParam, Item, OutputItem, OutputMessageContent,
     };
 
     if app.cancel.active_id.is_some() {
@@ -306,13 +319,10 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
     let operation_id = app.cancel.next_id;
     app.cancel.active_id = Some(operation_id);
     let cancel_token = app.cancel.active.child();
+    let thinking_level = app.thinking_level;
     let sender = app.events.sender.clone();
     tokio::spawn(async move {
-        let request = CreateResponse {
-            input: InputParam::Items(input_items),
-            model: Some(model_name),
-            ..Default::default()
-        };
+        let request = build_compact_request(input_items, model_name, thinking_level);
         // Race the model request against cancellation so Esc doesn't leave
         // the UI stuck in Cancelling.
         let result = match cancel_token
@@ -616,6 +626,34 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
             let model_arg = arg.split_whitespace().next().unwrap_or("").to_string();
             start_compact(app, &model_arg);
         }
+        Some(Command::Thinking(arg)) => {
+            app.input_panel.clear();
+            let arg = arg.trim();
+            if arg.is_empty() {
+                app.conversation_panel.add_info_string(format!(
+                    "thinking level: {}\nusage: /thinking <{}>",
+                    app.thinking_level.label(),
+                    crate::thinking::ThinkingLevel::VALUES
+                ));
+            } else if let Some(level) = crate::thinking::ThinkingLevel::parse(arg) {
+                app.thinking_level = level;
+                let detail = if level == crate::thinking::ThinkingLevel::Auto {
+                    "provider/model default; reasoning.effort is omitted"
+                } else {
+                    "sent explicitly as reasoning.effort"
+                };
+                app.conversation_panel.add_info_string(format!(
+                    "thinking level set to: {} ({detail})",
+                    level.label()
+                ));
+            } else {
+                app.conversation_panel.add_error_string(format!(
+                    "unknown thinking level '{arg}' — use {}",
+                    crate::thinking::ThinkingLevel::VALUES
+                ));
+            }
+            session::save_session(app);
+        }
         Some(Command::Providers(arg)) => {
             app.input_panel.clear();
             let arg = arg.trim();
@@ -813,8 +851,28 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConversationPanel, queue_pending_request};
+    use super::{ConversationPanel, build_compact_request, queue_pending_request};
     use async_openai::types::responses::{ImageDetail, InputImageContent};
+
+    #[test]
+    fn compact_request_uses_the_selected_thinking_level() {
+        let request = build_compact_request(
+            Vec::new(),
+            "test-model".to_string(),
+            crate::thinking::ThinkingLevel::Low,
+        );
+        assert_eq!(
+            serde_json::to_value(request.reasoning).unwrap()["effort"],
+            "low"
+        );
+
+        let auto = build_compact_request(
+            Vec::new(),
+            "test-model".to_string(),
+            crate::thinking::ThinkingLevel::Auto,
+        );
+        assert!(auto.reasoning.is_none());
+    }
 
     #[tokio::test]
     async fn queued_file_reference_uses_the_real_expansion_path() {

@@ -115,6 +115,8 @@ pub struct App<'a> {
     pub current_model: String,
     /// Whether supported `@image` references are sent as multimodal inputs.
     pub vision_enabled: bool,
+    /// Reasoning effort for main chat and compaction requests.
+    pub(crate) thinking_level: crate::thinking::ThinkingLevel,
     /// Images belonging to the queued follow-up message while a turn is busy.
     pub(crate) pending_images: Vec<async_openai::types::responses::InputImageContent>,
     /// Event handler.
@@ -213,6 +215,7 @@ impl App<'_> {
         let mut current_model = provider_manager.default_model();
         let mut work_mode = WorkMode::default();
         let mut vision_enabled = false;
+        let mut thinking_level = crate::thinking::ThinkingLevel::default();
 
         let mut saved_activated_skills: Vec<String> = Vec::new();
         if let Some(mgr) = &session_mgr
@@ -227,6 +230,7 @@ impl App<'_> {
                 current_model = model;
             }
             vision_enabled = saved.vision_enabled;
+            thinking_level = saved.thinking_level;
             if saved.classifier_model.is_some() {
                 config.classifier_model = saved.classifier_model;
             }
@@ -255,6 +259,7 @@ impl App<'_> {
             provider_manager,
             current_model,
             vision_enabled,
+            thinking_level,
             pending_images: Vec::new(),
             events: EventHandler::new(),
             config,
@@ -393,6 +398,7 @@ impl App<'_> {
             policy,
             coauthor: self.config.git_coauthor.clone(),
             vision_enabled: self.vision_enabled,
+            thinking_level: self.thinking_level,
             hooks: vec![
                 Arc::new(DiagnosticsHook {
                     state: self.diagnostics_state.clone(),

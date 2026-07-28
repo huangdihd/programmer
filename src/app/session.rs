@@ -71,6 +71,7 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     session.work_mode = Some(app.work_mode);
     session.current_model = Some(app.current_model.clone());
     session.vision_enabled = app.vision_enabled;
+    session.thinking_level = app.thinking_level;
     session.classifier_model = app.config.classifier_model.clone();
     session.todos = app.todo_list.todos.clone();
     session.activated_skills = app.skill_registry.activated_names().to_vec();

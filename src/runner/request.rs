@@ -33,6 +33,8 @@ pub(crate) struct SystemContext<'a> {
     pub coauthor: Option<&'a str>,
     /// Whether stored image input parts should be included in this request.
     pub vision_enabled: bool,
+    /// Reasoning effort to send, or `Auto` to omit the field.
+    pub thinking_level: crate::thinking::ThinkingLevel,
 }
 
 /// Assemble a streaming [`CreateResponse`] for `conversation` under `ctx`,
@@ -54,6 +56,7 @@ pub(crate) fn build_request(
         ),
         model: Some(model_name),
         tools: Some(tools),
+        reasoning: ctx.thinking_level.reasoning(),
         ..Default::default()
     }
 }
@@ -81,6 +84,7 @@ mod tests {
             plan_prompt: None,
             coauthor: Some("Ada <ada@example.com>"),
             vision_enabled: true,
+            thinking_level: crate::thinking::ThinkingLevel::High,
         };
         let req = build_request(&conv, &ctx, "model-x".to_string(), {
             use crate::tools::provider::ToolProvider;
@@ -89,6 +93,10 @@ mod tests {
 
         assert_eq!(req.stream, Some(true));
         assert_eq!(req.model.as_deref(), Some("model-x"));
+        assert_eq!(
+            serde_json::to_value(&req.reasoning).unwrap()["effort"],
+            "high"
+        );
         assert!(
             req.tools.as_ref().is_some_and(|t| !t.is_empty()),
             "tool list present"

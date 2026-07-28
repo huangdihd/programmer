@@ -145,6 +145,7 @@ fn base_request(model: &str, prompt: String) -> CreateResponse {
         model: Some(model.to_string()),
         input: InputParam::Text(prompt),
         instructions: Some(CLASSIFIER_INSTRUCTIONS.to_string()),
+        reasoning: Some(async_openai::types::responses::ReasoningEffort::None.into()),
         temperature: Some(0.0),
         store: Some(false),
         ..Default::default()
@@ -310,6 +311,14 @@ fn parse_reasoned(text: &str) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifier_requests_disable_reasoning() {
+        let request = base_request("test-model", "test prompt".to_string());
+        let value = serde_json::to_value(request).expect("classifier request should serialize");
+
+        assert_eq!(value["reasoning"]["effort"], "none");
+    }
 
     #[test]
     fn parse_reasoned_verdicts() {

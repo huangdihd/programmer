@@ -56,6 +56,9 @@ pub enum Command {
     /// after it. The optional argument picks a different model for the
     /// summarization request only.
     Compact(String),
+    /// `/thinking [level]` — set or show the reasoning effort used by the main
+    /// conversation and `/compact`.
+    Thinking(String),
     /// `/vision <on|off>` — enable or disable image attachments for this session.
     Vision(String),
 }
@@ -93,6 +96,7 @@ impl Command {
             "plan" => Some(Command::Plan(args)),
             "terminal" | "term" => Some(Command::Terminal(args)),
             "compact" => Some(Command::Compact(args)),
+            "thinking" => Some(Command::Thinking(args)),
             "vision" => Some(Command::Vision(args)),
             _ => None,
         }
@@ -114,6 +118,7 @@ impl Command {
             "plan",
             "terminal",
             "compact",
+            "thinking",
             "vision",
             "clear",
             "quit",
@@ -153,6 +158,10 @@ impl Command {
             (
                 "/compact [provider/model]",
                 "Summarize older history to shrink the model's context",
+            ),
+            (
+                "/thinking [auto|none|minimal|low|medium|high|xhigh]",
+                "Set/show reasoning effort for chat and compaction",
             ),
             (
                 "/vision <on|off>",
@@ -250,6 +259,9 @@ impl CompletionEngine {
             "model" | "m" => Self::complete_model(text, cmd, pm),
             "classifier" => Self::complete_model(text, cmd, pm),
             "compact" => Self::complete_model(text, cmd, pm),
+            "thinking" => {
+                Self::complete_subcommand(text, cmd, crate::thinking::ThinkingLevel::COMPLETIONS)
+            }
             "vision" => Self::complete_subcommand(text, cmd, &["on", "off"]),
             "mode" => Self::complete_subcommand(text, cmd, &["manual", "edits", "auto"]),
             "providers" | "provider" => Self::complete_subcommand(text, cmd, &["show", "manage"]),
@@ -720,6 +732,24 @@ fn skip_gif_sub_blocks(bytes: &[u8], pos: &mut usize) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_command_is_parsed_and_off_is_not_a_level() {
+        assert!(matches!(
+            Command::parse("/thinking high"),
+            Some(Command::Thinking(level)) if level == "high"
+        ));
+        assert!(Command::all_commands().contains(&"thinking"));
+        assert_eq!(crate::thinking::ThinkingLevel::parse("off"), None);
+
+        let state = CompletionEngine::complete_subcommand(
+            "thinking h",
+            "thinking",
+            crate::thinking::ThinkingLevel::COMPLETIONS,
+        )
+        .expect("thinking level completion");
+        assert_eq!(state.candidates, vec!["high"]);
+    }
 
     #[test]
     fn active_at_token_detects_trailing_reference() {

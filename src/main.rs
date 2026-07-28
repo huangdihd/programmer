@@ -37,6 +37,7 @@ mod session;
 mod skills;
 mod tasks;
 mod terminal;
+mod thinking;
 mod todos;
 mod tools;
 mod ui;
@@ -244,6 +245,7 @@ async fn run_print_mode(
         policy,
         coauthor: config.git_coauthor.clone(),
         vision_enabled: false,
+        thinking_level: crate::thinking::ThinkingLevel::Auto,
         // Print mode stays lean: no turn hooks (post-edit diagnostics, reminders).
         hooks: Vec::new(),
         stream_retrying: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

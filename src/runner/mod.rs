@@ -85,6 +85,8 @@ pub(crate) struct TurnRunner {
     /// Include stored image parts in API requests. When false, the conversation
     /// preserves them but sends textual placeholders instead.
     pub vision_enabled: bool,
+    /// Reasoning effort for main chat requests.
+    pub thinking_level: crate::thinking::ThinkingLevel,
     /// Pluggable turn hooks (post-edit diagnostics, the PROGRAMMER.md reminder,
     /// and any future check) run around each tool batch. Empty by default, so
     /// `-p` runs stay lean.
@@ -244,6 +246,7 @@ impl TurnRunner {
                     plan_prompt: surface.plan_prompt(),
                     coauthor: self.coauthor.as_deref(),
                     vision_enabled: self.vision_enabled,
+                    thinking_level: self.thinking_level,
                 };
                 let conv = conversation.lock().unwrap();
                 request::build_request(&conv, &ctx, self.model_name.clone(), self.tools.tools())
@@ -729,6 +732,7 @@ mod tests {
             policy: RunnerPolicy::Yolo,
             coauthor: None,
             vision_enabled: true,
+            thinking_level: crate::thinking::ThinkingLevel::Auto,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
         }
@@ -962,6 +966,7 @@ mod tests {
             policy: RunnerPolicy::Sync(policy_mode.classifier()),
             coauthor: None,
             vision_enabled: true,
+            thinking_level: crate::thinking::ThinkingLevel::Auto,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
         }

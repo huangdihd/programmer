@@ -179,6 +179,9 @@ pub(crate) struct Session {
     /// Whether image attachments are sent to the model in this session.
     #[serde(default)]
     pub(crate) vision_enabled: bool,
+    /// Reasoning effort for main chat and compaction requests.
+    #[serde(default)]
+    pub(crate) thinking_level: crate::thinking::ThinkingLevel,
     /// Auto-mode classifier model when last saved, restored on resume.
     #[serde(default)]
     pub(crate) classifier_model: Option<String>,
@@ -251,6 +254,7 @@ impl SessionManager {
             work_mode: None,
             current_model: None,
             vision_enabled: false,
+            thinking_level: crate::thinking::ThinkingLevel::default(),
             classifier_model: None,
             todos: Vec::new(),
             activated_skills: Vec::new(),
@@ -630,7 +634,23 @@ mod tests {
     }
 
     #[test]
-    fn vision_and_todos_round_trip_independently_per_session() {
+    fn older_sessions_default_to_auto_thinking() {
+        let sessions_dir =
+            std::env::temp_dir().join(format!("programmer-session-test-{}", uuid_v4()));
+        let mgr = SessionManager { sessions_dir };
+        let mut value = serde_json::to_value(mgr.create()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("thinking_level")
+            .unwrap();
+
+        let loaded: Session = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.thinking_level, crate::thinking::ThinkingLevel::Auto);
+    }
+
+    #[test]
+    fn session_settings_and_todos_round_trip_independently() {
         let sessions_dir =
             std::env::temp_dir().join(format!("programmer-session-test-{}", uuid_v4()));
         let mgr = SessionManager {
@@ -639,12 +659,14 @@ mod tests {
 
         let mut first = mgr.create();
         first.vision_enabled = true;
+        first.thinking_level = crate::thinking::ThinkingLevel::High;
         let mut first_todos = crate::todos::TodoList::default();
         first_todos.add("first session only".to_string(), None);
         first.todos = first_todos.todos;
 
         let mut second = mgr.create();
         second.vision_enabled = false;
+        second.thinking_level = crate::thinking::ThinkingLevel::None;
         let mut second_todos = crate::todos::TodoList::default();
         second_todos.add("second session only".to_string(), None);
         second.todos = second_todos.todos;
@@ -656,6 +678,14 @@ mod tests {
         let loaded_second = mgr.load(&second.uuid).unwrap();
         assert!(loaded_first.vision_enabled);
         assert!(!loaded_second.vision_enabled);
+        assert_eq!(
+            loaded_first.thinking_level,
+            crate::thinking::ThinkingLevel::High
+        );
+        assert_eq!(
+            loaded_second.thinking_level,
+            crate::thinking::ThinkingLevel::None
+        );
         assert_eq!(loaded_first.todos[0].title, "first session only");
         assert_eq!(loaded_second.todos[0].title, "second session only");
 
