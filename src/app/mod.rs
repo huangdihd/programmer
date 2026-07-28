@@ -256,7 +256,7 @@ impl App<'_> {
             current_model,
             vision_enabled,
             pending_images: Vec::new(),
-            events: EventHandler::new(1.0 / crate::consts::TICK_FPS),
+            events: EventHandler::new(),
             config,
             input_panel,
             conversation_panel,

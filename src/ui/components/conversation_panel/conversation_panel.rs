@@ -514,6 +514,7 @@ impl ConversationPanel {
                 self.phase,
                 ActivePhase::ToolRunning
                     | ActivePhase::Classifying
+                    | ActivePhase::Checking
                     | ActivePhase::Compacting
                     | ActivePhase::Cancelling
             )
@@ -826,5 +827,15 @@ mod tests {
         // After TurnFinished clears the phase, it goes back to idle.
         panel.phase = ActivePhase::None;
         assert!(!panel.is_busy());
+    }
+
+    #[test]
+    fn is_busy_while_checking_diagnostics() {
+        let mut panel = ConversationPanel::new();
+        panel.phase = ActivePhase::Checking;
+        assert!(
+            panel.is_busy(),
+            "diagnostics are part of the active turn lifecycle"
+        );
     }
 }

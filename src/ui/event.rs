@@ -190,8 +190,8 @@ pub struct EventHandler {
 
 impl EventHandler {
     /// Constructs a new instance of [`EventHandler`].
-    pub fn new(tick_rate: f64) -> Self {
-        let tick_rate = Duration::from_secs_f64(tick_rate);
+    pub fn new() -> Self {
+        let tick_rate = tick_interval();
         let (sender, receiver) = mpsc::unbounded_channel();
         let _sender = sender.clone();
         let _task = tokio::spawn(async move {
@@ -250,16 +250,19 @@ impl EventHandler {
     }
 }
 
+fn tick_interval() -> Duration {
+    Duration::from_secs_f64(1.0 / crate::consts::TICK_FPS)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::tick_interval;
+
     #[test]
     fn tick_interval_is_one_over_tick_fps() {
-        // EventHandler::new(1.0 / TICK_FPS) computes Duration::from_secs_f64(1.0 / TICK_FPS).
-        // At 30 FPS, each tick should be ~33ms — not 30s (the bug was passing TICK_FPS
-        // directly, treating 30 as seconds instead of 1/30).
-        let tick_fps = crate::consts::TICK_FPS; // 30.0
-        let interval = std::time::Duration::from_secs_f64(1.0 / tick_fps);
-        let ms = interval.as_millis();
+        // EventHandler::new() uses this exact helper, so the production call
+        // site cannot accidentally pass FPS as a duration again.
+        let ms = tick_interval().as_millis();
         assert!(
             (30..=35).contains(&ms),
             "expected ~33ms per tick, got {ms}ms — is the formula 1.0 / TICK_FPS?"

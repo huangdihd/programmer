@@ -20,6 +20,7 @@ use super::surface::TuiSurface;
 use super::{diagnostics, session};
 use crate::classifier::{PlanPhase, WorkMode};
 use crate::commands::Command;
+use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
 use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::provider_panel::ProviderPanel;
 use crate::ui::components::skills_panel::SkillsPanel;
@@ -27,7 +28,7 @@ use crate::ui::components::todo_panel::TodoPanel;
 use crate::ui::event::{AppEvent, Event};
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
-    InputContent, InputMessage, InputRole, InputTextContent, OutputStatus,
+    InputContent, InputImageContent, InputMessage, InputRole, InputTextContent, OutputStatus,
 };
 
 use crate::prompts::PLAN_PLANNING_PROMPT;
@@ -58,25 +59,9 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     app.input_panel.push_history(typed.clone());
     app.input_panel.clear();
 
-    // Check busy synchronously, before any .await. An async gap (e.g. in
-    // expand_file_references) gives TurnFinished a window to clear the
-    // phase, defeating the is_busy() check inside start_request_as_with_images.
-    if app.conversation_panel.is_busy() {
-        let is_at_bottom = app.conversation_panel.is_at_bottom();
-        match app.conversation_panel.pending_message.as_mut() {
-            Some(pending) => {
-                pending.push('\n');
-                pending.push_str(&typed);
-            }
-            None => app.conversation_panel.pending_message = Some(typed),
-        }
-        app.pending_images.clear();
-        if is_at_bottom {
-            app.conversation_panel.scroll_to_bottom()
-        }
-        return;
-    }
-
+    // Expand before deciding whether to start or queue the request. Queued
+    // messages must retain the same path annotations and image attachments as
+    // messages that start immediately.
     let expanded = crate::commands::expand_file_references(&typed, app.vision_enabled).await;
     for notice in expanded.notices {
         app.conversation_panel.add_warning_string(notice);
@@ -109,19 +94,16 @@ async fn start_request_as_with_images(
     role: InputRole,
     mut images: Vec<async_openai::types::responses::InputImageContent>,
 ) {
-    if app.conversation_panel.is_busy() {
-        let is_at_bottom = app.conversation_panel.is_at_bottom();
-        match app.conversation_panel.pending_message.as_mut() {
-            Some(pending_message) => {
-                pending_message.push('\n');
-                pending_message.push_str(&text);
-            }
-            None => app.conversation_panel.pending_message = Some(text),
-        }
-        app.pending_images.append(&mut images);
-        if is_at_bottom {
-            app.conversation_panel.scroll_to_bottom()
-        }
+    // active_id is the lifecycle authority. UI phases are presentation state
+    // and can briefly lag the runner; they must never decide whether two turns
+    // are allowed to overlap.
+    if app.cancel.active_id.is_some() {
+        queue_pending_request(
+            &mut app.conversation_panel,
+            &mut app.pending_images,
+            text,
+            images,
+        );
         return;
     }
 
@@ -182,6 +164,30 @@ async fn start_request_as_with_images(
     });
 }
 
+/// Append a request to the single follow-up queue while preserving attachments.
+///
+/// Multiple messages are deliberately coalesced with newlines because the UI
+/// exposes one pending-message slot.
+fn queue_pending_request(
+    panel: &mut ConversationPanel,
+    pending_images: &mut Vec<InputImageContent>,
+    text: String,
+    mut images: Vec<InputImageContent>,
+) {
+    let is_at_bottom = panel.is_at_bottom();
+    match panel.pending_message.as_mut() {
+        Some(pending) => {
+            pending.push('\n');
+            pending.push_str(&text);
+        }
+        None => panel.pending_message = Some(text),
+    }
+    pending_images.append(&mut images);
+    if is_at_bottom {
+        panel.scroll_to_bottom();
+    }
+}
+
 /// Run a `!command` from the input: spawn it as an interactive PTY task and
 /// open the terminal panel focused on it, so the user drives it right away.
 /// The exit is watched from [`super::events`]'s tick: the panel closes, focus
@@ -238,7 +244,7 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
         CreateResponse, InputItem, InputParam, Item, OutputItem, OutputMessageContent,
     };
 
-    if app.conversation_panel.is_busy() {
+    if app.cancel.active_id.is_some() {
         app.conversation_panel
             .add_warning_string("cannot compact while a turn is in flight");
         return;
@@ -575,21 +581,21 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
             app.input_panel.clear();
             // /init doesn't stack — if a turn is already running, queue like any
             // other message.
-            if app.conversation_panel.is_busy() {
-                app.pending_images.clear();
-                app.conversation_panel.pending_message = Some(super::helpers::init_prompt());
+            if app.cancel.active_id.is_some() {
+                queue_pending_request(
+                    &mut app.conversation_panel,
+                    &mut app.pending_images,
+                    super::helpers::init_prompt(),
+                    Vec::new(),
+                );
                 return;
             }
             app.conversation_panel
                 .add_info_string("Scanning project and setting up diagnostics…");
-            let _tokio_handle = tokio::spawn({
-                let sender = app.events.sender.clone();
-                async move {
-                    // Let the info_string render before we push the init prompt.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let _ = sender.send(crate::ui::event::Event::App(AppEvent::StartInit));
-                }
-            });
+            // Queue immediately. A delayed spawn here creates a window where a
+            // normal request can start first and then have its token/id replaced
+            // by StartInit.
+            app.events.send(AppEvent::StartInit);
         }
         Some(Command::Session) => {
             app.input_panel.clear();
@@ -802,5 +808,57 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
 
     if is_known {
         app.input_panel.push_history(input.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConversationPanel, queue_pending_request};
+    use async_openai::types::responses::{ImageDetail, InputImageContent};
+
+    #[tokio::test]
+    async fn queued_file_reference_uses_the_real_expansion_path() {
+        let expanded = crate::commands::expand_file_references("inspect @Cargo.toml", false).await;
+        let mut panel = ConversationPanel::new();
+        let mut pending_images = Vec::new();
+
+        queue_pending_request(
+            &mut panel,
+            &mut pending_images,
+            expanded.text,
+            expanded.images,
+        );
+
+        let pending = panel.pending_message.as_deref().expect("queued text");
+        assert!(pending.contains("inspect @Cargo.toml"));
+        assert!(pending.contains("Referenced local file path (content not included): Cargo.toml"));
+        assert!(pending_images.is_empty());
+    }
+
+    #[test]
+    fn queue_coalesces_text_and_preserves_all_images() {
+        let image = || InputImageContent {
+            detail: ImageDetail::Auto,
+            file_id: None,
+            image_url: Some("data:image/png;base64,AAAA".to_string()),
+        };
+        let mut panel = ConversationPanel::new();
+        let mut pending_images = Vec::new();
+
+        queue_pending_request(
+            &mut panel,
+            &mut pending_images,
+            "first".to_string(),
+            vec![image()],
+        );
+        queue_pending_request(
+            &mut panel,
+            &mut pending_images,
+            "second".to_string(),
+            vec![image()],
+        );
+
+        assert_eq!(panel.pending_message.as_deref(), Some("first\nsecond"));
+        assert_eq!(pending_images.len(), 2);
     }
 }

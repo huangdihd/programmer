@@ -28,9 +28,12 @@ use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
 use crate::commands::CompletionEngine;
 use crate::response::partial_response::PartialResponse;
-use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
+use crate::ui::components::conversation_panel::conversation_panel::{
+    ActivePhase, ConversationPanel,
+};
 use crate::ui::components::question_panel::QuestionPanel;
 use crate::ui::event::{AppEvent, Event};
+use async_openai::types::responses::InputImageContent;
 use crossterm::event::KeyEventKind;
 
 // ---------------------------------------------------------------------------
@@ -78,6 +81,17 @@ fn is_current_turn(app: &App<'_>, op_id: u64) -> bool {
     is_current_turn_id(app.cancel.active_id, op_id)
 }
 
+/// Non-terminal events are accepted only while their operation is both current
+/// and live. A cancelled operation remains current until its finish event
+/// arrives, but its late phase/prompt/chunk events must not resurrect UI state.
+fn is_live_turn(app: &App<'_>, op_id: u64) -> bool {
+    is_live_turn_id(
+        app.cancel.active_id,
+        app.cancel.active.is_cancelled(),
+        op_id,
+    )
+}
+
 /// Core check: does `event_op_id` belong to the turn identified by `active_id`?
 /// `event_op_id == 0` means "untagged" and always passes (pre-operation-id or
 /// non-turn events). Exposed so tests exercise the same logic [`is_current_turn`]
@@ -86,12 +100,16 @@ fn is_current_turn_id(active_id: Option<u64>, event_op_id: u64) -> bool {
     event_op_id == 0 || active_id == Some(event_op_id)
 }
 
+fn is_live_turn_id(active_id: Option<u64>, cancelled: bool, event_op_id: u64) -> bool {
+    is_current_turn_id(active_id, event_op_id) && (event_op_id == 0 || !cancelled)
+}
+
 /// Dispatch an [`AppEvent`] to its handler.
 async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
     match app_event {
         AppEvent::Cancel => handle_cancel(app).await,
         AppEvent::ChunkReceived(op_id, chunk) => {
-            if !is_current_turn(app, op_id) {
+            if !is_live_turn(app, op_id) {
                 return;
             }
             if app.conversation_panel.receiving_response.is_some() {
@@ -99,14 +117,14 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             }
         }
         AppEvent::ResponseCommitted(op_id) => {
-            if !is_current_turn(app, op_id) {
+            if !is_live_turn(app, op_id) {
                 return;
             }
             app.conversation_panel.commit_live();
             app.sync_todos_from_store();
         }
         AppEvent::RunnerPhase(op_id, p) => {
-            if !is_current_turn(app, op_id) {
+            if !is_live_turn(app, op_id) {
                 return;
             }
             use crate::runner::RunnerPhase;
@@ -128,7 +146,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             reply,
             operation_id,
         } => {
-            if !is_current_turn(app, operation_id) {
+            if !is_live_turn(app, operation_id) {
                 // Drop the sender so the runner's review() gets a closed-channel
                 // denial instead of hanging.
                 return;
@@ -150,6 +168,10 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             // earlier) turn are dropped and Esc won't try to cancel a
             // turn that has already ended.
             app.cancel.active_id = None;
+            // A prompt may have been installed just before cancellation won the
+            // race. Turn completion is the final defensive cleanup boundary.
+            app.pending_review = None;
+            app.question_panel = None;
             app.conversation_panel.abort_receiving();
             app.conversation_panel.phase = ActivePhase::None;
             app.conversation_panel.flush_usage();
@@ -185,8 +207,9 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             // Start any queued follow-up request. handle_cancel deliberately
             // does NOT start it (it waits for us), so we start it for both
             // normal completion and cancellation — exactly once per turn.
-            if let Some(pending_request) = app.conversation_panel.pending_message.take() {
-                let images = std::mem::take(&mut app.pending_images);
+            if let Some((pending_request, images)) =
+                take_pending_request(&mut app.conversation_panel, &mut app.pending_images)
+            {
                 commands::start_request_with_images(app, pending_request, images).await;
             }
         }
@@ -204,8 +227,9 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             // handle_compact_finished clears active_id and resets the phase
             // back to idle. If the user queued a message while compacting,
             // start it now — just like TurnFinished does for normal turns.
-            if let Some(pending_request) = app.conversation_panel.pending_message.take() {
-                let images = std::mem::take(&mut app.pending_images);
+            if let Some((pending_request, images)) =
+                take_pending_request(&mut app.conversation_panel, &mut app.pending_images)
+            {
                 commands::start_request_with_images(app, pending_request, images).await;
             }
         }
@@ -217,12 +241,22 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             answer_tx,
             operation_id,
         } => {
-            if !is_current_turn(app, operation_id) {
+            if !is_live_turn(app, operation_id) {
                 return;
             }
             app.question_panel = Some(QuestionPanel::new(question, answer_tx));
         }
     }
+}
+
+fn take_pending_request(
+    panel: &mut ConversationPanel,
+    pending_images: &mut Vec<InputImageContent>,
+) -> Option<(String, Vec<InputImageContent>)> {
+    panel
+        .pending_message
+        .take()
+        .map(|text| (text, std::mem::take(pending_images)))
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +293,14 @@ async fn handle_cancel(app: &mut App<'_>) {
 
 /// `/init`: seed the init prompt and start the first runner turn.
 fn handle_start_init(app: &mut App<'_>) {
+    // StartInit is normally queued synchronously by `/init`. Keep this guard so
+    // duplicate or externally injected events can never replace a live turn's
+    // cancellation token and operation id.
+    if app.cancel.active_id.is_some() {
+        app.conversation_panel
+            .add_warning_string("cannot initialize while a turn is in flight");
+        return;
+    }
     app.conversation_panel.add_meta(
         "\u{25B8} Initializing project\u{2026}",
         helpers::init_prompt(),
@@ -497,7 +539,7 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_current_turn_id;
+    use super::{ConversationPanel, is_current_turn_id, is_live_turn_id, take_pending_request};
 
     #[test]
     fn is_current_turn_allows_untagged_zero_events() {
@@ -533,110 +575,37 @@ mod tests {
         assert!(!is_current_turn_id(Some(5), 3));
     }
 
-    /// After compact finishes, the panel phase resets to idle but any queued
-    /// pending_message survives so the event handler can consume it. The
-    /// handler must then start the queued request exactly once (taking the
-    /// message leaves None for a second take).
     #[test]
-    fn compact_lifecycle_preserves_pending_message_for_handler() {
-        use crate::ui::components::conversation_panel::conversation_panel::{
-            ActivePhase, ConversationPanel,
-        };
-
-        let mut panel = ConversationPanel::new();
-
-        // User queues a message while compact is in flight.
-        panel.phase = ActivePhase::Compacting;
-        panel.pending_message = Some("queued during compact".to_string());
-
-        // handle_compact_finished resets the phase (simulated here; the real
-        // function also clears app.cancel.active_id — tested separately).
-        panel.phase = ActivePhase::None;
-
-        // The pending message must survive the reset so the CompactFinished
-        // event handler can take it and start a new turn.
-        let taken = panel.pending_message.take();
-        assert_eq!(taken.as_deref(), Some("queued during compact"));
-
-        // Exactly once: a second take must be empty.
-        assert!(panel.pending_message.is_none());
-    }
-
-    /// When the panel is busy (e.g. ToolRunning), send_message must queue
-    /// the typed text into pending_message synchronously — before any async
-    /// gap (like expand_file_references) that could let TurnFinished clear
-    /// the phase. This test exercises the production path through
-    /// send_message and start_request_as_with_images.
-    #[tokio::test]
-    async fn send_message_queues_when_busy_before_async_gap() {
-        use crate::ui::components::conversation_panel::conversation_panel::{
-            ActivePhase, ConversationPanel,
-        };
-
-        // Simulate the exact same objects send_message touches.
-        let mut panel = ConversationPanel::new();
-        panel.phase = ActivePhase::ToolRunning; // is_busy() → true
-        assert!(panel.is_busy(), "ToolRunning must be busy");
-
-        // Simulate what send_message does after input.clear():
-        // it checks is_busy() synchronously, then queues.
-        //
-        // We can't easily construct a full App, so we test the core logic
-        // directly: the busy→queue path that was missing before the fix.
-        let typed = "test message".to_string();
-        let is_at_bottom = panel.is_at_bottom();
-
-        // This mirrors the fix in send_message.
-        if panel.is_busy() {
-            match panel.pending_message.as_mut() {
-                Some(pending) => {
-                    pending.push('\n');
-                    pending.push_str(&typed);
-                }
-                None => panel.pending_message = Some(typed.clone()),
-            }
-            if is_at_bottom {
-                panel.scroll_to_bottom();
-            }
-        }
-
-        // Verify: the message is queued.
-        assert_eq!(
-            panel.pending_message.as_deref(),
-            Some("test message"),
-            "typed text must be queued when panel is busy"
+    fn cancelled_turn_rejects_late_non_terminal_events() {
+        assert!(is_live_turn_id(Some(7), false, 7));
+        assert!(
+            !is_live_turn_id(Some(7), true, 7),
+            "late phase and prompt events must not revive cancelled UI state"
         );
-
-        // And it survives the phase reset (simulating TurnFinished).
-        panel.phase = ActivePhase::None;
-        let taken = panel.pending_message.take();
-        assert_eq!(taken.as_deref(), Some("test message"));
-        assert!(panel.pending_message.is_none());
+        assert!(!is_live_turn_id(Some(8), false, 7));
+        assert!(
+            is_live_turn_id(None, true, 0),
+            "untagged non-turn events retain their compatibility behavior"
+        );
     }
 
-    /// Multiple busy-mode messages concatenate with newlines.
     #[test]
-    fn pending_message_concatenates_multiple_entries() {
-        use crate::ui::components::conversation_panel::conversation_panel::{
-            ActivePhase, ConversationPanel,
-        };
+    fn pending_request_is_drained_with_images_exactly_once() {
+        use async_openai::types::responses::{ImageDetail, InputImageContent};
 
         let mut panel = ConversationPanel::new();
-        panel.phase = ActivePhase::ToolRunning;
+        panel.pending_message = Some("queued during compact".to_string());
+        let mut images = vec![InputImageContent {
+            detail: ImageDetail::Auto,
+            file_id: None,
+            image_url: Some("data:image/png;base64,AAAA".to_string()),
+        }];
 
-        // First message.
-        panel.pending_message = Some("first".to_string());
-
-        // Second message (same queue path as send_message).
-        let second = "second";
-        match panel.pending_message.as_mut() {
-            Some(pending) => {
-                pending.push('\n');
-                pending.push_str(second);
-            }
-            None => panel.pending_message = Some(second.to_string()),
-        }
-
-        assert_eq!(panel.pending_message.as_deref(), Some("first\nsecond"));
+        let (text, taken_images) =
+            take_pending_request(&mut panel, &mut images).expect("pending request");
+        assert_eq!(text, "queued during compact");
+        assert_eq!(taken_images.len(), 1);
+        assert!(images.is_empty());
+        assert!(take_pending_request(&mut panel, &mut images).is_none());
     }
 }
