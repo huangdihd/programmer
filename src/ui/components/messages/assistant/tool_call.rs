@@ -197,7 +197,11 @@ impl<'a> ToolCallMessage<'a> {
             };
             let mut first = true;
             for line in text.lines() {
-                let prefix = format!("  {} {status_char} ", if first { "\u{23BF}" } else { " " });
+                let prefix = if first {
+                    format!("  \u{23BF} {status_char} ")
+                } else {
+                    "      ".to_string()
+                };
                 lines.push(Line::from(Span::styled(
                     format!("{prefix}{line}"),
                     result_style,
@@ -515,6 +519,35 @@ mod tests {
             color(ToolCallMessage::new(&call, 80).failed(true).into_text()),
             Some(palette::RED)
         );
+    }
+
+    #[test]
+    fn expanded_tool_output_marks_status_only_once() {
+        let call = FunctionToolCall {
+            arguments: "{}".to_string(),
+            call_id: "call".to_string(),
+            namespace: None,
+            name: "test_tool".to_string(),
+            id: None,
+            status: None,
+        };
+        let output = FunctionCallOutputItemParam {
+            call_id: "call".to_string(),
+            output: FunctionCallOutput::Text("first\nsecond\nthird".to_string()),
+            id: None,
+            status: None,
+        };
+
+        let rendered = ToolCallMessage::new(&call, 80)
+            .output(Some(&output))
+            .expanded(true)
+            .into_text();
+        let lines = plain(&rendered.lines);
+
+        assert_eq!(lines.iter().filter(|line| line.contains('✓')).count(), 1);
+        assert_eq!(lines[1], "  ⎿ ✓ first");
+        assert_eq!(lines[2], "      second");
+        assert_eq!(lines[3], "      third");
     }
 
     #[test]

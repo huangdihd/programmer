@@ -25,7 +25,7 @@
 
 use super::{
     ask_user, blob, command, configure_diagnostics, diagnostics, edit_file, fetch, grep,
-    mcp_bridge, read_file, read_image, run_local_tool, task, todo, write_file,
+    mcp_bridge, read_file, read_image, request_permission, run_local_tool, task, todo, write_file,
 };
 use crate::mcp::McpManager;
 use crate::mcp::types::McpPolicy;
@@ -97,13 +97,13 @@ pub(crate) trait ToolProvider: Send + Sync {
 /// MCP server.
 pub(crate) struct LocalToolProvider {
     todos: Arc<Mutex<crate::todos::TodoList>>,
-    security: Arc<crate::security::SecurityManager>,
+    security: Arc<crate::security::SecurityHandle>,
 }
 
 impl LocalToolProvider {
     pub(crate) fn new(
         todos: Arc<Mutex<crate::todos::TodoList>>,
-        security: Arc<crate::security::SecurityManager>,
+        security: Arc<crate::security::SecurityHandle>,
     ) -> Self {
         Self { todos, security }
     }
@@ -119,7 +119,7 @@ impl Default for LocalToolProvider {
         .expect("the current directory should support the default security policy");
         Self::new(
             Arc::new(Mutex::new(crate::todos::TodoList::default())),
-            Arc::new(security),
+            Arc::new(crate::security::SecurityHandle::new(Arc::new(security))),
         )
     }
 }
@@ -129,6 +129,7 @@ impl ToolProvider for LocalToolProvider {
     fn tools(&self) -> Vec<Tool> {
         vec![
             command::tool(),
+            request_permission::tool(),
             read_file::tool(),
             read_image::tool(),
             write_file::tool(),
@@ -152,10 +153,16 @@ impl ToolProvider for LocalToolProvider {
     }
 
     fn requires_interaction(&self, name: &str) -> bool {
-        name == ask_user::NAME
+        matches!(name, ask_user::NAME | request_permission::NAME)
     }
 
     fn approval(&self, name: &str, arguments: &str) -> ToolApproval {
+        if name == request_permission::NAME {
+            // The tool itself cannot change anything until the user approves
+            // its dedicated prompt, so another classifier/approval round-trip
+            // would be redundant.
+            return ToolApproval::AutoApprove;
+        }
         // Mutating built-ins are classified; read-only ones auto-approve. This is
         // exactly the classifier's old read-only fast-path, now owned here.
         if crate::classifier::needs_review(name, arguments) {
@@ -175,42 +182,53 @@ impl ToolProvider for LocalToolProvider {
             ask_user::run(&call.arguments, ctx.sender, ctx.cancel, ctx.operation_id)
                 .await
                 .map(FunctionCallOutput::Text)
-        } else if call.name == command::NAME {
-            // The command tool streams its output to the live registry (keyed by
-            // call id) so the TUI can render it as it runs.
-            command::run_with_live_secure(
+        } else if call.name == request_permission::NAME {
+            request_permission::run(
                 &call.arguments,
-                &call.call_id,
+                ctx.sender,
                 ctx.cancel,
+                ctx.operation_id,
                 &self.security,
             )
             .await
             .map(FunctionCallOutput::Text)
+        } else if call.name == command::NAME {
+            let security = self.security.snapshot();
+            // The command tool streams its output to the live registry (keyed by
+            // call id) so the TUI can render it as it runs.
+            command::run_with_live_secure(&call.arguments, &call.call_id, ctx.cancel, &security)
+                .await
+                .map(FunctionCallOutput::Text)
         } else if call.name == todo::NAME {
             todo::run(&call.arguments, &self.todos)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == read_image::NAME {
-            read_image::run_with_security(&call.arguments, &self.security).await
+            let security = self.security.snapshot();
+            read_image::run_with_security(&call.arguments, &security).await
         } else if call.name == read_file::NAME {
-            read_file::run_with_security(&call.arguments, &self.security)
+            let security = self.security.snapshot();
+            read_file::run_with_security(&call.arguments, &security)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == write_file::NAME {
-            write_file::run_with_security(&call.arguments, &self.security)
+            let security = self.security.snapshot();
+            write_file::run_with_security(&call.arguments, &security)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == edit_file::NAME {
-            edit_file::run_with_security(&call.arguments, &self.security)
+            let security = self.security.snapshot();
+            edit_file::run_with_security(&call.arguments, &security)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == task::NAME {
-            task::run_with_security(&call.arguments, &self.security)
+            let security = self.security.snapshot();
+            task::run_with_security(&call.arguments, &security)
                 .await
                 .map(FunctionCallOutput::Text)
         } else {
-            self.security
-                .authorize_tool_call(&call.name, &call.arguments)?;
+            let security = self.security.snapshot();
+            security.authorize_tool_call(&call.name, &call.arguments)?;
             run_local_tool(&call.name, &call.arguments)
                 .await
                 .map(FunctionCallOutput::Text)
@@ -267,6 +285,9 @@ pub(crate) struct ToolRegistry {
     providers: Vec<Arc<dyn ToolProvider>>,
     /// Tool name → index into `providers`. First provider to claim a name wins.
     routes: HashMap<String, usize>,
+    /// Tool name → compiled parameter schema. Calls are checked against this
+    /// before either the approval policy or classifier sees them.
+    validators: HashMap<String, Result<jsonschema::Validator, String>>,
     /// The aggregated advertised list, precomputed so `tools()` is cheap.
     advertised: Vec<Tool>,
 }
@@ -274,11 +295,23 @@ pub(crate) struct ToolRegistry {
 impl ToolRegistry {
     pub(crate) fn new(providers: Vec<Arc<dyn ToolProvider>>) -> Self {
         let mut routes: HashMap<String, usize> = HashMap::new();
+        let mut validators = HashMap::new();
         let mut advertised: Vec<Tool> = Vec::new();
         for (i, provider) in providers.iter().enumerate() {
             for tool in provider.tools() {
-                if let Tool::Function(f) = &tool {
-                    routes.entry(f.name.clone()).or_insert(i);
+                if let Tool::Function(f) = &tool
+                    && let std::collections::hash_map::Entry::Vacant(route) =
+                        routes.entry(f.name.clone())
+                {
+                    route.insert(i);
+                    let schema = f
+                        .parameters
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                    validators.insert(
+                        f.name.clone(),
+                        jsonschema::validator_for(&schema).map_err(|error| error.to_string()),
+                    );
                 }
                 advertised.push(tool);
             }
@@ -286,6 +319,7 @@ impl ToolRegistry {
         Self {
             providers,
             routes,
+            validators,
             advertised,
         }
     }
@@ -297,6 +331,28 @@ impl ToolRegistry {
 
     fn provider_for(&self, name: &str) -> Option<&Arc<dyn ToolProvider>> {
         self.routes.get(name).map(|&i| &self.providers[i])
+    }
+
+    /// Validate a model-produced call before approval or classification. This
+    /// keeps malformed or unknown calls out of the policy model and returns a
+    /// deterministic error to the conversation instead.
+    pub(crate) fn validate(&self, call: &FunctionToolCall) -> Result<(), String> {
+        let validator = self
+            .validators
+            .get(&call.name)
+            .ok_or_else(|| format!("unknown tool '{}'", call.name))?
+            .as_ref()
+            .map_err(|error| {
+                format!(
+                    "tool '{}' has an invalid parameter schema: {error}",
+                    call.name
+                )
+            })?;
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
+            .map_err(|error| format!("arguments are not valid JSON: {error}"))?;
+        validator
+            .validate(&arguments)
+            .map_err(|error| format!("arguments do not match the schema: {error}"))
     }
 
     /// Whether `name` may run concurrently with other reads.
@@ -365,12 +421,14 @@ mod tests {
         assert!(names.contains(&read_file::NAME.to_string()));
         assert!(names.contains(&read_image::NAME.to_string()));
         assert!(names.contains(&ask_user::NAME.to_string()));
+        assert!(names.contains(&request_permission::NAME.to_string()));
         // Read-only classification drives concurrent execution.
         assert!(p.is_read_only(read_file::NAME));
         assert!(p.is_read_only(read_image::NAME));
         assert!(!p.is_read_only(write_file::NAME));
         // Interaction classification drives the headless pre-deny.
         assert!(p.requires_interaction(ask_user::NAME));
+        assert!(p.requires_interaction(request_permission::NAME));
         assert!(!p.requires_interaction(read_file::NAME));
     }
 
@@ -391,6 +449,30 @@ mod tests {
     }
 
     #[test]
+    fn registry_validates_calls_before_policy_routing() {
+        let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider::default())]);
+        let valid = call(read_file::NAME, r#"{"path":"src/main.rs"}"#);
+        assert!(reg.validate(&valid).is_ok());
+
+        let missing_required = call(read_file::NAME, "{}");
+        assert!(
+            reg.validate(&missing_required)
+                .unwrap_err()
+                .contains("required")
+        );
+
+        let malformed = call(read_file::NAME, "{");
+        assert!(
+            reg.validate(&malformed)
+                .unwrap_err()
+                .contains("not valid JSON")
+        );
+
+        let unknown = call("not_advertised", "{}");
+        assert!(reg.validate(&unknown).unwrap_err().contains("unknown tool"));
+    }
+
+    #[test]
     fn local_provider_approval_gates_mutating_only() {
         let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider::default())]);
         // Read-only built-ins auto-approve (bypass the classifier)...
@@ -402,6 +484,10 @@ mod tests {
         // ...mutating ones are classified.
         assert_eq!(reg.approval(write_file::NAME, "{}"), ToolApproval::Classify);
         assert_eq!(reg.approval(command::NAME, "{}"), ToolApproval::Classify);
+        assert_eq!(
+            reg.approval(request_permission::NAME, "{}"),
+            ToolApproval::AutoApprove
+        );
         // The task tool is action-dependent: observe auto-approves, create classifies.
         assert_eq!(
             reg.approval(task::NAME, r#"{"action":"list"}"#),

@@ -65,6 +65,25 @@ pub(crate) fn classifier_denied_output(
     }
 }
 
+/// Build a failed result for a malformed or unknown call. Validation failures
+/// are protocol errors, not policy decisions, so they must not be labelled as
+/// classifier denials.
+pub(crate) fn invalid_tool_call_output(
+    call: &FunctionToolCall,
+    reason: &str,
+) -> crate::tools::ToolOutput {
+    crate::tools::ToolOutput {
+        param: async_openai::types::responses::FunctionCallOutputItemParam {
+            call_id: call.call_id.clone(),
+            output: FunctionCallOutput::Text(format!("error: invalid tool call — {reason}")),
+            id: None,
+            status: None,
+        },
+        failed: true,
+        approval_label: Some(format!("\u{274c} invalid tool call — {reason}")),
+    }
+}
+
 /// Classify `calls` with a synchronous rule `classifier`, partitioning them into
 /// allow / deny / ask. Returns `None` if cancelled partway.
 pub(crate) fn classify_sync(

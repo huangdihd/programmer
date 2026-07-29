@@ -14,10 +14,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::classifier::WorkMode;
+use crate::security::SandboxMode;
 use crate::thinking::ThinkingLevel;
 use crate::ui::components::status_bar::status_bar::StatusBar;
 
-/// Bottom bar: status indicator on the left, work mode, model and thinking
+/// Bottom bar: work/sandbox modes and status on the left, model and thinking
 /// level in the middle, copyright on the right.
 #[derive(Debug)]
 pub struct Footer {
@@ -25,6 +26,7 @@ pub struct Footer {
     pub current_model: String,
     pub(crate) thinking_level: ThinkingLevel,
     pub work_mode: WorkMode,
+    pub(crate) sandbox_mode: SandboxMode,
     /// Whether the project has an LSP checker configured, so the LSP block shows
     /// even before a server has started.
     pub lsp_configured: bool,
@@ -39,6 +41,7 @@ impl Footer {
             current_model: String::new(),
             thinking_level: ThinkingLevel::default(),
             work_mode: WorkMode::default(),
+            sandbox_mode: SandboxMode::default(),
             lsp_configured: false,
             active_skills: String::new(),
         }
@@ -52,6 +55,10 @@ impl Footer {
         } else {
             format!(" {} · {} ", self.current_model, self.thinking_level.label())
         }
+    }
+
+    pub(crate) fn sandbox_text(&self) -> String {
+        format!(" \u{1f512} {} ", self.sandbox_mode.label())
     }
 }
 
@@ -75,5 +82,13 @@ mod tests {
         footer.thinking_level = ThinkingLevel::High;
 
         assert_eq!(footer.model_and_thinking_text(), " openai/gpt-5 · high ");
+    }
+
+    #[test]
+    fn sandbox_text_shows_the_effective_mode() {
+        let mut footer = Footer::new();
+        footer.sandbox_mode = SandboxMode::Off;
+
+        assert_eq!(footer.sandbox_text(), " 🔒 off ");
     }
 }

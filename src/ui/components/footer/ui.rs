@@ -15,6 +15,7 @@
 
 use super::footer::Footer;
 use crate::classifier::WorkMode;
+use crate::security::SandboxMode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -28,6 +29,8 @@ impl Widget for &Footer {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let mode_text = format!("  {} {} ", self.work_mode.icon(), self.work_mode.label());
         let mode_len = mode_text.len() as u16;
+        let sandbox_text = self.sandbox_text();
+        let sandbox_len = sandbox_text.width() as u16;
         let model_text = self.model_and_thinking_text();
         let model_len = model_text.width() as u16;
 
@@ -72,12 +75,13 @@ impl Widget for &Footer {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(mode_len),  // work mode (leftmost)
-                Constraint::Length(skill_len), // active skills
-                Constraint::Min(1),            // status
-                Constraint::Length(model_len), // model and thinking level
-                Constraint::Length(lsp_len),   // LSP status
-                Constraint::Length(28),        // "GPL-3.0-or-later · © 2026"
+                Constraint::Length(mode_len),    // work mode (leftmost)
+                Constraint::Length(sandbox_len), // sandbox mode
+                Constraint::Length(skill_len),   // active skills
+                Constraint::Min(1),              // status
+                Constraint::Length(model_len),   // model and thinking level
+                Constraint::Length(lsp_len),     // LSP status
+                Constraint::Length(28),          // "GPL-3.0-or-later · © 2026"
             ])
             .split(area);
 
@@ -92,33 +96,42 @@ impl Widget for &Footer {
             .style(mode_style)
             .render(chunks[0], buf);
 
+        let sandbox_style = match self.sandbox_mode {
+            SandboxMode::Restricted => Style::default().fg(Color::LightGreen),
+            SandboxMode::Network => Style::default().fg(Color::LightYellow),
+            SandboxMode::Off => Style::default().fg(Color::LightRed),
+        };
+        ratatui::widgets::Paragraph::new(sandbox_text)
+            .style(sandbox_style)
+            .render(chunks[1], buf);
+
         // Active skills (if any)
         if !skill_text.is_empty() {
             ratatui::widgets::Paragraph::new(skill_text)
                 .style(Style::default().fg(Color::LightMagenta))
-                .render(chunks[1], buf);
+                .render(chunks[2], buf);
         }
 
         // Status indicator
-        (&self.status).render(chunks[2], buf);
+        (&self.status).render(chunks[3], buf);
 
         // Model name and thinking level
         if !model_text.is_empty() {
             ratatui::widgets::Paragraph::new(model_text)
                 .style(Style::default().fg(ACCENT))
-                .render(chunks[3], buf);
+                .render(chunks[4], buf);
         }
 
         // LSP status (empty string renders nothing)
         if !lsp_text.is_empty() {
             ratatui::widgets::Paragraph::new(lsp_text)
                 .style(lsp_style)
-                .render(chunks[4], buf);
+                .render(chunks[5], buf);
         }
 
         // Right: copyright
         ratatui::widgets::Paragraph::new("GPL-3.0-or-later \u{b7} \u{a9} 2026")
             .style(Style::default().fg(DIM))
-            .render(chunks[5], buf);
+            .render(chunks[6], buf);
     }
 }

@@ -50,6 +50,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Keep input bursts from starving terminal redraws. Four events per frame
+/// sustains 120 events/second at the normal 30 FPS tick rate while giving
+/// trackpad scrolling and streamed output a frame boundary every few events.
+const MAX_EVENTS_PER_FRAME: usize = 4;
+
 /// A pending tool-call review request from the runner. Manual mode now gets
 /// per-call reviews (no batch), driven by the runner's `review()` callback.
 pub(crate) struct PendingReview {
@@ -204,8 +209,8 @@ pub struct App<'a> {
     pub(crate) mcp_reload_generation: u64,
     /// Current safety/work mode.
     pub work_mode: WorkMode,
-    /// Mandatory security policy shared by every local tool provider.
-    pub(crate) security: Arc<crate::security::SecurityManager>,
+    /// Live security policy shared by the UI and every local tool provider.
+    pub(crate) security: Arc<crate::security::SecurityHandle>,
     /// Manual-mode pending tool-call review (per-call, no batch). `None` when
     /// no review is in progress.
     pub(crate) pending_review: Option<PendingReview>,
@@ -304,11 +309,12 @@ impl App<'_> {
         input_panel.history = saved_history;
         let todo_list = crate::todos::TodoList { todos: saved_todos };
         let todo_store = Arc::new(Mutex::new(todo_list.clone()));
-        let security = Arc::new(
+        let security_manager = Arc::new(
             crate::security::SecurityManager::for_current_dir(config.security.clone())
                 .expect("security configuration should be validated before starting the app"),
         );
-        crate::security::install_active(security.clone());
+        crate::security::install_active(security_manager.clone());
+        let security = Arc::new(crate::security::SecurityHandle::new(security_manager));
         let mcp_server_statuses = config
             .mcp_servers
             .iter()
@@ -506,12 +512,17 @@ impl App<'_> {
             while self.running {
                 terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
 
-                let event = self.events.next().await?;
-                self.handle_event(event).await?;
-                while self.running {
-                    match self.events.try_next() {
-                        Some(event) => self.handle_event(event).await?,
-                        None => break,
+                let mut event = Some(self.events.next().await?);
+                for index in 0..MAX_EVENTS_PER_FRAME {
+                    let Some(current) = event.take() else {
+                        break;
+                    };
+                    self.handle_event(current).await?;
+                    if !self.running {
+                        break;
+                    }
+                    if index + 1 < MAX_EVENTS_PER_FRAME {
+                        event = self.events.try_next();
                     }
                 }
             }

@@ -63,8 +63,9 @@ pub enum Command {
     Thinking(String),
     /// `/vision <on|off>` — enable or disable image attachments for this session.
     Vision(String),
-    /// `/sandbox` — show mandatory filesystem and process isolation status.
-    Sandbox,
+    /// `/permission` (or `/sandbox`) — inspect or configure mandatory
+    /// filesystem and process isolation.
+    Permission(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +89,7 @@ enum CommandKind {
     Compact,
     Thinking,
     Vision,
-    Sandbox,
+    Permission,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,7 +99,21 @@ enum CompletionKind {
     Fixed(&'static [&'static str]),
     Skill,
     Terminal,
+    Permission,
 }
+
+pub(crate) const PERMISSION_BOOLEAN_SETTINGS: &[&str] = &[
+    "filesystem",
+    "sandbox",
+    "network",
+    "system-read",
+    "temp-write",
+    "fail-closed",
+    "file-protection",
+    "outside-read",
+];
+pub(crate) const PERMISSION_COLLECTION_KINDS: &[&str] = &["read", "write", "deny-read", "env"];
+const PERMISSION_ACTIONS: &[&str] = &["show", "mode", "reset", "add", "remove"];
 
 #[derive(Debug, Clone, Copy)]
 struct HelpEntry {
@@ -138,7 +153,7 @@ impl CommandKind {
             Self::Compact => Command::Compact(args),
             Self::Thinking => Command::Thinking(args),
             Self::Vision => Command::Vision(args),
-            Self::Sandbox => Command::Sandbox,
+            Self::Permission => Command::Permission(args),
         }
     }
 }
@@ -167,7 +182,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["n"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 17,
+            order: 19,
             usage: "/new | /n",
             description: "Start a new session (saves current)",
         }],
@@ -179,17 +194,17 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Fixed(&["show", "manage", "refresh"]),
         help: &[
             HelpEntry {
-                order: 18,
+                order: 20,
                 usage: "/providers show",
                 description: "List all configured providers and models",
             },
             HelpEntry {
-                order: 19,
+                order: 21,
                 usage: "/providers manage",
                 description: "Open the provider management panel",
             },
             HelpEntry {
-                order: 20,
+                order: 22,
                 usage: "/providers refresh",
                 description: "Refetch auto-discovered provider models",
             },
@@ -201,7 +216,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["s"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 21,
+            order: 23,
             usage: "/session | /s",
             description: "Show current session info",
         }],
@@ -212,7 +227,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 22,
+            order: 24,
             usage: "/usage",
             description: "Show token usage for the current session",
         }],
@@ -256,7 +271,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["todos", "t"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 16,
+            order: 18,
             usage: "/todo | /t",
             description: "Open the todo list panel",
         }],
@@ -367,15 +382,27 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         }],
     },
     CommandSpec {
-        kind: CommandKind::Sandbox,
-        name: "sandbox",
-        aliases: &["permissions"],
-        completion: CompletionKind::None,
-        help: &[HelpEntry {
-            order: 15,
-            usage: "/sandbox | /permissions",
-            description: "Show sandbox, file protection, and permission status",
-        }],
+        kind: CommandKind::Permission,
+        name: "permission",
+        aliases: &["permissions", "sandbox"],
+        completion: CompletionKind::Permission,
+        help: &[
+            HelpEntry {
+                order: 15,
+                usage: "/permission show | /sandbox show",
+                description: "Show sandbox, file protection, and permission status",
+            },
+            HelpEntry {
+                order: 16,
+                usage: "/permission mode <restricted|network|off> | <setting> <on|off>",
+                description: "Set the sandbox mode or another security setting",
+            },
+            HelpEntry {
+                order: 17,
+                usage: "/permission <add|remove> <kind> <value>",
+                description: "Configure sandbox paths and inherited environment names",
+            },
+        ],
     },
     CommandSpec {
         kind: CommandKind::Clear,
@@ -383,7 +410,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["c"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 23,
+            order: 25,
             usage: "/clear | /c",
             description: "Delete this session; reset chat, todos, images, and diagnostics",
         }],
@@ -394,7 +421,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["q", "exit"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 24,
+            order: 26,
             usage: "/quit | /q",
             description: "Exit the application",
         }],
@@ -405,7 +432,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["?"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 25,
+            order: 27,
             usage: "/help | /?",
             description: "Show this help",
         }],
@@ -434,9 +461,18 @@ impl Command {
             .map(|spec| spec.kind.command(args))
     }
 
-    /// All command names (without leading `/`), for completion.
+    /// All canonical command names without the leading `/`.
     pub fn all_commands() -> impl Iterator<Item = &'static str> {
         COMMAND_SPECS.iter().map(|spec| spec.name)
+    }
+
+    /// Canonical command names followed by aliases in catalog order.
+    fn completion_names() -> impl Iterator<Item = &'static str> {
+        Self::all_commands().chain(
+            COMMAND_SPECS
+                .iter()
+                .flat_map(|spec| spec.aliases.iter().copied()),
+        )
     }
 
     /// Human-readable descriptions for the help text.
@@ -546,7 +582,7 @@ impl CompletionEngine {
         if parts.is_empty() || (parts.len() == 1 && !text.ends_with(char::is_whitespace)) {
             // Completing the command name itself.
             let typed = parts.first().copied().unwrap_or("");
-            let candidates: Vec<String> = Command::all_commands()
+            let candidates: Vec<String> = Command::completion_names()
                 .filter(|c| c.starts_with(typed))
                 .map(|c| format!("/{}", c))
                 .collect();
@@ -561,7 +597,91 @@ impl CompletionEngine {
             CompletionKind::Fixed(values) => Self::complete_subcommand(text, cmd, values),
             CompletionKind::Skill => Self::complete_skill(text, cmd, skill_registry),
             CompletionKind::Terminal => Self::complete_terminal(text, cmd),
+            CompletionKind::Permission => Self::complete_permission(text, cmd),
         }
+    }
+
+    fn complete_permission(text: &str, cmd: &str) -> Option<CompletionState> {
+        let after_cmd = text[cmd.len()..].trim_start();
+        let trailing_space = after_cmd.ends_with(char::is_whitespace);
+        let parts = after_cmd.split_whitespace().collect::<Vec<_>>();
+
+        if parts.is_empty() || (parts.len() == 1 && !trailing_space) {
+            let typed = parts.first().copied().unwrap_or("");
+            let candidates = PERMISSION_ACTIONS
+                .iter()
+                .chain(PERMISSION_BOOLEAN_SETTINGS)
+                .filter(|candidate| candidate.starts_with(typed))
+                .map(|candidate| (*candidate).to_string())
+                .collect();
+            return CompletionState::new(format!("/{cmd} "), candidates);
+        }
+
+        let action = parts[0];
+        if action == "mode" {
+            let typed = parts
+                .get(1)
+                .copied()
+                .filter(|_| !trailing_space)
+                .unwrap_or("");
+            if parts.len() > 2 || (parts.len() == 2 && trailing_space) {
+                return None;
+            }
+            let candidates = crate::security::SandboxMode::VALUES
+                .iter()
+                .filter(|candidate| candidate.starts_with(typed))
+                .map(|candidate| (*candidate).to_string())
+                .collect();
+            return CompletionState::new(format!("/{cmd} mode "), candidates);
+        }
+
+        if PERMISSION_BOOLEAN_SETTINGS.contains(&action) {
+            let typed = parts
+                .get(1)
+                .copied()
+                .filter(|_| !trailing_space)
+                .unwrap_or("");
+            if parts.len() > 2 || (parts.len() == 2 && trailing_space) {
+                return None;
+            }
+            let candidates = ["on", "off"]
+                .into_iter()
+                .filter(|candidate| candidate.starts_with(typed))
+                .map(str::to_string)
+                .collect();
+            return CompletionState::new(format!("/{cmd} {action} "), candidates);
+        }
+
+        if matches!(action, "add" | "remove") {
+            if parts.len() == 1 || (parts.len() == 2 && !trailing_space) {
+                let typed = parts.get(1).copied().unwrap_or("");
+                let candidates = PERMISSION_COLLECTION_KINDS
+                    .iter()
+                    .filter(|candidate| candidate.starts_with(typed))
+                    .map(|candidate| (*candidate).to_string())
+                    .collect();
+                return CompletionState::new(format!("/{cmd} {action} "), candidates);
+            }
+
+            let kind = parts[1];
+            if !PERMISSION_COLLECTION_KINDS.contains(&kind) || kind == "env" {
+                return None;
+            }
+            let value = parts
+                .get(2)
+                .copied()
+                .filter(|_| !trailing_space)
+                .unwrap_or("");
+            if parts.len() > 3 || (parts.len() == 3 && trailing_space) {
+                return None;
+            }
+            return CompletionState::new(
+                format!("/{cmd} {action} {kind} "),
+                list_path_candidates(value),
+            );
+        }
+
+        None
     }
 
     /// Complete a `/terminal` task id from all running tasks. Each candidate is
@@ -1323,7 +1443,7 @@ mod tests {
             "compact",
             "thinking",
             "vision",
-            "sandbox",
+            "permission",
             "clear",
             "quit",
             "help",
@@ -1392,8 +1512,16 @@ mod tests {
                 "Enable or disable image attachments for this session",
             ),
             (
-                "/sandbox | /permissions",
+                "/permission show | /sandbox show",
                 "Show sandbox, file protection, and permission status",
+            ),
+            (
+                "/permission mode <restricted|network|off> | <setting> <on|off>",
+                "Set the sandbox mode or another security setting",
+            ),
+            (
+                "/permission <add|remove> <kind> <value>",
+                "Configure sandbox paths and inherited environment names",
             ),
             ("/todo | /t", "Open the todo list panel"),
             ("/new | /n", "Start a new session (saves current)"),
@@ -1488,6 +1616,58 @@ mod tests {
         let state = CompletionEngine::complete_subcommand("plan c", "plan", values)
             .expect("plan cancel completion");
         assert_eq!(state.candidates[0].value, "cancel");
+    }
+
+    #[test]
+    fn permission_command_and_alias_have_hierarchical_completions() {
+        assert!(matches!(
+            Command::parse("/permission network on"),
+            Some(Command::Permission(argument)) if argument == "network on"
+        ));
+        assert!(matches!(
+            Command::parse("/sandbox show"),
+            Some(Command::Permission(argument)) if argument == "show"
+        ));
+
+        let state = CompletionEngine::complete_permission("permission net", "permission")
+            .expect("permission setting completion");
+        assert_eq!(state.prefix, "/permission ");
+        assert_eq!(state.candidates[0].value, "network");
+
+        let state = CompletionEngine::complete_permission("permission network o", "permission")
+            .expect("permission toggle completion");
+        assert_eq!(state.prefix, "/permission network ");
+        assert_eq!(
+            state
+                .candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["on", "off"]
+        );
+
+        let state = CompletionEngine::complete_permission("sandbox add d", "sandbox")
+            .expect("sandbox collection completion");
+        assert_eq!(state.prefix, "/sandbox add ");
+        assert_eq!(state.candidates[0].value, "deny-read");
+
+        let state = CompletionEngine::complete_permission("sandbox mode n", "sandbox")
+            .expect("sandbox mode completion");
+        assert_eq!(state.prefix, "/sandbox mode ");
+        assert_eq!(state.candidates[0].value, "network");
+
+        let provider_manager = ProviderManager::from_config(&crate::ProgrammerConfig::default());
+        let skill_registry = crate::skills::SkillRegistry::default();
+        let state = CompletionEngine::complete("/sand", &provider_manager, &skill_registry)
+            .expect("sandbox alias command-name completion");
+        assert_eq!(
+            state
+                .candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/sandbox"]
+        );
     }
 
     #[test]

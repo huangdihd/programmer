@@ -401,9 +401,9 @@ impl TurnRunner {
     }
 
     /// Classify and execute one batch of tool calls, returning the outputs (or
-    /// `None` if cancelled). `ask_user` is pre-denied before classification so
-    /// it never reaches the executor — in a non-interactive run it would block
-    /// forever on a dead answer channel.
+    /// `None` if cancelled). Interactive tools are pre-denied before
+    /// classification when the surface has no UI, so they cannot block forever
+    /// on a dead answer channel.
     async fn run_calls(
         &self,
         conversation: &Mutex<Conversation>,
@@ -411,18 +411,18 @@ impl TurnRunner {
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
     ) -> Option<Vec<crate::tools::ToolOutput>> {
-        // ask_user needs an interactive front-end to answer it. A surface that
+        // Interactive tools need a front-end to answer them. A surface that
         // provides a tool-event channel (the TUI) can; without one (headless),
-        // pre-deny it so it doesn't hang forever on a dead answer channel.
+        // pre-deny them so they cannot hang on a dead answer channel.
         let tool_sender = surface.tool_event_sender();
         let mut denied: Vec<crate::tools::ToolOutput> = Vec::new();
         let mut classifiable: Vec<FunctionToolCall> = Vec::new();
         for call in calls {
-            if self.tools.requires_interaction(&call.name) && tool_sender.is_none() {
-                denied.push(classify::classifier_denied_output(
-                    &call,
-                    "ask_user is unavailable in non-interactive mode",
-                ));
+            if let Err(reason) = self.tools.validate(&call) {
+                denied.push(classify::invalid_tool_call_output(&call, &reason));
+            } else if self.tools.requires_interaction(&call.name) && tool_sender.is_none() {
+                let reason = format!("{} is unavailable in non-interactive mode", call.name);
+                denied.push(classify::classifier_denied_output(&call, &reason));
             } else {
                 classifiable.push(call);
             }
@@ -877,7 +877,11 @@ mod tests {
         // Response 2 finishes.
         let body1 = format!(
             "{}{}",
-            item_added_frame(1, 0, &call_item("a1", "ask_user", "{\"question\":\"?\"}")),
+            item_added_frame(
+                1,
+                0,
+                &call_item("a1", "ask_user", "{\"question\":\"?\",\"kind\":\"text\"}",),
+            ),
             completed_frame(2),
         );
         let body2 = format!(

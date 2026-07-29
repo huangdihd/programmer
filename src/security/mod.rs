@@ -15,12 +15,53 @@ pub(crate) mod policy;
 pub(crate) mod sandbox;
 
 pub use policy::SecurityConfig;
-pub(crate) use policy::SecurityManager;
+pub(crate) use policy::{SandboxMode, SecurityManager};
 pub(crate) use sandbox::SandboxInvocation;
 
 use std::sync::{Arc, OnceLock, RwLock};
 
 static ACTIVE_SECURITY: OnceLock<RwLock<Option<Arc<SecurityManager>>>> = OnceLock::new();
+
+pub(crate) struct SecurityHandle {
+    current: RwLock<Arc<SecurityManager>>,
+}
+
+impl SecurityHandle {
+    pub(crate) fn new(security: Arc<SecurityManager>) -> Self {
+        Self {
+            current: RwLock::new(security),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Arc<SecurityManager> {
+        self.current
+            .read()
+            .expect("security handle lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn replace(&self, security: Arc<SecurityManager>) {
+        *self.current.write().expect("security handle lock poisoned") = security.clone();
+        install_active(security);
+    }
+
+    pub(crate) fn set_sandbox_mode(&self, mode: SandboxMode) -> Result<(), String> {
+        let current = self.snapshot();
+        let mut config = current.security_config();
+        mode.apply(&mut config.sandbox);
+        let security = Arc::new(SecurityManager::new(config, current.workspace_path())?);
+        self.replace(security);
+        Ok(())
+    }
+
+    pub(crate) fn sandbox_mode(&self) -> SandboxMode {
+        self.snapshot().sandbox_mode()
+    }
+
+    pub(crate) fn status_text(&self) -> String {
+        self.snapshot().status_text()
+    }
+}
 
 pub(crate) fn install_active(security: Arc<SecurityManager>) {
     *ACTIVE_SECURITY

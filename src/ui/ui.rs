@@ -409,6 +409,7 @@ impl Widget for &mut App<'_> {
                 trimmed
             });
         self.footer.work_mode = self.work_mode;
+        self.footer.sandbox_mode = self.security.sandbox_mode();
         self.footer.current_model = self.current_model.clone();
         self.footer.thinking_level = self.thinking_level;
         self.footer.lsp_configured = self.diag.lsp_configured;

@@ -201,6 +201,7 @@ async fn run_print_mode(
             .map_err(|error| color_eyre::eyre::eyre!(error))?,
     );
     crate::security::install_active(security.clone());
+    let security = std::sync::Arc::new(crate::security::SecurityHandle::new(security));
     let pm = crate::providers::ProviderManager::new(&config).await;
     let chat_model = pm.default_model();
     let Some((chat_client, chat_name)) = pm.resolve(&chat_model).map(|(c, n)| (c.clone(), n))
@@ -209,10 +210,9 @@ async fn run_print_mode(
         std::process::exit(1);
     };
 
-    // Local built-ins only (no MCP in print mode), behind the registry. ask_user
-    // stays advertised: the headless surface has no interactive channel, so the
-    // runner pre-denies any ask_user call (via the provider's requires_interaction)
-    // with a clear reason before it executes.
+    // Local built-ins only (no MCP in print mode), behind the registry.
+    // Interactive tools stay advertised, but the headless surface has no
+    // interactive channel, so the runner pre-denies them with a clear reason.
     let tools = std::sync::Arc::new(ToolRegistry::new(vec![std::sync::Arc::new(
         LocalToolProvider::new(
             std::sync::Arc::new(std::sync::Mutex::new(Default::default())),

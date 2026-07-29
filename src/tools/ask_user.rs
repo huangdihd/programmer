@@ -130,6 +130,15 @@ pub async fn run(
         }
     };
 
+    prompt(question, sender, cancel, operation_id).await
+}
+
+pub(crate) async fn prompt(
+    question: Question,
+    sender: &mpsc::UnboundedSender<Event>,
+    cancel: &CancellationToken,
+    operation_id: u64,
+) -> Result<String, String> {
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     let _ = sender.send(Event::App(AppEvent::QuestionPrompt {
         question,

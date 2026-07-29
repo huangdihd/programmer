@@ -58,6 +58,62 @@ pub struct SandboxConfig {
     pub inherit_environment: Vec<String>,
 }
 
+/// Coarse process-isolation modes exposed in the UI and permission controls.
+/// Other sandbox settings (paths, environment, temporary writes) remain
+/// independently configurable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SandboxMode {
+    #[default]
+    Restricted,
+    Network,
+    Off,
+}
+
+impl SandboxMode {
+    pub(crate) const VALUES: &'static [&'static str] = &["restricted", "network", "off"];
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "restricted" | "default" => Some(Self::Restricted),
+            "network" => Some(Self::Network),
+            "off" | "disabled" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_config(config: &SandboxConfig) -> Self {
+        if !config.enabled {
+            Self::Off
+        } else if config.network {
+            Self::Network
+        } else {
+            Self::Restricted
+        }
+    }
+
+    pub(crate) fn apply(self, config: &mut SandboxConfig) {
+        match self {
+            Self::Restricted => {
+                config.enabled = true;
+                config.network = false;
+            }
+            Self::Network => {
+                config.enabled = true;
+                config.network = true;
+            }
+            Self::Off => config.enabled = false,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Restricted => "restricted",
+            Self::Network => "network",
+            Self::Off => "off",
+        }
+    }
+}
+
 impl Default for SandboxConfig {
     fn default() -> Self {
         let policy = &*DEFAULT_SANDBOX_POLICY;
@@ -347,6 +403,18 @@ impl SecurityManager {
         &self.config.sandbox
     }
 
+    pub(crate) fn sandbox_mode(&self) -> SandboxMode {
+        SandboxMode::from_config(&self.config.sandbox)
+    }
+
+    pub(crate) fn security_config(&self) -> SecurityConfig {
+        self.config.clone()
+    }
+
+    pub(crate) fn workspace_path(&self) -> PathBuf {
+        self.workspace.clone()
+    }
+
     pub(super) fn workspace(&self) -> &Path {
         &self.workspace
     }
@@ -355,7 +423,13 @@ impl SecurityManager {
         let report = skarn_sandbox::backend_report();
         let sandbox = &self.config.sandbox;
         format!(
-            "Security:\n  sandbox: {}\n  backend: {} ({:?})\n  network: {}\n  system reads: {}\n  temporary writes: {}\n  fail closed: {}\n  workspace: {}\n  extra readable paths: {}\n  extra writable paths: {}\n  denied read paths: {}\n  inherited environment patterns: {}\n  file conflict protection: {}\n  permission rules: {}",
+            "Security:\n  filesystem policy: {}\n  sandbox mode: {}\n  sandbox: {}\n  backend: {} ({:?})\n  network: {}\n  system reads: {}\n  temporary writes: {}\n  fail closed: {}\n  workspace: {}\n  reads outside workspace: {}\n  extra readable paths: {}\n  extra writable paths: {}\n  denied read paths: {}\n  inherited environment patterns: {}\n  file conflict protection: {}\n  permission rules: {}",
+            if self.config.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            self.sandbox_mode().label(),
             if sandbox.enabled {
                 "enabled"
             } else {
@@ -380,6 +454,11 @@ impl SecurityManager {
                 "disabled"
             },
             self.workspace.display(),
+            if self.config.allow_read_outside_workspace {
+                "allowed"
+            } else {
+                "denied"
+            },
             sandbox.readable_paths.len(),
             sandbox.writable_paths.len(),
             sandbox.denied_read_paths.len(),
