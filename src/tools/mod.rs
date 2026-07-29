@@ -266,6 +266,30 @@ pub(crate) async fn run_local_tool(name: &str, arguments: &str) -> Result<String
     }
 }
 
+pub(crate) async fn run_local_tool_secure(
+    name: &str,
+    arguments: &str,
+    security: &crate::security::SecurityManager,
+) -> Result<String, String> {
+    security.authorize_tool_call(name, arguments)?;
+    match name {
+        command::NAME => {
+            command::run_with_live_secure(
+                arguments,
+                "headless-command",
+                &crate::cancel::CancellationToken::new(),
+                security,
+            )
+            .await
+        }
+        read_file::NAME => read_file::run_with_security(arguments, security).await,
+        write_file::NAME => write_file::run_with_security(arguments, security).await,
+        edit_file::NAME => edit_file::run_with_security(arguments, security).await,
+        task::NAME => task::run_with_security(arguments, security).await,
+        _ => run_local_tool(name, arguments).await,
+    }
+}
+
 /// The local tools exposed when running as an MCP server (`--mcp-server`).
 /// Excludes `ask_user` (needs the interactive UI) and MCP passthrough tools.
 pub(crate) fn mcp_server_tools() -> Vec<Tool> {

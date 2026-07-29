@@ -80,6 +80,7 @@ pub(crate) struct ServerState {
     classifier: Option<(Client<OpenAIConfig>, String)>,
     event_tx: mpsc::UnboundedSender<ConsoleEvent>,
     next_call_id: AtomicU64,
+    security: Arc<crate::security::SecurityManager>,
 }
 
 /// Serve MCP over HTTP at `addr` with a ratatui approval console. Returns when
@@ -89,6 +90,7 @@ pub async fn serve(
     classifier: Option<(Client<OpenAIConfig>, String)>,
     addr: SocketAddr,
     allow_yolo: bool,
+    security: Arc<crate::security::SecurityManager>,
 ) -> color_eyre::Result<()> {
     let mode = Arc::new(Mutex::new(mode));
     let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -97,6 +99,7 @@ pub async fn serve(
         classifier,
         event_tx,
         next_call_id: AtomicU64::new(1),
+        security,
     });
 
     let app = Router::new()
@@ -171,10 +174,11 @@ impl ServerState {
         match self.decide(id, &name, &args).await {
             Ok(()) => {
                 self.emit(ConsoleEvent::Running { id });
-                let (text, is_error) = match crate::tools::run_local_tool(&name, &args).await {
-                    Ok(text) => (text, false),
-                    Err(text) => (text, true),
-                };
+                let (text, is_error) =
+                    match crate::tools::run_local_tool_secure(&name, &args, &self.security).await {
+                        Ok(text) => (text, false),
+                        Err(text) => (text, true),
+                    };
                 self.emit(ConsoleEvent::Finished {
                     id,
                     outcome: if is_error {

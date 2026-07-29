@@ -351,7 +351,8 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
     let (rows, cols) = crossterm::terminal::size()
         .map(|(w, h)| (h.saturating_sub(2).max(1), w.max(1)))
         .unwrap_or((24, 80));
-    match crate::tasks::spawn_bang(&command, None, Some(&command), rows, cols) {
+    match crate::tasks::spawn_bang_secure(&command, None, Some(&command), rows, cols, &app.security)
+    {
         Ok(id) => {
             // The record in the conversation; the transcript follows when the
             // command exits and the agent picks it up.
@@ -585,7 +586,8 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         | Command::Vision(_)
         | Command::Mode(_)
         | Command::Classifier(_)
-        | Command::Thinking(_)) => command_handlers::settings::execute(app, command),
+        | Command::Thinking(_)
+        | Command::Sandbox) => command_handlers::settings::execute(app, command),
         command @ (Command::Providers(_) | Command::Skill(_) | Command::Mcp(_)) => {
             command_handlers::integrations::execute(app, command)
         }
@@ -683,6 +685,11 @@ mod tests {
                 ExpectedCommandEffect::AppendedMessage,
             ),
             ("vision", "/vision", ExpectedCommandEffect::AppendedMessage),
+            (
+                "sandbox",
+                "/sandbox",
+                ExpectedCommandEffect::AppendedMessage,
+            ),
             (
                 "clear",
                 "/clear",

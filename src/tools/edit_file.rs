@@ -66,7 +66,7 @@ struct Args {
 }
 
 pub async fn run(arguments: &str) -> Result<String, String> {
-    let security = crate::security::SecurityManager::for_current_dir(Default::default())?;
+    let security = crate::security::SecurityManager::standalone()?;
     run_with_security(arguments, &security).await
 }
 
@@ -139,7 +139,7 @@ pub(crate) async fn run_with_security(
     match tokio::fs::write(&path, &updated).await {
         Ok(()) => {
             security.record_read(&path, updated.as_bytes());
-            Ok(format!("edited {}", path.display()))
+            Ok(format!("edited {}", args.path))
         }
         Err(error) => Err(format!(
             "error: could not write {}: {error}",

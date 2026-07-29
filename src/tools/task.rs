@@ -217,6 +217,20 @@ pub fn action_is_mutating(arguments: &str) -> bool {
 }
 
 pub async fn run(arguments: &str) -> Result<String, String> {
+    run_inner(arguments, None).await
+}
+
+pub(crate) async fn run_with_security(
+    arguments: &str,
+    security: &crate::security::SecurityManager,
+) -> Result<String, String> {
+    run_inner(arguments, Some(security)).await
+}
+
+async fn run_inner(
+    arguments: &str,
+    security: Option<&crate::security::SecurityManager>,
+) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return Err(format!("error: invalid arguments: {e}")),
@@ -231,13 +245,23 @@ pub async fn run(arguments: &str) -> Result<String, String> {
             if args.interactive.unwrap_or(false) {
                 let rows = args.rows.unwrap_or(24).clamp(4, 200);
                 let cols = args.cols.unwrap_or(80).clamp(20, 400);
-                let id = tasks::spawn_interactive(
-                    &command,
-                    args.dir.as_deref(),
-                    args.name.as_deref(),
-                    rows,
-                    cols,
-                )?;
+                let id = match security {
+                    Some(security) => tasks::spawn_interactive_secure(
+                        &command,
+                        args.dir.as_deref(),
+                        args.name.as_deref(),
+                        rows,
+                        cols,
+                        security,
+                    ),
+                    None => tasks::spawn_interactive(
+                        &command,
+                        args.dir.as_deref(),
+                        args.name.as_deref(),
+                        rows,
+                        cols,
+                    ),
+                }?;
                 if let Some(max) = args.max_output {
                     let _ = tasks::set_max_output(id, max);
                 }
@@ -248,7 +272,15 @@ pub async fn run(arguments: &str) -> Result<String, String> {
                      (text and/or named keys), and stop it with action=kill id={id}."
                 ));
             }
-            let id = tasks::spawn(&command, args.dir.as_deref(), args.name.as_deref())?;
+            let id = match security {
+                Some(security) => tasks::spawn_secure(
+                    &command,
+                    args.dir.as_deref(),
+                    args.name.as_deref(),
+                    security,
+                ),
+                None => tasks::spawn(&command, args.dir.as_deref(), args.name.as_deref()),
+            }?;
             if let Some(max) = args.max_output {
                 let _ = tasks::set_max_output(id, max);
             }

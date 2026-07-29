@@ -45,7 +45,7 @@ struct Args {
 }
 
 pub async fn run(arguments: &str) -> Result<FunctionCallOutput, String> {
-    let security = crate::security::SecurityManager::for_current_dir(Default::default())?;
+    let security = crate::security::SecurityManager::standalone()?;
     run_with_security(arguments, &security).await
 }
 

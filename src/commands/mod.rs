@@ -63,6 +63,8 @@ pub enum Command {
     Thinking(String),
     /// `/vision <on|off>` — enable or disable image attachments for this session.
     Vision(String),
+    /// `/sandbox` — show mandatory filesystem and process isolation status.
+    Sandbox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +88,7 @@ enum CommandKind {
     Compact,
     Thinking,
     Vision,
+    Sandbox,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +138,7 @@ impl CommandKind {
             Self::Compact => Command::Compact(args),
             Self::Thinking => Command::Thinking(args),
             Self::Vision => Command::Vision(args),
+            Self::Sandbox => Command::Sandbox,
         }
     }
 }
@@ -163,7 +167,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["n"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 16,
+            order: 17,
             usage: "/new | /n",
             description: "Start a new session (saves current)",
         }],
@@ -175,17 +179,17 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Fixed(&["show", "manage", "refresh"]),
         help: &[
             HelpEntry {
-                order: 17,
+                order: 18,
                 usage: "/providers show",
                 description: "List all configured providers and models",
             },
             HelpEntry {
-                order: 18,
+                order: 19,
                 usage: "/providers manage",
                 description: "Open the provider management panel",
             },
             HelpEntry {
-                order: 19,
+                order: 20,
                 usage: "/providers refresh",
                 description: "Refetch auto-discovered provider models",
             },
@@ -197,7 +201,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["s"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 20,
+            order: 21,
             usage: "/session | /s",
             description: "Show current session info",
         }],
@@ -208,7 +212,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 21,
+            order: 22,
             usage: "/usage",
             description: "Show token usage for the current session",
         }],
@@ -252,7 +256,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["todos", "t"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 15,
+            order: 16,
             usage: "/todo | /t",
             description: "Open the todo list panel",
         }],
@@ -363,12 +367,23 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         }],
     },
     CommandSpec {
+        kind: CommandKind::Sandbox,
+        name: "sandbox",
+        aliases: &["permissions"],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 15,
+            usage: "/sandbox | /permissions",
+            description: "Show sandbox, file protection, and permission status",
+        }],
+    },
+    CommandSpec {
         kind: CommandKind::Clear,
         name: "clear",
         aliases: &["c"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 22,
+            order: 23,
             usage: "/clear | /c",
             description: "Delete this session; reset chat, todos, images, and diagnostics",
         }],
@@ -379,7 +394,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["q", "exit"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 23,
+            order: 24,
             usage: "/quit | /q",
             description: "Exit the application",
         }],
@@ -390,7 +405,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["?"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 24,
+            order: 25,
             usage: "/help | /?",
             description: "Show this help",
         }],
@@ -1303,6 +1318,7 @@ mod tests {
             "compact",
             "thinking",
             "vision",
+            "sandbox",
             "clear",
             "quit",
             "help",
@@ -1369,6 +1385,10 @@ mod tests {
             (
                 "/vision <on|off>",
                 "Enable or disable image attachments for this session",
+            ),
+            (
+                "/sandbox | /permissions",
+                "Show sandbox, file protection, and permission status",
             ),
             ("/todo | /t", "Open the todo list panel"),
             ("/new | /n", "Start a new session (saves current)"),

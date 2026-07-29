@@ -236,11 +236,26 @@ impl LspServer {
     /// Spawn the server and complete the `initialize` handshake.
     async fn start(checker: &Checker, cwd: &Path) -> Result<LspServer, String> {
         let (program, flag) = crate::tools::shell();
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.arg(flag)
-            .arg(&checker.command)
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::piped())
+        let sandbox = crate::security::active()
+            .map(|security| {
+                security.sandbox_program_invocation(
+                    program,
+                    &[flag.to_string(), checker.command.clone()],
+                    cwd.to_str(),
+                )
+            })
+            .transpose()?
+            .flatten();
+        let mut cmd = if let Some(invocation) = sandbox {
+            let mut command = tokio::process::Command::new(&invocation.program);
+            crate::security::sandbox::configure_tokio_command(&mut command, invocation);
+            command
+        } else {
+            let mut command = tokio::process::Command::new(program);
+            command.arg(flag).arg(&checker.command).current_dir(cwd);
+            command
+        };
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);

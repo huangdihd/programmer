@@ -303,6 +303,7 @@ impl App<'_> {
             crate::security::SecurityManager::for_current_dir(config.security.clone())
                 .expect("security configuration should be validated before starting the app"),
         );
+        crate::security::install_active(security.clone());
         let mut app = Self {
             running: true,
             quit_requested_at: None,

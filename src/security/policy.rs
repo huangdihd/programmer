@@ -35,7 +35,7 @@ pub struct PermissionRule {
     pub effect: PermissionEffect,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SandboxConfig {
     /// Apply an OS sandbox to commands and background tasks.
@@ -44,6 +44,19 @@ pub struct SandboxConfig {
     pub network: bool,
     /// Additional paths that sandboxed processes may modify.
     pub writable_paths: Vec<PathBuf>,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            // Unit tests exercise process plumbing directly. Production starts
+            // sandboxed unless the user explicitly disables it.
+            enabled: cfg!(all(not(test), unix)),
+            network: false,
+            writable_paths: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -143,6 +156,15 @@ impl SecurityManager {
         let workspace = std::env::current_dir()
             .map_err(|error| format!("could not determine project directory: {error}"))?;
         Self::new(config, workspace)
+    }
+
+    pub(crate) fn standalone() -> Result<Self, String> {
+        let config = SecurityConfig {
+            enabled: false,
+            protect_file_changes: false,
+            ..SecurityConfig::default()
+        };
+        Self::for_current_dir(config)
     }
 
     pub(crate) fn resolve_path(&self, path: impl AsRef<Path>) -> Result<PathBuf, String> {
@@ -267,6 +289,55 @@ impl SecurityManager {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn sandbox_invocation(
+        &self,
+        command: &str,
+        dir: Option<&str>,
+    ) -> Result<Option<crate::security::SandboxInvocation>, String> {
+        crate::security::sandbox::invocation(self, command, dir)
+    }
+
+    pub(crate) fn sandbox_program_invocation(
+        &self,
+        program: &str,
+        args: &[String],
+        dir: Option<&str>,
+    ) -> Result<Option<crate::security::SandboxInvocation>, String> {
+        crate::security::sandbox::program_invocation(self, program, args, dir)
+    }
+
+    pub(super) fn sandbox_config(&self) -> &SandboxConfig {
+        &self.config.sandbox
+    }
+
+    pub(super) fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    pub(crate) fn status_text(&self) -> String {
+        let report = skarn_sandbox::backend_report();
+        let sandbox = &self.config.sandbox;
+        format!(
+            "Security:\n  sandbox: {}\n  backend: {} ({:?})\n  network: {}\n  workspace: {}\n  extra writable paths: {}\n  file conflict protection: {}\n  permission rules: {}",
+            if sandbox.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            report.backend,
+            report.status,
+            if sandbox.network { "allowed" } else { "denied" },
+            self.workspace.display(),
+            sandbox.writable_paths.len(),
+            if self.config.protect_file_changes {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            self.config.rules.len(),
+        )
     }
 }
 

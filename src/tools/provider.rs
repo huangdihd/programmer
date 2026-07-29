@@ -111,8 +111,12 @@ impl LocalToolProvider {
 
 impl Default for LocalToolProvider {
     fn default() -> Self {
-        let security = crate::security::SecurityManager::for_current_dir(Default::default())
-            .expect("the current directory should support the default security policy");
+        let security = if cfg!(test) {
+            crate::security::SecurityManager::standalone()
+        } else {
+            crate::security::SecurityManager::for_current_dir(Default::default())
+        }
+        .expect("the current directory should support the default security policy");
         Self::new(
             Arc::new(Mutex::new(crate::todos::TodoList::default())),
             Arc::new(security),
@@ -174,9 +178,14 @@ impl ToolProvider for LocalToolProvider {
         } else if call.name == command::NAME {
             // The command tool streams its output to the live registry (keyed by
             // call id) so the TUI can render it as it runs.
-            command::run_with_live(&call.arguments, &call.call_id, ctx.cancel)
-                .await
-                .map(FunctionCallOutput::Text)
+            command::run_with_live_secure(
+                &call.arguments,
+                &call.call_id,
+                ctx.cancel,
+                &self.security,
+            )
+            .await
+            .map(FunctionCallOutput::Text)
         } else if call.name == todo::NAME {
             todo::run(&call.arguments, &self.todos)
                 .await
@@ -193,6 +202,10 @@ impl ToolProvider for LocalToolProvider {
                 .map(FunctionCallOutput::Text)
         } else if call.name == edit_file::NAME {
             edit_file::run_with_security(&call.arguments, &self.security)
+                .await
+                .map(FunctionCallOutput::Text)
+        } else if call.name == task::NAME {
+            task::run_with_security(&call.arguments, &self.security)
                 .await
                 .map(FunctionCallOutput::Text)
         } else {

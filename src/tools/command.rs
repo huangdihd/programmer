@@ -80,33 +80,58 @@ enum TimeoutAction {
 }
 
 pub async fn run(arguments: &str) -> Result<String, String> {
-    run_inner(arguments, None, &crate::cancel::CancellationToken::new()).await
+    run_inner(
+        arguments,
+        None,
+        &crate::cancel::CancellationToken::new(),
+        None,
+    )
+    .await
 }
 
 /// Like [`run`], but streams the command's output to the live registry under
 /// `call_id` while it runs, so the TUI can render it in real time. Used by the
 /// agent's tool path (which has a call id); the plain [`run`] is used by the
 /// MCP server and headless callers that have nowhere to show live output.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn run_with_live(
     arguments: &str,
     call_id: &str,
     cancel: &crate::cancel::CancellationToken,
 ) -> Result<String, String> {
-    run_inner(arguments, Some(call_id), cancel).await
+    run_inner(arguments, Some(call_id), cancel, None).await
+}
+
+pub(crate) async fn run_with_live_secure(
+    arguments: &str,
+    call_id: &str,
+    cancel: &crate::cancel::CancellationToken,
+    security: &crate::security::SecurityManager,
+) -> Result<String, String> {
+    run_inner(arguments, Some(call_id), cancel, Some(security)).await
 }
 
 async fn run_inner(
     arguments: &str,
     live_id: Option<&str>,
     cancel: &crate::cancel::CancellationToken,
+    security: Option<&crate::security::SecurityManager>,
 ) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
         Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
-    let id = crate::tasks::spawn_command(&args.command, args.dir.as_deref(), live_id)
-        .map_err(|error| command_spawn_error(&error))?;
+    let id = match security {
+        Some(security) => crate::tasks::spawn_command_secure(
+            &args.command,
+            args.dir.as_deref(),
+            live_id,
+            security,
+        ),
+        None => crate::tasks::spawn_command(&args.command, args.dir.as_deref(), live_id),
+    }
+    .map_err(|error| command_spawn_error(&error))?;
     let timeout_secs = args.timeout.unwrap_or(120);
     let wait = wait_for_finish_or_promotion(id);
     let wait_or_cancel = async {
@@ -529,6 +554,60 @@ mod live_tests {
         let _ = crate::tasks::wait_until_finished(id)
             .await
             .expect("task stops");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires the host OS sandbox and a built sandbox worker"]
+    async fn sandboxed_command_writes_inside_and_denies_outside() {
+        let root = std::env::temp_dir().join(format!(
+            "programmer-command-sandbox-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let mut config = crate::security::SecurityConfig::default();
+        config.sandbox.enabled = true;
+        config.protect_file_changes = false;
+        let security =
+            crate::security::SecurityManager::new(config, root.clone()).expect("security manager");
+        let inside = root.join("inside.txt");
+        let inside_args = serde_json::json!({
+            "command": format!("printf ok > {}", inside.display())
+        })
+        .to_string();
+
+        run_with_live_secure(
+            &inside_args,
+            "sandbox-inside",
+            &crate::cancel::CancellationToken::new(),
+            &security,
+        )
+        .await
+        .expect("workspace write should succeed");
+        assert_eq!(tokio::fs::read_to_string(&inside).await.unwrap(), "ok");
+
+        let outside = std::path::PathBuf::from(format!(
+            "/private/tmp/programmer-command-sandbox-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside_args = serde_json::json!({
+            "command": format!("printf escape > {}", outside.display())
+        })
+        .to_string();
+        let error = run_with_live_secure(
+            &outside_args,
+            "sandbox-outside",
+            &crate::cancel::CancellationToken::new(),
+            &security,
+        )
+        .await
+        .expect_err("outside write should be denied");
+        assert!(
+            error.contains("Operation not permitted") || error.contains("Permission denied"),
+            "unexpected sandbox error: {error}"
+        );
+        assert!(!outside.exists());
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     fn background_task_id(result: &str) -> u64 {

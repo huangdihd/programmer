@@ -83,8 +83,21 @@ impl McpClient {
         // whose prefix args must precede the server's own. A no-op elsewhere.
         let (program, mut argv) = crate::tools::resolve_program(command);
         argv.extend(args.iter().cloned());
-        let mut cmd = Command::new(&program);
-        cmd.args(&argv);
+        let sandbox = crate::security::active()
+            .map(|security| {
+                security.sandbox_program_invocation(&program, &argv, Some(workspace_root))
+            })
+            .transpose()?
+            .flatten();
+        let mut cmd = if let Some(invocation) = sandbox {
+            let mut command = Command::new(&invocation.program);
+            crate::security::sandbox::configure_tokio_command(&mut command, invocation);
+            command
+        } else {
+            let mut command = Command::new(&program);
+            command.args(&argv);
+            command
+        };
         for (k, v) in env {
             cmd.env(k, v);
         }

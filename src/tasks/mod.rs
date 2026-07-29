@@ -376,7 +376,24 @@ pub fn clear_finished() -> usize {
 /// its id immediately. Output is captured incrementally; completion is
 /// recorded by a detached reader task.
 pub fn spawn(command: &str, dir: Option<&str>, name: Option<&str>) -> Result<u64, String> {
-    spawn_pipe(command, dir, name, TaskKind::Background, None, true)
+    spawn_pipe(command, dir, name, TaskKind::Background, None, true, None)
+}
+
+pub fn spawn_secure(
+    command: &str,
+    dir: Option<&str>,
+    name: Option<&str>,
+    security: &crate::security::SecurityManager,
+) -> Result<u64, String> {
+    spawn_pipe(
+        command,
+        dir,
+        name,
+        TaskKind::Background,
+        None,
+        true,
+        Some(security),
+    )
 }
 
 /// Spawn a foreground command tool call through the shared task process
@@ -394,6 +411,24 @@ pub fn spawn_command(
         TaskKind::Command,
         call_id,
         false,
+        None,
+    )
+}
+
+pub fn spawn_command_secure(
+    command: &str,
+    dir: Option<&str>,
+    call_id: Option<&str>,
+    security: &crate::security::SecurityManager,
+) -> Result<u64, String> {
+    spawn_pipe(
+        command,
+        dir,
+        Some(command),
+        TaskKind::Command,
+        call_id,
+        false,
+        Some(security),
     )
 }
 
@@ -404,16 +439,31 @@ fn spawn_pipe(
     kind: TaskKind,
     call_id: Option<&str>,
     keep_stdin_open: bool,
+    security: Option<&crate::security::SecurityManager>,
 ) -> Result<u64, String> {
-    let (program, flag) = crate::tools::shell();
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.arg(flag);
-    // `raw_arg` keeps the command's own quoting intact on Windows (see the
-    // `command` tool for the full story).
-    #[cfg(windows)]
-    cmd.raw_arg(command);
-    #[cfg(not(windows))]
-    cmd.arg(command);
+    let sandbox = security
+        .map(|security| security.sandbox_invocation(command, dir))
+        .transpose()?
+        .flatten();
+    let mut cmd = if let Some(invocation) = sandbox {
+        let mut cmd = tokio::process::Command::new(&invocation.program);
+        crate::security::sandbox::configure_tokio_command(&mut cmd, invocation);
+        cmd
+    } else {
+        let (program, flag) = crate::tools::shell();
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.arg(flag);
+        // `raw_arg` keeps the command's own quoting intact on Windows (see the
+        // `command` tool for the full story).
+        #[cfg(windows)]
+        cmd.raw_arg(command);
+        #[cfg(not(windows))]
+        cmd.arg(command);
+        if let Some(dir) = dir {
+            cmd.current_dir(dir);
+        }
+        cmd
+    };
     // Put the shell and its descendants in a dedicated process group so kill,
     // timeout, and cancellation terminate the whole command tree rather than
     // leaving grandchildren alive with stdout/stderr pipes held open.
@@ -421,9 +471,6 @@ fn spawn_pipe(
     {
         use std::os::unix::process::CommandExt;
         cmd.as_std_mut().process_group(0);
-    }
-    if let Some(dir) = dir {
-        cmd.current_dir(dir);
     }
     cmd.stdin(if keep_stdin_open {
         std::process::Stdio::piped()
@@ -699,18 +746,45 @@ pub fn spawn_interactive(
     rows: u16,
     cols: u16,
 ) -> Result<u64, String> {
-    spawn_interactive_with_origin(command, dir, name, rows, cols, TaskOrigin::TaskTool)
+    spawn_interactive_with_origin(command, dir, name, rows, cols, TaskOrigin::TaskTool, None)
 }
 
-/// Spawn an interactive command entered directly by the user with `!command`.
-pub fn spawn_bang(
+pub fn spawn_interactive_secure(
     command: &str,
     dir: Option<&str>,
     name: Option<&str>,
     rows: u16,
     cols: u16,
+    security: &crate::security::SecurityManager,
 ) -> Result<u64, String> {
-    spawn_interactive_with_origin(command, dir, name, rows, cols, TaskOrigin::BangCommand)
+    spawn_interactive_with_origin(
+        command,
+        dir,
+        name,
+        rows,
+        cols,
+        TaskOrigin::TaskTool,
+        Some(security),
+    )
+}
+
+pub fn spawn_bang_secure(
+    command: &str,
+    dir: Option<&str>,
+    name: Option<&str>,
+    rows: u16,
+    cols: u16,
+    security: &crate::security::SecurityManager,
+) -> Result<u64, String> {
+    spawn_interactive_with_origin(
+        command,
+        dir,
+        name,
+        rows,
+        cols,
+        TaskOrigin::BangCommand,
+        Some(security),
+    )
 }
 
 fn spawn_interactive_with_origin(
@@ -720,6 +794,7 @@ fn spawn_interactive_with_origin(
     rows: u16,
     cols: u16,
     origin: TaskOrigin,
+    security: Option<&crate::security::SecurityManager>,
 ) -> Result<u64, String> {
     #[cfg(windows)]
     harden_dll_search();
@@ -735,21 +810,30 @@ fn spawn_interactive_with_origin(
 
     // Run the command through the host shell, matching the `command`/`task`
     // tools so shell syntax works.
-    let (program, flag) = crate::tools::shell();
-    let mut cmd = CommandBuilder::new(program);
-    cmd.arg(flag);
-    cmd.arg(command);
-    // portable-pty's CommandBuilder does NOT inherit the parent's cwd (it
-    // defaults to the home directory), so set it explicitly — to `dir` when
-    // given, otherwise the app's working directory, matching pipe tasks.
-    match dir {
-        Some(dir) => cmd.cwd(dir),
-        None => {
-            if let Ok(cwd) = std::env::current_dir() {
-                cmd.cwd(cwd);
+    let sandbox = security
+        .map(|security| security.sandbox_invocation(command, dir))
+        .transpose()?
+        .flatten();
+    let cmd = if let Some(invocation) = sandbox {
+        let mut cmd = CommandBuilder::new(&invocation.program);
+        crate::security::sandbox::configure_pty_command(&mut cmd, invocation);
+        cmd
+    } else {
+        let (program, flag) = crate::tools::shell();
+        let mut cmd = CommandBuilder::new(program);
+        cmd.arg(flag);
+        cmd.arg(command);
+        // portable-pty's CommandBuilder does NOT inherit the parent's cwd.
+        match dir {
+            Some(dir) => cmd.cwd(dir),
+            None => {
+                if let Ok(cwd) = std::env::current_dir() {
+                    cmd.cwd(cwd);
+                }
             }
         }
-    }
+        cmd
+    };
 
     let mut child = pair
         .slave

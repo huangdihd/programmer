@@ -19,8 +19,15 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::Mode(arg) => mode(app, &arg),
         Command::Classifier(arg) => classifier(app, &arg),
         Command::Thinking(arg) => thinking(app, &arg),
+        Command::Sandbox => sandbox(app),
         _ => unreachable!("settings handler received a command from another domain"),
     }
+}
+
+fn sandbox(app: &mut App<'_>) -> CommandOutcome {
+    app.conversation_panel
+        .add_info_string(app.security.status_text());
+    CommandOutcome::handled(true)
 }
 
 fn model(app: &mut App<'_>, model: String) -> CommandOutcome {

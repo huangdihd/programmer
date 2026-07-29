@@ -196,6 +196,11 @@ async fn run_print_mode(
     }
 
     let (config, _) = load_config()?;
+    let security = std::sync::Arc::new(
+        crate::security::SecurityManager::for_current_dir(config.security.clone())
+            .map_err(|error| color_eyre::eyre::eyre!(error))?,
+    );
+    crate::security::install_active(security.clone());
     let pm = crate::providers::ProviderManager::new(&config).await;
     let chat_model = pm.default_model();
     let Some((chat_client, chat_name)) = pm.resolve(&chat_model).map(|(c, n)| (c.clone(), n))
@@ -209,7 +214,10 @@ async fn run_print_mode(
     // runner pre-denies any ask_user call (via the provider's requires_interaction)
     // with a clear reason before it executes.
     let tools = std::sync::Arc::new(ToolRegistry::new(vec![std::sync::Arc::new(
-        LocalToolProvider::default(),
+        LocalToolProvider::new(
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+            security,
+        ),
     )]));
 
     let policy = match mode {
@@ -431,7 +439,12 @@ async fn main() -> color_eyre::Result<()> {
             std::process::exit(2);
         }
         let classifier = build_mcp_classifier().await;
-        mcp::server::McpServer::new(args.mcp_mode, classifier)
+        let (config, _) = load_config()?;
+        let security = crate::security::SecurityManager::for_current_dir(config.security)
+            .map_err(|error| color_eyre::eyre::eyre!(error))?;
+        let security = std::sync::Arc::new(security);
+        crate::security::install_active(security.clone());
+        mcp::server::McpServer::with_security(args.mcp_mode, classifier, security)
             .run()
             .await?;
         return Ok(());
@@ -451,8 +464,13 @@ async fn main() -> color_eyre::Result<()> {
             }
         };
         let classifier = build_mcp_classifier().await;
-        let allow_yolo = load_config().map(|(c, _)| c.allow_yolo).unwrap_or(false);
-        mcp::http_server::serve(args.mcp_mode, classifier, addr, allow_yolo).await?;
+        let config = load_config().map(|(config, _)| config).unwrap_or_default();
+        let allow_yolo = config.allow_yolo;
+        let security = crate::security::SecurityManager::for_current_dir(config.security)
+            .map_err(|error| color_eyre::eyre::eyre!(error))?;
+        let security = std::sync::Arc::new(security);
+        crate::security::install_active(security.clone());
+        mcp::http_server::serve(args.mcp_mode, classifier, addr, allow_yolo, security).await?;
         return Ok(());
     }
 

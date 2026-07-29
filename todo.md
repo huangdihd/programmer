@@ -10,13 +10,15 @@
   - ~~stream command output in the TUI while it is running~~
   - ~~view interactive and non-interactive tasks with `/terminal`~~
 - ~~convert a command into a task~~
-- configurable restricted access control rule system
+- ~~configurable restricted access control rule system~~
 - multi agents(traditional sub agents or use interactive background task system to launch itself again?)
 - sandbox
+  - ~~macOS Seatbelt and Linux Landlock/seccomp process sandbox~~
+  - Windows AppContainer process launcher
 - ~~store too long outputs as files~~
 - ~~display full output when commands are running~~
 - ~~default classifier model~~
-- monitor local file changes and prevent modifications after changes before read
+- ~~monitor local file changes and prevent modifications after changes before read~~
 - ~~after switch sessions using /new, task can't be cleaned and todos can't update as expectations~~
 - ~~fix intermittent failure where Esc does not interrupt the active operation~~
 - ~~require Ctrl+C twice to exit~~

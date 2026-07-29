@@ -102,6 +102,24 @@ allow_yolo = true
 # "" to disable. (GitHub organizations can't be commit co-authors.)
 git_coauthor = "programmer <noreply@programmer.local>"
 
+[security]
+enabled = true
+protect_file_changes = true
+allow_read_outside_workspace = true
+
+[security.sandbox]
+# Enabled by default on macOS and Linux. Windows currently runs unsandboxed.
+enabled = true
+network = false
+writable_paths = []
+
+# Rules use absolute globs or the portable `workspace/**` prefix. Explicit
+# denies take precedence over allows.
+[[security.rules]]
+operation = "read"
+pattern = "/path/to/private/**"
+effect = "deny"
+
 [providers.openai]
 base_url = "https://api.openai.com/v1"
 api_key = "sk-your-key-here"
@@ -119,6 +137,11 @@ api_key = "sk-your-key-here"
 | `classifier_model` | (chat model) | `provider/model` for the Auto-mode classifier. Must be a **non-reasoning** model (see [Auto mode](#work-modes)). |
 | `allow_yolo` | `false` | Whether `/mode yolo` and `Ctrl+T` can reach YOLO mode. |
 | `git_coauthor` | `programmer <noreply@programmer.local>` | `Co-Authored-By:` trailer added to the agent's git commits. Use a GitHub-linked email for an avatar; `""` disables. |
+| `security.protect_file_changes` | `true` | Require an existing file to be read before overwrite and reject writes if it changed after that read. |
+| `security.allow_read_outside_workspace` | `true` | Permit direct read tools outside the project unless a rule denies the path. |
+| `security.sandbox.enabled` | macOS/Linux: `true`; Windows: `false` | Apply the native OS process sandbox to commands, tasks, diagnostics, LSP, and stdio MCP servers. |
+| `security.sandbox.network` | `false` | Permit network access from sandboxed child processes. |
+| `security.sandbox.writable_paths` | `[]` | Additional paths sandboxed child processes may modify. |
 
 Each provider is a `[providers.<name>]` section. You can add as many as you want.
 
@@ -225,6 +248,7 @@ programmer
 | `/classifier [provider/model]` | Set/show the Auto-mode classifier model |
 | `/classifier clear` | Reset classifier to the chat model |
 | `/vision <on\|off>` | Enable/disable `@image` attachments for this session |
+| `/sandbox` `/permissions` | Show sandbox, file protection, and permission status |
 | `/todo` `/t` | Open this session's todo list |
 | `/new` `/n` | Start a new session (auto-saves current) |
 | `/session` `/s` | Show current session UUID and info |

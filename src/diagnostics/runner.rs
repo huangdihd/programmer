@@ -47,11 +47,26 @@ pub async fn run_checker(
     let parser = checker.resolve_parser()?;
 
     let (program, flag) = crate::tools::shell();
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.arg(flag)
-        .arg(&checker.command)
-        .current_dir(cwd)
-        .stdout(std::process::Stdio::piped())
+    let sandbox = crate::security::active()
+        .map(|security| {
+            security.sandbox_program_invocation(
+                program,
+                &[flag.to_string(), checker.command.clone()],
+                cwd.to_str(),
+            )
+        })
+        .transpose()?
+        .flatten();
+    let mut cmd = if let Some(invocation) = sandbox {
+        let mut command = tokio::process::Command::new(&invocation.program);
+        crate::security::sandbox::configure_tokio_command(&mut command, invocation);
+        command
+    } else {
+        let mut command = tokio::process::Command::new(program);
+        command.arg(flag).arg(&checker.command).current_dir(cwd);
+        command
+    };
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);

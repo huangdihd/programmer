@@ -49,6 +49,7 @@ pub struct McpServer {
     classifier: Option<(Client<OpenAIConfig>, String)>,
     client_elicitation: bool,
     next_request_id: u64,
+    security: std::sync::Arc<crate::security::SecurityManager>,
 }
 
 /// What a static (no-IO) gate decision resolves to.
@@ -64,12 +65,24 @@ enum Gate {
 }
 
 impl McpServer {
+    #[cfg(test)]
     pub fn new(mode: WorkMode, classifier: Option<(Client<OpenAIConfig>, String)>) -> Self {
+        let security = crate::security::SecurityManager::for_current_dir(Default::default())
+            .expect("the current directory should support the default security policy");
+        Self::with_security(mode, classifier, std::sync::Arc::new(security))
+    }
+
+    pub(crate) fn with_security(
+        mode: WorkMode,
+        classifier: Option<(Client<OpenAIConfig>, String)>,
+        security: std::sync::Arc<crate::security::SecurityManager>,
+    ) -> Self {
         McpServer {
             mode,
             classifier,
             client_elicitation: false,
             next_request_id: 1,
+            security,
         }
     }
 
@@ -189,10 +202,11 @@ impl McpServer {
             return Ok(tool_content(format!("error: {reason}"), true));
         }
 
-        let (text, is_error) = match crate::tools::run_local_tool(name, &args_str).await {
-            Ok(text) => (text, false),
-            Err(text) => (text, true),
-        };
+        let (text, is_error) =
+            match crate::tools::run_local_tool_secure(name, &args_str, &self.security).await {
+                Ok(text) => (text, false),
+                Err(text) => (text, true),
+            };
         Ok(tool_content(text, is_error))
     }
 
