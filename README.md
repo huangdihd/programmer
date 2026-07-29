@@ -335,6 +335,12 @@ historical images without deleting them from the session; turning it back on
 restores them. Other local files are referenced by path only; their contents are
 not copied into the request context.
 
+You can also copy an image to the system clipboard and press `Ctrl+V` in the
+main input to attach it. The input shows a `[Pasted image #N WIDTHxHEIGHT]`
+placeholder; deleting that placeholder removes the attachment before sending.
+Terminal emulators generally reserve `Cmd+V` for text paste, so image paste uses
+`Ctrl+V` on macOS as well.
+
 | Flag / command | Action |
 |---|---|
 | `programmer --resume` | Interactive picker to choose a saved session |

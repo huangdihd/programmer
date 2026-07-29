@@ -1,4 +1,5 @@
 - ~~multimodal support(use /vision on/off to switch support)~~
+  - ~~paste images directly from the system clipboard with Ctrl+V~~
 - ~~jump to bottom button~~
 - ~~http mcp~~
 - ~~redesign the `--mcp-http` mode UI~~

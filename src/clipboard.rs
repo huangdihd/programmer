@@ -15,6 +15,65 @@
 
 use std::io::Write;
 
+use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+#[derive(Debug)]
+pub struct ClipboardImage {
+    pub png: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// Reads an image from the system clipboard and encodes its RGBA pixels as PNG.
+///
+/// `Ok(None)` means the clipboard currently contains no image. Other clipboard
+/// or image-encoding failures are returned so the TUI can surface them.
+pub fn read_image() -> Result<Option<ClipboardImage>, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
+    let image = match clipboard.get_image() {
+        Ok(image) => image,
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(error) => return Err(format!("failed to read clipboard image: {error}")),
+    };
+
+    let png = encode_rgba(image.width, image.height, &image.bytes)?;
+
+    Ok(Some(ClipboardImage {
+        png,
+        width: image.width,
+        height: image.height,
+    }))
+}
+
+fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let encoded_width =
+        u32::try_from(width).map_err(|_| "clipboard image width is too large".to_string())?;
+    let encoded_height =
+        u32::try_from(height).map_err(|_| "clipboard image height is too large".to_string())?;
+    let expected_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "clipboard image dimensions are too large".to_string())?;
+    if rgba.len() != expected_len {
+        return Err(format!(
+            "clipboard returned invalid RGBA data: expected {expected_len} bytes, got {}",
+            rgba.len()
+        ));
+    }
+
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(
+            rgba,
+            encoded_width,
+            encoded_height,
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| format!("failed to encode clipboard image: {error}"))?;
+    Ok(png)
+}
+
 /// Copies text to the system clipboard. On Windows this writes UTF-16 straight
 /// to the clipboard via the Win32 API; elsewhere it pipes to the platform's
 /// clipboard command. If that fails, it falls back to the OSC 52 escape
@@ -137,6 +196,51 @@ fn osc52(text: &str) -> std::io::Result<()> {
     stdout.flush()
 }
 
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::encode_rgba;
+
+    #[test]
+    fn rgba_is_encoded_as_png() {
+        let png = encode_rgba(1, 1, &[255, 0, 0, 255]).expect("valid RGBA");
+
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn invalid_rgba_length_is_rejected() {
+        let error = encode_rgba(2, 1, &[0; 4]).expect_err("one pixel is missing");
+
+        assert!(error.contains("expected 8 bytes"));
+    }
+}
+
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
@@ -194,30 +298,4 @@ mod windows_tests {
         );
         assert_eq!(read_clipboard().as_deref(), Some(text));
     }
-}
-
-fn base64(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
 }

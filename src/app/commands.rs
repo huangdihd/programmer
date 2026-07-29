@@ -50,6 +50,7 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     if typed.is_empty() {
         return;
     }
+    let pasted_images = app.input_panel.take_images();
     // History keeps the compact `@path` form; the model receives a path-only
     // reference for regular files or an image attachment when vision is on.
     app.input_panel.push_history(typed.clone());
@@ -65,7 +66,15 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     for notice in expanded.notices {
         app.conversation_panel.add_warning_string(notice);
     }
-    start_request_with_images(app, expanded.text, expanded.images).await;
+    let mut images = pasted_images;
+    images.extend(expanded.images);
+    let omitted = crate::commands::limit_image_attachments(&mut images);
+    if omitted > 0 {
+        app.conversation_panel.add_warning_string(format!(
+            "omitted {omitted} image(s): attachment count or total size exceeds the per-message limit"
+        ));
+    }
+    start_request_with_images(app, expanded.text, images).await;
 }
 
 pub(crate) async fn start_request_with_images(

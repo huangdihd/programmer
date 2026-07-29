@@ -40,6 +40,8 @@ vt100 = "0.15"
 # a ratatui approval console.
 axum = "0.8"
 base64 = "0.22.1"
+arboard = { version = "3.6.1", features = ["image-data"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # Dependencies (dozens of tree-sitter grammars, aws-lc-sys, …) carry enough
 # debug info to blow past the MSVC PDB size limit (LNK1140). Strip debuginfo

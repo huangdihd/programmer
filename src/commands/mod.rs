@@ -903,7 +903,61 @@ fn is_executable(entry: &std::fs::DirEntry) -> bool {
 /// another third on top of the raw bytes.
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
-const MAX_IMAGES_PER_MESSAGE: usize = 20;
+pub(crate) const MAX_IMAGES_PER_MESSAGE: usize = 20;
+
+pub(crate) fn image_attachment_from_bytes(bytes: &[u8]) -> Result<InputImageContent, String> {
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "clipboard image is {} bytes; limit is {MAX_IMAGE_BYTES}",
+            bytes.len()
+        ));
+    }
+    let kind = detect_image(bytes)
+        .ok_or_else(|| "clipboard image encoding is not supported".to_string())?;
+    Ok(InputImageContent {
+        detail: ImageDetail::Auto,
+        file_id: None,
+        image_url: Some(format!(
+            "data:{};base64,{}",
+            kind.mime_type(),
+            BASE64.encode(bytes)
+        )),
+    })
+}
+
+pub(crate) fn limit_image_attachments(images: &mut Vec<InputImageContent>) -> usize {
+    let original_len = images.len();
+    let mut total_bytes = 0u64;
+    let mut kept = Vec::with_capacity(original_len.min(MAX_IMAGES_PER_MESSAGE));
+
+    for image in images.drain(..) {
+        let bytes = image
+            .image_url
+            .as_deref()
+            .and_then(data_url_decoded_len)
+            .unwrap_or_default();
+        if kept.len() >= MAX_IMAGES_PER_MESSAGE
+            || total_bytes.saturating_add(bytes) > MAX_TOTAL_IMAGE_BYTES
+        {
+            continue;
+        }
+        total_bytes += bytes;
+        kept.push(image);
+    }
+    *images = kept;
+    original_len - images.len()
+}
+
+fn data_url_decoded_len(url: &str) -> Option<u64> {
+    let encoded = url.split_once(',')?.1;
+    let padding = encoded
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'=')
+        .count();
+    let decoded = encoded.len().checked_div(4)?.checked_mul(3)?;
+    u64::try_from(decoded.checked_sub(padding)?).ok()
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ExpandedReferences {
@@ -1704,6 +1758,34 @@ mod tests {
                 .is_some_and(|url| url.starts_with("data:image/png;base64,"))
         );
         tokio::fs::remove_file(path).await.ok();
+    }
+
+    #[test]
+    fn clipboard_png_becomes_an_image_attachment() {
+        let attachment =
+            image_attachment_from_bytes(b"\x89PNG\r\n\x1a\nfake").expect("PNG attachment");
+
+        assert!(
+            attachment
+                .image_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        );
+    }
+
+    #[test]
+    fn combined_image_attachments_respect_count_limit() {
+        let attachment = || InputImageContent {
+            detail: ImageDetail::Auto,
+            file_id: None,
+            image_url: Some("data:image/png;base64,AAAA".to_string()),
+        };
+        let mut images = (0..MAX_IMAGES_PER_MESSAGE + 2)
+            .map(|_| attachment())
+            .collect();
+
+        assert_eq!(limit_image_attachments(&mut images), 2);
+        assert_eq!(images.len(), MAX_IMAGES_PER_MESSAGE);
     }
 
     #[test]

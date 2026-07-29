@@ -176,6 +176,12 @@ pub(crate) async fn handle_key_events(
         return Ok(());
     }
 
+    // ---- Ctrl+V: paste an image directly from the system clipboard ----
+    if is_image_paste_shortcut(key_event) {
+        paste_clipboard_image(app);
+        return Ok(());
+    }
+
     // ---- completion-popup navigation ----
     if app
         .input_panel
@@ -314,6 +320,42 @@ pub(crate) async fn handle_key_events(
 
 fn is_promote_shortcut(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('z') && key.modifiers == KeyModifiers::CONTROL
+}
+
+fn is_image_paste_shortcut(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('v' | 'V')) && key.modifiers == KeyModifiers::CONTROL
+}
+
+fn paste_clipboard_image(app: &mut App<'_>) {
+    let image = match crate::clipboard::read_image() {
+        Ok(Some(image)) => image,
+        Ok(None) => {
+            app.conversation_panel
+                .add_warning_string("clipboard does not contain an image");
+            return;
+        }
+        Err(error) => {
+            app.conversation_panel.add_error_string(error);
+            return;
+        }
+    };
+    let attachment = match crate::commands::image_attachment_from_bytes(&image.png) {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            app.conversation_panel.add_warning_string(error);
+            return;
+        }
+    };
+    if !app
+        .input_panel
+        .add_image(attachment, image.width, image.height)
+    {
+        app.conversation_panel.add_warning_string(format!(
+            "cannot paste more than {} images into one message",
+            crate::commands::MAX_IMAGES_PER_MESSAGE
+        ));
+    }
+    update_completions(app);
 }
 
 /// Handle a key while the task panel is open. Pipe tasks are strictly read-only
@@ -615,6 +657,18 @@ mod tests {
         )));
         assert!(!is_promote_shortcut(KeyEvent::new(
             KeyCode::Char('z'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn ctrl_v_is_the_image_paste_shortcut() {
+        assert!(is_image_paste_shortcut(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_image_paste_shortcut(KeyEvent::new(
+            KeyCode::Char('v'),
             KeyModifiers::NONE
         )));
     }

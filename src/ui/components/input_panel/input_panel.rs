@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::commands::CompletionState;
+use async_openai::types::responses::InputImageContent;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui_textarea::{Input, TextArea};
 
@@ -29,6 +30,9 @@ pub struct InputPanel<'a> {
     /// Large pastes collapsed into placeholders: `(placeholder, full content)`.
     /// Expanded back into the text when the message is sent.
     pub pastes: Vec<(String, String)>,
+    /// Clipboard images associated with placeholders still present in the draft.
+    images: Vec<(String, InputImageContent)>,
+    next_image_id: usize,
 }
 
 impl InputPanel<'_> {
@@ -51,6 +55,8 @@ impl InputPanel<'_> {
             history: Vec::new(),
             history_index: -1,
             pastes: Vec::new(),
+            images: Vec::new(),
+            next_image_id: 1,
         }
     }
 
@@ -100,6 +106,32 @@ impl InputPanel<'_> {
         self.pastes.push((placeholder, content));
     }
 
+    /// Add a clipboard image at the cursor. Removing its placeholder before
+    /// sending also removes the associated attachment.
+    pub fn add_image(&mut self, image: InputImageContent, width: usize, height: usize) -> bool {
+        let content = self.get_content();
+        self.images
+            .retain(|(placeholder, _)| content.contains(placeholder));
+        if self.images.len() >= crate::commands::MAX_IMAGES_PER_MESSAGE {
+            return false;
+        }
+
+        let placeholder = format!("[Pasted image #{} {width}x{height}]", self.next_image_id);
+        self.next_image_id += 1;
+        self.insert_str(&placeholder);
+        self.images.push((placeholder, image));
+        true
+    }
+
+    /// Drain attachments whose placeholders are still present in the draft.
+    pub fn take_images(&mut self) -> Vec<InputImageContent> {
+        let content = self.get_content();
+        std::mem::take(&mut self.images)
+            .into_iter()
+            .filter_map(|(placeholder, image)| content.contains(&placeholder).then_some(image))
+            .collect()
+    }
+
     pub fn input(&mut self, input: impl Into<Input>) -> bool {
         let modified = self.text_area.input(input);
         if modified {
@@ -128,6 +160,8 @@ impl InputPanel<'_> {
 
     pub fn clear(&mut self) -> bool {
         self.pastes.clear();
+        self.images.clear();
+        self.next_image_id = 1;
         self.completion = None;
         self.text_area.clear()
     }
@@ -202,6 +236,15 @@ impl InputPanel<'_> {
 mod tests {
     use super::*;
     use crate::commands::CompletionCandidate;
+    use async_openai::types::responses::ImageDetail;
+
+    fn image() -> InputImageContent {
+        InputImageContent {
+            detail: ImageDetail::Auto,
+            file_id: None,
+            image_url: Some("data:image/png;base64,AAAA".to_string()),
+        }
+    }
 
     #[test]
     fn clear_dismisses_completion_state() {
@@ -222,5 +265,17 @@ mod tests {
 
         assert!(panel.get_content().is_empty());
         assert!(panel.completion.is_none());
+    }
+
+    #[test]
+    fn image_placeholder_controls_attachment() {
+        let mut panel = InputPanel::new();
+        assert!(panel.add_image(image(), 640, 480));
+        assert_eq!(panel.get_content(), "[Pasted image #1 640x480]");
+        assert_eq!(panel.take_images().len(), 1);
+
+        assert!(panel.add_image(image(), 320, 200));
+        panel.set_content("placeholder removed");
+        assert!(panel.take_images().is_empty());
     }
 }
