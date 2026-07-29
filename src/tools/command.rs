@@ -36,7 +36,10 @@ pub fn tool() -> Tool {
         NAME,
         "Execute a shell command in the user's project directory and return its \
          combined stdout/stderr and exit code. The command runs through the host \
-         platform's shell (see the environment info in the system prompt).",
+         platform's shell (see the environment info in the system prompt). If a \
+         security policy blocks required work, use request_permission to ask for \
+         the exact filesystem access or least-permissive sandbox mode, then retry \
+         after approval.",
         json!({
             "command": {
                 "type": "string",
@@ -618,8 +621,9 @@ mod live_tests {
         .await
         .expect("sandbox environment should be readable");
         assert!(!environment.contains("PROGRAMMER_SANDBOX_POLICY="));
-        assert!(!environment.contains("SSH_AUTH_SOCK="));
-        assert!(!environment.contains("LLMHUB_API_KEY="));
+        if let Some(path) = std::env::var_os("PATH") {
+            assert!(environment.contains(&format!("PATH={}", path.to_string_lossy())));
+        }
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

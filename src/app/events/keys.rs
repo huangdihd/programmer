@@ -176,6 +176,36 @@ pub(crate) async fn handle_key_events(
         return Ok(());
     }
 
+    // ---- security profile management panel (modal) ----
+    if app.security_panel.is_some() {
+        use crate::ui::components::security_panel::PanelAction as SecurityAction;
+        let previous_profile = app.config.active_security_profile.clone();
+        let previous_security = app.config.security.clone();
+        let action = app
+            .security_panel
+            .as_mut()
+            .expect("checked above")
+            .handle_key(key_event, &mut app.config);
+        match action {
+            SecurityAction::Close => app.security_panel = None,
+            SecurityAction::Saved => session::persist_config(app),
+            SecurityAction::Apply => match app.install_active_security() {
+                Ok(()) => session::persist_config(app),
+                Err(error) => {
+                    app.config.active_security_profile = previous_profile.clone();
+                    app.config
+                        .security_profiles
+                        .insert(previous_profile, previous_security.clone());
+                    app.config.security = previous_security;
+                    app.conversation_panel
+                        .add_error_string(format!("invalid security configuration: {error}"));
+                }
+            },
+            SecurityAction::None => {}
+        }
+        return Ok(());
+    }
+
     // ---- Ctrl+V: paste an image directly from the system clipboard ----
     if is_image_paste_shortcut(key_event) {
         paste_clipboard_image(app);
@@ -490,6 +520,10 @@ pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
         return;
     }
     if let Some(panel) = app.mcp_panel.as_mut() {
+        panel.handle_paste(&data);
+        return;
+    }
+    if let Some(panel) = app.security_panel.as_mut() {
         panel.handle_paste(&data);
         return;
     }

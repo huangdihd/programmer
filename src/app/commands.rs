@@ -621,6 +621,7 @@ mod tests {
         ProviderPanel,
         SkillsPanel,
         McpPanel,
+        SecurityPanel,
         TodoPanel,
         Quit,
     }
@@ -687,8 +688,8 @@ mod tests {
             ("vision", "/vision", ExpectedCommandEffect::AppendedMessage),
             (
                 "permission",
-                "/permission show",
-                ExpectedCommandEffect::AppendedMessage,
+                "/permission manage",
+                ExpectedCommandEffect::SecurityPanel,
             ),
             (
                 "clear",
@@ -723,6 +724,7 @@ mod tests {
                 ExpectedCommandEffect::ProviderPanel => assert!(app.provider_panel.is_some()),
                 ExpectedCommandEffect::SkillsPanel => assert!(app.skills_panel.is_some()),
                 ExpectedCommandEffect::McpPanel => assert!(app.mcp_panel.is_some()),
+                ExpectedCommandEffect::SecurityPanel => assert!(app.security_panel.is_some()),
                 ExpectedCommandEffect::TodoPanel => assert!(app.todo_panel.is_some()),
                 ExpectedCommandEffect::Quit => assert!(!app.running),
             }

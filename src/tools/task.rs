@@ -62,6 +62,9 @@ pub fn tool() -> Tool {
          The agent is notified automatically when a background task completes, \
          fails, or is killed. Do not repeatedly poll with `output` or `wait` \
          unless the current step must block for the result. \
+         If a security policy blocks required work, use request_permission to ask \
+         for the exact filesystem access or least-permissive sandbox mode, then \
+         retry after approval. \
          Prefer the `command` tool for anything that finishes quickly — use \
          background tasks only when the command should outlive the current step.",
         json!({

@@ -15,7 +15,7 @@ pub(crate) mod policy;
 pub(crate) mod sandbox;
 
 pub use policy::SecurityConfig;
-pub(crate) use policy::{SandboxMode, SecurityManager};
+pub(crate) use policy::{AccessKind, SandboxMode, SecurityManager};
 pub(crate) use sandbox::SandboxInvocation;
 
 use std::sync::{Arc, OnceLock, RwLock};
@@ -40,9 +40,12 @@ impl SecurityHandle {
             .clone()
     }
 
-    pub(crate) fn replace(&self, security: Arc<SecurityManager>) {
+    pub(crate) fn replace(&self, security: Arc<SecurityManager>) -> Result<(), String> {
+        let current = self.snapshot();
+        security.inherit_session_grants(&current)?;
         *self.current.write().expect("security handle lock poisoned") = security.clone();
         install_active(security);
+        Ok(())
     }
 
     pub(crate) fn set_sandbox_mode(&self, mode: SandboxMode) -> Result<(), String> {
@@ -50,12 +53,19 @@ impl SecurityHandle {
         let mut config = current.security_config();
         mode.apply(&mut config.sandbox);
         let security = Arc::new(SecurityManager::new(config, current.workspace_path())?);
-        self.replace(security);
-        Ok(())
+        self.replace(security)
     }
 
     pub(crate) fn sandbox_mode(&self) -> SandboxMode {
         self.snapshot().sandbox_mode()
+    }
+
+    pub(crate) fn grant_path(
+        &self,
+        operation: AccessKind,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<std::path::PathBuf, String> {
+        self.snapshot().grant_path(operation, path)
     }
 
     pub(crate) fn status_text(&self) -> String {

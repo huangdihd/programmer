@@ -10,15 +10,26 @@ use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessKind {
     Read,
     Write,
     Execute,
     Network,
+}
+
+impl AccessKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Execute => "execute",
+            Self::Network => "network",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -35,7 +46,7 @@ pub struct PermissionRule {
     pub effect: PermissionEffect,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SandboxConfig {
     /// Apply an OS sandbox to commands and background tasks.
@@ -54,8 +65,8 @@ pub struct SandboxConfig {
     pub writable_paths: Vec<PathBuf>,
     /// Paths that sandboxed processes must not read.
     pub denied_read_paths: Vec<PathBuf>,
-    /// Environment variable name globs inherited by sandboxed processes.
-    pub inherit_environment: Vec<String>,
+    /// Environment variable name globs removed from sandboxed processes.
+    pub denied_environment: Vec<String>,
 }
 
 /// Coarse process-isolation modes exposed in the UI and permission controls.
@@ -63,8 +74,8 @@ pub struct SandboxConfig {
 /// independently configurable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SandboxMode {
-    #[default]
     Restricted,
+    #[default]
     Network,
     Off,
 }
@@ -118,8 +129,6 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         let policy = &*DEFAULT_SANDBOX_POLICY;
         Self {
-            // Unit tests exercise process plumbing directly. Production starts
-            // sandboxed unless the user explicitly disables it.
             enabled: cfg!(all(not(test), unix)),
             network: policy.network,
             allow_system_read: policy.allow_system_read,
@@ -128,7 +137,7 @@ impl Default for SandboxConfig {
             readable_paths: policy.readable_paths.clone(),
             writable_paths: policy.writable_paths.clone(),
             denied_read_paths: policy.denied_read_paths.clone(),
-            inherit_environment: policy.inherit_environment.clone(),
+            denied_environment: policy.denied_environment.clone(),
         }
     }
 }
@@ -142,7 +151,7 @@ struct BundledSandboxPolicy {
     readable_paths: Vec<PathBuf>,
     writable_paths: Vec<PathBuf>,
     denied_read_paths: Vec<PathBuf>,
-    inherit_environment: Vec<String>,
+    denied_environment: Vec<String>,
 }
 
 static DEFAULT_SANDBOX_POLICY: LazyLock<BundledSandboxPolicy> = LazyLock::new(|| {
@@ -150,7 +159,7 @@ static DEFAULT_SANDBOX_POLICY: LazyLock<BundledSandboxPolicy> = LazyLock::new(||
         .expect("bundled sandbox defaults must be valid TOML")
 });
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SecurityConfig {
     pub enabled: bool,
@@ -187,6 +196,7 @@ pub(crate) struct SecurityManager {
     workspace: PathBuf,
     config: SecurityConfig,
     rules: Vec<CompiledRule>,
+    session_grants: RwLock<HashSet<(AccessKind, PathBuf)>>,
     snapshots: Mutex<HashMap<PathBuf, blake3::Hash>>,
     dirty: Arc<Mutex<HashSet<PathBuf>>>,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -237,6 +247,7 @@ impl SecurityManager {
             workspace,
             config,
             rules,
+            session_grants: RwLock::new(HashSet::new()),
             snapshots: Mutex::new(HashMap::new()),
             dirty,
             _watcher: watcher,
@@ -290,6 +301,15 @@ impl SecurityManager {
             return Ok(path);
         }
 
+        if self
+            .session_grants
+            .read()
+            .map_err(|_| "session permission store is unavailable".to_string())?
+            .contains(&(operation, path.clone()))
+        {
+            return Ok(path);
+        }
+
         let candidate = slash_path(&path);
         if self.rules.iter().any(|rule| {
             rule.operation == operation
@@ -297,8 +317,11 @@ impl SecurityManager {
                 && rule.matcher.is_match(&candidate)
         }) {
             return Err(format!(
-                "security policy denied {operation:?} access to {}",
-                path.display()
+                "security policy denied {} access to {}; call request_permission with kind \
+                 'filesystem', operation '{}', and this path to ask the user for session access",
+                operation.label(),
+                path.display(),
+                operation.label()
             ));
         }
         if self.rules.iter().any(|rule| {
@@ -319,10 +342,60 @@ impl SecurityManager {
             Ok(path)
         } else {
             Err(format!(
-                "security policy denied {operation:?} access outside the project: {}",
-                path.display()
+                "security policy denied {} access outside the project: {}; call \
+                 request_permission with kind 'filesystem', operation '{}', and this path to ask \
+                 the user for session access",
+                operation.label(),
+                path.display(),
+                operation.label()
             ))
         }
+    }
+
+    pub(crate) fn grant_path(
+        &self,
+        operation: AccessKind,
+        path: impl AsRef<Path>,
+    ) -> Result<PathBuf, String> {
+        let path = self.resolve_path(path)?;
+        self.session_grants
+            .write()
+            .map_err(|_| "session permission store is unavailable".to_string())?
+            .insert((operation, path.clone()));
+        Ok(path)
+    }
+
+    pub(crate) fn inherit_session_grants(&self, previous: &Self) -> Result<(), String> {
+        let previous = previous
+            .session_grants
+            .read()
+            .map_err(|_| "session permission store is unavailable".to_string())?
+            .clone();
+        self.session_grants
+            .write()
+            .map_err(|_| "session permission store is unavailable".to_string())?
+            .extend(previous);
+        Ok(())
+    }
+
+    pub(crate) fn session_grant_count(&self) -> usize {
+        self.session_grants
+            .read()
+            .map(|grants| grants.len())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn session_granted_paths(&self, operation: AccessKind) -> Vec<PathBuf> {
+        self.session_grants
+            .read()
+            .map(|grants| {
+                grants
+                    .iter()
+                    .filter(|(granted_operation, _)| *granted_operation == operation)
+                    .map(|(_, path)| path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn authorize_tool_call(&self, name: &str, arguments: &str) -> Result<(), String> {
@@ -423,12 +496,13 @@ impl SecurityManager {
         let report = skarn_sandbox::backend_report();
         let sandbox = &self.config.sandbox;
         format!(
-            "Security:\n  filesystem policy: {}\n  sandbox mode: {}\n  sandbox: {}\n  backend: {} ({:?})\n  network: {}\n  system reads: {}\n  temporary writes: {}\n  fail closed: {}\n  workspace: {}\n  reads outside workspace: {}\n  extra readable paths: {}\n  extra writable paths: {}\n  denied read paths: {}\n  inherited environment patterns: {}\n  file conflict protection: {}\n  permission rules: {}",
+            "Security:\n  filesystem policy: {}\n  session filesystem grants: {}\n  sandbox mode: {}\n  sandbox: {}\n  backend: {} ({:?})\n  network: {}\n  system reads: {}\n  temporary writes: {}\n  fail closed: {}\n  workspace: {}\n  reads outside workspace: {}\n  extra readable paths: {}\n  extra writable paths: {}\n  denied read paths: {}\n  denied environment patterns: {}\n  file conflict protection: {}\n  permission rules: {}",
             if self.config.enabled {
                 "enabled"
             } else {
                 "disabled"
             },
+            self.session_grant_count(),
             self.sandbox_mode().label(),
             if sandbox.enabled {
                 "enabled"
@@ -462,7 +536,7 @@ impl SecurityManager {
             sandbox.readable_paths.len(),
             sandbox.writable_paths.len(),
             sandbox.denied_read_paths.len(),
-            sandbox.inherit_environment.len(),
+            sandbox.denied_environment.len(),
             if self.config.protect_file_changes {
                 "enabled"
             } else {
@@ -548,7 +622,7 @@ fail_closed = false
 readable_paths = ["/custom/read"]
 writable_paths = ["/custom/write"]
 denied_read_paths = ["/custom/secret"]
-inherit_environment = ["CUSTOM_*"]
+denied_environment = ["CUSTOM_*"]
 "#,
         )
         .unwrap();
@@ -561,7 +635,7 @@ inherit_environment = ["CUSTOM_*"]
         assert_eq!(config.readable_paths, [PathBuf::from("/custom/read")]);
         assert_eq!(config.writable_paths, [PathBuf::from("/custom/write")]);
         assert_eq!(config.denied_read_paths, [PathBuf::from("/custom/secret")]);
-        assert_eq!(config.inherit_environment, ["CUSTOM_*"]);
+        assert_eq!(config.denied_environment, ["CUSTOM_*"]);
     }
 
     #[test]
@@ -569,9 +643,21 @@ inherit_environment = ["CUSTOM_*"]
         let config: SandboxConfig = toml::from_str("enabled = true").unwrap();
 
         assert!(config.enabled);
-        assert!(!config.denied_read_paths.is_empty());
-        assert!(!config.inherit_environment.is_empty());
+        assert!(config.network);
+        assert!(config.readable_paths.is_empty());
+        assert!(config.writable_paths.is_empty());
+        assert!(config.denied_read_paths.is_empty());
+        assert!(config.denied_environment.is_empty());
         assert!(config.fail_closed);
+    }
+
+    #[test]
+    fn default_security_keeps_file_protection_and_process_sandbox_on_in_production() {
+        let config = SecurityConfig::default();
+
+        assert!(config.protect_file_changes);
+        assert_eq!(config.sandbox.enabled, cfg!(all(not(test), unix)));
+        assert!(config.sandbox.network);
     }
 
     #[test]
@@ -633,6 +719,36 @@ inherit_environment = ["CUSTOM_*"]
                 .is_err()
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_grant_allows_only_the_exact_operation_and_path() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
+        let external =
+            std::env::temp_dir().join(format!("programmer-external-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let denied = external.join("denied.txt");
+        let granted = external.join("granted.txt");
+        let config = SecurityConfig {
+            allow_read_outside_workspace: false,
+            ..SecurityConfig::default()
+        };
+        let security = manager(config, &root);
+
+        let denial = security
+            .authorize_path(AccessKind::Write, &granted)
+            .unwrap_err();
+        assert!(denial.contains("call request_permission"));
+        assert!(denial.contains("operation 'write'"));
+        security.grant_path(AccessKind::Write, &granted).unwrap();
+
+        assert!(security.authorize_path(AccessKind::Write, &granted).is_ok());
+        assert!(security.authorize_path(AccessKind::Read, &granted).is_err());
+        assert!(security.authorize_path(AccessKind::Write, &denied).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
     }
 
     #[test]

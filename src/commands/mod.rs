@@ -112,8 +112,11 @@ pub(crate) const PERMISSION_BOOLEAN_SETTINGS: &[&str] = &[
     "file-protection",
     "outside-read",
 ];
-pub(crate) const PERMISSION_COLLECTION_KINDS: &[&str] = &["read", "write", "deny-read", "env"];
-const PERMISSION_ACTIONS: &[&str] = &["show", "mode", "reset", "add", "remove"];
+pub(crate) const PERMISSION_COLLECTION_KINDS: &[&str] = &["read", "write", "deny-read", "deny-env"];
+const PERMISSION_ACTIONS: &[&str] = &[
+    "show", "manage", "profile", "mode", "reset", "add", "remove",
+];
+const PERMISSION_PROFILE_ACTIONS: &[&str] = &["list", "use", "create", "clone", "rename", "delete"];
 
 #[derive(Debug, Clone, Copy)]
 struct HelpEntry {
@@ -384,23 +387,23 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         kind: CommandKind::Permission,
         name: "permission",
-        aliases: &["permissions", "sandbox"],
+        aliases: &["sandbox"],
         completion: CompletionKind::Permission,
         help: &[
             HelpEntry {
                 order: 15,
-                usage: "/permission show | /sandbox show",
-                description: "Show sandbox, file protection, and permission status",
+                usage: "/permission show | manage",
+                description: "Show security status or open the profile management panel",
             },
             HelpEntry {
                 order: 16,
-                usage: "/permission mode <restricted|network|off> | <setting> <on|off>",
-                description: "Set the sandbox mode or another security setting",
+                usage: "/permission profile <list|use|create|rename|delete>",
+                description: "List, switch, or manage named security profiles",
             },
             HelpEntry {
                 order: 17,
-                usage: "/permission <add|remove> <kind> <value>",
-                description: "Configure sandbox paths and inherited environment names",
+                usage: "/permission mode <restricted|network|off> | <setting> <on|off>",
+                description: "Configure the active profile mode, settings, paths, and environment",
             },
         ],
     },
@@ -618,6 +621,19 @@ impl CompletionEngine {
         }
 
         let action = parts[0];
+        if matches!(action, "profile" | "profiles") {
+            if parts.len() == 1 || (parts.len() == 2 && !trailing_space) {
+                let typed = parts.get(1).copied().unwrap_or("");
+                let candidates = PERMISSION_PROFILE_ACTIONS
+                    .iter()
+                    .filter(|candidate| candidate.starts_with(typed))
+                    .map(|candidate| (*candidate).to_string())
+                    .collect();
+                return CompletionState::new(format!("/{cmd} profile "), candidates);
+            }
+            return None;
+        }
+
         if action == "mode" {
             let typed = parts
                 .get(1)
@@ -664,7 +680,7 @@ impl CompletionEngine {
             }
 
             let kind = parts[1];
-            if !PERMISSION_COLLECTION_KINDS.contains(&kind) || kind == "env" {
+            if !PERMISSION_COLLECTION_KINDS.contains(&kind) || kind == "deny-env" {
                 return None;
             }
             let value = parts
@@ -1512,16 +1528,16 @@ mod tests {
                 "Enable or disable image attachments for this session",
             ),
             (
-                "/permission show | /sandbox show",
-                "Show sandbox, file protection, and permission status",
+                "/permission show | manage",
+                "Show security status or open the profile management panel",
+            ),
+            (
+                "/permission profile <list|use|create|rename|delete>",
+                "List, switch, or manage named security profiles",
             ),
             (
                 "/permission mode <restricted|network|off> | <setting> <on|off>",
-                "Set the sandbox mode or another security setting",
-            ),
-            (
-                "/permission <add|remove> <kind> <value>",
-                "Configure sandbox paths and inherited environment names",
+                "Configure the active profile mode, settings, paths, and environment",
             ),
             ("/todo | /t", "Open the todo list panel"),
             ("/new | /n", "Start a new session (saves current)"),
@@ -1628,6 +1644,7 @@ mod tests {
             Command::parse("/sandbox show"),
             Some(Command::Permission(argument)) if argument == "show"
         ));
+        assert!(Command::parse("/permissions show").is_none());
 
         let state = CompletionEngine::complete_permission("permission net", "permission")
             .expect("permission setting completion");
@@ -1651,10 +1668,27 @@ mod tests {
         assert_eq!(state.prefix, "/sandbox add ");
         assert_eq!(state.candidates[0].value, "deny-read");
 
+        let state = CompletionEngine::complete_permission("sandbox add deny-e", "sandbox")
+            .expect("environment blacklist completion");
+        assert_eq!(state.prefix, "/sandbox add ");
+        assert_eq!(state.candidates[0].value, "deny-env");
+
         let state = CompletionEngine::complete_permission("sandbox mode n", "sandbox")
             .expect("sandbox mode completion");
         assert_eq!(state.prefix, "/sandbox mode ");
         assert_eq!(state.candidates[0].value, "network");
+
+        let state = CompletionEngine::complete_permission("permission profile c", "permission")
+            .expect("security profile action completion");
+        assert_eq!(state.prefix, "/permission profile ");
+        assert_eq!(
+            state
+                .candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["create", "clone"]
+        );
 
         let provider_manager = ProviderManager::from_config(&crate::ProgrammerConfig::default());
         let skill_registry = crate::skills::SkillRegistry::default();

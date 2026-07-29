@@ -108,16 +108,16 @@ protect_file_changes = true
 allow_read_outside_workspace = true
 
 [security.sandbox]
-# Enabled by default on macOS and Linux. Windows currently runs unsandboxed.
+# Enabled by default on supported Unix platforms with network access allowed.
 enabled = true
-network = false
+network = true
 allow_system_read = true
 allow_temp_write = true
 fail_closed = true
-readable_paths = ["~/.cargo/registry"]
+readable_paths = []
 writable_paths = []
-denied_read_paths = ["~/.ssh", "~/.aws"]
-inherit_environment = ["HOME", "PATH", "TMPDIR", "LANG", "LC_*"]
+denied_read_paths = []
+denied_environment = []
 
 # Rules use absolute globs or the portable `workspace/**` prefix. Explicit
 # denies take precedence over allows.
@@ -145,15 +145,15 @@ api_key = "sk-your-key-here"
 | `git_coauthor` | `programmer <noreply@programmer.local>` | `Co-Authored-By:` trailer added to the agent's git commits. Use a GitHub-linked email for an avatar; `""` disables. |
 | `security.protect_file_changes` | `true` | Require an existing file to be read before overwrite and reject writes if it changed after that read. |
 | `security.allow_read_outside_workspace` | `true` | Permit direct read tools outside the project unless a rule denies the path. |
-| `security.sandbox.enabled` | macOS/Linux: `true`; Windows: `false` | Apply the native OS process sandbox to commands, tasks, diagnostics, LSP, and stdio MCP servers. |
-| `security.sandbox.network` | `false` | Permit network access from sandboxed child processes. |
+| `security.sandbox.enabled` | `true` on supported Unix platforms | Apply the native OS process sandbox to commands, tasks, diagnostics, LSP, and stdio MCP servers. |
+| `security.sandbox.network` | `true` | Permit network access from sandboxed child processes. |
 | `security.sandbox.allow_system_read` | `true` | Permit reads needed to execute system programs and load shared libraries. |
 | `security.sandbox.allow_temp_write` | `true` | Permit writes to the platform temporary directory. |
 | `security.sandbox.fail_closed` | `true` | Refuse to run a child process when the platform backend cannot enforce its policy. |
-| `security.sandbox.readable_paths` | bundled policy | Additional paths sandboxed child processes may read. `~` and workspace-relative paths are supported. |
+| `security.sandbox.readable_paths` | `[]` | Additional paths sandboxed child processes may read. `~` and workspace-relative paths are supported. |
 | `security.sandbox.writable_paths` | `[]` | Additional paths sandboxed child processes may modify. |
-| `security.sandbox.denied_read_paths` | bundled policy | Paths sandboxed child processes must not read. |
-| `security.sandbox.inherit_environment` | bundled policy | Environment variable name globs inherited after the parent environment is cleared. |
+| `security.sandbox.denied_read_paths` | `[]` | Paths sandboxed child processes must not read. |
+| `security.sandbox.denied_environment` | `[]` | Environment variable name globs removed from sandboxed child processes. An empty list inherits the complete parent environment. |
 
 Each provider is a `[providers.<name>]` section. You can add as many as you want.
 
@@ -260,7 +260,7 @@ programmer
 | `/classifier [provider/model]` | Set/show the Auto-mode classifier model |
 | `/classifier clear` | Reset classifier to the chat model |
 | `/vision <on\|off>` | Enable/disable `@image` attachments for this session |
-| `/sandbox` `/permissions` | Show sandbox, file protection, and permission status |
+| `/permission` `/sandbox` | Show sandbox, file protection, and permission status |
 | `/todo` `/t` | Open this session's todo list |
 | `/new` `/n` | Start a new session (auto-saves current) |
 | `/session` `/s` | Show current session UUID and info |

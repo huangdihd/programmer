@@ -80,6 +80,15 @@ pub(super) fn program_invocation(
     for path in &config.writable_paths {
         builder = builder.read_write(security.resolve_path(path)?);
     }
+    for path in security.session_granted_paths(super::policy::AccessKind::Read) {
+        builder = builder.read(path);
+    }
+    for path in security.session_granted_paths(super::policy::AccessKind::Execute) {
+        builder = builder.exec(path);
+    }
+    for path in security.session_granted_paths(super::policy::AccessKind::Write) {
+        builder = builder.read_write(path);
+    }
 
     let policy_json = serde_json::to_string(&builder.build())
         .map_err(|error| format!("could not serialize sandbox policy: {error}"))?;
@@ -93,16 +102,16 @@ pub(super) fn program_invocation(
         args: worker_args,
         policy_json,
         cwd,
-        environment: inherited_environment(&config.inherit_environment)?,
+        environment: inherited_environment(&config.denied_environment)?,
     }))
 }
 
-fn inherited_environment(patterns: &[String]) -> Result<Vec<(OsString, OsString)>, String> {
-    let matchers = compile_environment_patterns(patterns)?;
+fn inherited_environment(denied_patterns: &[String]) -> Result<Vec<(OsString, OsString)>, String> {
+    let denied = compile_environment_patterns(denied_patterns)?;
     Ok(std::env::vars_os()
         .filter(|(name, _)| {
             name.to_str()
-                .is_some_and(|name| matchers.iter().any(|matcher| matcher.is_match(name)))
+                .is_none_or(|name| !denied.iter().any(|matcher| matcher.is_match(name)))
         })
         .collect())
 }
@@ -170,9 +179,13 @@ pub(crate) fn run_worker_if_requested() {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        policy
-            .apply_to_current_process()
-            .unwrap_or_else(|error| fail_worker(&format!("could not apply sandbox: {error}")));
+        policy.apply_to_current_process().unwrap_or_else(|error| {
+            fail_worker(&format!(
+                "could not apply sandbox: {error}\n\
+                     Call request_permission with kind 'sandbox' and mode 'off' to ask the user \
+                     to continue without process isolation."
+            ))
+        });
         let error = std::process::Command::new(program).args(args).exec();
         fail_worker(&format!("could not execute sandboxed command: {error}"));
     }
@@ -255,8 +268,20 @@ mod tests {
         config.sandbox.denied_read_paths = vec![denied.clone()];
         config.sandbox.readable_paths = vec![readable.clone()];
         let security = super::super::SecurityManager::new(config, root.clone()).unwrap();
+        let session_read =
+            std::env::temp_dir().join(format!("programmer-session-read-{}", uuid::Uuid::new_v4()));
+        let session_write =
+            std::env::temp_dir().join(format!("programmer-session-write-{}", uuid::Uuid::new_v4()));
+        security
+            .grant_path(super::super::policy::AccessKind::Read, &session_read)
+            .unwrap();
+        security
+            .grant_path(super::super::policy::AccessKind::Write, &session_write)
+            .unwrap();
         let denied = security.resolve_path(denied).unwrap();
         let readable = security.resolve_path(readable).unwrap();
+        let session_read = security.resolve_path(session_read).unwrap();
+        let session_write = security.resolve_path(session_write).unwrap();
 
         let wrapped = invocation(&security, "echo test", None)
             .unwrap()
@@ -268,20 +293,29 @@ mod tests {
         let policy: Policy = serde_json::from_str(&wrapped.policy_json).unwrap();
         assert!(policy.fs_deny_read.contains(&denied));
         assert!(policy.fs_read.contains(&readable));
+        assert!(policy.fs_read.contains(&session_read));
+        assert!(policy.fs_read_write.contains(&session_write));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn sandbox_environment_uses_configured_globs() {
+    fn sandbox_environment_excludes_configured_globs() {
         let patterns = vec!["PATH".to_string(), "LC_*".to_string()];
-        let matchers = compile_environment_patterns(&patterns).unwrap();
-        let matches = |name| matchers.iter().any(|matcher| matcher.is_match(name));
+        let denied = compile_environment_patterns(&patterns).unwrap();
+        let inherited = |name| !denied.iter().any(|matcher| matcher.is_match(name));
 
-        assert!(matches("PATH"));
-        assert!(matches("LC_ALL"));
-        assert!(!matches("OPENAI_API_KEY"));
-        assert!(!matches("SSH_AUTH_SOCK"));
-        assert!(!matches(POLICY_ENV));
+        assert!(!inherited("PATH"));
+        assert!(!inherited("LC_ALL"));
+        assert!(inherited("OPENAI_API_KEY"));
+        assert!(inherited("SSH_AUTH_SOCK"));
+        assert!(inherited(POLICY_ENV));
+    }
+
+    #[test]
+    fn empty_environment_blacklist_inherits_every_variable() {
+        let inherited = inherited_environment(&[]).unwrap();
+
+        assert_eq!(inherited.len(), std::env::vars_os().count());
     }
 
     #[test]

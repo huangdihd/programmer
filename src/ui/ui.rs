@@ -368,6 +368,11 @@ impl Widget for &mut App<'_> {
             panel.render(&self.config, self.mcp_manager.as_deref(), area, buf);
             return;
         }
+        // The security profile panel is modal and replaces the whole UI.
+        if let Some(panel) = &self.security_panel {
+            panel.render(&self.config, area, buf);
+            return;
+        }
         // The task panel is modal and replaces the whole UI. Interactive tasks
         // receive the visible grid size; pipe tasks render captured output.
         if let Some(pane) = &mut self.terminal_pane {
@@ -410,6 +415,7 @@ impl Widget for &mut App<'_> {
             });
         self.footer.work_mode = self.work_mode;
         self.footer.sandbox_mode = self.security.sandbox_mode();
+        self.footer.sandbox_profile = self.config.active_security_profile.clone();
         self.footer.current_model = self.current_model.clone();
         self.footer.thinking_level = self.thinking_level;
         self.footer.lsp_configured = self.diag.lsp_configured;

@@ -64,7 +64,8 @@ async fn handle_crossterm(
             handle_key_events(app, key_event).await?
         }
         crossterm::event::Event::Paste(data) => keys::handle_paste(app, data),
-        crossterm::event::Event::Mouse(_) if app.provider_panel.is_some() => {}
+        crossterm::event::Event::Mouse(_)
+            if app.provider_panel.is_some() || app.security_panel.is_some() => {}
         // The task viewer owns the whole screen. Interactive tasks can forward
         // mouse input to their PTY; read-only tasks use the wheel to scroll.
         crossterm::event::Event::Mouse(mouse) if app.terminal_pane.is_some() => {
@@ -360,6 +361,7 @@ fn has_blocking_surface(app: &App<'_>) -> bool {
         || app.provider_panel.is_some()
         || app.skills_panel.is_some()
         || app.mcp_panel.is_some()
+        || app.security_panel.is_some()
         || app.todo_panel.is_some()
         || app.terminal_pane.is_some()
         || (app.work_mode == WorkMode::Plan

@@ -454,6 +454,17 @@ mod tests {
         let valid = call(read_file::NAME, r#"{"path":"src/main.rs"}"#);
         assert!(reg.validate(&valid).is_ok());
 
+        let sandbox_permission = call(
+            request_permission::NAME,
+            r#"{"kind":"sandbox","mode":"network","operation":null,"path":null,"reason":"download dependencies"}"#,
+        );
+        assert!(reg.validate(&sandbox_permission).is_ok());
+        let filesystem_permission = call(
+            request_permission::NAME,
+            r#"{"kind":"filesystem","mode":null,"operation":"write","path":"/tmp/output","reason":"write the requested output"}"#,
+        );
+        assert!(reg.validate(&filesystem_permission).is_ok());
+
         let missing_required = call(read_file::NAME, "{}");
         assert!(
             reg.validate(&missing_required)

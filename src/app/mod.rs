@@ -37,6 +37,7 @@ use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::provider_panel::ProviderPanel;
 use crate::ui::components::question_panel::QuestionPanel;
+use crate::ui::components::security_panel::SecurityPanel;
 use crate::ui::components::sidebar::Sidebar;
 use crate::ui::components::skills_panel::SkillsPanel;
 use crate::ui::components::todo_panel::TodoPanel;
@@ -182,6 +183,8 @@ pub struct App<'a> {
     pub skills_panel: Option<SkillsPanel>,
     /// Full-screen MCP server management panel, when open.
     pub mcp_panel: Option<McpPanel>,
+    /// Full-screen security profile management panel, when open.
+    pub security_panel: Option<SecurityPanel>,
     /// Modal question panel shown when the model calls `ask_user`.
     pub question_panel: Option<QuestionPanel>,
     /// Todo-list panel shown with `/todo`.
@@ -252,6 +255,13 @@ impl std::fmt::Debug for App<'_> {
 }
 
 impl App<'_> {
+    /// Validate and install the active policy after a profile switch or edit.
+    pub(crate) fn install_active_security(&mut self) -> Result<(), String> {
+        let security =
+            crate::security::SecurityManager::for_current_dir(self.config.security.clone())?;
+        self.security.replace(Arc::new(security))
+    }
+
     /// Constructs a new instance of [`App`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
@@ -265,6 +275,7 @@ impl App<'_> {
         open_provider_panel: bool,
         project_name: String,
     ) -> Self {
+        config.normalize_security_profiles();
         let provider_manager = ProviderManager::from_config(&config);
         let mut current_model = provider_manager.default_model();
         let mut work_mode = WorkMode::default();
@@ -336,6 +347,7 @@ impl App<'_> {
             provider_panel: open_provider_panel.then(ProviderPanel::new),
             skills_panel: None,
             mcp_panel: None,
+            security_panel: None,
             question_panel: None,
             todo_panel: None,
             terminal_pane: None,

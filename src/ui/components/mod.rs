@@ -23,6 +23,7 @@ pub mod messages;
 pub mod panel_search;
 pub mod provider_panel;
 pub mod question_panel;
+pub mod security_panel;
 pub mod sidebar;
 pub mod skills_panel;
 pub mod status_bar;

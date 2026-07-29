@@ -313,6 +313,9 @@ mod tests {
             classifier_model: None,
             allow_yolo: false,
             security: Default::default(),
+            security_profiles: Default::default(),
+            active_security_profile: crate::config::programmer_config::DEFAULT_SECURITY_PROFILE
+                .to_string(),
             git_coauthor: None,
             mcp_servers: Vec::new(),
             model: None,

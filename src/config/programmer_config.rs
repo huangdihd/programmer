@@ -14,7 +14,22 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+pub(crate) const DEFAULT_SECURITY_PROFILE: &str = "default";
+
+pub(crate) fn validate_security_profile_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("profile name is required".to_string());
+    }
+    if name
+        .chars()
+        .any(|character| !(character.is_ascii_alphanumeric() || "_-.".contains(character)))
+    {
+        return Err("use only letters, numbers, '.', '-' or '_'".to_string());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -32,9 +47,17 @@ pub struct ProgrammerConfig {
     #[serde(default)]
     pub allow_yolo: bool,
     /// Mandatory filesystem and process isolation. Unlike work-mode approval,
-    /// these restrictions still apply in YOLO mode.
-    #[serde(default)]
+    /// these restrictions still apply in YOLO mode. This field only accepts
+    /// legacy single-policy configs; current configs serialize profiles below.
+    #[serde(default, skip_serializing)]
     pub security: crate::security::SecurityConfig,
+    /// Named security policies. The active profile is copied into `security`
+    /// at load time so runtime consumers keep one immutable policy snapshot.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub security_profiles: BTreeMap<String, crate::security::SecurityConfig>,
+    /// Name of the security profile currently enforced by local tools.
+    #[serde(default = "default_security_profile_name")]
+    pub active_security_profile: String,
     /// Co-author identity (`Name <email>`) the agent adds as a
     /// `Co-Authored-By:` trailer to git commit messages it writes. For the
     /// co-author to show a GitHub avatar, the email must belong to a GitHub
@@ -83,6 +106,10 @@ fn default_git_coauthor() -> Option<String> {
     Some("programmer <noreply@programmer.local>".to_string())
 }
 
+fn default_security_profile_name() -> String {
+    DEFAULT_SECURITY_PROFILE.to_string()
+}
+
 impl Default for ProgrammerConfig {
     fn default() -> Self {
         let mut providers = HashMap::new();
@@ -96,12 +123,17 @@ impl Default for ProgrammerConfig {
                 classifier_model: None,
             },
         );
+        let security = crate::security::SecurityConfig::default();
         ProgrammerConfig {
             default_provider: "openai".to_string(),
             providers,
             classifier_model: None,
             allow_yolo: false,
-            security: crate::security::SecurityConfig::default(),
+            security,
+            // Kept empty until normalization so deserialization can distinguish
+            // a legacy `[security]` table from current named profiles.
+            security_profiles: BTreeMap::new(),
+            active_security_profile: default_security_profile_name(),
             git_coauthor: default_git_coauthor(),
             mcp_servers: Vec::new(),
             model: None,
@@ -117,17 +149,30 @@ impl ProgrammerConfig {
     /// Returns `true` if migration happened, so the caller can persist the new
     /// config format back to disk.
     pub fn migrate_if_needed(&mut self) -> bool {
+        let mut changed = self.migrate_provider_config();
+        changed |= self.normalize_security_profiles();
+        changed
+    }
+
+    fn migrate_provider_config(&mut self) -> bool {
         if !self.providers.is_empty() {
             return false;
         }
-
-        let base_url = match &self.base_url {
-            Some(u) if u != "Type your base_url here" => u.clone(),
-            _ => return false,
+        let Some(base_url) = self
+            .base_url
+            .as_ref()
+            .filter(|value| value.as_str() != "Type your base_url here")
+            .cloned()
+        else {
+            return false;
         };
-        let api_key = match &self.api_key {
-            Some(k) if k != "Type your api_key here" => k.clone(),
-            _ => return false,
+        let Some(api_key) = self
+            .api_key
+            .as_ref()
+            .filter(|value| value.as_str() != "Type your api_key here")
+            .cloned()
+        else {
+            return false;
         };
         let model = self.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
 
@@ -142,11 +187,57 @@ impl ProgrammerConfig {
             },
         );
         self.default_provider = "openai".to_string();
-        // Clear legacy fields so they aren't serialized back.
         self.model = None;
         self.base_url = None;
         self.api_key = None;
         true
+    }
+
+    /// Ensure an active named profile exists and mirror it into the runtime
+    /// `security` field. Returns whether persisted profile metadata changed.
+    pub(crate) fn normalize_security_profiles(&mut self) -> bool {
+        let mut changed = false;
+        if self.security_profiles.is_empty() {
+            self.security_profiles
+                .insert(DEFAULT_SECURITY_PROFILE.to_string(), self.security.clone());
+            changed = true;
+        }
+        if !self
+            .security_profiles
+            .contains_key(&self.active_security_profile)
+        {
+            self.active_security_profile = self
+                .security_profiles
+                .first_key_value()
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(default_security_profile_name);
+            changed = true;
+        }
+        self.security = self
+            .security_profiles
+            .get(&self.active_security_profile)
+            .expect("normalized security profile must exist")
+            .clone();
+        changed
+    }
+
+    /// Update both the active named profile and the live runtime copy.
+    pub(crate) fn update_active_security(
+        &mut self,
+        update: impl FnOnce(&mut crate::security::SecurityConfig),
+    ) {
+        update(&mut self.security);
+        self.security_profiles
+            .insert(self.active_security_profile.clone(), self.security.clone());
+    }
+
+    pub(crate) fn activate_security_profile(&mut self, name: &str) -> Result<(), String> {
+        let Some(profile) = self.security_profiles.get(name).cloned() else {
+            return Err(format!("unknown security profile '{name}'"));
+        };
+        self.active_security_profile = name.to_string();
+        self.security = profile;
+        Ok(())
     }
 }
 
@@ -192,7 +283,9 @@ mod tests {
 
     #[test]
     fn generated_config_exposes_the_complete_sandbox_policy() {
-        let serialized = toml::to_string(&ProgrammerConfig::default()).expect("serialize");
+        let mut config = ProgrammerConfig::default();
+        config.normalize_security_profiles();
+        let serialized = toml::to_string(&config).expect("serialize");
 
         for field in [
             "allow_system_read",
@@ -201,12 +294,59 @@ mod tests {
             "readable_paths",
             "writable_paths",
             "denied_read_paths",
-            "inherit_environment",
+            "denied_environment",
         ] {
             assert!(
                 serialized.contains(field),
                 "generated config omitted sandbox field {field}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_single_security_policy_migrates_to_default_profile() {
+        let source = r#"
+[security]
+enabled = false
+protect_file_changes = false
+
+[security.sandbox]
+enabled = true
+network = true
+"#;
+        let mut config: ProgrammerConfig =
+            toml::from_str(source).expect("deserialize legacy config");
+
+        assert!(config.security_profiles.is_empty());
+        assert!(config.migrate_if_needed());
+        assert_eq!(config.active_security_profile, DEFAULT_SECURITY_PROFILE);
+        assert_eq!(
+            config.security_profiles[DEFAULT_SECURITY_PROFILE],
+            config.security
+        );
+        assert!(!config.security.enabled);
+        assert!(config.security.sandbox.network);
+    }
+
+    #[test]
+    fn named_security_profiles_round_trip_and_restore_active_policy() {
+        let mut config = ProgrammerConfig::default();
+        config.normalize_security_profiles();
+        let mut network = config.security.clone();
+        network.sandbox.network = true;
+        config
+            .security_profiles
+            .insert("network".to_string(), network.clone());
+        config
+            .activate_security_profile("network")
+            .expect("activate");
+
+        let serialized = toml::to_string(&config).expect("serialize");
+        assert!(!serialized.contains("\n[security]\n"));
+        let mut restored: ProgrammerConfig = toml::from_str(&serialized).expect("deserialize");
+        restored.normalize_security_profiles();
+
+        assert_eq!(restored.active_security_profile, "network");
+        assert_eq!(restored.security, network);
     }
 }

@@ -9,11 +9,12 @@ use super::CommandOutcome;
 use crate::app::{App, session};
 use crate::classifier::WorkMode;
 use crate::commands::{Command, PERMISSION_BOOLEAN_SETTINGS, PERMISSION_COLLECTION_KINDS};
+use crate::config::programmer_config::validate_security_profile_name;
 use crate::security::SandboxMode;
 use crate::security::SecurityConfig;
 use crate::thinking::ThinkingLevel;
+use crate::ui::components::security_panel::SecurityPanel;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOutcome {
     app.input_panel.clear();
@@ -29,22 +30,39 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
 }
 
 fn permission(app: &mut App<'_>, arg: &str) -> CommandOutcome {
-    let previous = app.config.security.clone();
-    match update_security_config(&mut app.config.security, arg) {
+    let parts = arg.split_whitespace().collect::<Vec<_>>();
+    if matches!(parts.as_slice(), ["manage"]) {
+        app.security_panel = Some(SecurityPanel::new());
+        return CommandOutcome::handled(false);
+    }
+    if matches!(parts.first(), Some(&"profile") | Some(&"profiles")) {
+        return permission_profile(app, &parts[1..]);
+    }
+
+    let previous_profile = app.config.active_security_profile.clone();
+    let previous_security = app.config.security.clone();
+    let mut updated = app.config.security.clone();
+    match update_security_config(&mut updated, arg) {
         Ok(SecurityUpdate::Show) => {
-            app.conversation_panel
-                .add_info_string(app.security.status_text());
+            app.conversation_panel.add_info_string(format!(
+                "Active security profile: {}\n{}",
+                app.config.active_security_profile,
+                app.security.status_text()
+            ));
         }
         Ok(SecurityUpdate::Changed(message)) => {
-            match crate::security::SecurityManager::for_current_dir(app.config.security.clone()) {
-                Ok(security) => {
-                    let security = Arc::new(security);
-                    app.security.replace(security);
+            app.config
+                .update_active_security(|config| *config = updated);
+            match app.install_active_security() {
+                Ok(()) => {
                     session::persist_config(app);
-                    app.conversation_panel.add_info_string(message);
+                    app.conversation_panel.add_info_string(format!(
+                        "{message} in profile '{}'",
+                        app.config.active_security_profile
+                    ));
                 }
                 Err(error) => {
-                    app.config.security = previous;
+                    restore_active_security(&mut app.config, previous_profile, previous_security);
                     app.conversation_panel
                         .add_error_string(format!("invalid security configuration: {error}"));
                 }
@@ -53,6 +71,152 @@ fn permission(app: &mut App<'_>, arg: &str) -> CommandOutcome {
         Err(error) => app.conversation_panel.add_error_string(error),
     }
     CommandOutcome::handled(true)
+}
+
+fn permission_profile(app: &mut App<'_>, args: &[&str]) -> CommandOutcome {
+    let previous_profile = app.config.active_security_profile.clone();
+    let previous_security = app.config.security.clone();
+    let result = update_security_profiles(&mut app.config, args);
+    match result {
+        Ok(ProfileUpdate::Show(message)) => app.conversation_panel.add_info_string(message),
+        Ok(ProfileUpdate::Saved(message)) => {
+            session::persist_config(app);
+            app.conversation_panel.add_info_string(message);
+        }
+        Ok(ProfileUpdate::Apply(message)) => match app.install_active_security() {
+            Ok(()) => {
+                session::persist_config(app);
+                app.conversation_panel.add_info_string(message);
+            }
+            Err(error) => {
+                restore_active_security(&mut app.config, previous_profile, previous_security);
+                app.conversation_panel
+                    .add_error_string(format!("invalid security configuration: {error}"));
+            }
+        },
+        Err(error) => {
+            app.conversation_panel.add_error_string(error);
+        }
+    }
+    CommandOutcome::handled(true)
+}
+
+fn restore_active_security(
+    config: &mut crate::config::programmer_config::ProgrammerConfig,
+    profile: String,
+    security: SecurityConfig,
+) {
+    config.active_security_profile = profile.clone();
+    config.security_profiles.insert(profile, security.clone());
+    config.security = security;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProfileUpdate {
+    Show(String),
+    Saved(String),
+    Apply(String),
+}
+
+fn update_security_profiles(
+    config: &mut crate::config::programmer_config::ProgrammerConfig,
+    args: &[&str],
+) -> Result<ProfileUpdate, String> {
+    match args {
+        [] | ["list"] | ["show"] => {
+            let lines = config
+                .security_profiles
+                .iter()
+                .map(|(name, profile)| {
+                    format!(
+                        "  {} {name} ({})",
+                        if config.active_security_profile == *name {
+                            "●"
+                        } else {
+                            " "
+                        },
+                        SandboxMode::from_config(&profile.sandbox).label()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(ProfileUpdate::Show(format!(
+                "Security profiles:\n{lines}\nUse /permission manage to edit profiles."
+            )))
+        }
+        ["use", name] | ["switch", name] => {
+            config.activate_security_profile(name)?;
+            Ok(ProfileUpdate::Apply(format!(
+                "active security profile set to '{name}'"
+            )))
+        }
+        ["create", name] | ["clone", name] => create_security_profile(config, name, None),
+        ["create", name, source] | ["clone", name, source] => {
+            create_security_profile(config, name, Some(source))
+        }
+        ["delete", name] | ["remove", name] => {
+            if !config.security_profiles.contains_key(*name) {
+                return Err(format!("unknown security profile '{name}'"));
+            }
+            if config.active_security_profile == *name {
+                return Err("activate another profile before deleting the active one".to_string());
+            }
+            if config.security_profiles.len() == 1 {
+                return Err("the last security profile cannot be deleted".to_string());
+            }
+            config.security_profiles.remove(*name);
+            Ok(ProfileUpdate::Saved(format!(
+                "security profile '{name}' deleted"
+            )))
+        }
+        ["rename", old, new] => {
+            validate_security_profile_name(new)?;
+            if old == new {
+                if config.security_profiles.contains_key(*old) {
+                    return Ok(ProfileUpdate::Saved(format!(
+                        "security profile remains '{old}'"
+                    )));
+                }
+                return Err(format!("unknown security profile '{old}'"));
+            }
+            if config.security_profiles.contains_key(*new) {
+                return Err(format!("security profile '{new}' already exists"));
+            }
+            let profile = config
+                .security_profiles
+                .remove(*old)
+                .ok_or_else(|| format!("unknown security profile '{old}'"))?;
+            config.security_profiles.insert((*new).to_string(), profile);
+            if config.active_security_profile == *old {
+                config.active_security_profile = (*new).to_string();
+            }
+            Ok(ProfileUpdate::Saved(format!(
+                "security profile '{old}' renamed to '{new}'"
+            )))
+        }
+        _ => Err(permission_usage()),
+    }
+}
+
+fn create_security_profile(
+    config: &mut crate::config::programmer_config::ProgrammerConfig,
+    name: &str,
+    source: Option<&str>,
+) -> Result<ProfileUpdate, String> {
+    validate_security_profile_name(name)?;
+    if config.security_profiles.contains_key(name) {
+        return Err(format!("security profile '{name}' already exists"));
+    }
+    let source = source.unwrap_or(&config.active_security_profile);
+    let profile = config
+        .security_profiles
+        .get(source)
+        .cloned()
+        .ok_or_else(|| format!("unknown security profile '{source}'"))?;
+    config.security_profiles.insert(name.to_string(), profile);
+    Ok(ProfileUpdate::Saved(format!(
+        "security profile '{name}' cloned from '{source}'"
+    )))
 }
 
 #[derive(Debug)]
@@ -133,11 +297,11 @@ fn update_collection(
     if !PERMISSION_COLLECTION_KINDS.contains(&kind) {
         return Err(format!("unknown permission collection '{kind}'"));
     }
-    if kind == "env" {
+    if kind == "deny-env" {
         globset::Glob::new(value)
             .map_err(|error| format!("invalid environment name pattern '{value}': {error}"))?;
         return update_value(
-            &mut config.sandbox.inherit_environment,
+            &mut config.sandbox.denied_environment,
             action,
             value.to_string(),
             kind,
@@ -181,11 +345,13 @@ fn update_value<T: PartialEq>(
 }
 
 fn permission_usage() -> String {
-    "usage: /permission show | /permission mode <restricted|network|off> | \
+    "usage: /permission show | /permission manage | \
+     /permission profile <list|use|create|delete|rename> ... | \
+     /permission mode <restricted|network|off> | \
      /permission reset | \
      /permission <filesystem|sandbox|network|system-read|temp-write|fail-closed|\
      file-protection|outside-read> <on|off> | \
-     /permission <add|remove> <read|write|deny-read|env> <value>"
+     /permission <add|remove> <read|write|deny-read|deny-env> <value>"
         .to_string()
 }
 
@@ -379,6 +545,40 @@ mod tests {
     }
 
     #[test]
+    fn profile_commands_clone_and_switch_policies() {
+        let mut config = crate::config::programmer_config::ProgrammerConfig::default();
+        config.normalize_security_profiles();
+        config.update_active_security(|profile| profile.sandbox.network = true);
+
+        assert!(matches!(
+            update_security_profiles(&mut config, &["create", "online"]),
+            Ok(ProfileUpdate::Saved(_))
+        ));
+        assert!(config.security_profiles["online"].sandbox.network);
+        assert!(matches!(
+            update_security_profiles(&mut config, &["use", "online"]),
+            Ok(ProfileUpdate::Apply(_))
+        ));
+        assert_eq!(config.active_security_profile, "online");
+        assert_eq!(config.security, config.security_profiles["online"]);
+    }
+
+    #[test]
+    fn profile_commands_protect_active_profile_from_deletion() {
+        let mut config = crate::config::programmer_config::ProgrammerConfig::default();
+        config.normalize_security_profiles();
+        config
+            .security_profiles
+            .insert("other".to_string(), SecurityConfig::default());
+
+        let error = update_security_profiles(&mut config, &["delete", "default"])
+            .expect_err("active profile deletion must fail");
+
+        assert!(error.contains("activate another profile"));
+        assert!(config.security_profiles.contains_key("default"));
+    }
+
+    #[test]
     fn permission_updates_collection_settings_without_duplicates() {
         let mut config = SecurityConfig::default();
         config.sandbox.readable_paths.clear();
@@ -392,6 +592,13 @@ mod tests {
 
         update_security_config(&mut config, "remove read ../shared").expect("remove path");
         assert!(config.sandbox.readable_paths.is_empty());
+
+        update_security_config(&mut config, "add deny-env SECRET_*")
+            .expect("add environment blacklist pattern");
+        assert_eq!(config.sandbox.denied_environment, ["SECRET_*"]);
+        update_security_config(&mut config, "remove deny-env SECRET_*")
+            .expect("remove environment blacklist pattern");
+        assert!(config.sandbox.denied_environment.is_empty());
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub struct Footer {
     pub(crate) thinking_level: ThinkingLevel,
     pub work_mode: WorkMode,
     pub(crate) sandbox_mode: SandboxMode,
+    pub(crate) sandbox_profile: String,
     /// Whether the project has an LSP checker configured, so the LSP block shows
     /// even before a server has started.
     pub lsp_configured: bool,
@@ -42,6 +43,7 @@ impl Footer {
             thinking_level: ThinkingLevel::default(),
             work_mode: WorkMode::default(),
             sandbox_mode: SandboxMode::default(),
+            sandbox_profile: String::new(),
             lsp_configured: false,
             active_skills: String::new(),
         }
@@ -58,7 +60,15 @@ impl Footer {
     }
 
     pub(crate) fn sandbox_text(&self) -> String {
-        format!(" \u{1f512} {} ", self.sandbox_mode.label())
+        if self.sandbox_profile.is_empty() {
+            format!(" \u{1f512} {} ", self.sandbox_mode.label())
+        } else {
+            format!(
+                " \u{1f512} {}/{} ",
+                self.sandbox_profile,
+                self.sandbox_mode.label()
+            )
+        }
     }
 }
 
@@ -88,7 +98,8 @@ mod tests {
     fn sandbox_text_shows_the_effective_mode() {
         let mut footer = Footer::new();
         footer.sandbox_mode = SandboxMode::Off;
+        footer.sandbox_profile = "local".to_string();
 
-        assert_eq!(footer.sandbox_text(), " 🔒 off ");
+        assert_eq!(footer.sandbox_text(), " 🔒 local/off ");
     }
 }
