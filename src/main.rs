@@ -33,6 +33,7 @@ mod prompts;
 mod providers;
 mod response;
 mod runner;
+mod security;
 mod session;
 mod skills;
 mod tasks;
@@ -463,6 +464,8 @@ async fn main() -> color_eyre::Result<()> {
 
     let bootstrap = resolve_session(resume);
     let (programmer_config, _config_path) = load_config()?;
+    crate::security::SecurityManager::for_current_dir(programmer_config.security.clone())
+        .map_err(|error| color_eyre::eyre::eyre!(error))?;
 
     // Derive a project name from the current directory for the terminal title.
     let project_name = std::env::current_dir()

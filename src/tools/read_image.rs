@@ -45,9 +45,20 @@ struct Args {
 }
 
 pub async fn run(arguments: &str) -> Result<FunctionCallOutput, String> {
+    let security = crate::security::SecurityManager::for_current_dir(Default::default())?;
+    run_with_security(arguments, &security).await
+}
+
+pub(crate) async fn run_with_security(
+    arguments: &str,
+    security: &crate::security::SecurityManager,
+) -> Result<FunctionCallOutput, String> {
     let args: Args = serde_json::from_str(arguments)
         .map_err(|error| format!("error: invalid arguments: {error}"))?;
-    let path = expand_tilde(&args.path);
+    let path = security.authorize_path(
+        crate::security::policy::AccessKind::Read,
+        expand_tilde(&args.path),
+    )?;
     let metadata = tokio::fs::metadata(&path)
         .await
         .map_err(|error| format!("error: could not read {}: {error}", path.display()))?;
@@ -65,6 +76,7 @@ pub async fn run(arguments: &str) -> Result<FunctionCallOutput, String> {
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|error| format!("error: could not read {}: {error}", path.display()))?;
+    security.record_read(&path, &bytes);
     let image = crate::commands::image_content_from_bytes(&bytes)
         .map_err(|error| format!("error: {error}"))?;
     let decoded = image::load_from_memory(&bytes)

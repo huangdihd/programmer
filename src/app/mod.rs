@@ -199,6 +199,8 @@ pub struct App<'a> {
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     /// Current safety/work mode.
     pub work_mode: WorkMode,
+    /// Mandatory security policy shared by every local tool provider.
+    pub(crate) security: Arc<crate::security::SecurityManager>,
     /// Manual-mode pending tool-call review (per-call, no batch). `None` when
     /// no review is in progress.
     pub(crate) pending_review: Option<PendingReview>,
@@ -297,6 +299,10 @@ impl App<'_> {
         input_panel.history = saved_history;
         let todo_list = crate::todos::TodoList { todos: saved_todos };
         let todo_store = Arc::new(Mutex::new(todo_list.clone()));
+        let security = Arc::new(
+            crate::security::SecurityManager::for_current_dir(config.security.clone())
+                .expect("security configuration should be validated before starting the app"),
+        );
         let mut app = Self {
             running: true,
             quit_requested_at: None,
@@ -322,6 +328,7 @@ impl App<'_> {
             todo_list,
             todo_store,
             work_mode,
+            security,
             pending_review: None,
             classifier_no_logprobs: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
@@ -419,8 +426,10 @@ impl App<'_> {
         let model_str = self.current_model.clone();
         // Unify every tool source behind the registry: the local built-ins are
         // one provider, all connected MCP servers another.
-        let mut providers: Vec<Arc<dyn ToolProvider>> =
-            vec![Arc::new(LocalToolProvider::new(self.todo_store.clone()))];
+        let mut providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(LocalToolProvider::new(
+            self.todo_store.clone(),
+            self.security.clone(),
+        ))];
         if let Some(mcp) = &self.mcp_manager {
             providers.push(Arc::new(McpToolProvider {
                 manager: mcp.clone(),

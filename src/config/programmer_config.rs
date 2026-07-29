@@ -31,6 +31,10 @@ pub struct ProgrammerConfig {
     /// it can't be reached by the normal Ctrl+T cycle or a bare `/mode yolo`.
     #[serde(default)]
     pub allow_yolo: bool,
+    /// Mandatory filesystem and process isolation. Unlike work-mode approval,
+    /// these restrictions still apply in YOLO mode.
+    #[serde(default)]
+    pub security: crate::security::SecurityConfig,
     /// Co-author identity (`Name <email>`) the agent adds as a
     /// `Co-Authored-By:` trailer to git commit messages it writes. For the
     /// co-author to show a GitHub avatar, the email must belong to a GitHub
@@ -97,6 +101,7 @@ impl Default for ProgrammerConfig {
             providers,
             classifier_model: None,
             allow_yolo: false,
+            security: crate::security::SecurityConfig::default(),
             git_coauthor: default_git_coauthor(),
             mcp_servers: Vec::new(),
             model: None,

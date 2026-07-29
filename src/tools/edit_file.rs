@@ -66,15 +66,27 @@ struct Args {
 }
 
 pub async fn run(arguments: &str) -> Result<String, String> {
+    let security = crate::security::SecurityManager::for_current_dir(Default::default())?;
+    run_with_security(arguments, &security).await
+}
+
+pub(crate) async fn run_with_security(
+    arguments: &str,
+    security: &crate::security::SecurityManager,
+) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
         Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
-    let contents = match tokio::fs::read_to_string(&args.path).await {
+    let path = security.authorize_path(crate::security::policy::AccessKind::Write, &args.path)?;
+    let bytes = match tokio::fs::read(&path).await {
         Ok(contents) => contents,
         Err(error) => return Err(format!("error: could not read {}: {error}", args.path)),
     };
+    security.validate_write(&path, Some(&bytes))?;
+    let contents = String::from_utf8(bytes)
+        .map_err(|error| format!("error: could not read {}: {error}", path.display()))?;
 
     // Normalize CRLF → LF so old_string matching works across platforms.
     let contents = contents.replace("\r\n", "\n");
@@ -124,8 +136,14 @@ pub async fn run(arguments: &str) -> Result<String, String> {
     }
 
     let updated = contents.replacen(&old_normalized, &args.new_string, 1);
-    match tokio::fs::write(&args.path, updated).await {
-        Ok(()) => Ok(format!("edited {}", args.path)),
-        Err(error) => Err(format!("error: could not write {}: {error}", args.path)),
+    match tokio::fs::write(&path, &updated).await {
+        Ok(()) => {
+            security.record_read(&path, updated.as_bytes());
+            Ok(format!("edited {}", path.display()))
+        }
+        Err(error) => Err(format!(
+            "error: could not write {}: {error}",
+            path.display()
+        )),
     }
 }

@@ -292,6 +292,7 @@ mod tests {
             providers,
             classifier_model: None,
             allow_yolo: false,
+            security: Default::default(),
             git_coauthor: None,
             mcp_servers: Vec::new(),
             model: None,

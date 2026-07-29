@@ -47,6 +47,10 @@ image = { version = "0.25.10", default-features = false, features = [
     "png",
     "webp",
 ] }
+blake3 = "1.8"
+globset = "0.4"
+notify = "8"
+skarn-sandbox = "=1.0.1"
 
 # Dependencies (dozens of tree-sitter grammars, aws-lc-sys, …) carry enough
 # debug info to blow past the MSVC PDB size limit (LNK1140). Strip debuginfo

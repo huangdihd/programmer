@@ -97,17 +97,26 @@ pub(crate) trait ToolProvider: Send + Sync {
 /// MCP server.
 pub(crate) struct LocalToolProvider {
     todos: Arc<Mutex<crate::todos::TodoList>>,
+    security: Arc<crate::security::SecurityManager>,
 }
 
 impl LocalToolProvider {
-    pub(crate) fn new(todos: Arc<Mutex<crate::todos::TodoList>>) -> Self {
-        Self { todos }
+    pub(crate) fn new(
+        todos: Arc<Mutex<crate::todos::TodoList>>,
+        security: Arc<crate::security::SecurityManager>,
+    ) -> Self {
+        Self { todos, security }
     }
 }
 
 impl Default for LocalToolProvider {
     fn default() -> Self {
-        Self::new(Arc::new(Mutex::new(crate::todos::TodoList::default())))
+        let security = crate::security::SecurityManager::for_current_dir(Default::default())
+            .expect("the current directory should support the default security policy");
+        Self::new(
+            Arc::new(Mutex::new(crate::todos::TodoList::default())),
+            Arc::new(security),
+        )
     }
 }
 
@@ -173,8 +182,22 @@ impl ToolProvider for LocalToolProvider {
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == read_image::NAME {
-            read_image::run(&call.arguments).await
+            read_image::run_with_security(&call.arguments, &self.security).await
+        } else if call.name == read_file::NAME {
+            read_file::run_with_security(&call.arguments, &self.security)
+                .await
+                .map(FunctionCallOutput::Text)
+        } else if call.name == write_file::NAME {
+            write_file::run_with_security(&call.arguments, &self.security)
+                .await
+                .map(FunctionCallOutput::Text)
+        } else if call.name == edit_file::NAME {
+            edit_file::run_with_security(&call.arguments, &self.security)
+                .await
+                .map(FunctionCallOutput::Text)
         } else {
+            self.security
+                .authorize_tool_call(&call.name, &call.arguments)?;
             run_local_tool(&call.name, &call.arguments)
                 .await
                 .map(FunctionCallOutput::Text)
