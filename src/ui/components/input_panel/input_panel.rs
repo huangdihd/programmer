@@ -16,7 +16,7 @@
 use crate::commands::CompletionState;
 use async_openai::types::responses::InputImageContent;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui_textarea::{Input, TextArea};
+use ratatui_textarea::{CursorMove, Input, TextArea};
 
 #[derive(Debug, Clone)]
 pub struct InputPanel<'a> {
@@ -130,6 +130,66 @@ impl InputPanel<'_> {
             .into_iter()
             .filter_map(|(placeholder, image)| content.contains(&placeholder).then_some(image))
             .collect()
+    }
+
+    pub(crate) fn placeholders(&self) -> impl Iterator<Item = &str> {
+        self.pastes
+            .iter()
+            .map(|(placeholder, _)| placeholder.as_str())
+            .chain(
+                self.images
+                    .iter()
+                    .map(|(placeholder, _)| placeholder.as_str()),
+            )
+    }
+
+    pub fn delete_placeholder_backward(&mut self) -> bool {
+        self.delete_placeholder_at_cursor(true)
+    }
+
+    pub fn delete_placeholder_forward(&mut self) -> bool {
+        self.delete_placeholder_at_cursor(false)
+    }
+
+    fn delete_placeholder_at_cursor(&mut self, backward: bool) -> bool {
+        if self.text_area.selection_range().is_some() {
+            return false;
+        }
+        let cursor = self.text_area.cursor();
+        let (row, cursor) = (cursor.0, cursor.1);
+        let Some(line) = self.text_area.lines().get(row) else {
+            return false;
+        };
+
+        let mut matched = None;
+        'placeholders: for placeholder in self.placeholders() {
+            for (byte_start, _) in line.match_indices(placeholder) {
+                let start = line[..byte_start].chars().count();
+                let end = start + placeholder.chars().count();
+                let touches_placeholder = if backward {
+                    cursor > start && cursor <= end
+                } else {
+                    cursor >= start && cursor < end
+                };
+                if touches_placeholder {
+                    matched = Some((placeholder.to_string(), start, end - start));
+                    break 'placeholders;
+                }
+            }
+        }
+
+        let Some((placeholder, start, len)) = matched else {
+            return false;
+        };
+        let (Ok(row), Ok(start)) = (u16::try_from(row), u16::try_from(start)) else {
+            return false;
+        };
+        self.text_area.move_cursor(CursorMove::Jump(row, start));
+        self.text_area.delete_str(len);
+        self.pastes.retain(|(value, _)| value != &placeholder);
+        self.images.retain(|(value, _)| value != &placeholder);
+        self.history_index = -1;
+        true
     }
 
     pub fn input(&mut self, input: impl Into<Input>) -> bool {
@@ -276,6 +336,27 @@ mod tests {
 
         assert!(panel.add_image(image(), 320, 200));
         panel.set_content("placeholder removed");
+        assert!(panel.take_images().is_empty());
+    }
+
+    #[test]
+    fn backspace_removes_an_entire_paste_placeholder() {
+        let mut panel = InputPanel::new();
+        panel.add_paste("first\nsecond".to_string());
+
+        assert!(panel.delete_placeholder_backward());
+        assert!(panel.get_content().is_empty());
+        assert!(panel.pastes.is_empty());
+    }
+
+    #[test]
+    fn delete_removes_an_entire_image_placeholder() {
+        let mut panel = InputPanel::new();
+        assert!(panel.add_image(image(), 640, 480));
+        panel.text_area.move_cursor(CursorMove::Jump(0, 0));
+
+        assert!(panel.delete_placeholder_forward());
+        assert!(panel.get_content().is_empty());
         assert!(panel.take_images().is_empty());
     }
 }

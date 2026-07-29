@@ -185,8 +185,8 @@ pub(crate) const PLAN_PLANNING_PROMPT: &str = "\
 
 You are in **Plan Mode**. You must NOT make any changes yet.
 
-1. **Explore**: Read files, search the codebase, and understand the problem using
-   read_file, grep, blob, and diagnostics.
+1. **Explore**: Read files and images, search the codebase, and understand the
+   problem using read_file, read_image, grep, blob, and diagnostics.
 2. **Plan**: Use the `todo` tool to list the steps you intend to take.
 3. **Present**: Output a clear, step-by-step plan:
    - Which files need changes and what approach

@@ -19,7 +19,7 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         }
         Command::Clear => clear(app),
         Command::New => new(app),
-        Command::Session => CommandOutcome::handled(true),
+        Command::Session => show_session(app),
         Command::Usage => usage(app),
         Command::Todo => {
             app.sync_todos_from_store();
@@ -32,6 +32,40 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         }
         Command::Help => help(app),
         _ => unreachable!("session handler received a command from another domain"),
+    }
+}
+
+fn show_session(app: &mut App<'_>) -> CommandOutcome {
+    let item_count = app.conversation_panel.items_snapshot().len();
+    let message = match &app.session.mgr {
+        Some(manager) => {
+            let path = manager.session_path(&app.session.uuid);
+            format_session_info(item_count, &app.session.uuid, Some((&path, path.exists())))
+        }
+        None => format_session_info(item_count, &app.session.uuid, None),
+    };
+    app.conversation_panel.add_info_string(message);
+    CommandOutcome::handled(true)
+}
+
+fn format_session_info(
+    item_count: usize,
+    uuid: &str,
+    session_file: Option<(&std::path::Path, bool)>,
+) -> String {
+    match session_file {
+        Some((path, exists)) => {
+            let status = if exists {
+                "saved on disk"
+            } else {
+                "not yet saved"
+            };
+            format!(
+                "Session: {item_count} messages, {status}\n  uuid: {uuid}\n  path: {}",
+                path.display()
+            )
+        }
+        None => format!("Session: {item_count} messages (no session manager)\n  uuid: {uuid}"),
     }
 }
 
@@ -108,8 +142,31 @@ fn help(app: &mut App<'_>) -> CommandOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::format_usage;
+    use super::{format_session_info, format_usage};
     use crate::conversation::UsageSummary;
+    use std::path::Path;
+
+    #[test]
+    fn session_info_reports_identity_path_and_saved_state() {
+        let message = format_session_info(
+            7,
+            "session-uuid",
+            Some((Path::new("/tmp/session-uuid.json"), true)),
+        );
+
+        assert_eq!(
+            message,
+            "Session: 7 messages, saved on disk\n  uuid: session-uuid\n  path: /tmp/session-uuid.json"
+        );
+    }
+
+    #[test]
+    fn session_info_handles_unavailable_session_manager() {
+        assert_eq!(
+            format_session_info(0, "session-uuid", None),
+            "Session: 0 messages (no session manager)\n  uuid: session-uuid"
+        );
+    }
 
     #[test]
     fn usage_message_reports_session_and_last_turn_totals() {

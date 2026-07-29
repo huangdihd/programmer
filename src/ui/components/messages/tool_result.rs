@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use async_openai::types::responses::{FunctionCallOutput, FunctionCallOutputItemParam};
+use async_openai::types::responses::FunctionCallOutputItemParam;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui_widgets::block::{Block, Padding};
@@ -55,10 +55,7 @@ impl<'a> ToolResultMessage<'a> {
     }
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
-        let text = match &self.output.output {
-            FunctionCallOutput::Text(text) => text.clone(),
-            FunctionCallOutput::Content(_) => "[non-text output]".to_string(),
-        };
+        let text = crate::ui::image_preview::output_text(&self.output.output);
         let failed = self.failed;
         let result_style = if failed {
             Style::new().fg(palette::RED_MUTED)
@@ -102,6 +99,10 @@ impl<'a> ToolResultMessage<'a> {
                 result_style,
             )));
         }
+        lines.extend(crate::ui::image_preview::preview_lines(
+            &self.output.output,
+            u16::MAX,
+        ));
 
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })

@@ -125,6 +125,11 @@ pub(crate) fn format_tool_details(tool_name: &str, arguments: &str) -> Vec<Strin
             }
             lines
         }
+        "read_image" => v
+            .get("path")
+            .and_then(|path| path.as_str())
+            .map(|path| vec![format!("path: {path}")])
+            .unwrap_or_else(|| vec![arguments.to_string()]),
         _ => vec![arguments.to_string()],
     }
 }

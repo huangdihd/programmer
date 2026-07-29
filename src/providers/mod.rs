@@ -52,7 +52,6 @@ impl ProviderManager {
     pub async fn new(config: &ProgrammerConfig) -> Self {
         let mut clients: HashMap<String, Client<OpenAIConfig>> = HashMap::new();
         let mut models: HashMap<String, Vec<String>> = HashMap::new();
-        let mut startup_errors = Vec::new();
 
         // Build clients synchronously — always instant.
         for (name, provider_config) in &config.providers {
@@ -67,13 +66,39 @@ impl ProviderManager {
             }
         }
 
+        let (discovered, startup_errors) = Self::discover_models(&config.providers, &clients).await;
+        models.extend(discovered);
+
+        ProviderManager {
+            clients,
+            models,
+            configs: config.providers.clone(),
+            default_provider: config.default_provider.clone(),
+            startup_errors,
+        }
+    }
+
+    /// Fetch auto-discovered model lists for every provider without a manual
+    /// `models` list. Returns the discovered models plus any per-provider or
+    /// global timeout errors.
+    ///
+    /// This runs the same network fetches as [`Self::new`] but without
+    /// rebuilding clients, so it can be executed in a background task and the
+    /// result applied to an existing manager.
+    pub async fn discover_models(
+        providers: &HashMap<String, ProviderConfig>,
+        clients: &HashMap<String, Client<OpenAIConfig>>,
+    ) -> (HashMap<String, Vec<String>>, Vec<String>) {
+        let mut models: HashMap<String, Vec<String>> = HashMap::new();
+        let mut startup_errors = Vec::new();
+
         // Fetch models concurrently, but with a hard cap so startup is
         // never blocked indefinitely (some DNS / TCP stacks on Windows
         // can bypass tokio::time::timeout).
         const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-        let fetches = config.providers.iter().filter_map(|(name, pc)| {
+        let fetches = providers.iter().filter_map(|(name, pc)| {
             if pc.models.is_some() {
-                return None; // already populated above
+                return None; // manual list already present
             }
             let client = clients.get(name).unwrap().clone();
             let name = name.clone();
@@ -91,12 +116,7 @@ impl ProviderManager {
                         (name, Err(msg))
                     }
                     Err(_) => {
-                        let msg = format!(
-                            "timed out fetching models for provider '{name}' after \
-                             {}s — check your network \
-                             (provider still works, but /model completion won't list its models)",
-                            MODEL_FETCH_TIMEOUT.as_secs()
-                        );
+                        let msg = model_fetch_timeout_message(&name);
                         (name, Err(msg))
                     }
                 }
@@ -118,19 +138,31 @@ impl ProviderManager {
             Err(_) => {
                 startup_errors.push(
                     "model discovery timed out — providers work, \
-                     but /model completion may be incomplete"
+                     but /model completion may be incomplete; \
+                     use /providers refresh to retry"
                         .to_string(),
                 );
             }
         }
 
-        ProviderManager {
-            clients,
-            models,
-            configs: config.providers.clone(),
-            default_provider: config.default_provider.clone(),
-            startup_errors,
+        (models, startup_errors)
+    }
+
+    /// Apply a background model-discovery result to this manager.
+    ///
+    /// Replaces the auto-discovered model lists and startup errors, leaving
+    /// manually configured models and provider clients untouched.
+    pub fn apply_model_refresh(
+        &mut self,
+        models: HashMap<String, Vec<String>>,
+        startup_errors: Vec<String>,
+    ) {
+        // Only overwrite entries for providers that were auto-discovered
+        // (manual configs are not present in `models`).
+        for (name, list) in models {
+            self.models.insert(name, list);
         }
+        self.startup_errors = startup_errors;
     }
 
     /// Resolve a `provider/model` string into a client reference and the bare
@@ -197,6 +229,12 @@ impl ProviderManager {
             .unwrap_or_default()
     }
 
+    /// Access the provider clients so model discovery can be re-run in the
+    /// background without rebuilding the manager.
+    pub(crate) fn clients(&self) -> &HashMap<String, Client<OpenAIConfig>> {
+        &self.clients
+    }
+
     /// Create a stub instance for tests — no clients, no models.
     #[cfg(test)]
     pub fn stub(models: HashMap<String, Vec<String>>) -> Self {
@@ -210,9 +248,27 @@ impl ProviderManager {
     }
 }
 
+fn model_fetch_timeout_message(name: &str) -> String {
+    format!(
+        "timed out fetching models for provider '{name}' after {}s — \
+         use /providers refresh to retry \
+         (provider still works, but /model completion won't list its models)",
+        MODEL_FETCH_TIMEOUT.as_secs()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_fetch_timeout_points_to_refresh_command() {
+        let message = model_fetch_timeout_message("llmhub");
+
+        assert!(message.contains("provider 'llmhub'"));
+        assert!(message.contains("/providers refresh"));
+        assert!(!message.contains("check your network"));
+    }
 
     /// Startup must never hang on model discovery: an unreachable provider
     /// gets cut off by the timeout, reports an error, and falls back to

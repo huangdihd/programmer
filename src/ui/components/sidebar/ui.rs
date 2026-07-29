@@ -743,7 +743,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let tasks = vec![SidebarTaskSnapshot {
             id: 7,
-            name: "cargo watch 构建监听".to_string(),
+            name: "cargo watch build monitor".to_string(),
             status: crate::tasks::TaskStatus::Running,
             exit_code: None,
             elapsed: Duration::from_secs(75),

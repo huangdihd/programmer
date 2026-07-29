@@ -25,12 +25,12 @@
 
 use super::{
     ask_user, blob, command, configure_diagnostics, diagnostics, edit_file, fetch, grep,
-    mcp_bridge, read_file, run_local_tool, task, todo, write_file,
+    mcp_bridge, read_file, read_image, run_local_tool, task, todo, write_file,
 };
 use crate::mcp::McpManager;
 use crate::mcp::types::McpPolicy;
 use crate::ui::event::Event;
-use async_openai::types::responses::{FunctionToolCall, Tool};
+use async_openai::types::responses::{FunctionCallOutput, FunctionToolCall, Tool};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
@@ -86,7 +86,11 @@ pub(crate) trait ToolProvider: Send + Sync {
 
     /// Execute one call this provider owns, returning the raw tool result
     /// (`Ok` = success, `Err` = failure — the caller wraps and truncates it).
-    async fn call(&self, call: &FunctionToolCall, ctx: &ToolCtx<'_>) -> Result<String, String>;
+    async fn call(
+        &self,
+        call: &FunctionToolCall,
+        ctx: &ToolCtx<'_>,
+    ) -> Result<FunctionCallOutput, String>;
 }
 
 /// The built-in local tools, exposed as one provider — the local analogue of an
@@ -113,6 +117,7 @@ impl ToolProvider for LocalToolProvider {
         vec![
             command::tool(),
             read_file::tool(),
+            read_image::tool(),
             write_file::tool(),
             edit_file::tool(),
             grep::tool(),
@@ -129,7 +134,7 @@ impl ToolProvider for LocalToolProvider {
     fn is_read_only(&self, name: &str) -> bool {
         matches!(
             name,
-            read_file::NAME | grep::NAME | blob::NAME | fetch::NAME
+            read_file::NAME | read_image::NAME | grep::NAME | blob::NAME | fetch::NAME
         )
     }
 
@@ -147,18 +152,32 @@ impl ToolProvider for LocalToolProvider {
         }
     }
 
-    async fn call(&self, call: &FunctionToolCall, ctx: &ToolCtx<'_>) -> Result<String, String> {
+    async fn call(
+        &self,
+        call: &FunctionToolCall,
+        ctx: &ToolCtx<'_>,
+    ) -> Result<FunctionCallOutput, String> {
         if call.name == ask_user::NAME {
             // ask_user needs the UI channel, so it isn't part of run_local_tool.
-            ask_user::run(&call.arguments, ctx.sender, ctx.cancel, ctx.operation_id).await
+            ask_user::run(&call.arguments, ctx.sender, ctx.cancel, ctx.operation_id)
+                .await
+                .map(FunctionCallOutput::Text)
         } else if call.name == command::NAME {
             // The command tool streams its output to the live registry (keyed by
             // call id) so the TUI can render it as it runs.
-            command::run_with_live(&call.arguments, &call.call_id, ctx.cancel).await
+            command::run_with_live(&call.arguments, &call.call_id, ctx.cancel)
+                .await
+                .map(FunctionCallOutput::Text)
         } else if call.name == todo::NAME {
-            todo::run(&call.arguments, &self.todos).await
+            todo::run(&call.arguments, &self.todos)
+                .await
+                .map(FunctionCallOutput::Text)
+        } else if call.name == read_image::NAME {
+            read_image::run(&call.arguments).await
         } else {
-            run_local_tool(&call.name, &call.arguments).await
+            run_local_tool(&call.name, &call.arguments)
+                .await
+                .map(FunctionCallOutput::Text)
         }
     }
 }
@@ -190,8 +209,14 @@ impl ToolProvider for McpToolProvider {
         }
     }
 
-    async fn call(&self, call: &FunctionToolCall, _ctx: &ToolCtx<'_>) -> Result<String, String> {
-        mcp_bridge::run_mcp_call(call, Some(self.manager.as_ref())).await
+    async fn call(
+        &self,
+        call: &FunctionToolCall,
+        _ctx: &ToolCtx<'_>,
+    ) -> Result<FunctionCallOutput, String> {
+        mcp_bridge::run_mcp_call(call, Some(self.manager.as_ref()))
+            .await
+            .map(FunctionCallOutput::Text)
     }
 }
 
@@ -267,7 +292,7 @@ impl ToolRegistry {
         &self,
         call: &FunctionToolCall,
         ctx: &ToolCtx<'_>,
-    ) -> Result<String, String> {
+    ) -> Result<FunctionCallOutput, String> {
         match self.provider_for(&call.name) {
             Some(provider) => provider.call(call, ctx).await,
             None => Err(format!("error: unknown tool '{}'", call.name)),
@@ -302,9 +327,11 @@ mod tests {
             })
             .collect();
         assert!(names.contains(&read_file::NAME.to_string()));
+        assert!(names.contains(&read_image::NAME.to_string()));
         assert!(names.contains(&ask_user::NAME.to_string()));
         // Read-only classification drives concurrent execution.
         assert!(p.is_read_only(read_file::NAME));
+        assert!(p.is_read_only(read_image::NAME));
         assert!(!p.is_read_only(write_file::NAME));
         // Interaction classification drives the headless pre-deny.
         assert!(p.requires_interaction(ask_user::NAME));
@@ -383,7 +410,7 @@ mod tests {
         let r = reg
             .call(&call("read_file", &format!("{{\"path\":{path}}}")), &ctx)
             .await;
-        assert_eq!(r.as_deref(), Ok("hello"));
+        assert_eq!(r, Ok(FunctionCallOutput::Text("hello".to_string())));
         let _ = std::fs::remove_file(&tmp);
 
         // An unadvertised name is a failed result, not a panic.

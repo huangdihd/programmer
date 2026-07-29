@@ -227,7 +227,11 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         }
         AppEvent::Quit => handle_quit_request(app),
         AppEvent::ProvidersChanged => reload_provider_manager(app).await,
-        AppEvent::RefreshProviderModels => handle_provider_models_refresh(app).await,
+        AppEvent::RefreshProviderModels => handle_provider_models_refresh(app),
+        AppEvent::ProviderModelsRefreshed {
+            models,
+            startup_errors,
+        } => handle_provider_models_refreshed(app, models, startup_errors),
         AppEvent::McpChanged => handle_mcp_changed(app).await,
         AppEvent::QuestionPrompt {
             question,
@@ -471,14 +475,35 @@ async fn reload_provider_manager(app: &mut App<'_>) {
     }
 }
 
-async fn handle_provider_models_refresh(app: &mut App<'_>) {
-    reload_provider_manager(app).await;
-    let provider_names = app.provider_manager.provider_names();
-    let provider_count = provider_names.len();
-    let model_count = provider_names
-        .into_iter()
-        .map(|name| app.provider_manager.models_for(name).len())
-        .sum::<usize>();
+/// `/providers refresh`: kick off background model discovery so the event
+/// loop stays responsive while the network fetches run.
+fn handle_provider_models_refresh(app: &mut App<'_>) {
+    let providers = app.config.providers.clone();
+    let clients = app.provider_manager.clients().clone();
+    let tx = app.events.sender.clone();
+    tokio::spawn(async move {
+        let (models, startup_errors) =
+            crate::providers::ProviderManager::discover_models(&providers, &clients).await;
+        let _ = tx.send(Event::App(AppEvent::ProviderModelsRefreshed {
+            models,
+            startup_errors,
+        }));
+    });
+}
+
+/// Background model discovery finished: apply the fresh lists and report.
+fn handle_provider_models_refreshed(
+    app: &mut App<'_>,
+    models: std::collections::HashMap<String, Vec<String>>,
+    startup_errors: Vec<String>,
+) {
+    let model_count = models.values().map(|v| v.len()).sum::<usize>();
+    let provider_count = models.len();
+    app.provider_manager
+        .apply_model_refresh(models, startup_errors);
+    for msg in &app.provider_manager.startup_errors {
+        app.conversation_panel.add_error_string(msg.clone());
+    }
     app.conversation_panel.add_info_string(format!(
         "Provider models refreshed: {model_count} model(s) across {provider_count} provider(s)."
     ));

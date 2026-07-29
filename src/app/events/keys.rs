@@ -275,11 +275,15 @@ pub(crate) async fn handle_key_events(
             update_completions(app);
         }
         KeyCode::Backspace => {
-            app.input_panel.input(key_event);
+            if !app.input_panel.delete_placeholder_backward() {
+                app.input_panel.input(key_event);
+            }
             update_completions(app);
         }
         KeyCode::Delete => {
-            app.input_panel.input(key_event);
+            if !app.input_panel.delete_placeholder_forward() {
+                app.input_panel.input(key_event);
+            }
             update_completions(app);
         }
         KeyCode::Up => {
@@ -339,7 +343,7 @@ fn paste_clipboard_image(app: &mut App<'_>) {
             return;
         }
     };
-    let attachment = match crate::commands::image_attachment_from_bytes(&image.png) {
+    let attachment = match crate::commands::image_content_from_bytes(&image.png) {
         Ok(attachment) => attachment,
         Err(error) => {
             app.conversation_panel.add_warning_string(error);

@@ -306,6 +306,9 @@ impl McpManager {
     pub(crate) fn server_count(&self) -> usize {
         self.servers.len()
     }
+    pub(crate) fn has_server(&self, name: &str) -> bool {
+        self.servers.contains_key(name)
+    }
 
     pub(crate) fn all_tools(&self) -> Vec<(String, McpTool)> {
         let mut out = Vec::new();

@@ -13,9 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use async_openai::types::responses::{
-    FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
-};
+use async_openai::types::responses::{FunctionCallOutputItemParam, FunctionToolCall};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use unicode_width::UnicodeWidthStr;
@@ -29,6 +27,7 @@ use crate::ui::markdown_theme::palette;
 /// full result. Successful calls render in green; failed calls render in red.
 pub struct ToolCallMessage<'a> {
     call: &'a FunctionToolCall,
+    width: u16,
     output: Option<&'a FunctionCallOutputItemParam>,
     failed: bool,
     expanded: bool,
@@ -42,9 +41,10 @@ pub struct ToolCallMessage<'a> {
 }
 
 impl<'a> ToolCallMessage<'a> {
-    pub fn new(call: &'a FunctionToolCall) -> Self {
+    pub fn new(call: &'a FunctionToolCall, width: u16) -> Self {
         Self {
             call,
+            width,
             output: None,
             failed: false,
             expanded: false,
@@ -79,10 +79,9 @@ impl<'a> ToolCallMessage<'a> {
     }
 
     pub fn into_text(self) -> Text<'static> {
-        let result_text = self.output.map(|o| match &o.output {
-            FunctionCallOutput::Text(t) => t.clone(),
-            FunctionCallOutput::Content(_) => "[non-text output]".to_string(),
-        });
+        let output = self.output;
+        let result_text =
+            output.map(|output| crate::ui::image_preview::output_text(&output.output));
         let failed = self.failed;
 
         let status_color = if failed { palette::RED } else { palette::GREEN };
@@ -205,6 +204,12 @@ impl<'a> ToolCallMessage<'a> {
                     "  \u{23BF} [no output]",
                     detail_style(),
                 )));
+            }
+            if let Some(output) = output {
+                lines.extend(crate::ui::image_preview::preview_lines(
+                    &output.output,
+                    self.width,
+                ));
             }
         } else if let Some(live) = self.live_output {
             push_live_output(&mut lines, live, muted, None);
@@ -444,6 +449,12 @@ fn value_text(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_openai::types::responses::{
+        FunctionCallOutput, ImageDetail, InputContent, InputImageContent, InputTextContent,
+    };
+    use base64::Engine;
+    use image::{ImageBuffer, ImageFormat, Rgb};
+    use std::io::Cursor;
 
     #[test]
     fn diff_ops_keeps_unchanged_middle_line() {
@@ -497,6 +508,54 @@ mod tests {
         assert_eq!(rendered.first().unwrap(), "  ⎿ line 1");
         assert_eq!(rendered.last().unwrap(), "  ⎿ line 12");
         assert!(!rendered.iter().any(|line| line.contains('⋯')));
+    }
+
+    #[test]
+    fn image_tool_output_preview_appears_only_when_expanded() {
+        let image = ImageBuffer::from_pixel(2, 2, Rgb([0u8, 255, 0]));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        let output = FunctionCallOutputItemParam {
+            call_id: "image-call".to_string(),
+            output: FunctionCallOutput::Content(vec![
+                InputContent::InputText(InputTextContent {
+                    text: "Read image test.png (2x2).".to_string(),
+                }),
+                InputContent::InputImage(InputImageContent {
+                    detail: ImageDetail::Auto,
+                    file_id: None,
+                    image_url: Some(format!(
+                        "data:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+                    )),
+                }),
+            ]),
+            id: None,
+            status: None,
+        };
+        let call = FunctionToolCall {
+            arguments: r#"{"path":"test.png"}"#.to_string(),
+            call_id: "image-call".to_string(),
+            namespace: None,
+            name: crate::tools::read_image::NAME.to_string(),
+            id: None,
+            status: None,
+        };
+
+        let collapsed = ToolCallMessage::new(&call, 80)
+            .output(Some(&output))
+            .into_text();
+        assert!(
+            !plain(&collapsed.lines)
+                .iter()
+                .any(|line| line.contains('▀'))
+        );
+
+        let expanded = ToolCallMessage::new(&call, 80)
+            .output(Some(&output))
+            .expanded(true)
+            .into_text();
+        assert!(plain(&expanded.lines).iter().any(|line| line.contains('▀')));
     }
 
     fn plain(lines: &[Line<'static>]) -> Vec<String> {

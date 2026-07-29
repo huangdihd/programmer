@@ -291,7 +291,7 @@ mod windows_tests {
     fn copy_roundtrips_unicode_without_mojibake() {
         // The exact failure the user hit: non-ASCII went through `clip` and came
         // back garbled. A native UTF-16 write must preserve it byte-for-byte.
-        let text = "无法立即完成一个非阻止性套接字操作 — hello 世界 🌍";
+        let text = "résumé unavailable — hello 🌍";
         assert!(
             set_clipboard_windows(text),
             "native clipboard write should succeed"

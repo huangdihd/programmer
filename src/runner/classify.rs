@@ -187,7 +187,7 @@ fn extract_msg_text(msg: &async_openai::types::responses::OutputMessage) -> Stri
 /// Build light and full classifier context strings from the conversation items.
 ///
 /// `light_context` carries the last few user+assistant exchanges so the fast
-/// yes/no path has enough to understand short replies like "好的".
+/// yes/no path has enough to understand short replies like "sounds good".
 ///
 /// `full_context` carries the **complete** conversation transcript (every user
 /// message, every assistant message, every tool call with args, every tool

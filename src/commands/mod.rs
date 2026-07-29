@@ -370,7 +370,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         help: &[HelpEntry {
             order: 22,
             usage: "/clear | /c",
-            description: "Clear the conversation history",
+            description: "Delete this session; reset chat, todos, images, and diagnostics",
         }],
     },
     CommandSpec {
@@ -901,19 +901,21 @@ fn is_executable(entry: &std::fs::DirEntry) -> bool {
 
 /// Keep local image attachments bounded: base64 and session JSON add roughly
 /// another third on top of the raw bytes.
-const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 pub(crate) const MAX_IMAGES_PER_MESSAGE: usize = 20;
 
-pub(crate) fn image_attachment_from_bytes(bytes: &[u8]) -> Result<InputImageContent, String> {
+pub(crate) fn image_content_from_bytes(bytes: &[u8]) -> Result<InputImageContent, String> {
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
         return Err(format!(
-            "clipboard image is {} bytes; limit is {MAX_IMAGE_BYTES}",
+            "image is {} bytes; limit is {MAX_IMAGE_BYTES}",
             bytes.len()
         ));
     }
-    let kind = detect_image(bytes)
-        .ok_or_else(|| "clipboard image encoding is not supported".to_string())?;
+    let kind = detect_image(bytes).ok_or_else(|| "image encoding is not supported".to_string())?;
+    if kind == ImageKind::Gif && gif_frame_count(bytes).unwrap_or(2) != 1 {
+        return Err("animated or malformed GIF files are not supported".to_string());
+    }
     Ok(InputImageContent {
         detail: ImageDetail::Auto,
         file_id: None,
@@ -966,13 +968,58 @@ pub(crate) struct ExpandedReferences {
     pub notices: Vec<String>,
 }
 
+fn reference_tails(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices('@').filter_map(|(index, _)| {
+        let starts_token = index == 0
+            || text[..index]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        starts_token.then_some(&text[index + 1..])
+    })
+}
+
+fn quoted_reference(tail: &str) -> Option<&str> {
+    let quote = tail.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let quoted = &tail[quote.len_utf8()..];
+    let end = quoted.find(quote)?;
+    Some(&quoted[..end])
+}
+
+async fn resolve_file_reference(tail: &str) -> Option<(String, String, std::fs::Metadata)> {
+    let candidates = if let Some(quoted) = quoted_reference(tail) {
+        vec![quoted]
+    } else {
+        let mut ends = tail
+            .char_indices()
+            .filter_map(|(index, c)| c.is_whitespace().then_some(index))
+            .collect::<Vec<_>>();
+        ends.push(tail.len());
+        ends.into_iter()
+            .rev()
+            .map(|end| tail[..end].trim_end())
+            .filter(|candidate| !candidate.is_empty())
+            .collect()
+    };
+
+    for path in candidates {
+        let fs_path = expand_tilde(path);
+        if let Ok(meta) = tokio::fs::metadata(&fs_path).await
+            && meta.is_file()
+        {
+            return Some((path.to_string(), fs_path, meta));
+        }
+    }
+    None
+}
+
 /// Expand diagnostic and local-path references in a sent message. Diagnostic
 /// references use the latest already-collected snapshot; they never run a
-/// checker while the user is sending a message. Supported images are attached
-/// when vision is enabled, while other files are passed as path-only references.
+/// checker while the user is sending a message. Supported images are retained
+/// in session history and filtered at request time when vision is off, while
+/// other files are passed as path-only references.
 pub(crate) async fn expand_references(
     text: &str,
-    vision_enabled: bool,
     diagnostics: Option<&[Diagnostic]>,
 ) -> ExpandedReferences {
     let mut seen_paths = std::collections::HashSet::new();
@@ -984,10 +1031,8 @@ pub(crate) async fn expand_references(
     let mut notices = Vec::new();
     let mut total_image_bytes = 0u64;
 
-    for raw in text.split_whitespace() {
-        let Some(reference) = raw.strip_prefix('@') else {
-            continue;
-        };
+    for tail in reference_tails(text) {
+        let reference = tail.split_whitespace().next().unwrap_or_default();
         if reference.is_empty() {
             continue;
         }
@@ -1012,15 +1057,13 @@ pub(crate) async fn expand_references(
             continue;
         }
 
-        let path = reference;
-        if !seen_paths.insert(path) {
-            continue;
-        }
-        let fs_path = expand_tilde(path);
-        let Ok(meta) = tokio::fs::metadata(&fs_path).await else {
+        let Some((path, fs_path, meta)) = resolve_file_reference(tail).await else {
+            notices.push(format!(
+                "could not resolve @{reference}: local file does not exist"
+            ));
             continue;
         };
-        if !meta.is_file() {
+        if !seen_paths.insert(path.clone()) {
             continue;
         }
 
@@ -1033,12 +1076,6 @@ pub(crate) async fn expand_references(
         };
 
         if let Some(kind) = detect_image(&header[..header_len]) {
-            if !vision_enabled {
-                notices.push(format!(
-                    "skipped image @{path}: vision is off; use /vision on to attach images"
-                ));
-                continue;
-            }
             if images.len() >= MAX_IMAGES_PER_MESSAGE {
                 notices.push(format!(
                     "skipped image @{path}: at most {MAX_IMAGES_PER_MESSAGE} images may be attached to one message"
@@ -1067,15 +1104,10 @@ pub(crate) async fn expand_references(
                 ));
                 continue;
             }
-            images.push(InputImageContent {
-                detail: ImageDetail::Auto,
-                file_id: None,
-                image_url: Some(format!(
-                    "data:{};base64,{}",
-                    kind.mime_type(),
-                    BASE64.encode(&bytes)
-                )),
-            });
+            images.push(
+                image_content_from_bytes(&bytes)
+                    .expect("validated supported image must produce image content"),
+            );
             total_image_bytes += meta.len();
             continue;
         }
@@ -1351,7 +1383,10 @@ mod tests {
             ),
             ("/session | /s", "Show current session info"),
             ("/usage", "Show token usage for the current session"),
-            ("/clear | /c", "Clear the conversation history"),
+            (
+                "/clear | /c",
+                "Delete this session; reset chat, todos, images, and diagnostics",
+            ),
             ("/quit | /q", "Exit the application"),
             ("/help | /?", "Show this help"),
         ];
@@ -1616,7 +1651,7 @@ mod tests {
 
     #[tokio::test]
     async fn expand_file_references_adds_path_without_content() {
-        let out = expand_references("look at @Cargo.toml please", false, None).await;
+        let out = expand_references("look at @Cargo.toml please", None).await;
         assert!(
             out.text.starts_with("look at @Cargo.toml please"),
             "keeps typed text"
@@ -1635,10 +1670,14 @@ mod tests {
 
     #[tokio::test]
     async fn expand_file_references_leaves_plain_text_alone() {
-        let out = expand_references("no references here @nonexistent.xyz", false, None).await;
+        let out = expand_references("no references here @nonexistent.xyz", None).await;
         assert_eq!(out.text, "no references here @nonexistent.xyz");
         assert!(out.images.is_empty());
-        assert!(out.notices.is_empty());
+        assert!(
+            out.notices
+                .iter()
+                .any(|notice| notice.contains("local file does not exist"))
+        );
     }
 
     #[tokio::test]
@@ -1658,7 +1697,6 @@ mod tests {
         ];
         let out = expand_references(
             "fix @errors and @diagnostic:src/lib.rs:42:5",
-            false,
             Some(&diagnostics),
         )
         .await;
@@ -1675,7 +1713,7 @@ mod tests {
 
     #[tokio::test]
     async fn expand_references_warns_when_diagnostics_are_missing_or_stale() {
-        let unavailable = expand_references("fix @errors", false, None).await;
+        let unavailable = expand_references("fix @errors", None).await;
         assert_eq!(unavailable.text, "fix @errors");
         assert!(
             unavailable
@@ -1684,7 +1722,7 @@ mod tests {
                 .any(|notice| notice.contains("diagnostics are not ready"))
         );
 
-        let stale = expand_references("fix @diagnostic:src/lib.rs:42", false, Some(&[])).await;
+        let stale = expand_references("fix @diagnostic:src/lib.rs:42", Some(&[])).await;
         assert_eq!(stale.text, "fix @diagnostic:src/lib.rs:42");
         assert!(
             stale
@@ -1708,7 +1746,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let out = expand_references("@diagnostics", false, Some(&diagnostics)).await;
+        let out = expand_references("@diagnostics", Some(&diagnostics)).await;
         assert!(out.text.contains("… 1 more diagnostics omitted"));
         assert!(
             out.notices
@@ -1726,7 +1764,7 @@ mod tests {
             .unwrap();
         let reference = format!("@{}", path.display());
 
-        let out = expand_references(&reference, false, None).await;
+        let out = expand_references(&reference, None).await;
         assert!(out.text.contains(&format!(
             "Referenced local file path (content not included): {}",
             path.display()
@@ -1737,7 +1775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_reference_respects_vision_switch() {
+    async fn image_reference_is_retained_for_request_time_vision_filtering() {
         let path =
             std::env::temp_dir().join(format!("programmer_vision_{}.png", std::process::id()));
         tokio::fs::write(&path, b"\x89PNG\r\n\x1a\nfake")
@@ -1745,14 +1783,11 @@ mod tests {
             .unwrap();
         let reference = format!("@{}", path.display());
 
-        let off = expand_references(&reference, false, None).await;
-        assert!(off.images.is_empty());
-        assert!(off.notices.iter().any(|n| n.contains("vision is off")));
-
-        let on = expand_references(&reference, true, None).await;
-        assert_eq!(on.images.len(), 1);
+        let out = expand_references(&reference, None).await;
+        assert_eq!(out.images.len(), 1);
+        assert!(out.notices.is_empty());
         assert!(
-            on.images[0]
+            out.images[0]
                 .image_url
                 .as_deref()
                 .is_some_and(|url| url.starts_with("data:image/png;base64,"))
@@ -1760,10 +1795,28 @@ mod tests {
         tokio::fs::remove_file(path).await.ok();
     }
 
+    #[tokio::test]
+    async fn image_reference_supports_unquoted_paths_with_spaces() {
+        let path = std::env::temp_dir().join(format!(
+            "programmer vision spaced {}.png",
+            std::process::id()
+        ));
+        tokio::fs::write(&path, b"\x89PNG\r\n\x1a\nfake")
+            .await
+            .unwrap();
+        let input = format!("@{} describe this image", path.display());
+
+        let out = expand_references(&input, None).await;
+
+        assert_eq!(out.images.len(), 1);
+        assert!(out.notices.is_empty());
+        tokio::fs::remove_file(path).await.ok();
+    }
+
     #[test]
     fn clipboard_png_becomes_an_image_attachment() {
         let attachment =
-            image_attachment_from_bytes(b"\x89PNG\r\n\x1a\nfake").expect("PNG attachment");
+            image_content_from_bytes(b"\x89PNG\r\n\x1a\nfake").expect("PNG attachment");
 
         assert!(
             attachment

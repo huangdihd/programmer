@@ -20,6 +20,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 const ACCENT: Color = Color::LightBlue;
+const PASTE_ACCENT: Color = Color::LightMagenta;
 /// Accent while the input is a `!command` (shell mode) — the green of the
 /// terminal panel's grabbed state.
 const BANG_ACCENT: Color = Color::LightGreen;
@@ -58,6 +59,32 @@ impl Widget for &InputPanel<'_> {
             .render(chunks[0], buf);
 
         self.text_area.render(chunks[1], buf);
+        style_placeholders(self, chunks[1], buf);
+    }
+}
+
+fn style_placeholders(panel: &InputPanel<'_>, area: Rect, buf: &mut Buffer) {
+    let placeholders = panel
+        .placeholders()
+        .map(|placeholder| placeholder.chars().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let style = Style::default()
+        .fg(PASTE_ACCENT)
+        .add_modifier(Modifier::BOLD);
+
+    for y in area.y..area.bottom() {
+        let symbols = (area.x..area.right())
+            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect::<Vec<_>>();
+        for placeholder in &placeholders {
+            for start in 0..=symbols.len().saturating_sub(placeholder.len()) {
+                if symbols[start..].starts_with(placeholder) {
+                    for offset in 0..placeholder.len() {
+                        buf[(area.x + (start + offset) as u16, y)].set_style(style);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -95,5 +122,20 @@ mod tests {
         panel.set_content("cargo test");
         let back = render_to_text(&panel);
         assert!(back.contains(" Input "), "back to normal: {back}");
+    }
+
+    #[test]
+    fn pasted_placeholder_has_distinct_color() {
+        let mut panel = InputPanel::new();
+        panel.add_paste("many\nlines".to_string());
+        let area = Rect::new(0, 0, 60, 5);
+        let mut buf = Buffer::empty(area);
+
+        panel.render(area, &mut buf);
+
+        let opening_bracket = (0..area.width)
+            .find(|&x| buf[(x, 1)].symbol() == "[")
+            .expect("rendered paste placeholder");
+        assert_eq!(buf[(opening_bracket, 1)].fg, PASTE_ACCENT);
     }
 }

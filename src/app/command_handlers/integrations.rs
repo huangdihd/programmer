@@ -129,11 +129,11 @@ fn mcp(app: &mut App<'_>, arg: &str) {
                 .mcp_servers
                 .iter()
                 .map(|server| {
-                    let policy = match server.auto_approve {
-                        crate::mcp::types::McpPolicy::Trusted => "trusted",
-                        crate::mcp::types::McpPolicy::Review => "review",
-                    };
-                    format!("  {} ({}:{policy})", server.name, server.command)
+                    let connected = app
+                        .mcp_manager
+                        .as_deref()
+                        .is_some_and(|manager| manager.has_server(&server.name));
+                    format_mcp_server(server, connected)
                 })
                 .collect();
             lines.insert(0, "MCP servers:".to_string());
@@ -144,5 +144,56 @@ fn mcp(app: &mut App<'_>, arg: &str) {
             "usage: /mcp show — list MCP servers and their status\n\
              \u{20}      /mcp manage — open the management panel",
         ),
+    }
+}
+
+fn format_mcp_server(server: &crate::mcp::types::McpServerConfig, connected: bool) -> String {
+    let status = if connected {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    let transport = match &server.url {
+        Some(_) => "HTTP".to_string(),
+        None => format!("stdio: {}", server.command),
+    };
+    let policy = match server.auto_approve {
+        crate::mcp::types::McpPolicy::Trusted => "trusted",
+        crate::mcp::types::McpPolicy::Review => "review",
+    };
+    format!("  {} [{status}] ({transport}, {policy})", server.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_mcp_server;
+    use crate::mcp::types::{McpPolicy, McpServerConfig};
+    use std::collections::HashMap;
+
+    fn server(command: &str, url: Option<&str>) -> McpServerConfig {
+        McpServerConfig {
+            name: "example".to_string(),
+            command: command.to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: url.map(str::to_string),
+            auto_approve: McpPolicy::Trusted,
+        }
+    }
+
+    #[test]
+    fn mcp_status_formats_stdio_servers() {
+        assert_eq!(
+            format_mcp_server(&server("example-mcp", None), true),
+            "  example [connected] (stdio: example-mcp, trusted)"
+        );
+    }
+
+    #[test]
+    fn mcp_status_formats_http_servers_without_an_empty_command() {
+        assert_eq!(
+            format_mcp_server(&server("", Some("https://example.com/mcp")), false),
+            "  example [disconnected] (HTTP, trusted)"
+        );
     }
 }

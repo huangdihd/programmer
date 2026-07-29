@@ -24,6 +24,7 @@ pub mod grep;
 pub(crate) mod mcp_bridge;
 pub(crate) mod provider;
 pub mod read_file;
+pub mod read_image;
 pub mod task;
 pub mod todo;
 pub mod write_file;
@@ -177,11 +178,13 @@ pub(crate) async fn run_tool_call(
     sender: &tokio::sync::mpsc::UnboundedSender<crate::ui::event::Event>,
     mcp: Option<&crate::mcp::McpManager>,
 ) -> ToolOutput {
-    // Every branch yields a `Result<String, String>`: `Ok` is a successful
-    // result, `Err` is a failure. This is the single source of truth for the
-    // `failed` flag below.
-    let result: Result<String, String> = if call.name.starts_with("mcp__") {
-        mcp_bridge::run_mcp_call(call, mcp).await
+    // Every branch yields a `Result<FunctionCallOutput, String>`: `Ok` is a
+    // successful text or multimodal result, `Err` is a failure. This is the
+    // single source of truth for the `failed` flag below.
+    let result: Result<FunctionCallOutput, String> = if call.name.starts_with("mcp__") {
+        mcp_bridge::run_mcp_call(call, mcp)
+            .await
+            .map(FunctionCallOutput::Text)
     } else if call.name == ask_user::NAME {
         // ask_user needs the UI channel, so it isn't part of run_local_tool.
         ask_user::run(
@@ -191,8 +194,13 @@ pub(crate) async fn run_tool_call(
             0,
         )
         .await
+        .map(FunctionCallOutput::Text)
+    } else if call.name == read_image::NAME {
+        read_image::run(&call.arguments).await
     } else {
-        run_local_tool(&call.name, &call.arguments).await
+        run_local_tool(&call.name, &call.arguments)
+            .await
+            .map(FunctionCallOutput::Text)
     };
 
     make_tool_output_for_call(call, result)
@@ -202,7 +210,7 @@ pub(crate) async fn run_tool_call(
 /// the inline output budget.
 pub(crate) fn make_tool_output_for_call(
     call: &FunctionToolCall,
-    result: Result<String, String>,
+    result: Result<FunctionCallOutput, String>,
 ) -> ToolOutput {
     make_tool_output_named(&call.name, &call.call_id, result)
 }
@@ -210,18 +218,24 @@ pub(crate) fn make_tool_output_for_call(
 fn make_tool_output_named(
     tool_name: &str,
     call_id: &str,
-    result: Result<String, String>,
+    result: Result<FunctionCallOutput, String>,
 ) -> ToolOutput {
-    let (text, failed) = match result {
-        Ok(text) => (text, false),
-        Err(text) => (text, true),
+    let (output, failed) = match result {
+        Ok(FunctionCallOutput::Text(text)) => (
+            FunctionCallOutput::Text(archive_and_truncate(tool_name, call_id, text)),
+            false,
+        ),
+        Ok(output) => (output, false),
+        Err(text) => (
+            FunctionCallOutput::Text(archive_and_truncate(tool_name, call_id, text)),
+            true,
+        ),
     };
-    let text = archive_and_truncate(tool_name, call_id, text);
 
     ToolOutput {
         param: FunctionCallOutputItemParam {
             call_id: call_id.to_string(),
-            output: FunctionCallOutput::Text(text),
+            output,
             id: None,
             status: None,
         },
@@ -410,7 +424,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let original = "你好-output\n".repeat(MAX_OUTPUT_LENGTH);
+        let original = "résumé-output\n".repeat(MAX_OUTPUT_LENGTH);
         let relative =
             archive_output_in(&root, "mcp/unsafe", "../call", &original).expect("archive");
         assert!(relative.starts_with(".programmer/outputs"));
@@ -429,13 +443,13 @@ mod tests {
 
     #[test]
     fn truncated_output_keeps_unicode_head_tail_and_archive_path() {
-        let original = "始".repeat(MAX_OUTPUT_LENGTH) + &"终".repeat(20);
+        let original = "α".repeat(MAX_OUTPUT_LENGTH) + &"ω".repeat(20);
         let text = truncate_output(
             original,
             "full output saved to .programmer/outputs/command-call.txt",
         );
-        assert!(text.starts_with('始'));
-        assert!(text.ends_with('终'));
+        assert!(text.starts_with('α'));
+        assert!(text.ends_with('ω'));
         assert!(text.contains(".programmer/outputs/command-call.txt"));
         assert!(text.contains("8020 chars total"));
     }

@@ -317,7 +317,7 @@ impl SessionManager {
     }
 
     /// Path to a specific session file.
-    fn session_path(&self, uuid: &str) -> PathBuf {
+    pub(crate) fn session_path(&self, uuid: &str) -> PathBuf {
         self.sessions_dir.join(format!("{uuid}.json"))
     }
 }

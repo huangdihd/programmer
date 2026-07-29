@@ -106,7 +106,7 @@ impl<'a> AssistantMessage<'a> {
                     .into_parts()
             }
             OutputItem::FunctionCall(call) => (
-                ToolCallMessage::new(call)
+                ToolCallMessage::new(call, self.width)
                     .output(self.tool_output.map(|(output, _, _)| output))
                     .failed(
                         self.tool_output

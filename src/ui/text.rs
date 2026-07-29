@@ -101,23 +101,23 @@ mod tests {
         assert_eq!(truncate_to_width("hello", 10), "hello");
         // ASCII over budget: cut with ellipsis.
         assert_eq!(truncate_to_width("hello world", 5), "hello…");
-        // CJK chars are 2 columns wide; never split mid-char.
-        assert_eq!(truncate_to_width("浏览器布局", 4), "浏览…");
-        assert_eq!(truncate_to_width("浏览器布局", 5), "浏览…");
+        // Full-width characters occupy 2 columns; never split mid-char.
+        assert_eq!(truncate_to_width("ＡＢＣＤＥ", 4), "ＡＢ…");
+        assert_eq!(truncate_to_width("ＡＢＣＤＥ", 5), "ＡＢ…");
         // Zero budget is safe.
         assert_eq!(truncate_to_width("x", 0), "…");
         assert_eq!(truncate_to_width("", 0), "");
     }
 
     #[test]
-    fn wrapping_breaks_at_spaces_and_survives_cjk() {
+    fn wrapping_breaks_at_spaces_and_survives_wide_characters() {
         assert_eq!(wrap_to_width("ab cd", 3), vec!["ab", "cd"]);
-        // A long CJK run wraps at width boundaries without panicking.
-        let chunks = wrap_to_width("浏览器上的布局错位问题", 6);
+        // A long full-width run wraps at width boundaries without panicking.
+        let chunks = wrap_to_width("ＡＢＣＤＥＦＧ", 6);
         assert!(chunks.iter().all(|c| c.chars().count() <= 3));
-        assert_eq!(chunks.concat(), "浏览器上的布局错位问题");
+        assert_eq!(chunks.concat(), "ＡＢＣＤＥＦＧ");
         // Degenerate budget still makes progress.
-        assert_eq!(wrap_to_width("浏", 1), vec!["浏"]);
+        assert_eq!(wrap_to_width("Ａ", 1), vec!["Ａ"]);
         assert_eq!(wrap_to_width("abc", 0), vec!["abc"]);
     }
 

@@ -54,7 +54,7 @@ impl WelcomeMessage {
             .wrap(Wrap { trim: true })
             .line_count(right_chunks[1].width) as u16;
 
-        left_lines.max(right_lines) + 2 // 上下边框
+        left_lines.max(right_lines) + 2 // Top and bottom borders.
     }
 
     fn block(&self) -> Block<'static> {

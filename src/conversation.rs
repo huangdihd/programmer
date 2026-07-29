@@ -101,7 +101,11 @@ impl Conversation {
             {
                 match &mut output.output {
                     FunctionCallOutput::Text(text) => text.push_str(extra),
-                    other => *other = FunctionCallOutput::Text(extra.trim_start().to_string()),
+                    FunctionCallOutput::Content(content) => {
+                        content.push(InputContent::InputText(InputTextContent {
+                            text: extra.trim_start().to_string(),
+                        }));
+                    }
                 }
                 self.mutation_version += 1;
                 return true;
@@ -400,7 +404,7 @@ impl Conversation {
                     input_items.push(output_item.clone().into());
                     if let OutputItem::FunctionCall(call) = output_item {
                         let output = match recorded_outputs.remove(call.call_id.as_str()) {
-                            Some(output) => output.clone(),
+                            Some(output) => function_output_for_vision(output, vision_enabled),
                             // A call with no recorded output (e.g. the user
                             // cancelled while the tool was running) would make
                             // the API reject the whole history; answer it
@@ -432,6 +436,9 @@ impl Conversation {
             .iter()
             .map(|item| match item {
                 MessageItem::Input(input) => input_image_count(input),
+                MessageItem::ToolOutput { output, .. } => {
+                    function_output_image_count(&output.output)
+                }
                 _ => 0,
             })
             .sum()
@@ -471,6 +478,34 @@ fn omit_images(content: &[InputContent]) -> Vec<InputContent> {
         .collect()
 }
 
+fn function_output_for_vision(
+    output: &FunctionCallOutputItemParam,
+    vision_enabled: bool,
+) -> FunctionCallOutputItemParam {
+    if vision_enabled {
+        return output.clone();
+    }
+    let mut output = output.clone();
+    if let FunctionCallOutput::Content(content) = &output.output {
+        output.output = FunctionCallOutput::Content(omit_images(content));
+    }
+    output
+}
+
+fn content_image_count(content: &[InputContent]) -> usize {
+    content
+        .iter()
+        .filter(|part| matches!(part, InputContent::InputImage(_)))
+        .count()
+}
+
+fn function_output_image_count(output: &FunctionCallOutput) -> usize {
+    match output {
+        FunctionCallOutput::Content(content) => content_image_count(content),
+        FunctionCallOutput::Text(_) => 0,
+    }
+}
+
 fn input_image_count(input: &InputItem) -> usize {
     let content = match input {
         InputItem::Item(Item::Message(ApiMessageItem::Input(message))) => {
@@ -482,12 +517,7 @@ fn input_image_count(input: &InputItem) -> usize {
         },
         _ => None,
     };
-    content.map_or(0, |parts| {
-        parts
-            .iter()
-            .filter(|part| matches!(part, InputContent::InputImage(_)))
-            .count()
-    })
+    content.map_or(0, content_image_count)
 }
 
 #[cfg(test)]
@@ -527,6 +557,16 @@ mod tests {
             failed: false,
             approval_label: None,
         }
+    }
+
+    fn tool_output_content(items: &[InputItem]) -> Option<&[InputContent]> {
+        items.iter().find_map(|item| match item {
+            InputItem::Item(Item::FunctionCallOutput(output)) => match &output.output {
+                FunctionCallOutput::Content(content) => Some(content.as_slice()),
+                FunctionCallOutput::Text(_) => None,
+            },
+            _ => None,
+        })
     }
 
     fn assistant_text(text: &str) -> OutputItem {
@@ -724,6 +764,60 @@ mod tests {
             InputItem::Item(Item::Message(ApiMessageItem::Input(message)))
                 if message.content.iter().any(|part| matches!(part, InputContent::InputImage(_)))
         )));
+    }
+
+    #[test]
+    fn vision_switch_filters_images_returned_by_tools() {
+        use async_openai::types::responses::{ImageDetail, InputImageContent};
+
+        let mut conv = Conversation::new();
+        conv.add_output(call("read_image_call"));
+        conv.add_tool_output(crate::tools::ToolOutput {
+            param: FunctionCallOutputItemParam {
+                call_id: "read_image_call".to_string(),
+                output: FunctionCallOutput::Content(vec![
+                    InputContent::InputText("Read image cat.png (1x1).".into()),
+                    InputContent::InputImage(InputImageContent {
+                        detail: ImageDetail::Auto,
+                        file_id: None,
+                        image_url: Some("data:image/png;base64,AAAA".to_string()),
+                    }),
+                ]),
+                id: None,
+                status: None,
+            },
+            failed: false,
+            approval_label: None,
+        });
+        assert_eq!(conv.image_count(), 1);
+
+        let InputParam::Items(off) =
+            conv.to_input_param_with_vision("test/model", None, None, None, false)
+        else {
+            panic!("expected items");
+        };
+        let off_content = tool_output_content(&off).expect("multimodal tool output");
+        assert!(
+            !off_content
+                .iter()
+                .any(|part| matches!(part, InputContent::InputImage(_)))
+        );
+        assert!(off_content.iter().any(|part| matches!(
+            part,
+            InputContent::InputText(text) if text.text.contains("image omitted")
+        )));
+
+        let InputParam::Items(on) =
+            conv.to_input_param_with_vision("test/model", None, None, None, true)
+        else {
+            panic!("expected items");
+        };
+        assert!(
+            tool_output_content(&on)
+                .expect("multimodal tool output")
+                .iter()
+                .any(|part| matches!(part, InputContent::InputImage(_)))
+        );
     }
 
     #[test]

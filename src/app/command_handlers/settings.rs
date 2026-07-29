@@ -106,10 +106,13 @@ fn mode(app: &mut App<'_>, arg: &str) -> CommandOutcome {
             return CommandOutcome::without_history(false);
         }
     }
-    if app.work_mode != previous {
-        session::persist_config(app);
-    }
-    CommandOutcome::handled(false)
+    let message = if app.work_mode == previous {
+        format!("work mode unchanged: {}", app.work_mode.label())
+    } else {
+        format!("work mode set to: {}", app.work_mode.label())
+    };
+    app.conversation_panel.add_info_string(message);
+    CommandOutcome::handled(true)
 }
 
 fn classifier(app: &mut App<'_>, arg: &str) -> CommandOutcome {

@@ -48,7 +48,7 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
         MessageItem::Input(input) if is_hidden_developer_input(input) => 0,
         MessageItem::Input(input) => {
             let text = crate::app::helpers::extract_input_text(input).unwrap_or_default();
-            rough_line_count(&text, w)
+            rough_line_count(&text, w).saturating_add(input_image_rows(input))
         }
         MessageItem::Output(output) => match output {
             OutputItem::Reasoning(_) => 3, // rough
@@ -60,7 +60,9 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
             async_openai::types::responses::FunctionCallOutput::Text(t) => {
                 rough_line_count(t, w).min(20)
             }
-            _ => 1,
+            async_openai::types::responses::FunctionCallOutput::Content(content) => {
+                crate::ui::image_preview::estimated_rows(content).max(1)
+            }
         },
         MessageItem::OpenAIError(_)
         | MessageItem::Error(_)
@@ -72,6 +74,21 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
         // estimate ignores the expanded state — the real height comes from the
         // built paragraph).
         MessageItem::Compacted { .. } => 1,
+    }
+}
+
+fn input_image_rows(input: &InputItem) -> u16 {
+    match input {
+        InputItem::Item(Item::Message(ApiMessageItem::Input(message))) => {
+            crate::ui::image_preview::estimated_rows(&message.content)
+        }
+        InputItem::EasyMessage(message) => match &message.content {
+            async_openai::types::responses::EasyInputContent::ContentList(content) => {
+                crate::ui::image_preview::estimated_rows(content)
+            }
+            async_openai::types::responses::EasyInputContent::Text(_) => 0,
+        },
+        _ => 0,
     }
 }
 
@@ -114,9 +131,10 @@ fn build_item_paragraph(
                 Vec::new(),
             )
         }
-        MessageItem::Input(input_item) => {
-            (UserMessage::new(input_item).into_paragraph(), Vec::new())
-        }
+        MessageItem::Input(input_item) => (
+            UserMessage::new(input_item, content_width).into_paragraph(),
+            Vec::new(),
+        ),
         MessageItem::Output(output_item) => AssistantMessage::new(output_item, content_width)
             .expanded(expanded)
             .tool_output(tool_output)
@@ -237,13 +255,20 @@ impl Widget for &mut ConversationPanel {
         // fully rendering them, so we can figure out which ones are visible.
         let mut est_heights: Vec<u16> = Vec::with_capacity(conv.items.len());
         for index in 0..conv.items.len() {
-            let h = if matches!(&conv.items[index], MessageItem::ToolOutput { output, .. }
+            let mut h = if matches!(&conv.items[index], MessageItem::ToolOutput { output, .. }
                 if call_ids.contains(output.call_id.as_str()))
             {
                 0 // hidden inside its call's entry
             } else {
                 estimate_item_height(&conv.items[index], content_width)
             };
+            if let MessageItem::Output(OutputItem::FunctionCall(call)) = &conv.items[index]
+                && let Some((output, _, _)) = outputs_by_call.get(call.call_id.as_str())
+                && let async_openai::types::responses::FunctionCallOutput::Content(content) =
+                    &output.output
+            {
+                h = h.saturating_add(crate::ui::image_preview::estimated_rows(content));
+            }
             est_heights.push(h);
         }
 

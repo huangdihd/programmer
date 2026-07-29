@@ -335,9 +335,15 @@ historical images without deleting them from the session; turning it back on
 restores them. Other local files are referenced by path only; their contents are
 not copied into the request context.
 
+The agent can inspect a local image itself with the read-only `read_image` tool.
+Its result is sent back to vision-capable models as image content, and expanding
+the tool call in the TUI shows a compact true-color half-block preview.
+
 You can also copy an image to the system clipboard and press `Ctrl+V` in the
 main input to attach it. The input shows a `[Pasted image #N WIDTHxHEIGHT]`
 placeholder; deleting that placeholder removes the attachment before sending.
+After sending, the message replaces the placeholder with the same compact
+true-color half-block preview used by `read_image`.
 Terminal emulators generally reserve `Cmd+V` for text paste, so image paste uses
 `Ctrl+V` on macOS as well.
 

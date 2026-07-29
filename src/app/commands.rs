@@ -26,8 +26,14 @@ use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
     InputContent, InputImageContent, InputMessage, InputRole, InputTextContent, OutputStatus,
 };
+use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::prompts::PLAN_PLANNING_PROMPT;
+
+static PASTED_IMAGE_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[Pasted image #\d+ \d+x\d+\]").expect("valid pasted-image placeholder regex")
+});
 
 /// Build an optional plan-mode system prompt snippet.
 fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
@@ -52,7 +58,9 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     }
     let pasted_images = app.input_panel.take_images();
     // History keeps the compact `@path` form; the model receives a path-only
-    // reference for regular files or an image attachment when vision is on.
+    // reference for regular files or a stored image for image paths. The
+    // conversation filters stored images out of API requests while vision is
+    // off, without deleting them from session history.
     app.input_panel.push_history(typed.clone());
     app.input_panel.clear();
 
@@ -60,9 +68,7 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     // messages must retain the same path annotations and image attachments as
     // messages that start immediately.
     let diagnostics = app.diagnostics_state.lock().unwrap().baseline.clone();
-    let expanded =
-        crate::commands::expand_references(&typed, app.vision_enabled, diagnostics.as_deref())
-            .await;
+    let expanded = crate::commands::expand_references(&typed, diagnostics.as_deref()).await;
     for notice in expanded.notices {
         app.conversation_panel.add_warning_string(notice);
     }
@@ -144,16 +150,8 @@ async fn start_ready_request(
     inputs: Vec<(String, InputRole, Vec<InputImageContent>)>,
 ) {
     debug_assert!(app.cancel.active_id.is_none());
-    for (text, role, mut images) in inputs {
-        if !app.vision_enabled && !images.is_empty() {
-            let count = images.len();
-            images.clear();
-            app.conversation_panel.add_warning_string(format!(
-                "omitted {count} queued image(s) because vision is off"
-            ));
-        }
-        let mut content = vec![InputContent::InputText(InputTextContent { text })];
-        content.extend(images.into_iter().map(InputContent::InputImage));
+    for (text, role, images) in inputs {
+        let content = ordered_message_content(text, images);
         app.conversation_panel
             .add_input_message(ApiMessageItem::Input(InputMessage {
                 content,
@@ -295,6 +293,37 @@ pub(super) fn queue_pending_request(
     pending_images.append(&mut images);
     if is_at_bottom {
         panel.scroll_to_bottom();
+    }
+}
+
+fn ordered_message_content(text: String, images: Vec<InputImageContent>) -> Vec<InputContent> {
+    let mut content = Vec::new();
+    let mut images = images.into_iter();
+    let mut text_start = 0;
+
+    for placeholder in PASTED_IMAGE_PLACEHOLDER.find_iter(&text) {
+        push_input_text(&mut content, &text[text_start..placeholder.start()]);
+        if let Some(image) = images.next() {
+            content.push(InputContent::InputImage(image));
+        }
+        text_start = placeholder.end();
+    }
+
+    push_input_text(&mut content, &text[text_start..]);
+    content.extend(images.map(InputContent::InputImage));
+    if content.is_empty() {
+        content.push(InputContent::InputText(InputTextContent {
+            text: String::new(),
+        }));
+    }
+    content
+}
+
+fn push_input_text(content: &mut Vec<InputContent>, text: &str) {
+    if !text.is_empty() {
+        content.push(InputContent::InputText(InputTextContent {
+            text: text.to_string(),
+        }));
     }
 }
 
@@ -576,10 +605,122 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationPanel, build_compact_request, format_task_updates, queue_pending_request,
+        ConversationPanel, build_compact_request, execute_command, format_task_updates,
+        ordered_message_content, queue_pending_request,
     };
-    use async_openai::types::responses::{ImageDetail, InputImageContent};
-    use std::time::Duration;
+    use async_openai::types::responses::{ImageDetail, InputContent, InputImageContent};
+    use std::{collections::BTreeSet, time::Duration};
+
+    #[derive(Clone, Copy, Debug)]
+    enum ExpectedCommandEffect {
+        AppendedMessage,
+        ResetWithInfo,
+        ClearedConversation,
+        ProviderPanel,
+        SkillsPanel,
+        McpPanel,
+        TodoPanel,
+        Quit,
+    }
+
+    async fn command_test_app() -> crate::app::App<'static> {
+        let mut config = crate::config::programmer_config::ProgrammerConfig::default();
+        config.providers.clear();
+        crate::app::App::new(
+            config,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "test-session".to_string(),
+            None,
+            Vec::new(),
+            false,
+            "test-project".to_string(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_registered_command_has_an_observable_effect() {
+        let cases = [
+            ("model", "/model", ExpectedCommandEffect::AppendedMessage),
+            ("new", "/new", ExpectedCommandEffect::ResetWithInfo),
+            (
+                "providers",
+                "/providers manage",
+                ExpectedCommandEffect::ProviderPanel,
+            ),
+            (
+                "session",
+                "/session",
+                ExpectedCommandEffect::AppendedMessage,
+            ),
+            ("usage", "/usage", ExpectedCommandEffect::AppendedMessage),
+            ("mode", "/mode auto", ExpectedCommandEffect::AppendedMessage),
+            (
+                "classifier",
+                "/classifier",
+                ExpectedCommandEffect::AppendedMessage,
+            ),
+            ("init", "/init", ExpectedCommandEffect::AppendedMessage),
+            ("todo", "/todo", ExpectedCommandEffect::TodoPanel),
+            ("skill", "/skill manage", ExpectedCommandEffect::SkillsPanel),
+            ("mcp", "/mcp manage", ExpectedCommandEffect::McpPanel),
+            ("plan", "/plan", ExpectedCommandEffect::AppendedMessage),
+            (
+                "terminal",
+                "/terminal invalid",
+                ExpectedCommandEffect::AppendedMessage,
+            ),
+            (
+                "compact",
+                "/compact",
+                ExpectedCommandEffect::AppendedMessage,
+            ),
+            (
+                "thinking",
+                "/thinking",
+                ExpectedCommandEffect::AppendedMessage,
+            ),
+            ("vision", "/vision", ExpectedCommandEffect::AppendedMessage),
+            (
+                "clear",
+                "/clear",
+                ExpectedCommandEffect::ClearedConversation,
+            ),
+            ("quit", "/quit", ExpectedCommandEffect::Quit),
+            ("help", "/help", ExpectedCommandEffect::AppendedMessage),
+        ];
+
+        let covered: BTreeSet<_> = cases.iter().map(|(name, _, _)| *name).collect();
+        let registered: BTreeSet<_> = crate::commands::Command::all_commands().collect();
+        assert_eq!(covered, registered, "update this contract for new commands");
+
+        for (name, input, expected) in cases {
+            let mut app = command_test_app().await;
+            let before = app.conversation_panel.items_snapshot().len();
+            execute_command(&mut app, input).await;
+
+            match expected {
+                ExpectedCommandEffect::AppendedMessage => assert!(
+                    app.conversation_panel.items_snapshot().len() > before,
+                    "/{name} produced no visible message"
+                ),
+                ExpectedCommandEffect::ResetWithInfo => assert!(matches!(
+                    app.conversation_panel.items_snapshot().last(),
+                    Some(crate::response::message_item::MessageItem::Info(_))
+                )),
+                ExpectedCommandEffect::ClearedConversation => {
+                    assert!(app.conversation_panel.items_snapshot().is_empty())
+                }
+                ExpectedCommandEffect::ProviderPanel => assert!(app.provider_panel.is_some()),
+                ExpectedCommandEffect::SkillsPanel => assert!(app.skills_panel.is_some()),
+                ExpectedCommandEffect::McpPanel => assert!(app.mcp_panel.is_some()),
+                ExpectedCommandEffect::TodoPanel => assert!(app.todo_panel.is_some()),
+                ExpectedCommandEffect::Quit => assert!(!app.running),
+            }
+        }
+    }
 
     #[test]
     fn compact_request_uses_the_selected_thinking_level() {
@@ -603,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_file_reference_uses_the_real_expansion_path() {
-        let expanded = crate::commands::expand_references("inspect @Cargo.toml", false, None).await;
+        let expanded = crate::commands::expand_references("inspect @Cargo.toml", None).await;
         let mut panel = ConversationPanel::new();
         let mut pending_images = Vec::new();
 
@@ -645,6 +786,26 @@ mod tests {
 
         assert_eq!(panel.pending_message.as_deref(), Some("first\nsecond"));
         assert_eq!(pending_images.len(), 2);
+    }
+
+    #[test]
+    fn pasted_image_stays_before_text_typed_after_it() {
+        let image = InputImageContent {
+            detail: ImageDetail::Auto,
+            file_id: None,
+            image_url: Some("data:image/png;base64,AAAA".to_string()),
+        };
+
+        let content = ordered_message_content(
+            "[Pasted image #1 640x480]Can you see this?".to_string(),
+            vec![image],
+        );
+
+        assert!(matches!(content[0], InputContent::InputImage(_)));
+        assert!(matches!(
+            &content[1],
+            InputContent::InputText(text) if text.text == "Can you see this?"
+        ));
     }
 
     #[test]
