@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui_markdown::highlight::{CodeHighlighter, TreeSitterHighlighter, segments_to_lines};
 use ratatui_markdown::markdown::RenderHooks;
 
-use crate::ui::markdown_theme::palette;
+use crate::ui::markdown_theme::{CODE_COLORS, palette};
 
 /// The clickable copy label on a code block's top row.
 pub const COPY_LABEL: &str = "⧉ copy";
@@ -53,7 +53,7 @@ const RIGHT_PAD: usize = 2;
 /// initialized instance across every code block and frame.
 fn highlighter() -> Arc<dyn CodeHighlighter> {
     static HL: OnceLock<Arc<dyn CodeHighlighter>> = OnceLock::new();
-    HL.get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
+    HL.get_or_init(|| Arc::new(TreeSitterHighlighter::new().with_code_colors(CODE_COLORS)))
         .clone()
 }
 
@@ -82,7 +82,7 @@ impl CodeBlockHooks {
     /// The block's top padding row: a dim language label on the left and the
     /// clickable copy label on the right.
     fn label_line(&self, lang: &str) -> Line<'static> {
-        let base = Style::default().bg(CODE_BG);
+        let base = Style::default().fg(palette::TEXT).bg(CODE_BG);
         let label_style = Style::default().fg(LABEL_FG).bg(CODE_BG);
 
         let mut spans = vec![Span::styled(INDENT, base)];
@@ -142,7 +142,7 @@ impl RenderHooks for CodeBlockHooks {
         }
 
         let content = content.replace('\t', "    ");
-        let base = Style::default().bg(CODE_BG);
+        let base = Style::default().fg(palette::TEXT).bg(CODE_BG);
         let inner = self.width.saturating_sub(INDENT.len() + RIGHT_PAD);
 
         let segments = highlighter().highlight(lang, &content);
@@ -189,5 +189,16 @@ mod tests {
 
         // A top label row, the two code rows, and a bottom padding row.
         assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn plain_code_uses_the_application_text_color() {
+        let hooks = CodeBlockHooks::new(20);
+        let lines = hooks
+            .render_code_block("", "plain text")
+            .expect("hooks always render a block");
+        let content = &lines[1];
+
+        assert_eq!(content.spans[0].style.fg, Some(palette::TEXT));
     }
 }

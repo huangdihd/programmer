@@ -25,6 +25,7 @@ pub(crate) mod mcp_bridge;
 pub(crate) mod provider;
 pub mod read_file;
 pub mod read_image;
+mod search_budget;
 pub mod task;
 pub mod todo;
 pub mod write_file;

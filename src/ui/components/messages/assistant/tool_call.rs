@@ -24,7 +24,8 @@ use crate::ui::markdown_theme::palette;
 /// Renders a tool call the model made, together with its result once it has
 /// one. Collapsed it is the tool name plus a one-line summary, with the first
 /// line of the result below; expanded it shows each argument and the
-/// full result. Successful calls render in green; failed calls render in red.
+/// full result. Pending calls render in yellow, successful calls in green, and
+/// failed calls in red.
 pub struct ToolCallMessage<'a> {
     call: &'a FunctionToolCall,
     width: u16,
@@ -84,7 +85,11 @@ impl<'a> ToolCallMessage<'a> {
             output.map(|output| crate::ui::image_preview::output_text(&output.output));
         let failed = self.failed;
 
-        let status_color = if failed { palette::RED } else { palette::GREEN };
+        let status_color = match (failed, output.is_some()) {
+            (true, _) => palette::RED,
+            (false, true) => palette::GREEN,
+            (false, false) => palette::YELLOW,
+        };
         let status_char = if failed { "\u{2717}" } else { "\u{2713}" };
         let accent = Style::new().fg(status_color).add_modifier(Modifier::BOLD);
         let muted = Style::new().fg(palette::MUTED);
@@ -474,6 +479,42 @@ mod tests {
     fn command_background_hint_shows_the_shortcut() {
         let hint = plain(&[background_hint()]);
         assert_eq!(hint, ["  Ctrl+Z move to background"]);
+    }
+
+    #[test]
+    fn tool_call_color_tracks_pending_success_and_failure() {
+        let call = FunctionToolCall {
+            arguments: "{}".to_string(),
+            call_id: "call".to_string(),
+            namespace: None,
+            name: "test_tool".to_string(),
+            id: None,
+            status: None,
+        };
+        let output = FunctionCallOutputItemParam {
+            call_id: "call".to_string(),
+            output: FunctionCallOutput::Text("ok".to_string()),
+            id: None,
+            status: None,
+        };
+        let color = |text: Text<'static>| text.lines[0].spans[1].style.fg;
+
+        assert_eq!(
+            color(ToolCallMessage::new(&call, 80).into_text()),
+            Some(palette::YELLOW)
+        );
+        assert_eq!(
+            color(
+                ToolCallMessage::new(&call, 80)
+                    .output(Some(&output))
+                    .into_text()
+            ),
+            Some(palette::GREEN)
+        );
+        assert_eq!(
+            color(ToolCallMessage::new(&call, 80).failed(true).into_text()),
+            Some(palette::RED)
+        );
     }
 
     #[test]

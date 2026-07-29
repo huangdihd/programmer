@@ -831,6 +831,8 @@ fn expand_tilde(path: &str) -> String {
 /// trailing `/` so completion can descend into them. A leading `~/` is
 /// expanded for the directory read but kept verbatim in the candidates.
 fn list_path_candidates(partial: &str) -> Vec<String> {
+    const MAX_CANDIDATES: usize = 50;
+
     // A bare `~` can only become the home directory.
     if partial == "~" {
         return vec!["~/".to_string()];
@@ -867,10 +869,13 @@ fn list_path_candidates(partial: &str) -> Vec<String> {
             candidate.push('/');
         }
         out.push((is_dir, candidate));
+        if out.len() >= MAX_CANDIDATES {
+            break;
+        }
     }
-    // Directories first, then alphabetical; cap the list so the popup stays small.
+    // Directories first, then alphabetical.
     out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    out.into_iter().map(|(_, c)| c).take(50).collect()
+    out.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
 /// Executable names found on `PATH`, sorted and deduplicated. Scanned once per
@@ -1640,6 +1645,22 @@ mod tests {
         let dir_pos = got.iter().position(|c| c == "src/commands/").unwrap();
         let file_pos = got.iter().position(|c| c == "src/consts.rs").unwrap();
         assert!(dir_pos < file_pos, "dirs first: {got:?}");
+    }
+
+    #[test]
+    fn list_path_candidates_stops_at_the_popup_limit() {
+        let dir =
+            std::env::temp_dir().join(format!("programmer_path_candidates_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..75 {
+            std::fs::write(dir.join(format!("candidate_{index}")), "").unwrap();
+        }
+
+        let got = list_path_candidates(&format!("{}/candidate_", dir.display()));
+
+        assert_eq!(got.len(), 50);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
