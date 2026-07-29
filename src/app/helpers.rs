@@ -109,3 +109,56 @@ pub(crate) fn extract_input_text(input: &InputItem) -> Option<String> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_input(text: &str) -> MessageItem {
+        let input: InputItem = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}]
+        }))
+        .unwrap();
+        MessageItem::Input(input)
+    }
+
+    #[test]
+    fn first_user_text_extracts_from_input() {
+        assert_eq!(
+            first_user_text(&[user_input("hello")]).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn first_user_text_skips_non_input_items() {
+        let items = vec![
+            MessageItem::Info("skip me".to_string()),
+            user_input("user says hi"),
+            user_input("second message"),
+        ];
+        assert_eq!(first_user_text(&items).as_deref(), Some("user says hi"));
+    }
+
+    #[test]
+    fn first_user_text_returns_none_for_empty() {
+        assert!(first_user_text(&[]).is_none());
+        assert!(
+            first_user_text(&[MessageItem::Info("no user input".to_string())]).is_none()
+        );
+    }
+
+    #[test]
+    fn extract_input_text_handles_non_message() {
+        // serde_json will just fail to deserialize a function call as an InputItem
+        let input: InputItem = serde_json::from_value(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "result"
+        }))
+        .unwrap();
+        assert!(extract_input_text(&input).is_none());
+    }
+}

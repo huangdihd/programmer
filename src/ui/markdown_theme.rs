@@ -57,7 +57,7 @@ pub const CODE_COLORS: CodeColors = CodeColors {
     keyword: palette::PURPLE,
     string: palette::GREEN,
     string_escape: palette::CYAN,
-    number: palette::YELLOW,
+    number: Color::Cyan,
     constant: palette::PURPLE,
     function: palette::BLUE,
     r#type: palette::CYAN,
@@ -65,7 +65,7 @@ pub const CODE_COLORS: CodeColors = CodeColors {
     property: palette::BLUE,
     operator: palette::PURPLE,
     punctuation: palette::MUTED,
-    attribute: palette::YELLOW,
+    attribute: Color::Cyan,
     tag: palette::BLUE,
     label: palette::RED_MUTED,
     error: palette::RED,
@@ -113,7 +113,7 @@ impl RichTextTheme for AppTheme {
     }
 
     fn get_json_number_color(&self) -> Color {
-        palette::YELLOW
+        Color::Cyan
     }
     fn get_json_bool_color(&self) -> Color {
         palette::PURPLE
@@ -122,7 +122,7 @@ impl RichTextTheme for AppTheme {
         palette::FAINT
     }
     fn get_accent_yellow(&self) -> Color {
-        palette::YELLOW
+        Color::Cyan
     }
     fn get_code_colors(&self) -> CodeColors {
         CODE_COLORS

@@ -82,73 +82,23 @@ impl App<'_> {
         &mut self,
         area: Rect,
         buf: &mut Buffer,
-        has_todo_bar: bool,
-        todo_bar_height: u16,
         bottom_height: u16,
     ) {
         // Named indices into the constraint array so they don't drift when
         // rows are added or removed.
         const POS_CONV: usize = 0;
-        const POS_TODO: usize = 1;
-        const POS_BOTTOM: usize = 2;
-        const POS_FOOTER: usize = 3;
+        const POS_BOTTOM: usize = 1;
+        const POS_FOOTER: usize = 2;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(2),                  // POS_CONV
-                Constraint::Length(todo_bar_height), // POS_TODO
-                Constraint::Length(bottom_height),   // POS_BOTTOM
-                Constraint::Length(1),               // POS_FOOTER
+                Constraint::Min(2),                // POS_CONV
+                Constraint::Length(bottom_height), // POS_BOTTOM
+                Constraint::Length(1),             // POS_FOOTER
             ])
             .split(area);
         self.conversation_panel.render(chunks[POS_CONV], buf);
-
-        // ---- compact todo bar (inline, above the input area) ----
-        if has_todo_bar {
-            let pending = self
-                .todo_list
-                .todos
-                .iter()
-                .filter(|t| t.status == crate::todos::TodoStatus::Pending)
-                .count();
-            let in_progress = self
-                .todo_list
-                .todos
-                .iter()
-                .filter(|t| t.status == crate::todos::TodoStatus::InProgress)
-                .count();
-            let completed = self
-                .todo_list
-                .todos
-                .iter()
-                .filter(|t| t.status == crate::todos::TodoStatus::Completed)
-                .count();
-            let mut parts = Vec::new();
-            if pending > 0 {
-                parts.push(format!("{} pending", pending));
-            }
-            if in_progress > 0 {
-                parts.push(format!("{} in progress", in_progress));
-            }
-            if completed > 0 {
-                parts.push(format!("{} completed", completed));
-            }
-            let summary = parts.join(", ");
-            let line = Line::from(vec![
-                Span::styled(
-                    " ☐ Todos: ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(summary, Style::default().fg(Color::Gray)),
-                Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("/todo", Style::default().fg(Color::Cyan)),
-                Span::styled(" to manage", Style::default().fg(Color::DarkGray)),
-            ]);
-            Paragraph::new(line).render(chunks[POS_TODO], buf);
-        }
 
         if let Some(panel) = &self.question_panel {
             panel.render(chunks[POS_BOTTOM], buf);
@@ -458,11 +408,6 @@ impl Widget for &mut App<'_> {
             self.input_panel.needed_height()
         };
 
-        // Show a compact todo bar when there are items and the full modal
-        // isn't open.
-        let has_todo_bar = !self.todo_list.todos.is_empty() && self.todo_panel.is_none();
-        let todo_bar_height: u16 = if has_todo_bar { 1 } else { 0 };
-
         // ---- logo at top (full width, even with sidebar open) ----
         let vert = Layout::default()
             .direction(Direction::Vertical)
@@ -487,7 +432,7 @@ impl Widget for &mut App<'_> {
                 .split(content_area);
             self.sidebar_area = Some(horiz[1]);
 
-            self.render_main(horiz[0], buf, has_todo_bar, todo_bar_height, bottom_height);
+            self.render_main(horiz[0], buf, bottom_height);
 
             let expanded_task_ids = self
                 .sidebar
@@ -514,8 +459,6 @@ impl Widget for &mut App<'_> {
             self.render_main(
                 content_area,
                 buf,
-                has_todo_bar,
-                todo_bar_height,
                 bottom_height,
             );
         }

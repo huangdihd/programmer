@@ -608,3 +608,85 @@ impl PartialResponse {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh() -> PartialResponse {
+        PartialResponse::new(CancellationToken::new())
+    }
+
+    fn msg_item() -> OutputItem {
+        serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "id": "m1",
+            "role": "assistant",
+            "content": [],
+            "status": "in_progress"
+        }))
+        .unwrap()
+    }
+
+    fn fc_item() -> OutputItem {
+        serde_json::from_value(serde_json::json!({
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "read_file",
+            "arguments": "{}"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_response_has_no_items() {
+        let p = fresh();
+        assert!(p.get_message_items().is_empty());
+        assert!(!p.has_function_calls());
+        assert!(!p.has_message_items());
+        assert_eq!(p.streaming_kind(), None);
+    }
+
+    #[test]
+    fn detects_function_call() {
+        let mut p = fresh();
+        p.set_item(fc_item(), 0);
+        assert!(p.has_function_calls());
+        assert!(!p.has_message_items());
+        assert_eq!(p.streaming_kind(), Some(StreamingKind::ToolCall));
+    }
+
+    #[test]
+    fn detects_message_item() {
+        let mut p = fresh();
+        p.set_item(msg_item(), 0);
+        assert!(p.has_message_items());
+        assert!(!p.has_function_calls());
+    }
+
+    #[test]
+    fn finalize_without_finish_reason_is_error() {
+        let p = fresh();
+        assert!(matches!(p.finalize().unwrap_err(), FinalizeError::NotFinished));
+    }
+
+    #[test]
+    fn get_message_items_marks_in_progress() {
+        let mut p = fresh();
+        p.set_item(msg_item(), 0);
+        let items = p.get_message_items();
+        assert_eq!(items.len(), 1);
+        // Not yet finished — second element is `true` (in progress).
+        assert!(items[0].1);
+    }
+
+    #[test]
+    fn get_message_items_marks_finished_after_done_event() {
+        let mut p = fresh();
+        p.set_item(msg_item(), 0);
+        p.mark_finished(0);
+        let items = p.get_message_items();
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].1, "item should be finished");
+    }
+}
