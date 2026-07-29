@@ -74,12 +74,13 @@ pub(super) fn program_invocation(
 
     let policy_json = serde_json::to_string(&builder.build())
         .map_err(|error| format!("could not serialize sandbox policy: {error}"))?;
-    let mut worker_args = Vec::with_capacity(args.len() + 2);
+    let mut worker_args = Vec::with_capacity(args.len() + 3);
+    worker_args.push("--sandbox-worker".to_string());
     worker_args.push("--".to_string());
     worker_args.push(program.to_string());
     worker_args.extend(args.iter().cloned());
     Ok(Some(SandboxInvocation {
-        program: worker_executable()?,
+        program: sandbox_host_executable()?,
         args: worker_args,
         policy_json,
         cwd,
@@ -105,44 +106,66 @@ fn common_development_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn worker_executable() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("PROGRAMMER_SANDBOX_WORKER") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(format!(
-            "PROGRAMMER_SANDBOX_WORKER does not point to a file: {}",
-            path.display()
-        ));
-    }
-
+fn sandbox_host_executable() -> Result<PathBuf, String> {
     let current = std::env::current_exe()
         .map_err(|error| format!("could not locate the programmer executable: {error}"))?;
-    let filename = if cfg!(windows) {
-        "programmer-sandbox-worker.exe"
-    } else {
-        "programmer-sandbox-worker"
-    };
-    let parent = current
+
+    #[cfg(test)]
+    if current
         .parent()
-        .ok_or_else(|| "programmer executable has no parent directory".to_string())?;
-    let direct = parent.join(filename);
-    if direct.is_file() {
-        return Ok(direct);
-    }
-    if parent.file_name().is_some_and(|name| name == "deps")
-        && let Some(debug_dir) = parent.parent()
+        .and_then(|parent| parent.file_name())
+        .is_some_and(|name| name == "deps")
+        && let Some(debug_dir) = current.parent().and_then(|parent| parent.parent())
     {
-        let candidate = debug_dir.join(filename);
+        let candidate = debug_dir.join(if cfg!(windows) {
+            "programmer.exe"
+        } else {
+            "programmer"
+        });
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-    Err(format!(
-        "sandbox worker was not found next to {}; rebuild with `cargo build --bins`",
-        current.display()
-    ))
+
+    Ok(current)
+}
+
+pub(crate) fn run_worker_if_requested() {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--sandbox-worker")) {
+        return;
+    }
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+        fail_worker("sandbox worker arguments are invalid");
+    }
+    let Some(program) = args.next() else {
+        fail_worker("sandbox worker requires a program");
+    };
+    let policy_json =
+        std::env::var(POLICY_ENV).unwrap_or_else(|_| fail_worker("sandbox policy is missing"));
+    let policy: Policy = serde_json::from_str(&policy_json)
+        .unwrap_or_else(|error| fail_worker(&format!("invalid sandbox policy: {error}")));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        policy
+            .apply_to_current_process()
+            .unwrap_or_else(|error| fail_worker(&format!("could not apply sandbox: {error}")));
+        let error = std::process::Command::new(program).args(args).exec();
+        fail_worker(&format!("could not execute sandboxed command: {error}"));
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = (program, args, policy);
+        fail_worker("the sandbox worker does not yet support Windows process launching");
+    }
+}
+
+fn fail_worker(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(126);
 }
 
 pub(crate) fn configure_tokio_command(
@@ -175,6 +198,25 @@ mod tests {
         let security =
             super::super::SecurityManager::new(Default::default(), root.clone()).unwrap();
         assert!(invocation(&security, "echo test", None).unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enabled_sandbox_reexecutes_programmer_in_worker_mode() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-sandbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = super::super::SecurityConfig::default();
+        config.sandbox.enabled = true;
+        let security = super::super::SecurityManager::new(config, root.clone()).unwrap();
+
+        let wrapped = invocation(&security, "echo test", None)
+            .unwrap()
+            .expect("sandbox invocation");
+
+        assert_eq!(wrapped.args[0], "--sandbox-worker");
+        assert_eq!(wrapped.args[1], "--");
+        assert_eq!(wrapped.program, sandbox_host_executable().unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -558,7 +558,7 @@ mod live_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "requires the host OS sandbox and a built sandbox worker"]
+    #[ignore = "requires the host OS sandbox and a built programmer binary"]
     async fn sandboxed_command_writes_inside_and_denies_outside() {
         let root = std::env::temp_dir().join(format!(
             "programmer-command-sandbox-{}",

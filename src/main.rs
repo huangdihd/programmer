@@ -411,10 +411,17 @@ fn load_config() -> color_eyre::Result<(ProgrammerConfig, std::path::PathBuf)> {
     Ok((programmer_config, config_path))
 }
 
-#[tokio::main]
-async fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<()> {
     #[cfg(windows)]
     crate::tasks::harden_dll_search();
+    crate::security::sandbox::run_worker_if_requested();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> color_eyre::Result<()> {
     let args = parse_args();
 
     if args.help {
