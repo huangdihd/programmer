@@ -165,6 +165,18 @@ impl Conversation {
         self.items.push(MessageItem::Warning(message.into()));
     }
 
+    /// Remove every warning with the given text.
+    pub fn remove_warning_string(&mut self, message: &str) -> bool {
+        let original_len = self.items.len();
+        self.items
+            .retain(|item| !matches!(item, MessageItem::Warning(text) if text == message));
+        let removed = self.items.len() != original_len;
+        if removed {
+            self.mutation_version += 1;
+        }
+        removed
+    }
+
     /// Whether there is API-visible history worth compacting: any input/output
     /// item after the last `/compact` boundary.
     pub fn has_compactable_history(&self) -> bool {
@@ -529,6 +541,23 @@ mod tests {
             phase: None,
             status: OutputStatus::Completed,
         })
+    }
+
+    #[test]
+    fn remove_warning_string_removes_only_matching_warnings() {
+        let mut conv = Conversation::new();
+        conv.add_warning_string("temporary");
+        conv.add_info_string("keep");
+        conv.add_warning_string("temporary");
+        conv.add_warning_string("keep warning");
+
+        assert!(conv.remove_warning_string("temporary"));
+        assert_eq!(conv.mutation_version, 1);
+        assert_eq!(conv.items.len(), 2);
+        assert!(matches!(&conv.items[0], MessageItem::Info(text) if text == "keep"));
+        assert!(matches!(&conv.items[1], MessageItem::Warning(text) if text == "keep warning"));
+        assert!(!conv.remove_warning_string("missing"));
+        assert_eq!(conv.mutation_version, 1);
     }
 
     #[test]

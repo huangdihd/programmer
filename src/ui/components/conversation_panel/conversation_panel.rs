@@ -570,6 +570,18 @@ impl ConversationPanel {
         self.stick_to_bottom = true;
     }
 
+    pub fn remove_warning_string(&mut self, message: &str) {
+        if self
+            .conversation
+            .lock()
+            .unwrap()
+            .remove_warning_string(message)
+        {
+            // Removing an item shifts every later index used by the expansion state.
+            self.expanded_items.clear();
+        }
+    }
+
     /// Whether there is API-visible history worth compacting: any input/output
     /// item after the last `/compact` boundary.
     pub fn has_compactable_history(&self) -> bool {

@@ -243,6 +243,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
 }
 
 const QUIT_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const QUIT_CONFIRM_WARNING: &str = "Press Ctrl+C again within 2 seconds to exit.";
 
 fn handle_quit_request(app: &mut App<'_>) {
     let now = std::time::Instant::now();
@@ -251,13 +252,30 @@ fn handle_quit_request(app: &mut App<'_>) {
         return;
     }
 
+    app.conversation_panel
+        .remove_warning_string(QUIT_CONFIRM_WARNING);
     app.quit_requested_at = Some(now);
     app.conversation_panel
-        .add_warning_string("Press Ctrl+C again within 2 seconds to exit.".to_string());
+        .add_warning_string(QUIT_CONFIRM_WARNING);
 }
 
 fn quit_is_confirmed(previous: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     previous.is_some_and(|pressed_at| now.duration_since(pressed_at) <= QUIT_CONFIRM_TIMEOUT)
+}
+
+fn quit_confirmation_expired(
+    previous: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    previous.is_some_and(|pressed_at| now.duration_since(pressed_at) > QUIT_CONFIRM_TIMEOUT)
+}
+
+fn expire_quit_confirmation(app: &mut App<'_>, now: std::time::Instant) {
+    if quit_confirmation_expired(app.quit_requested_at, now) {
+        app.quit_requested_at = None;
+        app.conversation_panel
+            .remove_warning_string(QUIT_CONFIRM_WARNING);
+    }
 }
 
 fn take_pending_request(
@@ -498,6 +516,7 @@ async fn handle_mcp_changed(app: &mut App<'_>) {
 /// for exit (auto-closing the terminal panel, handing `!` results to the
 /// agent).
 pub(crate) fn tick(app: &mut App<'_>) {
+    expire_quit_confirmation(app, std::time::Instant::now());
     session::flush_if_dirty(app);
     poll_finished_terminals(app);
     if app.cancel.active_id.is_none()
@@ -585,7 +604,7 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
 mod tests {
     use super::{
         ConversationPanel, QUIT_CONFIRM_TIMEOUT, is_current_turn_id, is_live_turn_id,
-        quit_is_confirmed, take_pending_request,
+        quit_confirmation_expired, quit_is_confirmed, take_pending_request,
     };
     use std::time::{Duration, Instant};
 
@@ -599,6 +618,21 @@ mod tests {
             first_press + QUIT_CONFIRM_TIMEOUT
         ));
         assert!(!quit_is_confirmed(
+            Some(first_press),
+            first_press + QUIT_CONFIRM_TIMEOUT + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn quit_confirmation_expires_after_timeout() {
+        let first_press = Instant::now();
+
+        assert!(!quit_confirmation_expired(None, first_press));
+        assert!(!quit_confirmation_expired(
+            Some(first_press),
+            first_press + QUIT_CONFIRM_TIMEOUT
+        ));
+        assert!(quit_confirmation_expired(
             Some(first_press),
             first_press + QUIT_CONFIRM_TIMEOUT + Duration::from_millis(1)
         ));
