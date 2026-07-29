@@ -189,4 +189,24 @@ mod tests {
         let serialized = toml::to_string(&config).expect("serialize");
         assert!(!serialized.contains("mcp_servers"));
     }
+
+    #[test]
+    fn generated_config_exposes_the_complete_sandbox_policy() {
+        let serialized = toml::to_string(&ProgrammerConfig::default()).expect("serialize");
+
+        for field in [
+            "allow_system_read",
+            "allow_temp_write",
+            "fail_closed",
+            "readable_paths",
+            "writable_paths",
+            "denied_read_paths",
+            "inherit_environment",
+        ] {
+            assert!(
+                serialized.contains(field),
+                "generated config omitted sandbox field {field}"
+            );
+        }
+    }
 }

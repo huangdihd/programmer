@@ -111,7 +111,13 @@ allow_read_outside_workspace = true
 # Enabled by default on macOS and Linux. Windows currently runs unsandboxed.
 enabled = true
 network = false
+allow_system_read = true
+allow_temp_write = true
+fail_closed = true
+readable_paths = ["~/.cargo/registry"]
 writable_paths = []
+denied_read_paths = ["~/.ssh", "~/.aws"]
+inherit_environment = ["HOME", "PATH", "TMPDIR", "LANG", "LC_*"]
 
 # Rules use absolute globs or the portable `workspace/**` prefix. Explicit
 # denies take precedence over allows.
@@ -141,7 +147,13 @@ api_key = "sk-your-key-here"
 | `security.allow_read_outside_workspace` | `true` | Permit direct read tools outside the project unless a rule denies the path. |
 | `security.sandbox.enabled` | macOS/Linux: `true`; Windows: `false` | Apply the native OS process sandbox to commands, tasks, diagnostics, LSP, and stdio MCP servers. |
 | `security.sandbox.network` | `false` | Permit network access from sandboxed child processes. |
+| `security.sandbox.allow_system_read` | `true` | Permit reads needed to execute system programs and load shared libraries. |
+| `security.sandbox.allow_temp_write` | `true` | Permit writes to the platform temporary directory. |
+| `security.sandbox.fail_closed` | `true` | Refuse to run a child process when the platform backend cannot enforce its policy. |
+| `security.sandbox.readable_paths` | bundled policy | Additional paths sandboxed child processes may read. `~` and workspace-relative paths are supported. |
 | `security.sandbox.writable_paths` | `[]` | Additional paths sandboxed child processes may modify. |
+| `security.sandbox.denied_read_paths` | bundled policy | Paths sandboxed child processes must not read. |
+| `security.sandbox.inherit_environment` | bundled policy | Environment variable name globs inherited after the parent environment is cleared. |
 
 Each provider is a `[providers.<name>]` section. You can add as many as you want.
 

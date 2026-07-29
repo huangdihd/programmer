@@ -10,7 +10,7 @@ use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -42,22 +42,57 @@ pub struct SandboxConfig {
     pub enabled: bool,
     /// Permit network access from sandboxed processes.
     pub network: bool,
+    /// Permit reads required for system programs and shared libraries.
+    pub allow_system_read: bool,
+    /// Permit sandboxed processes to modify the platform temporary directory.
+    pub allow_temp_write: bool,
+    /// Refuse to run when the platform backend cannot enforce the policy.
+    pub fail_closed: bool,
+    /// Additional paths that sandboxed processes may read.
+    pub readable_paths: Vec<PathBuf>,
     /// Additional paths that sandboxed processes may modify.
     pub writable_paths: Vec<PathBuf>,
+    /// Paths that sandboxed processes must not read.
+    pub denied_read_paths: Vec<PathBuf>,
+    /// Environment variable name globs inherited by sandboxed processes.
+    pub inherit_environment: Vec<String>,
 }
 
-#[allow(clippy::derivable_impls)]
 impl Default for SandboxConfig {
     fn default() -> Self {
+        let policy = &*DEFAULT_SANDBOX_POLICY;
         Self {
             // Unit tests exercise process plumbing directly. Production starts
             // sandboxed unless the user explicitly disables it.
             enabled: cfg!(all(not(test), unix)),
-            network: false,
-            writable_paths: Vec::new(),
+            network: policy.network,
+            allow_system_read: policy.allow_system_read,
+            allow_temp_write: policy.allow_temp_write,
+            fail_closed: policy.fail_closed,
+            readable_paths: policy.readable_paths.clone(),
+            writable_paths: policy.writable_paths.clone(),
+            denied_read_paths: policy.denied_read_paths.clone(),
+            inherit_environment: policy.inherit_environment.clone(),
         }
     }
 }
+
+#[derive(Deserialize)]
+struct BundledSandboxPolicy {
+    network: bool,
+    allow_system_read: bool,
+    allow_temp_write: bool,
+    fail_closed: bool,
+    readable_paths: Vec<PathBuf>,
+    writable_paths: Vec<PathBuf>,
+    denied_read_paths: Vec<PathBuf>,
+    inherit_environment: Vec<String>,
+}
+
+static DEFAULT_SANDBOX_POLICY: LazyLock<BundledSandboxPolicy> = LazyLock::new(|| {
+    toml::from_str(include_str!("default_sandbox.toml"))
+        .expect("bundled sandbox defaults must be valid TOML")
+});
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -320,7 +355,7 @@ impl SecurityManager {
         let report = skarn_sandbox::backend_report();
         let sandbox = &self.config.sandbox;
         format!(
-            "Security:\n  sandbox: {}\n  backend: {} ({:?})\n  network: {}\n  workspace: {}\n  extra writable paths: {}\n  file conflict protection: {}\n  permission rules: {}",
+            "Security:\n  sandbox: {}\n  backend: {} ({:?})\n  network: {}\n  system reads: {}\n  temporary writes: {}\n  fail closed: {}\n  workspace: {}\n  extra readable paths: {}\n  extra writable paths: {}\n  denied read paths: {}\n  inherited environment patterns: {}\n  file conflict protection: {}\n  permission rules: {}",
             if sandbox.enabled {
                 "enabled"
             } else {
@@ -329,8 +364,26 @@ impl SecurityManager {
             report.backend,
             report.status,
             if sandbox.network { "allowed" } else { "denied" },
+            if sandbox.allow_system_read {
+                "allowed"
+            } else {
+                "denied"
+            },
+            if sandbox.allow_temp_write {
+                "allowed"
+            } else {
+                "denied"
+            },
+            if sandbox.fail_closed {
+                "enabled"
+            } else {
+                "disabled"
+            },
             self.workspace.display(),
+            sandbox.readable_paths.len(),
             sandbox.writable_paths.len(),
+            sandbox.denied_read_paths.len(),
+            sandbox.inherit_environment.len(),
             if self.config.protect_file_changes {
                 "enabled"
             } else {
@@ -402,6 +455,44 @@ mod tests {
 
     fn manager(config: SecurityConfig, workspace: &Path) -> SecurityManager {
         SecurityManager::new(config, workspace.to_path_buf()).unwrap()
+    }
+
+    #[test]
+    fn sandbox_policy_lists_are_configurable() {
+        let config: SandboxConfig = toml::from_str(
+            r#"
+enabled = true
+network = true
+allow_system_read = false
+allow_temp_write = false
+fail_closed = false
+readable_paths = ["/custom/read"]
+writable_paths = ["/custom/write"]
+denied_read_paths = ["/custom/secret"]
+inherit_environment = ["CUSTOM_*"]
+"#,
+        )
+        .unwrap();
+
+        assert!(config.enabled);
+        assert!(config.network);
+        assert!(!config.allow_system_read);
+        assert!(!config.allow_temp_write);
+        assert!(!config.fail_closed);
+        assert_eq!(config.readable_paths, [PathBuf::from("/custom/read")]);
+        assert_eq!(config.writable_paths, [PathBuf::from("/custom/write")]);
+        assert_eq!(config.denied_read_paths, [PathBuf::from("/custom/secret")]);
+        assert_eq!(config.inherit_environment, ["CUSTOM_*"]);
+    }
+
+    #[test]
+    fn partial_sandbox_config_retains_policy_defaults() {
+        let config: SandboxConfig = toml::from_str("enabled = true").unwrap();
+
+        assert!(config.enabled);
+        assert!(!config.denied_read_paths.is_empty());
+        assert!(!config.inherit_environment.is_empty());
+        assert!(config.fail_closed);
     }
 
     #[test]

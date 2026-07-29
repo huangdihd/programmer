@@ -6,59 +6,17 @@
 // (at your option) any later version.
 
 use skarn_sandbox::{NetPolicy, Policy};
-use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::PathBuf;
 
 pub(crate) const POLICY_ENV: &str = "PROGRAMMER_SANDBOX_POLICY";
-
-const SAFE_ENVIRONMENT_VARIABLES: &[&str] = &[
-    "ANDROID_HOME",
-    "ANDROID_SDK_ROOT",
-    "AR",
-    "CC",
-    "CARGO_HOME",
-    "CLICOLOR",
-    "CLICOLOR_FORCE",
-    "CMAKE_PREFIX_PATH",
-    "COLORTERM",
-    "CPATH",
-    "CXX",
-    "DEVELOPER_DIR",
-    "GOPATH",
-    "GOROOT",
-    "HOME",
-    "JAVA_HOME",
-    "LANG",
-    "LANGUAGE",
-    "LD",
-    "LIBRARY_PATH",
-    "LOGNAME",
-    "MACOSX_DEPLOYMENT_TARGET",
-    "NO_COLOR",
-    "PATH",
-    "PKG_CONFIG_PATH",
-    "RUST_BACKTRACE",
-    "RUST_LOG",
-    "RUSTUP_HOME",
-    "SDKROOT",
-    "SHELL",
-    "TEMP",
-    "TERM",
-    "TERMINFO",
-    "TERMINFO_DIRS",
-    "TERM_PROGRAM",
-    "TERM_PROGRAM_VERSION",
-    "TMP",
-    "TMPDIR",
-    "TZ",
-    "USER",
-];
 
 pub(crate) struct SandboxInvocation {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub policy_json: String,
     pub cwd: PathBuf,
+    pub environment: Vec<(OsString, OsString)>,
 }
 
 pub(super) fn invocation(
@@ -98,22 +56,26 @@ pub(super) fn program_invocation(
     }
 
     let mut builder = Policy::builder()
-        .workspace(security.workspace())
-        .read_write(std::env::temp_dir())
+        .read_write(security.workspace())
+        .allow_read_system(config.allow_system_read)
         .net(if config.network {
             NetPolicy::AllowAll
         } else {
             NetPolicy::DenyAll
         })
-        .fail_closed(true);
+        .fail_closed(config.fail_closed);
 
-    for path in common_development_paths() {
-        if path.exists() {
-            builder = builder.read(path);
-        }
+    if config.allow_temp_write {
+        builder = builder.read_write(std::env::temp_dir());
     }
-    for path in sensitive_read_paths(security.workspace()) {
-        builder = builder.deny_read(path);
+    for path in &config.readable_paths {
+        builder = builder.read(security.resolve_path(path)?);
+    }
+    for path in &config.denied_read_paths {
+        let path = security.resolve_path(path)?;
+        if !security.workspace().starts_with(&path) {
+            builder = builder.deny_read(path);
+        }
     }
     for path in &config.writable_paths {
         builder = builder.read_write(security.resolve_path(path)?);
@@ -131,85 +93,33 @@ pub(super) fn program_invocation(
         args: worker_args,
         policy_json,
         cwd,
+        environment: inherited_environment(&config.inherit_environment)?,
     }))
 }
 
-fn common_development_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        paths.extend([
-            home.join(".cargo").join("bin"),
-            home.join(".cargo").join("git"),
-            home.join(".cargo").join("registry"),
-            home.join(".rustup"),
-            home.join(".local").join("share"),
-        ]);
-    }
-    paths.extend(
-        ["/opt/homebrew", "/nix/store"]
-            .into_iter()
-            .map(PathBuf::from),
-    );
-    paths
+fn inherited_environment(patterns: &[String]) -> Result<Vec<(OsString, OsString)>, String> {
+    let matchers = compile_environment_patterns(patterns)?;
+    Ok(std::env::vars_os()
+        .filter(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| matchers.iter().any(|matcher| matcher.is_match(name)))
+        })
+        .collect())
 }
 
-fn sensitive_read_paths(workspace: &Path) -> Vec<PathBuf> {
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
-    };
-    let mut paths = [
-        ".bash_history",
-        ".claude",
-        ".codex",
-        ".config/opencode",
-        ".fish_history",
-        ".local/share/fish/fish_history",
-        ".zsh_history",
-        "Library/Application Support/1Password",
-        "Library/Application Support/Arc/User Data",
-        "Library/Application Support/Bitwarden",
-        "Library/Application Support/BraveSoftware",
-        "Library/Application Support/Firefox",
-        "Library/Application Support/Google/Chrome",
-        "Library/Application Support/Microsoft Edge",
-        "Library/Application Support/com.apple.TCC",
-        "Library/Application Support/programmer",
-        "Library/Cookies",
-        "Library/Keychains",
-        "Library/Mail",
-        "Library/Messages",
-        "Library/Safari",
-    ]
-    .into_iter()
-    .map(|path| home.join(path))
-    .filter(|path| path.exists() && !workspace.starts_with(path))
-    .collect::<Vec<_>>();
-    for base in [dirs::config_dir(), dirs::data_dir()].into_iter().flatten() {
-        paths.push(base.join("programmer"));
-    }
-    paths.retain(|path| path.exists() && !workspace.starts_with(path));
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-fn should_inherit_environment(name: &OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    #[cfg(not(windows))]
-    {
-        name.starts_with("LC_") || SAFE_ENVIRONMENT_VARIABLES.contains(&name)
-    }
-    #[cfg(windows)]
-    {
-        let name = name.to_ascii_uppercase();
-        name.starts_with("LC_") || SAFE_ENVIRONMENT_VARIABLES.contains(&name.as_str())
-    }
-}
-
-fn safe_environment() -> impl Iterator<Item = (OsString, OsString)> {
-    std::env::vars_os().filter(|(name, _)| should_inherit_environment(name))
+fn compile_environment_patterns(patterns: &[String]) -> Result<Vec<globset::GlobMatcher>, String> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            globset::GlobBuilder::new(pattern)
+                .case_insensitive(cfg!(windows))
+                .build()
+                .map(|glob| glob.compile_matcher())
+                .map_err(|error| {
+                    format!("invalid sandbox environment pattern '{pattern}': {error}")
+                })
+        })
+        .collect()
 }
 
 fn sandbox_host_executable() -> Result<PathBuf, String> {
@@ -283,29 +193,44 @@ pub(crate) fn configure_tokio_command(
     command: &mut tokio::process::Command,
     invocation: SandboxInvocation,
 ) {
+    let SandboxInvocation {
+        args,
+        policy_json,
+        cwd,
+        environment,
+        ..
+    } = invocation;
     command.env_clear();
-    command.envs(safe_environment());
-    command.args(invocation.args);
-    command.env(POLICY_ENV, invocation.policy_json);
-    command.current_dir(invocation.cwd);
+    command.envs(environment);
+    command.args(args);
+    command.env(POLICY_ENV, policy_json);
+    command.current_dir(cwd);
 }
 
 pub(crate) fn configure_pty_command(
     command: &mut portable_pty::CommandBuilder,
     invocation: SandboxInvocation,
 ) {
+    let SandboxInvocation {
+        args,
+        policy_json,
+        cwd,
+        environment,
+        ..
+    } = invocation;
     command.env_clear();
-    for (name, value) in safe_environment() {
+    for (name, value) in environment {
         command.env(name, value);
     }
-    command.args(invocation.args);
-    command.env(POLICY_ENV, invocation.policy_json);
-    command.cwd(invocation.cwd);
+    command.args(args);
+    command.env(POLICY_ENV, policy_json);
+    command.cwd(cwd);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn disabled_sandbox_does_not_wrap_commands() {
@@ -325,7 +250,13 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let mut config = super::super::SecurityConfig::default();
         config.sandbox.enabled = true;
+        let denied = root.join("secret");
+        let readable = root.join("toolchain");
+        config.sandbox.denied_read_paths = vec![denied.clone()];
+        config.sandbox.readable_paths = vec![readable.clone()];
         let security = super::super::SecurityManager::new(config, root.clone()).unwrap();
+        let denied = security.resolve_path(denied).unwrap();
+        let readable = security.resolve_path(readable).unwrap();
 
         let wrapped = invocation(&security, "echo test", None)
             .unwrap()
@@ -335,26 +266,28 @@ mod tests {
         assert_eq!(wrapped.args[1], "--");
         assert_eq!(wrapped.program, sandbox_host_executable().unwrap());
         let policy: Policy = serde_json::from_str(&wrapped.policy_json).unwrap();
-        for path in sensitive_read_paths(&root) {
-            assert!(policy.fs_deny_read.contains(&path));
-        }
+        assert!(policy.fs_deny_read.contains(&denied));
+        assert!(policy.fs_read.contains(&readable));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn sandbox_environment_only_inherits_safe_variables() {
-        assert!(should_inherit_environment(OsStr::new("PATH")));
-        assert!(should_inherit_environment(OsStr::new("LC_ALL")));
-        assert!(should_inherit_environment(OsStr::new("JAVA_HOME")));
-        #[cfg(not(windows))]
-        assert!(!should_inherit_environment(OsStr::new("java_home")));
-        assert!(!should_inherit_environment(OsStr::new("OPENAI_API_KEY")));
-        assert!(!should_inherit_environment(OsStr::new("LLMHUB_API_KEY")));
-        assert!(!should_inherit_environment(OsStr::new("SSH_AUTH_SOCK")));
-        assert!(!should_inherit_environment(OsStr::new(
-            "AWS_SECRET_ACCESS_KEY"
-        )));
-        assert!(!should_inherit_environment(OsStr::new(POLICY_ENV)));
+    fn sandbox_environment_uses_configured_globs() {
+        let patterns = vec!["PATH".to_string(), "LC_*".to_string()];
+        let matchers = compile_environment_patterns(&patterns).unwrap();
+        let matches = |name| matchers.iter().any(|matcher| matcher.is_match(name));
+
+        assert!(matches("PATH"));
+        assert!(matches("LC_ALL"));
+        assert!(!matches("OPENAI_API_KEY"));
+        assert!(!matches("SSH_AUTH_SOCK"));
+        assert!(!matches(POLICY_ENV));
+    }
+
+    #[test]
+    fn invalid_environment_glob_rejects_the_invocation() {
+        let error = compile_environment_patterns(&["[".to_string()]).unwrap_err();
+        assert!(error.contains("invalid sandbox environment pattern"));
     }
 
     #[test]
@@ -367,6 +300,7 @@ mod tests {
             args: vec!["--sandbox-worker".to_string()],
             policy_json: "{}".to_string(),
             cwd: root.clone(),
+            environment: Vec::new(),
         };
         let mut command = tokio::process::Command::new("programmer");
 
