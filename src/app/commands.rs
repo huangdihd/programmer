@@ -58,7 +58,10 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     // Expand before deciding whether to start or queue the request. Queued
     // messages must retain the same path annotations and image attachments as
     // messages that start immediately.
-    let expanded = crate::commands::expand_file_references(&typed, app.vision_enabled).await;
+    let diagnostics = app.diagnostics_state.lock().unwrap().baseline.clone();
+    let expanded =
+        crate::commands::expand_references(&typed, app.vision_enabled, diagnostics.as_deref())
+            .await;
     for notice in expanded.notices {
         app.conversation_panel.add_warning_string(notice);
     }
@@ -591,7 +594,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_file_reference_uses_the_real_expansion_path() {
-        let expanded = crate::commands::expand_file_references("inspect @Cargo.toml", false).await;
+        let expanded = crate::commands::expand_references("inspect @Cargo.toml", false, None).await;
         let mut panel = ConversationPanel::new();
         let mut pending_images = Vec::new();
 

@@ -296,7 +296,7 @@ impl App<'_> {
             let longest = completion
                 .candidates
                 .iter()
-                .map(|c| c.len())
+                .map(|candidate| candidate.label.len())
                 .max()
                 .unwrap_or(0) as u16;
             let popup_width = (longest + 2).clamp(10, chunks[POS_BOTTOM].width);
@@ -310,6 +310,7 @@ impl App<'_> {
 
             let popup = CompletionPopup {
                 candidates: &completion.candidates,
+                label: |candidate| candidate.label.as_str(),
                 selected: completion.selected,
                 scroll_offset: completion.scroll_offset,
             };

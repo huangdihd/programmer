@@ -566,8 +566,15 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
         // Shell-style completion for `!command` lines.
         CompletionEngine::complete_bang(&content)
     } else {
-        // Non-slash input may still carry a trailing `@file` reference.
-        CompletionEngine::complete_file_ref(&content)
+        // Non-slash input may still carry a trailing diagnostic or file reference.
+        let diagnostics = app
+            .diagnostics_state
+            .lock()
+            .unwrap()
+            .baseline
+            .clone()
+            .unwrap_or_default();
+        CompletionEngine::complete_reference(&content, &diagnostics)
     };
     if let Some(ref mut c) = app.input_panel.completion {
         c.visible = true;

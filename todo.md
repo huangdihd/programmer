@@ -33,8 +33,8 @@
 - ~~git cooperator signature~~
 - ~~expose local tools as a MCP server~~
 - ~~`@` to reference local files by path without injecting their contents~~
-- improve `@` references
-  - support referencing errors, warnings, and lint diagnostics
+- ~~improve `@` references~~
+  - ~~support referencing errors, warnings, and lint diagnostics~~
 - ~~! to run a command interactively in the app~~
 - ~~multi-provider support~~
 - ~~session persistence~~

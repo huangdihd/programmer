@@ -16,9 +16,10 @@
 pub mod ui;
 
 /// The completion popup widget.
-pub struct CompletionPopup<'a> {
-    /// Display strings for each candidate.
-    pub candidates: &'a [String],
+pub struct CompletionPopup<'a, T> {
+    /// Completion choices rendered by their display labels.
+    pub candidates: &'a [T],
+    pub label: fn(&T) -> &str,
     /// Currently selected index.
     pub selected: usize,
     /// Scroll offset (items scrolled off the top).

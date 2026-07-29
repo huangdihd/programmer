@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::diagnostics::{Diagnostic, Severity};
 use crate::providers::ProviderManager;
 use async_openai::types::responses::{ImageDetail, InputImageContent};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -442,10 +443,10 @@ impl Command {
 #[derive(Debug, Clone)]
 pub struct CompletionState {
     /// Input text before the token being completed; accepting candidate `i`
-    /// produces `prefix + candidates[i]`.
+    /// produces `prefix + candidates[i].value`.
     pub prefix: String,
-    /// Candidates for the current token only (this is what the popup shows).
-    pub candidates: Vec<String>,
+    /// Candidates for the current token.
+    pub candidates: Vec<CompletionCandidate>,
     /// Index of the currently-highlighted candidate.
     pub selected: usize,
     /// Whether the popup is visible (first Tab shows it).
@@ -454,8 +455,40 @@ pub struct CompletionState {
     pub scroll_offset: usize,
 }
 
+/// One completion choice. `label` is rendered in the popup while `value` is
+/// inserted into the input, allowing descriptive diagnostic candidates without
+/// putting their messages into the user's prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionCandidate {
+    pub value: String,
+    pub label: String,
+}
+
+impl CompletionCandidate {
+    fn plain(value: String) -> Self {
+        Self {
+            label: value.clone(),
+            value,
+        }
+    }
+
+    fn labeled(value: String, label: String) -> Self {
+        Self { value, label }
+    }
+}
+
 impl CompletionState {
     fn new(prefix: String, candidates: Vec<String>) -> Option<Self> {
+        Self::with_candidates(
+            prefix,
+            candidates
+                .into_iter()
+                .map(CompletionCandidate::plain)
+                .collect(),
+        )
+    }
+
+    fn with_candidates(prefix: String, candidates: Vec<CompletionCandidate>) -> Option<Self> {
         if candidates.is_empty() {
             return None;
         }
@@ -470,7 +503,7 @@ impl CompletionState {
 
     /// The full input line that accepting candidate `i` produces.
     pub fn line(&self, i: usize) -> String {
-        format!("{}{}", self.prefix, self.candidates[i])
+        format!("{}{}", self.prefix, self.candidates[i].value)
     }
 }
 
@@ -533,13 +566,23 @@ impl CompletionEngine {
         CompletionState::new(prefix, candidates)
     }
 
-    /// Complete an `@file` reference. Triggered when the whitespace-delimited
-    /// token at the end of the input begins with `@`; the part after `@` is
-    /// treated as a (possibly partial) path relative to the working directory.
-    pub(crate) fn complete_file_ref(content: &str) -> Option<CompletionState> {
+    /// Complete an `@` reference from current diagnostics and local paths.
+    pub(crate) fn complete_reference(
+        content: &str,
+        diagnostics: &[Diagnostic],
+    ) -> Option<CompletionState> {
         let (prefix, partial) = active_at_token(content)?;
-        let candidates = list_path_candidates(&partial);
-        CompletionState::new(prefix, candidates)
+        let mut candidates = diagnostic_candidates(diagnostics)
+            .into_iter()
+            .filter(|candidate| candidate.value.starts_with(&partial))
+            .collect::<Vec<_>>();
+        candidates.extend(
+            list_path_candidates(&partial)
+                .into_iter()
+                .map(CompletionCandidate::plain),
+        );
+        candidates.truncate(MAX_COMPLETION_CANDIDATES);
+        CompletionState::with_candidates(prefix, candidates)
     }
 
     /// Complete a `!command` line, shell-style: the first word completes
@@ -670,6 +713,85 @@ fn active_at_token(content: &str) -> Option<(String, String)> {
 /// Directories skipped when the user hasn't started typing a name — they are
 /// large and rarely the intended reference.
 const NOISE_DIRS: &[&str] = &["target", "node_modules", ".git"];
+const MAX_COMPLETION_CANDIDATES: usize = 50;
+const MAX_REFERENCED_DIAGNOSTICS: usize = 100;
+
+fn diagnostic_candidates(diagnostics: &[Diagnostic]) -> Vec<CompletionCandidate> {
+    if diagnostics.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = vec![CompletionCandidate::labeled(
+        "diagnostics".to_string(),
+        format!("All diagnostics ({})", diagnostics.len()),
+    )];
+    for (value, severity, label) in [
+        ("errors", Severity::Error, "Errors"),
+        ("warnings", Severity::Warning, "Warnings"),
+        ("lints", Severity::Lint, "Lints"),
+    ] {
+        let count = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == severity)
+            .count();
+        if count > 0 {
+            candidates.push(CompletionCandidate::labeled(
+                value.to_string(),
+                format!("{label} ({count})"),
+            ));
+        }
+    }
+
+    let mut sorted = diagnostics.iter().collect::<Vec<_>>();
+    sorted.sort_by(|a, b| compare_diagnostics(a, b));
+    let mut seen_locations = std::collections::HashSet::new();
+    for diagnostic in sorted {
+        let value = diagnostic_reference(diagnostic);
+        if !seen_locations.insert(value.clone()) {
+            continue;
+        }
+        let icon = match diagnostic.severity {
+            Severity::Error => "E",
+            Severity::Warning => "W",
+            Severity::Lint => "L",
+            Severity::Info => "I",
+        };
+        candidates.push(CompletionCandidate::labeled(
+            value,
+            format!(
+                "{icon} {} — {}",
+                diagnostic_location(diagnostic),
+                diagnostic.message
+            ),
+        ));
+    }
+    candidates
+}
+
+fn diagnostic_location(diagnostic: &Diagnostic) -> String {
+    let mut location = diagnostic.file.clone();
+    if diagnostic.line > 0 {
+        location.push_str(&format!(":{}", diagnostic.line));
+        if let Some(col) = diagnostic.col {
+            location.push_str(&format!(":{col}"));
+        }
+    }
+    location
+}
+
+fn diagnostic_reference(diagnostic: &Diagnostic) -> String {
+    format!("diagnostic:{}", diagnostic_location(diagnostic))
+}
+
+fn compare_diagnostics(a: &Diagnostic, b: &Diagnostic) -> std::cmp::Ordering {
+    a.severity
+        .cmp(&b.severity)
+        .then_with(|| a.file.cmp(&b.file))
+        .then_with(|| a.line.cmp(&b.line))
+        .then_with(|| a.col.cmp(&b.col))
+        .then_with(|| a.code.cmp(&b.code))
+        .then_with(|| a.message.cmp(&b.message))
+}
 
 /// The user's home directory, from the environment (`HOME`, or `USERPROFILE`
 /// on Windows).
@@ -784,32 +906,60 @@ const MAX_TOTAL_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_IMAGES_PER_MESSAGE: usize = 20;
 
 #[derive(Debug, Default)]
-pub(crate) struct ExpandedFileReferences {
+pub(crate) struct ExpandedReferences {
     pub text: String,
     pub images: Vec<InputImageContent>,
     pub notices: Vec<String>,
 }
 
-/// Expand `@path` references in a sent message. Supported images are attached
-/// when vision is enabled; every other existing file is passed to the model as
-/// a path-only reference so its contents do not consume the request context.
-/// Tokens that do not resolve to a readable file are left alone.
-pub(crate) async fn expand_file_references(
+/// Expand diagnostic and local-path references in a sent message. Diagnostic
+/// references use the latest already-collected snapshot; they never run a
+/// checker while the user is sending a message. Supported images are attached
+/// when vision is enabled, while other files are passed as path-only references.
+pub(crate) async fn expand_references(
     text: &str,
     vision_enabled: bool,
-) -> ExpandedFileReferences {
-    let mut seen: Vec<String> = Vec::new();
+    diagnostics: Option<&[Diagnostic]>,
+) -> ExpandedReferences {
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut seen_diagnostic_references = std::collections::HashSet::new();
+    let mut referenced_diagnostics: std::collections::HashSet<Diagnostic> =
+        std::collections::HashSet::new();
     let mut references = String::new();
     let mut images = Vec::new();
     let mut notices = Vec::new();
     let mut total_image_bytes = 0u64;
 
     for raw in text.split_whitespace() {
-        let Some(path) = raw.strip_prefix('@') else {
+        let Some(reference) = raw.strip_prefix('@') else {
             continue;
         };
-        // Ignore empty and already-processed references.
-        if path.is_empty() || seen.iter().any(|p| p == path) {
+        if reference.is_empty() {
+            continue;
+        }
+        if is_diagnostic_reference(reference) {
+            if !seen_diagnostic_references.insert(reference) {
+                continue;
+            }
+            let Some(snapshot) = diagnostics else {
+                notices.push(format!(
+                    "could not resolve @{reference}: diagnostics are not ready"
+                ));
+                continue;
+            };
+            let matches = matching_diagnostics(reference, snapshot);
+            if matches.is_empty() {
+                notices.push(format!(
+                    "could not resolve @{reference}: no matching current diagnostics"
+                ));
+            } else {
+                referenced_diagnostics.extend(matches.into_iter().cloned());
+            }
+            continue;
+        }
+
+        let path = reference;
+        if !seen_paths.insert(path) {
             continue;
         }
         let fs_path = expand_tilde(path);
@@ -827,7 +977,6 @@ pub(crate) async fn expand_file_references(
         let Ok(header_len) = file.read(&mut header).await else {
             continue;
         };
-        seen.push(path.to_string());
 
         if let Some(kind) = detect_image(&header[..header_len]) {
             if !vision_enabled {
@@ -882,7 +1031,24 @@ pub(crate) async fn expand_file_references(
         ));
     }
 
-    ExpandedFileReferences {
+    if !referenced_diagnostics.is_empty() {
+        let mut diagnostics = referenced_diagnostics.into_iter().collect::<Vec<_>>();
+        diagnostics.sort_by(compare_diagnostics);
+        let omitted = diagnostics.len().saturating_sub(MAX_REFERENCED_DIAGNOSTICS);
+        diagnostics.truncate(MAX_REFERENCED_DIAGNOSTICS);
+        references.push_str("\n\nReferenced current diagnostics:");
+        for diagnostic in diagnostics {
+            references.push_str(&format!("\n- {}", diagnostic.render()));
+        }
+        if omitted > 0 {
+            references.push_str(&format!("\n- … {omitted} more diagnostics omitted"));
+            notices.push(format!(
+                "diagnostic references were limited to {MAX_REFERENCED_DIAGNOSTICS} entries"
+            ));
+        }
+    }
+
+    ExpandedReferences {
         text: if references.is_empty() {
             text.to_string()
         } else {
@@ -891,6 +1057,24 @@ pub(crate) async fn expand_file_references(
         images,
         notices,
     }
+}
+
+fn is_diagnostic_reference(reference: &str) -> bool {
+    matches!(reference, "diagnostics" | "errors" | "warnings" | "lints")
+        || reference.starts_with("diagnostic:")
+}
+
+fn matching_diagnostics<'a>(reference: &str, diagnostics: &'a [Diagnostic]) -> Vec<&'a Diagnostic> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| match reference {
+            "diagnostics" => true,
+            "errors" => diagnostic.severity == Severity::Error,
+            "warnings" => diagnostic.severity == Severity::Warning,
+            "lints" => diagnostic.severity == Severity::Lint,
+            _ => diagnostic_reference(diagnostic) == reference,
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -979,6 +1163,23 @@ fn skip_gif_sub_blocks(bytes: &[u8], pos: &mut usize) -> Option<()> {
 mod tests {
     use super::*;
 
+    fn diagnostic(
+        file: &str,
+        line: u32,
+        col: Option<u32>,
+        severity: Severity,
+        message: &str,
+    ) -> Diagnostic {
+        Diagnostic {
+            file: file.to_string(),
+            line,
+            col,
+            severity,
+            code: None,
+            message: message.to_string(),
+        }
+    }
+
     #[test]
     fn thinking_command_is_parsed_and_off_is_not_a_level() {
         assert!(matches!(
@@ -994,7 +1195,7 @@ mod tests {
             crate::thinking::ThinkingLevel::COMPLETIONS,
         )
         .expect("thinking level completion");
-        assert_eq!(state.candidates, vec!["high"]);
+        assert_eq!(state.candidates[0].value, "high");
     }
 
     #[test]
@@ -1148,7 +1349,7 @@ mod tests {
         let state = CompletionEngine::complete_subcommand("provider m", "provider", values)
             .expect("provider alias completion");
         assert_eq!(state.prefix, "/provider ");
-        assert_eq!(state.candidates, vec!["manage"]);
+        assert_eq!(state.candidates[0].value, "manage");
 
         let mode = COMMAND_SPECS
             .iter()
@@ -1160,7 +1361,7 @@ mod tests {
         assert_eq!(values, &["manual", "auto", "plan", "yolo"]);
         let state = CompletionEngine::complete_subcommand("mode p", "mode", values)
             .expect("mode plan completion");
-        assert_eq!(state.candidates, vec!["plan"]);
+        assert_eq!(state.candidates[0].value, "plan");
 
         let plan = COMMAND_SPECS
             .iter()
@@ -1172,7 +1373,7 @@ mod tests {
         assert_eq!(values, &["approve", "cancel"]);
         let state = CompletionEngine::complete_subcommand("plan c", "plan", values)
             .expect("plan cancel completion");
-        assert_eq!(state.candidates, vec!["cancel"]);
+        assert_eq!(state.candidates[0].value, "cancel");
     }
 
     #[test]
@@ -1195,6 +1396,73 @@ mod tests {
         assert_eq!(partial, "");
     }
 
+    #[test]
+    fn diagnostic_completion_separates_labels_from_inserted_values() {
+        let diagnostics = vec![
+            diagnostic(
+                "src/lib.rs",
+                42,
+                Some(5),
+                Severity::Error,
+                "mismatched types",
+            ),
+            diagnostic(
+                "src/lib.rs",
+                42,
+                Some(5),
+                Severity::Warning,
+                "also suspicious",
+            ),
+            diagnostic("src/ui.rs", 7, None, Severity::Lint, "needless borrow"),
+        ];
+
+        let state = CompletionEngine::complete_reference("fix @diag", &diagnostics)
+            .expect("diagnostic completions");
+        assert_eq!(state.prefix, "fix @");
+        assert_eq!(state.candidates[0].value, "diagnostics");
+        assert_eq!(state.candidates[0].label, "All diagnostics (3)");
+
+        let location = state
+            .candidates
+            .iter()
+            .find(|candidate| candidate.value == "diagnostic:src/lib.rs:42:5")
+            .expect("location candidate");
+        assert_eq!(location.label, "E src/lib.rs:42:5 — mismatched types");
+        assert_eq!(
+            state
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.value == "diagnostic:src/lib.rs:42:5")
+                .count(),
+            1,
+            "diagnostics at the same location are grouped"
+        );
+        let index = state
+            .candidates
+            .iter()
+            .position(|candidate| candidate.value == "diagnostic:src/lib.rs:42:5")
+            .unwrap();
+        assert_eq!(state.line(index), "fix @diagnostic:src/lib.rs:42:5");
+    }
+
+    #[test]
+    fn diagnostic_completion_lists_nonempty_severity_groups_in_order() {
+        let diagnostics = vec![
+            diagnostic("lint.rs", 3, None, Severity::Lint, "lint"),
+            diagnostic("warning.rs", 2, None, Severity::Warning, "warning"),
+            diagnostic("error.rs", 1, None, Severity::Error, "error"),
+        ];
+        let state =
+            CompletionEngine::complete_reference("@", &diagnostics).expect("all references");
+        let values = state
+            .candidates
+            .iter()
+            .take(4)
+            .map(|candidate| candidate.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec!["diagnostics", "errors", "warnings", "lints"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn bang_completion_lists_path_commands_and_files() {
@@ -1202,7 +1470,10 @@ mod tests {
         // `ls*` matches, so the 50-candidate cap can't push it out.
         let state = CompletionEngine::complete_bang("!ls").expect("commands starting with ls");
         assert_eq!(
-            state.candidates.first().map(String::as_str),
+            state
+                .candidates
+                .first()
+                .map(|candidate| candidate.value.as_str()),
             Some("ls"),
             "{:?}",
             state.candidates
@@ -1217,7 +1488,10 @@ mod tests {
         let state = CompletionEngine::complete_bang("!cat src/co").expect("path candidates");
         assert_eq!(state.prefix, "!cat ");
         assert!(
-            state.candidates.iter().any(|c| c == "src/commands/"),
+            state
+                .candidates
+                .iter()
+                .any(|candidate| candidate.value == "src/commands/"),
             "{:?}",
             state.candidates
         );
@@ -1271,14 +1545,14 @@ mod tests {
             state
                 .candidates
                 .iter()
-                .any(|candidate| candidate == "clear")
+                .any(|candidate| candidate.value == "clear")
         );
         for id in [interactive_id, pipe_id] {
             assert!(
                 state
                     .candidates
                     .iter()
-                    .any(|c| c.starts_with(&format!("{id}  "))),
+                    .any(|candidate| candidate.value.starts_with(&format!("{id}  "))),
                 "candidates: {:?}",
                 state.candidates
             );
@@ -1288,7 +1562,7 @@ mod tests {
 
     #[tokio::test]
     async fn expand_file_references_adds_path_without_content() {
-        let out = expand_file_references("look at @Cargo.toml please", false).await;
+        let out = expand_references("look at @Cargo.toml please", false, None).await;
         assert!(
             out.text.starts_with("look at @Cargo.toml please"),
             "keeps typed text"
@@ -1307,10 +1581,86 @@ mod tests {
 
     #[tokio::test]
     async fn expand_file_references_leaves_plain_text_alone() {
-        let out = expand_file_references("no references here @nonexistent.xyz", false).await;
+        let out = expand_references("no references here @nonexistent.xyz", false, None).await;
         assert_eq!(out.text, "no references here @nonexistent.xyz");
         assert!(out.images.is_empty());
         assert!(out.notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expand_references_filters_and_deduplicates_diagnostics() {
+        let diagnostics = vec![
+            Diagnostic {
+                code: Some("E0308".to_string()),
+                ..diagnostic(
+                    "src/lib.rs",
+                    42,
+                    Some(5),
+                    Severity::Error,
+                    "mismatched types",
+                )
+            },
+            diagnostic("src/main.rs", 9, None, Severity::Warning, "unused import"),
+        ];
+        let out = expand_references(
+            "fix @errors and @diagnostic:src/lib.rs:42:5",
+            false,
+            Some(&diagnostics),
+        )
+        .await;
+
+        assert!(out.text.contains("Referenced current diagnostics:"));
+        assert!(
+            out.text
+                .contains("- src/lib.rs:42:5 error[E0308] mismatched types")
+        );
+        assert!(!out.text.contains("unused import"));
+        assert_eq!(out.text.matches("mismatched types").count(), 1);
+        assert!(out.notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expand_references_warns_when_diagnostics_are_missing_or_stale() {
+        let unavailable = expand_references("fix @errors", false, None).await;
+        assert_eq!(unavailable.text, "fix @errors");
+        assert!(
+            unavailable
+                .notices
+                .iter()
+                .any(|notice| notice.contains("diagnostics are not ready"))
+        );
+
+        let stale = expand_references("fix @diagnostic:src/lib.rs:42", false, Some(&[])).await;
+        assert_eq!(stale.text, "fix @diagnostic:src/lib.rs:42");
+        assert!(
+            stale
+                .notices
+                .iter()
+                .any(|notice| notice.contains("no matching current diagnostics"))
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_diagnostic_references_have_a_context_limit() {
+        let diagnostics = (0..=MAX_REFERENCED_DIAGNOSTICS)
+            .map(|line| {
+                diagnostic(
+                    "src/generated.rs",
+                    line as u32 + 1,
+                    None,
+                    Severity::Error,
+                    &format!("problem {line}"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let out = expand_references("@diagnostics", false, Some(&diagnostics)).await;
+        assert!(out.text.contains("… 1 more diagnostics omitted"));
+        assert!(
+            out.notices
+                .iter()
+                .any(|notice| notice.contains("limited to 100 entries"))
+        );
     }
 
     #[tokio::test]
@@ -1322,7 +1672,7 @@ mod tests {
             .unwrap();
         let reference = format!("@{}", path.display());
 
-        let out = expand_file_references(&reference, false).await;
+        let out = expand_references(&reference, false, None).await;
         assert!(out.text.contains(&format!(
             "Referenced local file path (content not included): {}",
             path.display()
@@ -1341,11 +1691,11 @@ mod tests {
             .unwrap();
         let reference = format!("@{}", path.display());
 
-        let off = expand_file_references(&reference, false).await;
+        let off = expand_references(&reference, false, None).await;
         assert!(off.images.is_empty());
         assert!(off.notices.iter().any(|n| n.contains("vision is off")));
 
-        let on = expand_file_references(&reference, true).await;
+        let on = expand_references(&reference, true, None).await;
         assert_eq!(on.images.len(), 1);
         assert!(
             on.images[0]

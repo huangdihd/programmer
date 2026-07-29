@@ -746,6 +746,7 @@ impl ProviderPanel {
 
                     let popup = CompletionPopup {
                         candidates: &comp.candidates,
+                        label: String::as_str,
                         selected: comp.selected,
                         scroll_offset: comp.scroll_offset,
                     };

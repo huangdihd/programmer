@@ -23,7 +23,7 @@ const BG: Color = Color::Rgb(30, 30, 40);
 const FG: Color = Color::White;
 const ACCENT: Color = Color::LightBlue;
 
-impl Widget for &CompletionPopup<'_> {
+impl<T> Widget for &CompletionPopup<'_, T> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Clear whatever is behind the popup first.
         Clear.render(area, buf);
@@ -51,13 +51,13 @@ impl Widget for &CompletionPopup<'_> {
             .enumerate()
             .skip(scroll)
             .take(visible_height)
-            .map(|(i, text)| {
+            .map(|(i, candidate)| {
                 let style = if i == self.selected {
                     Style::default().fg(Color::Black).bg(ACCENT)
                 } else {
                     Style::default().fg(FG).bg(BG)
                 };
-                ListItem::new(text.as_str()).style(style)
+                ListItem::new((self.label)(candidate)).style(style)
             })
             .collect();
 

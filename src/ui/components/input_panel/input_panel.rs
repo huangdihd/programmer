@@ -128,6 +128,7 @@ impl InputPanel<'_> {
 
     pub fn clear(&mut self) -> bool {
         self.pastes.clear();
+        self.completion = None;
         self.text_area.clear()
     }
 
@@ -194,5 +195,32 @@ impl InputPanel<'_> {
             self.clear();
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::CompletionCandidate;
+
+    #[test]
+    fn clear_dismisses_completion_state() {
+        let mut panel = InputPanel::new();
+        panel.insert_str("@");
+        panel.completion = Some(CompletionState {
+            prefix: "@".to_string(),
+            candidates: vec![CompletionCandidate {
+                value: "diagnostics".to_string(),
+                label: "All diagnostics".to_string(),
+            }],
+            selected: 0,
+            visible: true,
+            scroll_offset: 0,
+        });
+
+        panel.clear();
+
+        assert!(panel.get_content().is_empty());
+        assert!(panel.completion.is_none());
     }
 }
