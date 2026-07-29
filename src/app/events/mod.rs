@@ -27,6 +27,7 @@ use super::{commands, diagnostics, helpers, session};
 use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
 use crate::commands::CompletionEngine;
+use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
 use crate::ui::components::conversation_panel::conversation_panel::{
     ActivePhase, ConversationPanel,
@@ -247,17 +248,25 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
 }
 
 const QUIT_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const QUIT_CONFIRM_WARNING: &str = "Press Ctrl+C again within 2 seconds to exit.";
+pub(crate) const QUIT_CONFIRM_WARNING: &str = "Press Ctrl+C again within 2 seconds to exit.";
+
+pub(crate) fn is_quit_confirmation_warning(item: &MessageItem) -> bool {
+    matches!(item, MessageItem::Warning(text) if text == QUIT_CONFIRM_WARNING)
+}
+
+pub(crate) fn remove_quit_confirmation_warning(panel: &mut ConversationPanel) {
+    panel.remove_warning_string(QUIT_CONFIRM_WARNING);
+}
 
 fn handle_quit_request(app: &mut App<'_>) {
     let now = std::time::Instant::now();
     if quit_is_confirmed(app.quit_requested_at, now) {
+        remove_quit_confirmation_warning(&mut app.conversation_panel);
         app.quit();
         return;
     }
 
-    app.conversation_panel
-        .remove_warning_string(QUIT_CONFIRM_WARNING);
+    remove_quit_confirmation_warning(&mut app.conversation_panel);
     app.quit_requested_at = Some(now);
     app.conversation_panel
         .add_warning_string(QUIT_CONFIRM_WARNING);
@@ -277,8 +286,7 @@ fn quit_confirmation_expired(
 fn expire_quit_confirmation(app: &mut App<'_>, now: std::time::Instant) {
     if quit_confirmation_expired(app.quit_requested_at, now) {
         app.quit_requested_at = None;
-        app.conversation_panel
-            .remove_warning_string(QUIT_CONFIRM_WARNING);
+        remove_quit_confirmation_warning(&mut app.conversation_panel);
     }
 }
 
@@ -628,9 +636,11 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationPanel, QUIT_CONFIRM_TIMEOUT, is_current_turn_id, is_live_turn_id,
-        quit_confirmation_expired, quit_is_confirmed, take_pending_request,
+        ConversationPanel, QUIT_CONFIRM_TIMEOUT, QUIT_CONFIRM_WARNING, is_current_turn_id,
+        is_live_turn_id, quit_confirmation_expired, quit_is_confirmed,
+        remove_quit_confirmation_warning, take_pending_request,
     };
+    use crate::response::message_item::MessageItem;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -661,6 +671,25 @@ mod tests {
             Some(first_press),
             first_press + QUIT_CONFIRM_TIMEOUT + Duration::from_millis(1)
         ));
+    }
+
+    #[test]
+    fn quit_confirmation_warning_can_be_removed_without_touching_other_warnings() {
+        let mut panel = ConversationPanel::new();
+        panel.add_warning_string(QUIT_CONFIRM_WARNING);
+        panel.add_warning_string("keep this warning");
+
+        remove_quit_confirmation_warning(&mut panel);
+
+        let items = panel.items_snapshot();
+        assert!(!items.iter().any(
+            |item| matches!(item, MessageItem::Warning(text) if text == QUIT_CONFIRM_WARNING)
+        ));
+        assert!(
+            items.iter().any(
+                |item| matches!(item, MessageItem::Warning(text) if text == "keep this warning")
+            )
+        );
     }
 
     #[test]

@@ -47,7 +47,8 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     app.session.dirty = false;
     app.sync_todos_from_store();
     let Some(mgr) = &app.session.mgr else { return };
-    let items: Vec<MessageItem> = app.conversation_panel.items_snapshot();
+    let mut items: Vec<MessageItem> = app.conversation_panel.items_snapshot();
+    remove_transient_items(&mut items);
     // Don't persist a session with no user input — there's nothing worth
     // resuming, and empty sessions only clutter the picker. `/init` sends a
     // (developer-role) input message, which `first_user_text` picks up, so a
@@ -84,6 +85,10 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     }
 }
 
+fn remove_transient_items(items: &mut Vec<MessageItem>) {
+    items.retain(|item| !super::events::is_quit_confirmation_warning(item));
+}
+
 /// Write the current config back to `config.toml` atomically.
 pub(crate) fn persist_config(app: &mut App<'_>) {
     let Some(config_dir) = dirs::config_dir() else {
@@ -113,5 +118,28 @@ pub(crate) fn delete_session(app: &mut App<'_>) {
         let _ = mgr.delete(&app.session.uuid);
         let new_session = mgr.create();
         app.session.uuid = new_session.uuid;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_transient_items;
+    use crate::app::events::QUIT_CONFIRM_WARNING;
+    use crate::response::message_item::MessageItem;
+
+    #[test]
+    fn quit_confirmation_warning_is_not_persisted() {
+        let mut items = vec![
+            MessageItem::Warning(QUIT_CONFIRM_WARNING.to_string()),
+            MessageItem::Warning("keep this warning".to_string()),
+        ];
+
+        remove_transient_items(&mut items);
+
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            MessageItem::Warning(text) if text == "keep this warning"
+        ));
     }
 }

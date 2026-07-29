@@ -280,6 +280,7 @@ impl App<'_> {
         }
         let mut conversation_panel = ConversationPanel::new();
         conversation_panel.restore_items(saved_items);
+        events::remove_quit_confirmation_warning(&mut conversation_panel);
         for msg in startup_messages {
             conversation_panel.add_info_string(msg);
         }
