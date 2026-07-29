@@ -125,7 +125,7 @@ impl<'a> ToolCallMessage<'a> {
                     dim,
                 )));
             } else if let Some(live) = self.live_output {
-                push_live_tail(&mut lines, live, muted);
+                push_live_output(&mut lines, live, muted, Some(LIVE_TAIL_LINES));
             } else if !failed {
                 lines.push(Line::from(Span::styled("  \u{23BF} \u{2026}", muted)));
             }
@@ -207,7 +207,7 @@ impl<'a> ToolCallMessage<'a> {
                 )));
             }
         } else if let Some(live) = self.live_output {
-            push_live_tail(&mut lines, live, muted);
+            push_live_output(&mut lines, live, muted, None);
         }
         if result_text.is_none() && !failed && self.call.name == crate::tools::command::NAME {
             lines.push(background_hint());
@@ -224,14 +224,19 @@ fn background_hint() -> Line<'static> {
     ))
 }
 
-/// Lines of live command output shown while it runs. Only the tail matters for
-/// "is it making progress"; the full output lands in the committed result.
+/// Lines of live command output shown while a running call is collapsed.
 const LIVE_TAIL_LINES: usize = 8;
 
-/// Append the tail of a running command's live output to `lines`, each row
-/// dimmed and marked with the result gutter. A leading `⋯` shows when earlier
-/// lines were dropped.
-fn push_live_tail(lines: &mut Vec<Line<'static>>, live: &str, muted: Style) {
+/// Append a running command's output to `lines`, each row dimmed and marked
+/// with the result gutter. Collapsed calls pass a line limit and get a leading
+/// `⋯` when earlier rows are hidden; expanded calls pass `None` to show all
+/// output retained by the task.
+fn push_live_output(
+    lines: &mut Vec<Line<'static>>,
+    live: &str,
+    muted: Style,
+    tail_lines: Option<usize>,
+) {
     let dim = muted.add_modifier(Modifier::DIM);
     let all: Vec<&str> = live.lines().collect();
     // A trailing newline yields no final empty entry from `.lines()`, so this is
@@ -240,7 +245,9 @@ fn push_live_tail(lines: &mut Vec<Line<'static>>, live: &str, muted: Style) {
         lines.push(Line::from(Span::styled("  \u{23BF} \u{2026}", muted)));
         return;
     }
-    let start = all.len().saturating_sub(LIVE_TAIL_LINES);
+    let start = tail_lines
+        .map(|limit| all.len().saturating_sub(limit))
+        .unwrap_or(0);
     if start > 0 {
         lines.push(Line::from(Span::styled("  \u{23BF} \u{22EF}", dim)));
     }
@@ -456,6 +463,40 @@ mod tests {
     fn command_background_hint_shows_the_shortcut() {
         let hint = plain(&[background_hint()]);
         assert_eq!(hint, ["  Ctrl+Z move to background"]);
+    }
+
+    #[test]
+    fn collapsed_live_output_keeps_only_the_tail() {
+        let live = (1..=12)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut lines = Vec::new();
+
+        push_live_output(&mut lines, &live, Style::default(), Some(LIVE_TAIL_LINES));
+
+        let rendered = plain(&lines);
+        assert_eq!(rendered.len(), LIVE_TAIL_LINES + 1);
+        assert_eq!(rendered.first().unwrap(), "  ⎿ ⋯");
+        assert_eq!(rendered[1], "  ⎿ line 5");
+        assert_eq!(rendered.last().unwrap(), "  ⎿ line 12");
+    }
+
+    #[test]
+    fn expanded_live_output_keeps_every_line() {
+        let live = (1..=12)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut lines = Vec::new();
+
+        push_live_output(&mut lines, &live, Style::default(), None);
+
+        let rendered = plain(&lines);
+        assert_eq!(rendered.len(), 12);
+        assert_eq!(rendered.first().unwrap(), "  ⎿ line 1");
+        assert_eq!(rendered.last().unwrap(), "  ⎿ line 12");
+        assert!(!rendered.iter().any(|line| line.contains('⋯')));
     }
 
     fn plain(lines: &[Line<'static>]) -> Vec<String> {

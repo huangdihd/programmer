@@ -38,9 +38,6 @@ const PTY_SCROLLBACK: usize = 1000;
 /// dropped so the tail (usually the interesting part) is always available.
 const MAX_TASK_OUTPUT: usize = 200_000;
 
-/// Live command output only needs a bounded tail in the conversation panel.
-const MAX_LIVE_OUTPUT: usize = 16_384;
-
 /// Cap on the output persisted per task in the session file.
 const MAX_PERSISTED_OUTPUT: usize = 10_000;
 
@@ -1499,7 +1496,7 @@ fn append_live_output(entry: &mut TaskEntry, chunk: &str) {
         return;
     }
     entry.live_output.push_str(chunk);
-    cap_buffer(&mut entry.live_output, MAX_LIVE_OUTPUT);
+    cap_buffer(&mut entry.live_output, entry.max_output);
 }
 
 /// Append a raw PTY chunk to an interactive task's transcript buffer.

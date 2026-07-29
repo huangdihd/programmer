@@ -13,7 +13,7 @@
 - multi agents(traditional sub agents or use interactive background task system to launch itself again?)
 - sandbox
 - ~~store too long outputs as files~~
-- display full output when commands are running
+- ~~display full output when commands are running~~
 - ~~default classifier model~~
 - monitor local file changes and prevent modifications after changes before read
 - ~~after switch sessions using /new, task can't be cleaned and todos can't update as expectations~~
