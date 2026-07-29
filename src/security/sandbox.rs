@@ -6,9 +6,53 @@
 // (at your option) any later version.
 
 use skarn_sandbox::{NetPolicy, Policy};
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 
 pub(crate) const POLICY_ENV: &str = "PROGRAMMER_SANDBOX_POLICY";
+
+const SAFE_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "ANDROID_HOME",
+    "ANDROID_SDK_ROOT",
+    "AR",
+    "CC",
+    "CARGO_HOME",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "CMAKE_PREFIX_PATH",
+    "COLORTERM",
+    "CPATH",
+    "CXX",
+    "DEVELOPER_DIR",
+    "GOPATH",
+    "GOROOT",
+    "HOME",
+    "JAVA_HOME",
+    "LANG",
+    "LANGUAGE",
+    "LD",
+    "LIBRARY_PATH",
+    "LOGNAME",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "NO_COLOR",
+    "PATH",
+    "PKG_CONFIG_PATH",
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+    "RUSTUP_HOME",
+    "SDKROOT",
+    "SHELL",
+    "TEMP",
+    "TERM",
+    "TERMINFO",
+    "TERMINFO_DIRS",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "USER",
+];
 
 pub(crate) struct SandboxInvocation {
     pub program: PathBuf,
@@ -68,6 +112,9 @@ pub(super) fn program_invocation(
             builder = builder.read(path);
         }
     }
+    for path in sensitive_read_paths(security.workspace()) {
+        builder = builder.deny_read(path);
+    }
     for path in &config.writable_paths {
         builder = builder.read_write(security.resolve_path(path)?);
     }
@@ -104,6 +151,65 @@ fn common_development_paths() -> Vec<PathBuf> {
             .map(PathBuf::from),
     );
     paths
+}
+
+fn sensitive_read_paths(workspace: &Path) -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let mut paths = [
+        ".bash_history",
+        ".claude",
+        ".codex",
+        ".config/opencode",
+        ".fish_history",
+        ".local/share/fish/fish_history",
+        ".zsh_history",
+        "Library/Application Support/1Password",
+        "Library/Application Support/Arc/User Data",
+        "Library/Application Support/Bitwarden",
+        "Library/Application Support/BraveSoftware",
+        "Library/Application Support/Firefox",
+        "Library/Application Support/Google/Chrome",
+        "Library/Application Support/Microsoft Edge",
+        "Library/Application Support/com.apple.TCC",
+        "Library/Application Support/programmer",
+        "Library/Cookies",
+        "Library/Keychains",
+        "Library/Mail",
+        "Library/Messages",
+        "Library/Safari",
+    ]
+    .into_iter()
+    .map(|path| home.join(path))
+    .filter(|path| path.exists() && !workspace.starts_with(path))
+    .collect::<Vec<_>>();
+    for base in [dirs::config_dir(), dirs::data_dir()].into_iter().flatten() {
+        paths.push(base.join("programmer"));
+    }
+    paths.retain(|path| path.exists() && !workspace.starts_with(path));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn should_inherit_environment(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    #[cfg(not(windows))]
+    {
+        name.starts_with("LC_") || SAFE_ENVIRONMENT_VARIABLES.contains(&name)
+    }
+    #[cfg(windows)]
+    {
+        let name = name.to_ascii_uppercase();
+        name.starts_with("LC_") || SAFE_ENVIRONMENT_VARIABLES.contains(&name.as_str())
+    }
+}
+
+fn safe_environment() -> impl Iterator<Item = (OsString, OsString)> {
+    std::env::vars_os().filter(|(name, _)| should_inherit_environment(name))
 }
 
 fn sandbox_host_executable() -> Result<PathBuf, String> {
@@ -145,6 +251,11 @@ pub(crate) fn run_worker_if_requested() {
         std::env::var(POLICY_ENV).unwrap_or_else(|_| fail_worker("sandbox policy is missing"));
     let policy: Policy = serde_json::from_str(&policy_json)
         .unwrap_or_else(|error| fail_worker(&format!("invalid sandbox policy: {error}")));
+    // The worker runs before the Tokio runtime or any other threads exist.
+    // Remove the serialized policy so the target cannot inspect its boundary.
+    unsafe {
+        std::env::remove_var(POLICY_ENV);
+    }
 
     #[cfg(unix)]
     {
@@ -172,6 +283,8 @@ pub(crate) fn configure_tokio_command(
     command: &mut tokio::process::Command,
     invocation: SandboxInvocation,
 ) {
+    command.env_clear();
+    command.envs(safe_environment());
     command.args(invocation.args);
     command.env(POLICY_ENV, invocation.policy_json);
     command.current_dir(invocation.cwd);
@@ -181,6 +294,10 @@ pub(crate) fn configure_pty_command(
     command: &mut portable_pty::CommandBuilder,
     invocation: SandboxInvocation,
 ) {
+    command.env_clear();
+    for (name, value) in safe_environment() {
+        command.env(name, value);
+    }
     command.args(invocation.args);
     command.env(POLICY_ENV, invocation.policy_json);
     command.cwd(invocation.cwd);
@@ -217,6 +334,52 @@ mod tests {
         assert_eq!(wrapped.args[0], "--sandbox-worker");
         assert_eq!(wrapped.args[1], "--");
         assert_eq!(wrapped.program, sandbox_host_executable().unwrap());
+        let policy: Policy = serde_json::from_str(&wrapped.policy_json).unwrap();
+        for path in sensitive_read_paths(&root) {
+            assert!(policy.fs_deny_read.contains(&path));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sandbox_environment_only_inherits_safe_variables() {
+        assert!(should_inherit_environment(OsStr::new("PATH")));
+        assert!(should_inherit_environment(OsStr::new("LC_ALL")));
+        assert!(should_inherit_environment(OsStr::new("JAVA_HOME")));
+        #[cfg(not(windows))]
+        assert!(!should_inherit_environment(OsStr::new("java_home")));
+        assert!(!should_inherit_environment(OsStr::new("OPENAI_API_KEY")));
+        assert!(!should_inherit_environment(OsStr::new("LLMHUB_API_KEY")));
+        assert!(!should_inherit_environment(OsStr::new("SSH_AUTH_SOCK")));
+        assert!(!should_inherit_environment(OsStr::new(
+            "AWS_SECRET_ACCESS_KEY"
+        )));
+        assert!(!should_inherit_environment(OsStr::new(POLICY_ENV)));
+    }
+
+    #[test]
+    fn sandbox_process_configuration_clears_parent_environment() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-sandbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let invocation = SandboxInvocation {
+            program: PathBuf::from("programmer"),
+            args: vec!["--sandbox-worker".to_string()],
+            policy_json: "{}".to_string(),
+            cwd: root.clone(),
+        };
+        let mut command = tokio::process::Command::new("programmer");
+
+        configure_tokio_command(&mut command, invocation);
+
+        let environment = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert!(environment.contains_key(OsStr::new(POLICY_ENV)));
+        assert!(!environment.contains_key(OsStr::new("OPENAI_API_KEY")));
+        assert!(!environment.contains_key(OsStr::new("SSH_AUTH_SOCK")));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

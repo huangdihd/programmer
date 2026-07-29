@@ -15,7 +15,7 @@
 
 use super::{ClickTarget, Sidebar, SidebarSection};
 use crate::diagnostics::{Diagnostic, Severity};
-use crate::mcp::McpManager;
+use crate::mcp::{McpConnectionState, McpServerStatus};
 use crate::tasks::{SidebarTaskSnapshot, TaskStatus};
 use crate::todos::{TodoList, TodoStatus};
 use crate::ui::text::{format_duration_secs, truncate_to_width, wrap_to_width};
@@ -35,13 +35,13 @@ impl Sidebar {
     /// Render the sidebar into `area`. Populates `self.click_map` so the
     /// caller can resolve mouse clicks back to section titles or items.
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    pub(crate) fn render(
         &mut self,
         area: Rect,
         buf: &mut Buffer,
         diagnostics: &[Diagnostic],
         lsp_configured: bool,
-        mcp_manager: Option<&McpManager>,
+        mcp_servers: &[McpServerStatus],
         todo_list: &TodoList,
         tasks: &[SidebarTaskSnapshot],
     ) {
@@ -61,7 +61,7 @@ impl Sidebar {
             inner.width,
             diagnostics,
             lsp_configured,
-            mcp_manager,
+            mcp_servers,
             todo_list,
             tasks,
         );
@@ -136,7 +136,7 @@ impl Sidebar {
         width: u16,
         diagnostics: &[Diagnostic],
         lsp_configured: bool,
-        mcp_manager: Option<&McpManager>,
+        mcp_servers: &[McpServerStatus],
         todo_list: &TodoList,
         tasks: &[SidebarTaskSnapshot],
     ) -> (Vec<Line<'static>>, Vec<ClickTarget>) {
@@ -152,7 +152,7 @@ impl Sidebar {
                 section.key,
                 diagnostics,
                 lsp_configured,
-                mcp_manager,
+                mcp_servers,
                 todo_list,
                 tasks,
             ) {
@@ -174,7 +174,7 @@ impl Sidebar {
                 section,
                 diagnostics,
                 lsp_configured,
-                mcp_manager,
+                mcp_servers,
                 todo_list,
                 tasks,
             );
@@ -194,7 +194,7 @@ impl Sidebar {
                         );
                     }
                     SidebarSection::Mcp => {
-                        self.render_mcp(&mut lines, &mut targets, width, mcp_manager);
+                        self.render_mcp(&mut lines, &mut targets, width, mcp_servers);
                     }
                     SidebarSection::Todos => {
                         self.render_todos(&mut lines, &mut targets, width, todo_list);
@@ -226,14 +226,14 @@ impl Sidebar {
         key: SidebarSection,
         diagnostics: &[Diagnostic],
         lsp_configured: bool,
-        mcp_manager: Option<&McpManager>,
+        mcp_servers: &[McpServerStatus],
         todo_list: &TodoList,
         tasks: &[SidebarTaskSnapshot],
     ) -> bool {
         match key {
             // Show when diagnostics exist or a live LSP is configured.
             SidebarSection::Diagnostics => lsp_configured || !diagnostics.is_empty(),
-            SidebarSection::Mcp => mcp_manager.map(|m| m.server_count() > 0).unwrap_or(false),
+            SidebarSection::Mcp => !mcp_servers.is_empty(),
             SidebarSection::Todos => !todo_list.todos.is_empty(),
             SidebarSection::Tasks => !tasks.is_empty(),
         }
@@ -246,7 +246,7 @@ impl Sidebar {
         section: &super::SectionState,
         diagnostics: &[Diagnostic],
         lsp_configured: bool,
-        mcp_manager: Option<&McpManager>,
+        mcp_servers: &[McpServerStatus],
         todo_list: &TodoList,
         tasks: &[SidebarTaskSnapshot],
     ) -> String {
@@ -287,13 +287,29 @@ impl Sidebar {
                 }
             }
             SidebarSection::Mcp => {
-                if let Some(mgr) = mcp_manager {
-                    let servers = mgr.server_count();
-                    let tools = mgr.all_tools().len();
-                    format!("MCP ({servers} servers, {tools} tools)")
-                } else {
-                    "MCP".to_string()
+                let mut parts = Vec::new();
+                let ready = mcp_servers
+                    .iter()
+                    .filter(|server| matches!(server.state, McpConnectionState::Connected { .. }))
+                    .count();
+                let connecting = mcp_servers
+                    .iter()
+                    .filter(|server| matches!(server.state, McpConnectionState::Connecting))
+                    .count();
+                let failed = mcp_servers
+                    .iter()
+                    .filter(|server| matches!(server.state, McpConnectionState::Failed { .. }))
+                    .count();
+                for (amount, label) in [
+                    (ready, "ready"),
+                    (connecting, "connecting"),
+                    (failed, "failed"),
+                ] {
+                    if amount > 0 {
+                        parts.push(format!("{amount} {label}"));
+                    }
                 }
+                format!("MCP ({})", parts.join(", "))
             }
             SidebarSection::Todos => {
                 let pending = todo_list
@@ -418,82 +434,48 @@ impl Sidebar {
         lines: &mut Vec<Line<'static>>,
         targets: &mut Vec<ClickTarget>,
         width: u16,
-        mcp_manager: Option<&McpManager>,
+        mcp_servers: &[McpServerStatus],
     ) {
-        let Some(mgr) = mcp_manager else {
-            lines.push(Line::from(Span::styled(
-                "  No MCP servers configured",
-                Style::default().fg(Color::DarkGray),
-            )));
-            targets.push(ClickTarget::None);
-            return;
-        };
-
-        let tools = mgr.all_tools();
-        let mut tool_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for (key, _) in &tools {
-            if let Some(rest) = key.strip_prefix("mcp__")
-                && let Some((server, _)) = rest.split_once("__")
-            {
-                *tool_counts.entry(server.to_string()).or_default() += 1;
-            }
-        }
-
-        let entries: Vec<(String, usize)> = tool_counts.into_iter().collect();
-        let entries_empty = entries.is_empty();
-
-        let mut count = 0usize;
-        for (server, tool_n) in entries.into_iter() {
-            if count >= VISIBLE_PER_SECTION {
-                break;
-            }
-            let line = Line::from(vec![
-                Span::raw("  "),
-                Span::styled("●", Style::default().fg(Color::Green)),
-                Span::raw(" "),
-                Span::styled(server, Style::default().fg(Color::White)),
-                Span::styled(
-                    format!(" ({tool_n} tools)"),
-                    Style::default().fg(Color::DarkGray),
+        for server in mcp_servers.iter().take(VISIBLE_PER_SECTION) {
+            let (dot_color, label, label_color) = match &server.state {
+                McpConnectionState::Connecting => {
+                    (Color::Yellow, " (connecting...)".to_string(), Color::Yellow)
+                }
+                McpConnectionState::Connected { tool_count } => (
+                    Color::Green,
+                    format!(" ({tool_count} tools)"),
+                    Color::DarkGray,
                 ),
-            ]);
-            lines.push(line);
+                McpConnectionState::Failed { .. } => {
+                    (Color::Red, " (failed)".to_string(), Color::Red)
+                }
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("●", Style::default().fg(dot_color)),
+                Span::raw(" "),
+                Span::styled(server.name.clone(), Style::default().fg(Color::White)),
+                Span::styled(label, Style::default().fg(label_color)),
+            ]));
             targets.push(ClickTarget::None);
-            count += 1;
-        }
 
-        // Wrap each startup error across as many lines as it needs so the full
-        // message is readable, rather than clipping it to a single line.
-        let msg_max = (width.saturating_sub(4)) as usize; // "  ✗ " / "    " indent
-        for err in &mgr.startup_errors {
-            if count >= VISIBLE_PER_SECTION {
-                break;
-            }
-            let chunks = wrap_to_width(err, msg_max);
-            for (i, chunk) in chunks.iter().enumerate() {
-                let line = if i == 0 {
-                    Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled("✗", Style::default().fg(Color::Red)),
-                        Span::raw(" "),
-                        Span::styled(chunk.clone(), Style::default().fg(Color::Yellow)),
-                    ])
-                } else {
-                    Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(chunk.clone(), Style::default().fg(Color::Yellow)),
-                    ])
-                };
-                lines.push(line);
+            let McpConnectionState::Failed { error } = &server.state else {
+                continue;
+            };
+            let msg_max = (width.saturating_sub(4)) as usize;
+            for chunk in wrap_to_width(error, msg_max) {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(chunk, Style::default().fg(Color::Yellow)),
+                ]));
                 targets.push(ClickTarget::None);
             }
-            count += 1;
         }
 
-        if entries_empty && mgr.startup_errors.is_empty() {
+        if mcp_servers.len() > VISIBLE_PER_SECTION {
+            let remaining = mcp_servers.len() - VISIBLE_PER_SECTION;
             lines.push(Line::from(Span::styled(
-                "  No tools discovered",
+                format!("    … {remaining} more"),
                 Style::default().fg(Color::DarkGray),
             )));
             targets.push(ClickTarget::None);
@@ -736,6 +718,58 @@ mod tests {
         text
     }
 
+    fn render_mcp_statuses(statuses: &[McpServerStatus]) -> String {
+        let mut sidebar = Sidebar::new();
+        let area = Rect::new(0, 0, 40, 20);
+        let mut buf = Buffer::empty(area);
+        sidebar.render(
+            area,
+            &mut buf,
+            &[],
+            false,
+            statuses,
+            &crate::todos::TodoList::default(),
+            &[],
+        );
+        buffer_text(&buf)
+    }
+
+    #[test]
+    fn mcp_connecting_server_is_visible() {
+        let text = render_mcp_statuses(&[McpServerStatus::connecting("codegraph")]);
+
+        assert!(text.contains("MCP (1 connecting)"), "got:\n{text}");
+        assert!(text.contains("codegraph (connecting...)"), "got:\n{text}");
+    }
+
+    #[test]
+    fn mcp_connected_server_with_no_tools_is_visible() {
+        let text = render_mcp_statuses(&[McpServerStatus {
+            name: "empty-server".to_string(),
+            state: McpConnectionState::Connected { tool_count: 0 },
+        }]);
+
+        assert!(text.contains("MCP (1 ready)"), "got:\n{text}");
+        assert!(text.contains("empty-server (0 tools)"), "got:\n{text}");
+    }
+
+    #[test]
+    fn mcp_failed_server_shows_its_error() {
+        let text = render_mcp_statuses(&[McpServerStatus {
+            name: "broken".to_string(),
+            state: McpConnectionState::Failed {
+                error: "tools/list returned invalid JSON".to_string(),
+            },
+        }]);
+
+        assert!(text.contains("MCP (1 failed)"), "got:\n{text}");
+        assert!(text.contains("broken (failed)"), "got:\n{text}");
+        assert!(
+            text.contains("tools/list returned invalid JSON"),
+            "got:\n{text}"
+        );
+    }
+
     #[test]
     fn tasks_section_renders_above_diagnostics() {
         let mut sidebar = Sidebar::new();
@@ -757,7 +791,7 @@ mod tests {
             &mut buf,
             &[],
             true,
-            None,
+            &[],
             &crate::todos::TodoList::default(),
             &tasks,
         );
@@ -794,7 +828,7 @@ mod tests {
             &mut buf,
             &[],
             false,
-            None,
+            &[],
             &crate::todos::TodoList::default(),
             &tasks,
         );
@@ -814,7 +848,7 @@ mod tests {
             &mut buf2,
             &[],
             false,
-            None,
+            &[],
             &crate::todos::TodoList::default(),
             &tasks,
         );

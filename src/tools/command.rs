@@ -559,7 +559,7 @@ mod live_tests {
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires the host OS sandbox and a built programmer binary"]
-    async fn sandboxed_command_writes_inside_and_denies_outside() {
+    async fn sandboxed_command_enforces_filesystem_and_environment() {
         let root = std::env::temp_dir().join(format!(
             "programmer-command-sandbox-{}",
             uuid::Uuid::new_v4()
@@ -607,6 +607,20 @@ mod live_tests {
             "unexpected sandbox error: {error}"
         );
         assert!(!outside.exists());
+
+        let environment_args = serde_json::json!({"command": "env"}).to_string();
+        let environment = run_with_live_secure(
+            &environment_args,
+            "sandbox-environment",
+            &crate::cancel::CancellationToken::new(),
+            &security,
+        )
+        .await
+        .expect("sandbox environment should be readable");
+        assert!(!environment.contains("PROGRAMMER_SANDBOX_POLICY="));
+        assert!(!environment.contains("SSH_AUTH_SOCK="));
+        assert!(!environment.contains("LLMHUB_API_KEY="));
+
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

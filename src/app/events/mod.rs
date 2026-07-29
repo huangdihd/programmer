@@ -227,13 +227,22 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             start_queued_work(app).await;
         }
         AppEvent::Quit => handle_quit_request(app),
-        AppEvent::ProvidersChanged => reload_provider_manager(app).await,
+        AppEvent::ProvidersChanged => reload_provider_manager(app),
         AppEvent::RefreshProviderModels => handle_provider_models_refresh(app),
         AppEvent::ProviderModelsRefreshed {
             models,
             startup_errors,
         } => handle_provider_models_refreshed(app, models, startup_errors),
-        AppEvent::McpChanged => handle_mcp_changed(app).await,
+        AppEvent::McpChanged => handle_mcp_changed(app),
+        AppEvent::McpServerConnectionUpdated {
+            generation,
+            server_name,
+            state,
+        } => handle_mcp_server_connection_updated(app, generation, &server_name, state),
+        AppEvent::McpReloaded {
+            generation,
+            manager,
+        } => handle_mcp_reloaded(app, generation, *manager),
         AppEvent::QuestionPrompt {
             question,
             answer_tx,
@@ -471,15 +480,20 @@ fn handle_compact_finished(
 }
 
 /// Providers changed: rebuild the manager and reset the model if it vanished.
-async fn reload_provider_manager(app: &mut App<'_>) {
-    app.provider_manager = crate::providers::ProviderManager::new(&app.config).await;
-    for msg in &app.provider_manager.startup_errors {
-        app.conversation_panel.add_error_string(msg.clone());
-    }
+fn reload_provider_manager(app: &mut App<'_>) {
+    app.provider_manager = crate::providers::ProviderManager::from_config(&app.config);
     if app.provider_manager.resolve(&app.current_model).is_none() {
         app.current_model = app.provider_manager.default_model();
         app.conversation_panel
             .add_info_string(format!("current model reset to: {}", app.current_model));
+    }
+    if app
+        .config
+        .providers
+        .values()
+        .any(|provider| provider.models.is_none())
+    {
+        handle_provider_models_refresh(app);
     }
 }
 
@@ -517,24 +531,81 @@ fn handle_provider_models_refreshed(
     ));
 }
 
-/// MCP config changed: reload the servers (or clear them).
-async fn handle_mcp_changed(app: &mut App<'_>) {
+/// MCP config changed: start a background reload (or clear the manager).
+fn handle_mcp_changed(app: &mut App<'_>) {
+    app.mcp_reload_generation = app.mcp_reload_generation.wrapping_add(1);
+    let generation = app.mcp_reload_generation;
+    app.mcp_manager = None;
+    app.mcp_server_statuses = app
+        .config
+        .mcp_servers
+        .iter()
+        .map(|server| crate::mcp::McpServerStatus::connecting(server.name.clone()))
+        .collect();
+
     if app.config.mcp_servers.is_empty() {
-        app.mcp_manager = None;
         app.conversation_panel
             .add_info_string("MCP servers cleared.".to_string());
-    } else {
-        let mcp = crate::mcp::McpManager::from_config(&app.config.mcp_servers, ".").await;
-        for err in &mcp.startup_errors {
-            app.conversation_panel.add_error_string(err.clone());
-        }
-        app.conversation_panel.add_info_string(format!(
-            "MCP reloaded: {} server(s), {} tool(s) available",
-            mcp.server_count(),
-            mcp.all_tools().len(),
-        ));
-        app.mcp_manager = Some(std::sync::Arc::new(mcp));
+        return;
     }
+
+    app.conversation_panel
+        .add_info_string("Connecting MCP servers...");
+    let configs = app.config.mcp_servers.clone();
+    let tx = app.events.sender.clone();
+    tokio::spawn(async move {
+        let manager = crate::mcp::McpManager::from_config_with_updates(
+            &configs,
+            ".",
+            |server_name, state| {
+                let _ = tx.send(Event::App(AppEvent::McpServerConnectionUpdated {
+                    generation,
+                    server_name,
+                    state,
+                }));
+            },
+        )
+        .await;
+        let _ = tx.send(Event::App(AppEvent::McpReloaded {
+            generation,
+            manager: Box::new(manager),
+        }));
+    });
+}
+
+fn handle_mcp_server_connection_updated(
+    app: &mut App<'_>,
+    generation: u64,
+    server_name: &str,
+    state: crate::mcp::McpConnectionState,
+) {
+    if generation != app.mcp_reload_generation {
+        return;
+    }
+    let Some(server) = app
+        .mcp_server_statuses
+        .iter_mut()
+        .find(|server| server.name == server_name)
+    else {
+        return;
+    };
+    server.state = state;
+}
+
+/// Apply a completed MCP reload if it still matches the latest config.
+fn handle_mcp_reloaded(app: &mut App<'_>, generation: u64, manager: crate::mcp::McpManager) {
+    if generation != app.mcp_reload_generation {
+        return;
+    }
+    for error in &manager.startup_errors {
+        app.conversation_panel.add_error_string(error.clone());
+    }
+    app.conversation_panel.add_info_string(format!(
+        "MCP: connected {} server(s), {} tool(s) available",
+        manager.server_count(),
+        manager.all_tools().len(),
+    ));
+    app.mcp_manager = Some(std::sync::Arc::new(manager));
 }
 
 // ---------------------------------------------------------------------------

@@ -44,38 +44,42 @@ impl std::fmt::Debug for ProviderManager {
 }
 
 impl ProviderManager {
-    /// Build a new manager from the application config.
-    ///
-    /// For each provider whose `models` field is `None`, we call the
-    /// `/models` endpoint to auto-discover available models at startup.
-    /// Wrapped in a global timeout so startup never hangs on network.
-    pub async fn new(config: &ProgrammerConfig) -> Self {
+    /// Build a manager from local configuration without performing network I/O.
+    pub fn from_config(config: &ProgrammerConfig) -> Self {
         let mut clients: HashMap<String, Client<OpenAIConfig>> = HashMap::new();
         let mut models: HashMap<String, Vec<String>> = HashMap::new();
 
-        // Build clients synchronously — always instant.
         for (name, provider_config) in &config.providers {
             let openai_config = OpenAIConfig::default()
                 .with_api_base(&provider_config.base_url)
                 .with_api_key(&provider_config.api_key);
             clients.insert(name.clone(), Client::with_config(openai_config));
-            if let Some(manual) = &provider_config.models {
-                models.insert(name.clone(), manual.clone());
-            } else {
-                models.insert(name.clone(), Vec::new());
-            }
+            models.insert(
+                name.clone(),
+                provider_config.models.clone().unwrap_or_default(),
+            );
         }
-
-        let (discovered, startup_errors) = Self::discover_models(&config.providers, &clients).await;
-        models.extend(discovered);
 
         ProviderManager {
             clients,
             models,
             configs: config.providers.clone(),
             default_provider: config.default_provider.clone(),
-            startup_errors,
+            startup_errors: Vec::new(),
         }
+    }
+
+    /// Build a new manager from the application config.
+    ///
+    /// For each provider whose `models` field is `None`, we call the
+    /// `/models` endpoint to auto-discover available models at startup.
+    /// Wrapped in a global timeout so startup never hangs on network.
+    pub async fn new(config: &ProgrammerConfig) -> Self {
+        let mut manager = Self::from_config(config);
+        let (models, startup_errors) =
+            Self::discover_models(&config.providers, &manager.clients).await;
+        manager.apply_model_refresh(models, startup_errors);
+        manager
     }
 
     /// Fetch auto-discovered model lists for every provider without a manual
@@ -268,6 +272,22 @@ mod tests {
         assert!(message.contains("provider 'llmhub'"));
         assert!(message.contains("/providers refresh"));
         assert!(!message.contains("check your network"));
+    }
+
+    #[test]
+    fn from_config_builds_clients_without_model_discovery() {
+        let mut config = ProgrammerConfig::default();
+        config.providers.get_mut("openai").unwrap().default_model =
+            Some("configured-model".to_string());
+
+        let start = std::time::Instant::now();
+        let manager = ProviderManager::from_config(&config);
+
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(manager.startup_errors.is_empty());
+        assert!(manager.models_for("openai").is_empty());
+        assert_eq!(manager.default_model(), "openai/configured-model");
+        assert!(manager.resolve("openai/any-model").is_some());
     }
 
     /// Startup must never hang on model discovery: an unreachable provider

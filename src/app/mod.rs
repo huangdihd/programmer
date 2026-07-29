@@ -27,6 +27,7 @@ pub(crate) mod surface;
 use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
 use crate::config::programmer_config::ProgrammerConfig;
+use crate::mcp::McpServerStatus;
 use crate::providers::ProviderManager;
 use crate::response::message_item::MessageItem;
 use crate::session::SessionManager;
@@ -197,6 +198,10 @@ pub struct App<'a> {
     pub(crate) skill_registry: crate::skills::SkillRegistry,
     /// MCP server manager (None if no servers configured).
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
+    /// Per-server MCP connection state shown while the manager is loading.
+    pub(crate) mcp_server_statuses: Vec<McpServerStatus>,
+    /// Identifies the latest background MCP reload so stale results are ignored.
+    pub(crate) mcp_reload_generation: u64,
     /// Current safety/work mode.
     pub work_mode: WorkMode,
     /// Mandatory security policy shared by every local tool provider.
@@ -255,7 +260,7 @@ impl App<'_> {
         open_provider_panel: bool,
         project_name: String,
     ) -> Self {
-        let provider_manager = ProviderManager::new(&config).await;
+        let provider_manager = ProviderManager::from_config(&config);
         let mut current_model = provider_manager.default_model();
         let mut work_mode = WorkMode::default();
         let mut vision_enabled = false;
@@ -304,6 +309,11 @@ impl App<'_> {
                 .expect("security configuration should be validated before starting the app"),
         );
         crate::security::install_active(security.clone());
+        let mcp_server_statuses = config
+            .mcp_servers
+            .iter()
+            .map(|server| McpServerStatus::connecting(server.name.clone()))
+            .collect();
         let mut app = Self {
             running: true,
             quit_requested_at: None,
@@ -355,6 +365,8 @@ impl App<'_> {
             },
             skill_registry: crate::skills::SkillRegistry::load(),
             mcp_manager: None,
+            mcp_server_statuses,
+            mcp_reload_generation: 0,
             plan_phase: crate::classifier::PlanPhase::default(),
             plan_review_selected: 0,
             project_name,
@@ -364,19 +376,19 @@ impl App<'_> {
             app.skill_registry.set_activated(&saved_activated_skills);
         }
 
+        if app
+            .config
+            .providers
+            .values()
+            .any(|provider| provider.models.is_none())
+        {
+            app.conversation_panel
+                .add_info_string("Refreshing provider model lists...");
+            app.events
+                .send(crate::ui::event::AppEvent::RefreshProviderModels);
+        }
         if !app.config.mcp_servers.is_empty() {
-            let mcp = crate::mcp::McpManager::from_config(&app.config.mcp_servers, ".").await;
-            for err in &mcp.startup_errors {
-                app.conversation_panel.add_error_string(err.clone());
-            }
-            if mcp.is_connected() {
-                app.conversation_panel.add_info_string(format!(
-                    "MCP: connected {} server(s), {} tool(s) available",
-                    mcp.server_count(),
-                    mcp.all_tools().len(),
-                ));
-            }
-            app.mcp_manager = Some(Arc::new(mcp));
+            app.events.send(crate::ui::event::AppEvent::McpChanged);
         }
 
         let (task_event_tx, mut task_event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -583,5 +595,44 @@ mod tests {
         assert!(state.pending.is_empty());
         assert!(state.ready_at.is_none());
         assert!(state.push(event(1)));
+    }
+
+    #[tokio::test]
+    async fn app_construction_does_not_wait_for_mcp_handshake() {
+        let mut config = crate::config::programmer_config::ProgrammerConfig::default();
+        config.providers.clear();
+        config.mcp_servers.push(crate::mcp::types::McpServerConfig {
+            name: "slow".to_string(),
+            command: "server-that-never-responds".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            url: None,
+            auto_approve: crate::mcp::types::McpPolicy::Trusted,
+        });
+
+        let app = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::App::new(
+                config,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                "startup-test".to_string(),
+                None,
+                Vec::new(),
+                false,
+                "test-project".to_string(),
+            ),
+        )
+        .await
+        .expect("App::new must not wait for an MCP process or handshake");
+
+        assert!(app.mcp_manager.is_none());
+        assert_eq!(app.mcp_server_statuses.len(), 1);
+        assert_eq!(app.mcp_server_statuses[0].name, "slow");
+        assert!(matches!(
+            app.mcp_server_statuses[0].state,
+            crate::mcp::McpConnectionState::Connecting
+        ));
     }
 }

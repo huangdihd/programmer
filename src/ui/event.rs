@@ -107,6 +107,18 @@ pub enum AppEvent {
     /// MCP server config changed (via the management panel): re-spawn the
     /// MCP manager from the current config.
     McpChanged,
+    /// One configured MCP server finished its background connection attempt.
+    McpServerConnectionUpdated {
+        generation: u64,
+        server_name: String,
+        state: crate::mcp::McpConnectionState,
+    },
+    /// A background MCP connection attempt finished. The generation prevents
+    /// an older attempt from replacing a manager created for newer config.
+    McpReloaded {
+        generation: u64,
+        manager: Box<crate::mcp::McpManager>,
+    },
     /// The `ask_user` tool is prompting the user. Carries the question and a
     /// oneshot sender that the UI uses to send the answer back. Tagged with
     /// the operation id so questions from stale turns are dropped.
@@ -183,6 +195,19 @@ impl std::fmt::Debug for AppEvent {
             Self::RefreshProviderModels => write!(f, "RefreshProviderModels"),
             Self::ProviderModelsRefreshed { .. } => write!(f, "ProviderModelsRefreshed"),
             Self::McpChanged => write!(f, "McpChanged"),
+            Self::McpServerConnectionUpdated {
+                generation,
+                server_name,
+                ..
+            } => f
+                .debug_struct("McpServerConnectionUpdated")
+                .field("generation", generation)
+                .field("server_name", server_name)
+                .finish(),
+            Self::McpReloaded { generation, .. } => f
+                .debug_struct("McpReloaded")
+                .field("generation", generation)
+                .finish(),
             Self::QuestionPrompt {
                 question,
                 operation_id,

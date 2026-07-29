@@ -197,10 +197,52 @@ pub struct McpManager {
     pub(crate) startup_errors: Vec<String>,
 }
 
+/// Current connection state for one configured MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpConnectionState {
+    /// The server handshake is still in progress.
+    Connecting,
+    /// The server completed its handshake and tool discovery.
+    Connected { tool_count: usize },
+    /// The server failed before becoming available.
+    Failed { error: String },
+}
+
+/// MCP state retained independently from the live manager so the UI can show
+/// servers while they are still connecting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpServerStatus {
+    pub(crate) name: String,
+    pub(crate) state: McpConnectionState,
+}
+
+impl McpServerStatus {
+    pub(crate) fn connecting(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            state: McpConnectionState::Connecting,
+        }
+    }
+}
+
 impl McpManager {
     /// Initialise all configured MCP servers. Spawns each, runs the handshake,
     /// discovers tools/resources/prompts.
+    #[cfg(test)]
     pub(crate) async fn from_config(configs: &[McpServerConfig], workspace_root: &str) -> Self {
+        Self::from_config_with_updates(configs, workspace_root, |_, _| {}).await
+    }
+
+    /// Initialise all configured MCP servers and report each completed
+    /// connection while the remaining servers continue loading.
+    pub(crate) async fn from_config_with_updates<F>(
+        configs: &[McpServerConfig],
+        workspace_root: &str,
+        mut on_update: F,
+    ) -> Self
+    where
+        F: FnMut(String, McpConnectionState),
+    {
         let mut servers: HashMap<String, McpServer> = HashMap::new();
         let mut startup_errors: Vec<String> = Vec::new();
 
@@ -208,9 +250,15 @@ impl McpManager {
             let name = cfg.name.clone();
             match Self::connect_one(cfg, workspace_root).await {
                 Ok(server) => {
+                    let tool_count = server.tools.lock().unwrap().len();
+                    on_update(name.clone(), McpConnectionState::Connected { tool_count });
                     servers.insert(name.clone(), server);
                 }
                 Err(e) => {
+                    on_update(
+                        name.clone(),
+                        McpConnectionState::Failed { error: e.clone() },
+                    );
                     startup_errors.push(format!("MCP server '{name}': {e}"));
                 }
             }
@@ -300,9 +348,6 @@ impl McpManager {
 
     // -- queries --
 
-    pub(crate) fn is_connected(&self) -> bool {
-        !self.servers.is_empty()
-    }
     pub(crate) fn server_count(&self) -> usize {
         self.servers.len()
     }
@@ -669,6 +714,33 @@ mod tests {
             "got: {:?}",
             mgr.startup_errors
         );
+    }
+
+    #[tokio::test]
+    async fn connection_updates_report_each_server_failure() {
+        let cfg = McpServerConfig {
+            name: "broken".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            url: None,
+            auto_approve: Default::default(),
+        };
+        let mut updates = Vec::new();
+
+        let manager = McpManager::from_config_with_updates(&[cfg], ".", |name, update| {
+            updates.push((name, update));
+        })
+        .await;
+
+        assert_eq!(manager.server_count(), 0);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, "broken");
+        assert!(matches!(
+            &updates[0].1,
+            McpConnectionState::Failed { error }
+                if error.contains("no command or url configured")
+        ));
     }
 
     fn python_exe() -> Option<String> {

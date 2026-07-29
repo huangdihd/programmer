@@ -498,7 +498,7 @@ impl Widget for &mut App<'_> {
                     .as_deref()
                     .unwrap_or(&[]),
                 self.diag.lsp_configured,
-                self.mcp_manager.as_deref(),
+                &self.mcp_server_statuses,
                 &self.todo_list,
                 &sidebar_tasks,
             );
