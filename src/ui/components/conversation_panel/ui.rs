@@ -38,7 +38,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui_widgets::paragraph::Paragraph;
 use std::collections::{HashMap, HashSet};
-use tui_scrollview::ScrollView;
+use tui_scrollview::{ScrollView, ScrollbarVisibility};
 
 /// Rough height estimate for an item, used to avoid expensive markdown rendering
 /// for items far from the viewport. Returns a u16 line count.
@@ -448,7 +448,8 @@ impl Widget for &mut ConversationPanel {
         let visible =
             |y: u16, height: u16| y < visible_bottom && y.saturating_add(height) > visible_top;
 
-        let mut scroll_view = ScrollView::new(Size::new(content_width, content_height));
+        let mut scroll_view = ScrollView::new(Size::new(content_width, content_height))
+            .scrollbars_visibility(ScrollbarVisibility::Never);
         let mut y = 0u16;
         if visible(y, welcome_height) {
             scroll_view.render_widget(
@@ -491,6 +492,28 @@ impl Widget for &mut ConversationPanel {
         // The scroll view has now clamped the offset to its real value; store it
         // and the layout for click hit-testing on the next event.
         let offset = self.scroll_view_state.offset().y;
+
+        // Draw a minimal custom scrollbar: no background, thin gray thumb.
+        if area.height > 0 && content_height > area.height {
+            let scrollbar_x = area.x + area.width.saturating_sub(1);
+            let viewport_h = area.height as f64;
+            let content_h = content_height as f64;
+            let thumb_h = ((viewport_h / content_h) * viewport_h).max(1.0) as u16;
+            let max_scroll = (content_height.saturating_sub(area.height)) as f64;
+            let ratio = if max_scroll > 0.0 {
+                offset as f64 / max_scroll
+            } else {
+                0.0
+            };
+            let thumb_top = ((area.height.saturating_sub(thumb_h)) as f64 * ratio) as u16;
+            let thumb_bottom = thumb_top.saturating_add(thumb_h).min(area.height);
+            for row in thumb_top..thumb_bottom {
+                if let Some(cell) = buf.cell_mut((scrollbar_x, area.y + row)) {
+                    cell.set_symbol("█")
+                        .set_style(Style::new().fg(palette::MUTED));
+                }
+            }
+        }
 
         // Paint the mouse selection as reversed cells on top of the rendered
         // content (screen coordinates, visible rows only).
