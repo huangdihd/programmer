@@ -54,7 +54,7 @@ struct Args {
     /// address (default 127.0.0.1:8765).
     mcp_http: Option<String>,
     /// Work mode for MCP tool gating (default Auto).
-    mcp_mode: crate::classifier::WorkMode,
+    work_mode: crate::classifier::WorkMode,
     /// `-p/--print <prompt>`: run one headless turn, print the final answer, and
     /// exit. No TUI, no session persistence.
     print: Option<String>,
@@ -72,15 +72,15 @@ Options:
   --providers       Open the provider management panel on startup
   --mcp-server      Run as an MCP server on stdio, exposing programmer's local
                     tools to any MCP client. Headless (no terminal), so it only
-                    accepts --mcp-mode auto (default) or yolo
+                    accepts --work-mode auto (default) or yolo
   --mcp-http [addr] Run an HTTP MCP server (default 127.0.0.1:8765) with a
                     ratatui approval console; the operator approves manual-mode
                     calls and switches mode (Ctrl+T) live
-  --mcp-mode <mode> Tool-gating mode for the MCP server: auto (default; LLM
+  --work-mode <mode> Tool-gating mode for the MCP server: auto (default; LLM
                     confirms dangerous tools), yolo (run everything). --mcp-http
                     also accepts manual (console approval) and plan (read-only)
   -p, --print <text> Run one headless turn on <text>, print the answer, and exit.
-                    No TUI or session. Honors --mcp-mode auto (default) or yolo
+                    No TUI or session. Honors --work-mode auto (default) or yolo
   -h, --help        Show this help and exit";
 
 fn parse_args() -> Args {
@@ -92,7 +92,7 @@ fn parse_args() -> Args {
         providers: false,
         mcp_server: false,
         mcp_http: None,
-        mcp_mode: crate::classifier::WorkMode::Auto,
+        work_mode: crate::classifier::WorkMode::Auto,
         print: None,
     };
     let mut i = 1;
@@ -117,9 +117,9 @@ fn parse_args() -> Args {
                     parsed.mcp_http = Some(String::new());
                 }
             }
-            "--mcp-mode" => {
+            "--work-mode" => {
                 if let Some(m) = args.get(i + 1) {
-                    parsed.mcp_mode = parse_work_mode(m);
+                    parsed.work_mode = parse_work_mode(m);
                     i += 1;
                 }
             }
@@ -190,7 +190,7 @@ async fn run_print_mode(
 
     if !mcp_server_mode_ok(mode) {
         eprintln!(
-            "-p/--print is non-interactive and supports only --mcp-mode auto (default) or yolo"
+            "-p/--print is non-interactive and supports only --work-mode auto (default) or yolo"
         );
         std::process::exit(2);
     }
@@ -431,17 +431,17 @@ async fn async_main() -> color_eyre::Result<()> {
 
     // Print mode: one headless turn to stdout, no TUI.
     if let Some(prompt) = args.print {
-        return run_print_mode(prompt, args.mcp_mode).await;
+        return run_print_mode(prompt, args.work_mode).await;
     }
 
     // MCP server mode: no TUI, stdout is reserved for the JSON-RPC protocol.
     // Launched by an MCP client as a subprocess, so there is no terminal — only
     // the non-interactive gating modes make sense here (see `mcp_server_mode_ok`).
     if args.mcp_server {
-        if !mcp_server_mode_ok(args.mcp_mode) {
+        if !mcp_server_mode_ok(args.work_mode) {
             eprintln!(
                 "--mcp-server is headless (stdio, no terminal) and supports only \
-                 --mcp-mode auto or yolo; use --mcp-http for a console (manual/plan)"
+                 --work-mode auto or yolo; use --mcp-http for a console (manual/plan)"
             );
             std::process::exit(2);
         }
@@ -451,7 +451,7 @@ async fn async_main() -> color_eyre::Result<()> {
             .map_err(|error| color_eyre::eyre::eyre!(error))?;
         let security = std::sync::Arc::new(security);
         crate::security::install_active(security.clone());
-        mcp::server::McpServer::with_security(args.mcp_mode, classifier, security)
+        mcp::server::McpServer::with_security(args.work_mode, classifier, security)
             .run()
             .await?;
         return Ok(());
@@ -477,7 +477,7 @@ async fn async_main() -> color_eyre::Result<()> {
             .map_err(|error| color_eyre::eyre::eyre!(error))?;
         let security = std::sync::Arc::new(security);
         crate::security::install_active(security.clone());
-        mcp::http_server::serve(args.mcp_mode, classifier, addr, allow_yolo, security).await?;
+        mcp::http_server::serve(args.work_mode, classifier, addr, allow_yolo, security).await?;
         return Ok(());
     }
 
