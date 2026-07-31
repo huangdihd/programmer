@@ -15,6 +15,7 @@
 - sandbox
   - ~~macOS Seatbelt and Linux Landlock/seccomp process sandbox~~
   - Windows AppContainer process launcher
+- Optimize headless mode
 - ~~store too long outputs as files~~
 - ~~display full output when commands are running~~
 - ~~default classifier model~~
