@@ -58,8 +58,12 @@ pub enum ActivePhase {
     Cancelling,
 }
 
-/// Number of rows scrolled per mouse-wheel notch.
-const SCROLL_LINES: usize = 3;
+/// Base rows scrolled per mouse-wheel notch.
+const SCROLL_LINES_BASE: usize = 1;
+/// Maximum rows per notch when scrolling fast.
+const SCROLL_LINES_MAX: usize = 5;
+/// Time window (ms) for consecutive scrolls to count as "fast" scrolling.
+const SCROLL_ACCEL_WINDOW_MS: u128 = 150;
 
 /// Renders one region (a message's vertical extent) into an off-screen buffer
 /// and copies the selected rows' text into `lines` (indexed relative to
@@ -230,6 +234,8 @@ pub struct ConversationPanel {
     /// it off; scrolling back to the bottom turns it on again. This replaces
     /// re-snapping on every chunk, which fought manual scrolling during streaming.
     pub(crate) stick_to_bottom: bool,
+    /// Timestamp of the last mouse-wheel scroll, for scroll acceleration.
+    last_scroll_at: Option<std::time::Instant>,
     /// Indices into `items` that the user has expanded. Foldable items (reasoning,
     /// tool calls, tool results) render collapsed unless their index is here.
     pub(crate) expanded_items: HashSet<usize>,
@@ -274,6 +280,7 @@ impl ConversationPanel {
             receiving_response: None,
             phase: ActivePhase::None,
             stick_to_bottom: true,
+            last_scroll_at: None,
             expanded_items: HashSet::new(),
             view_area: Rect::ZERO,
             view_offset: 0,
@@ -718,16 +725,47 @@ impl ConversationPanel {
     pub fn scroll_up(&mut self) {
         // Stop following the bottom so incoming content doesn't yank the view back.
         self.stick_to_bottom = false;
-        for _ in 0..SCROLL_LINES {
+        let lines = self.accelerated_lines();
+        for _ in 0..lines {
             self.scroll_view_state.scroll_up();
         }
     }
 
     pub fn scroll_down(&mut self) {
-        for _ in 0..SCROLL_LINES {
+        let lines = self.accelerated_lines();
+        for _ in 0..lines {
             self.scroll_view_state.scroll_down();
         }
         // Reaching the bottom again re-enables auto-follow.
+        if self.scroll_view_state.is_at_bottom() {
+            self.stick_to_bottom = true;
+        }
+    }
+
+    /// Return the number of lines to scroll, accelerating if scrolls are
+    /// consecutive and fast.
+    fn accelerated_lines(&mut self) -> usize {
+        let now = std::time::Instant::now();
+        let since_last = self
+            .last_scroll_at
+            .map_or(u128::MAX, |t| now.duration_since(t).as_millis());
+        self.last_scroll_at = Some(now);
+        if since_last < SCROLL_ACCEL_WINDOW_MS {
+            SCROLL_LINES_MAX
+        } else {
+            SCROLL_LINES_BASE
+        }
+    }
+
+    /// Scroll up by roughly one viewport page.
+    pub fn scroll_page_up(&mut self) {
+        self.stick_to_bottom = false;
+        self.scroll_view_state.scroll_page_up();
+    }
+
+    /// Scroll down by roughly one viewport page.
+    pub fn scroll_page_down(&mut self) {
+        self.scroll_view_state.scroll_page_down();
         if self.scroll_view_state.is_at_bottom() {
             self.stick_to_bottom = true;
         }

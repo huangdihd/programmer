@@ -316,6 +316,12 @@ pub(crate) async fn handle_key_events(
             }
             update_completions(app);
         }
+        KeyCode::PageUp => {
+            app.conversation_panel.scroll_page_up();
+        }
+        KeyCode::PageDown => {
+            app.conversation_panel.scroll_page_down();
+        }
         KeyCode::Up => {
             if app.input_panel.get_content().is_empty() {
                 if let Some(pending) = app.conversation_panel.pending_message.take() {
