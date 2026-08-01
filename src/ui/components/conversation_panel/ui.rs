@@ -15,7 +15,10 @@
 
 use crate::response::message_item::MessageItem;
 use crate::ui::components::conversation_panel::conversation_panel::{
-    CachedParagraph, ConversationPanel,
+    CachedParagraph, CachedToolGroup, ConversationPanel, ToolGroupLayout,
+};
+use crate::ui::components::conversation_panel::tool_group::{
+    ToolGroupMember, build_tool_group_paragraph, discover_tool_groups, function_call,
 };
 use crate::ui::components::messages::assistant_message::AssistantMessage;
 use crate::ui::components::messages::error_message::ErrorMessage;
@@ -239,6 +242,13 @@ impl Widget for &mut ConversationPanel {
                 _ => None,
             })
             .collect();
+        let tool_groups = discover_tool_groups(&conv.items);
+        let mut group_by_item = vec![None; conv.items.len()];
+        for (group_index, group) in tool_groups.iter().enumerate() {
+            for &item_index in &group.member_indices {
+                group_by_item[item_index] = Some(group_index);
+            }
+        }
 
         // Refresh the cache of finished messages. `items` is append-only, so an
         // entry is only rebuilt when the width changes (invalidating all), when
@@ -263,8 +273,21 @@ impl Widget for &mut ConversationPanel {
         // First pass: compute estimated heights for every item without
         // fully rendering them, so we can figure out which ones are visible.
         let mut est_heights: Vec<u16> = Vec::with_capacity(conv.items.len());
-        for index in 0..conv.items.len() {
-            let mut h = if matches!(&conv.items[index], MessageItem::ToolOutput { output, .. }
+        for (index, &group_index) in group_by_item.iter().enumerate() {
+            let mut h = if let Some(group_index) = group_index {
+                let group = &tool_groups[group_index];
+                if group.member_indices[0] != index {
+                    0
+                } else if self.expanded_tool_groups.contains(&group.key) {
+                    1 + group
+                        .member_indices
+                        .iter()
+                        .map(|&member| estimate_item_height(&conv.items[member], content_width))
+                        .sum::<u16>()
+                } else {
+                    2
+                }
+            } else if matches!(&conv.items[index], MessageItem::ToolOutput { output, .. }
                 if call_ids.contains(output.call_id.as_str()))
             {
                 0 // hidden inside its call's entry
@@ -321,8 +344,11 @@ impl Widget for &mut ConversationPanel {
             }
         }
 
-        for index in 0..conv.items.len() {
+        for (index, &group_index) in group_by_item.iter().enumerate() {
             let expanded = self.expanded_items.contains(&index);
+            let group = group_index.map(|group_index| &tool_groups[group_index]);
+            let is_group_start = group.is_some_and(|group| group.member_indices[0] == index);
+            let hidden_group_member = group.is_some() && !is_group_start;
             let (hidden, tool_output) = match &conv.items[index] {
                 MessageItem::ToolOutput { output, .. } => {
                     (call_ids.contains(output.call_id.as_str()), None)
@@ -333,7 +359,17 @@ impl Widget for &mut ConversationPanel {
                 MessageItem::Input(input) => (is_hidden_developer_input(input), None),
                 _ => (false, None),
             };
+            let hidden = hidden || hidden_group_member;
             let has_output = tool_output.is_some();
+            let effective_has_output = group
+                .filter(|_| is_group_start)
+                .map(|group| {
+                    group.member_indices.iter().all(|&member_index| {
+                        let call = function_call(&conv.items[member_index]).unwrap();
+                        outputs_by_call.contains_key(call.call_id.as_str())
+                    })
+                })
+                .unwrap_or(has_output);
             // A still-running `command` call streams its output live: fetch the
             // in-flight buffer and force a rebuild each frame while it grows, so
             // the panel shows output as it arrives rather than only the final
@@ -347,10 +383,43 @@ impl Widget for &mut ConversationPanel {
                 _ => None,
             };
             let in_viewport = index >= build_from || in_window[index];
+            let group_render_key = group.filter(|_| is_group_start).map(|group| {
+                let group_expanded = self.expanded_tool_groups.contains(&group.key);
+                let member_states = group.member_indices.iter().map(|&member_index| {
+                    let call = function_call(&conv.items[member_index]).unwrap();
+                    let output = outputs_by_call.get(call.call_id.as_str());
+                    format!(
+                        "{}{}",
+                        usize::from(self.expanded_items.contains(&member_index)),
+                        output.map_or('p', |(_, failed, _)| if *failed { 'f' } else { 's' })
+                    )
+                });
+                format!(
+                    "{}:{}",
+                    usize::from(group_expanded),
+                    member_states.collect::<String>()
+                )
+            });
+            let group_has_live_output = group.filter(|_| is_group_start).is_some_and(|group| {
+                self.expanded_tool_groups.contains(&group.key)
+                    && group.member_indices.iter().any(|&member_index| {
+                        let call = function_call(&conv.items[member_index]).unwrap();
+                        !outputs_by_call.contains_key(call.call_id.as_str())
+                            && call.name == crate::tools::command::NAME
+                            && crate::tools::command::live_output(&call.call_id).is_some()
+                    })
+            });
             let needs_build = live_output.is_some()
+                || group_has_live_output
                 || cache.entries.get(index).is_none_or(|entry| {
+                    let cached_group_key = entry
+                        .tool_group
+                        .as_ref()
+                        .map(|group| group.render_key.as_str());
                     entry.expanded != expanded
-                        || entry.has_output != has_output
+                        || entry.has_output != effective_has_output
+                        || cached_group_key != group_render_key.as_deref()
+                        || (hidden && entry.height != 0)
                         || (entry.lazy && in_viewport)
                 });
             if needs_build {
@@ -359,18 +428,70 @@ impl Widget for &mut ConversationPanel {
                         paragraph: Paragraph::new(""),
                         height: 0,
                         expanded,
-                        has_output,
+                        has_output: effective_has_output,
                         copy_buttons: Vec::new(),
                         lazy: false,
+                        tool_group: None,
                     }
                 } else if !in_viewport {
                     CachedParagraph {
                         paragraph: Paragraph::new(""),
                         height: est_heights[index],
                         expanded,
-                        has_output,
+                        has_output: effective_has_output,
                         copy_buttons: Vec::new(),
                         lazy: true,
+                        tool_group: group
+                            .filter(|_| is_group_start)
+                            .map(|group| CachedToolGroup {
+                                key: group.key.clone(),
+                                render_key: group_render_key.clone().unwrap(),
+                                member_headers: Vec::new(),
+                            }),
+                    }
+                } else if let Some(group) = group.filter(|_| is_group_start) {
+                    let group_expanded = self.expanded_tool_groups.contains(&group.key);
+                    let live_outputs: Vec<Option<String>> = group
+                        .member_indices
+                        .iter()
+                        .map(|&member_index| {
+                            let call = function_call(&conv.items[member_index]).unwrap();
+                            (!outputs_by_call.contains_key(call.call_id.as_str())
+                                && call.name == crate::tools::command::NAME)
+                                .then(|| crate::tools::command::live_output(&call.call_id))
+                                .flatten()
+                        })
+                        .collect();
+                    let members: Vec<ToolGroupMember<'_>> = group
+                        .member_indices
+                        .iter()
+                        .enumerate()
+                        .map(|(position, &member_index)| {
+                            let call = function_call(&conv.items[member_index]).unwrap();
+                            ToolGroupMember {
+                                index: member_index,
+                                call,
+                                output: outputs_by_call.get(call.call_id.as_str()).copied(),
+                                live_output: live_outputs[position].as_deref(),
+                                expanded: self.expanded_items.contains(&member_index),
+                            }
+                        })
+                        .collect();
+                    let (paragraph, member_headers) =
+                        build_tool_group_paragraph(group, &members, content_width, group_expanded);
+                    let height = paragraph.line_count(content_width) as u16;
+                    CachedParagraph {
+                        paragraph,
+                        height,
+                        expanded,
+                        has_output: effective_has_output,
+                        copy_buttons: Vec::new(),
+                        lazy: false,
+                        tool_group: Some(CachedToolGroup {
+                            key: group.key.clone(),
+                            render_key: group_render_key.clone().unwrap(),
+                            member_headers,
+                        }),
                     }
                 } else {
                     let (paragraph, copy_buttons) = build_item_paragraph(
@@ -385,9 +506,10 @@ impl Widget for &mut ConversationPanel {
                         paragraph,
                         height,
                         expanded,
-                        has_output,
+                        has_output: effective_has_output,
                         copy_buttons,
                         lazy: false,
+                        tool_group: None,
                     }
                 };
                 if index < cache.entries.len() {
@@ -482,8 +604,27 @@ impl Widget for &mut ConversationPanel {
         // Record each item's vertical extent (in buffer coordinates) so a click
         // can be mapped back to the item under the cursor.
         let mut layout: Vec<(usize, u16, u16)> = Vec::with_capacity(cache.entries.len());
+        let mut tool_group_layout = Vec::new();
         for (index, entry) in cache.entries.iter().enumerate() {
             layout.push((index, y, y.saturating_add(entry.height)));
+            if let Some(group) = &entry.tool_group {
+                tool_group_layout.push(ToolGroupLayout {
+                    key: group.key.clone(),
+                    top: y,
+                    bottom: y.saturating_add(entry.height),
+                    member_headers: group
+                        .member_headers
+                        .iter()
+                        .map(|header| {
+                            crate::ui::components::conversation_panel::tool_group::MemberHeader {
+                                index: header.index,
+                                top: y.saturating_add(header.top),
+                                bottom: y.saturating_add(header.bottom),
+                            }
+                        })
+                        .collect(),
+                });
+            }
             if visible(y, entry.height) {
                 scroll_view.render_widget(
                     &entry.paragraph,
@@ -583,7 +724,7 @@ impl Widget for &mut ConversationPanel {
             self.set_jump_button(None);
         }
 
-        self.set_layout(content_area, offset, layout, live_layout);
+        self.set_layout(content_area, offset, layout, live_layout, tool_group_layout);
     }
 }
 
@@ -591,9 +732,16 @@ impl Widget for &mut ConversationPanel {
 mod tests {
     use super::is_hidden_developer_input;
     use async_openai::types::responses::{
-        InputContent, InputMessage, InputRole, InputTextContent, Item,
-        MessageItem as ApiMessageItem, OutputStatus,
+        FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, InputContent,
+        InputMessage, InputRole, InputTextContent, Item, MessageItem as ApiMessageItem, OutputItem,
+        OutputStatus,
     };
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    use crate::tools::ToolOutput;
+    use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
 
     #[test]
     fn developer_runtime_inputs_are_hidden_from_chat_rendering() {
@@ -606,5 +754,80 @@ mod tests {
         }))
         .into();
         assert!(is_hidden_developer_input(&input));
+    }
+
+    #[test]
+    fn long_tool_run_collapses_and_refreshes_as_results_arrive() {
+        let mut panel = ConversationPanel::new();
+        for (index, name) in ["grep", "blob", "read_file"].into_iter().enumerate() {
+            panel
+                .conversation
+                .lock()
+                .unwrap()
+                .add_output(OutputItem::FunctionCall(tool_call(index, name)));
+        }
+        let area = Rect::new(0, 0, 80, 24);
+
+        let pending = render_text(&mut panel, area);
+        assert!(pending.contains("Exploring… · 0/3"));
+        assert!(!pending.contains("grep  {}"));
+
+        let group_row = pending
+            .lines()
+            .position(|line| line.contains("Exploring"))
+            .unwrap() as u16;
+        panel.handle_click(2, group_row);
+        assert!(panel.expanded_tool_groups.contains("call-0"));
+        let expanded = render_text(&mut panel, area);
+        assert!(expanded.contains("grep  {}"), "{expanded}");
+        assert!(expanded.contains("blob  {}"), "{expanded}");
+        assert!(expanded.contains("read_file  {}"), "{expanded}");
+
+        let first_call_row = expanded
+            .lines()
+            .position(|line| line.contains("grep  {}"))
+            .unwrap() as u16;
+        panel.handle_click(2, first_call_row);
+        assert!(panel.expanded_items.contains(&0));
+
+        for index in 0..3 {
+            panel.add_tool_output(ToolOutput {
+                param: FunctionCallOutputItemParam {
+                    call_id: format!("call-{index}"),
+                    output: FunctionCallOutput::Text("done".into()),
+                    id: None,
+                    status: None,
+                },
+                failed: index == 1,
+                approval_label: None,
+            });
+        }
+        let completed = render_text(&mut panel, area);
+        assert!(completed.contains("Explored · 3 calls · 1 failed"));
+    }
+
+    fn tool_call(index: usize, name: &str) -> FunctionToolCall {
+        FunctionToolCall {
+            arguments: "{}".into(),
+            call_id: format!("call-{index}"),
+            namespace: None,
+            name: name.into(),
+            id: None,
+            status: None,
+        }
+    }
+
+    fn render_text(panel: &mut ConversationPanel, area: Rect) -> String {
+        let mut buffer = Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .filter_map(|x| buffer.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use tui_scrollview::ScrollViewState;
 use unicode_width::UnicodeWidthStr;
 
+use super::tool_group::MemberHeader;
 use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
@@ -161,6 +162,26 @@ pub(crate) struct CachedParagraph {
     /// True when this entry's paragraph was skipped (only height estimated)
     /// to avoid expensive markdown rendering of far-offscreen items.
     pub lazy: bool,
+    /// Present when this cache slot represents a derived tool-call group rather
+    /// than its original single history item.
+    pub tool_group: Option<CachedToolGroup>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CachedToolGroup {
+    pub key: String,
+    /// Captures every view/output state that changes the rendered group.
+    pub render_key: String,
+    /// Clickable member header rows relative to the cached paragraph.
+    pub member_headers: Vec<MemberHeader>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ToolGroupLayout {
+    pub key: String,
+    pub top: u16,
+    pub bottom: u16,
+    pub member_headers: Vec<MemberHeader>,
 }
 
 /// A mouse text selection over the conversation, in scroll-buffer coordinates
@@ -253,6 +274,8 @@ pub struct ConversationPanel {
     /// Indices into `items` that the user has expanded. Foldable items (reasoning,
     /// tool calls, tool results) render collapsed unless their index is here.
     pub(crate) expanded_items: HashSet<usize>,
+    /// Stable first-call ids of tool groups the user opened.
+    pub(crate) expanded_tool_groups: HashSet<String>,
     /// The screen area the panel last rendered into, and the scroll offset used,
     /// so a mouse click can be mapped back to the item under the cursor.
     view_area: Rect,
@@ -263,6 +286,10 @@ pub struct ConversationPanel {
     /// Per-item vertical extent in scroll-buffer coordinates: `(index, top, bottom)`.
     /// Recorded each render and consulted on click.
     item_layout: Vec<(usize, u16, u16)>,
+    /// Group header/member hit regions from the last render. Kept separate
+    /// from `item_layout`, which remains one entry per cached paragraph for
+    /// selection extraction.
+    tool_group_layout: Vec<ToolGroupLayout>,
     /// Per-live-item vertical extent: `(live_index, top, bottom)`. Recorded
     /// alongside `item_layout` so clicks on streaming items can be mapped.
     live_item_layout: Vec<(usize, u16, u16)>,
@@ -301,10 +328,12 @@ impl ConversationPanel {
             last_scroll_at: None,
             last_scroll_activity_at: None,
             expanded_items: HashSet::new(),
+            expanded_tool_groups: HashSet::new(),
             view_area: Rect::ZERO,
             view_offset: 0,
             jump_button: None,
             item_layout: Vec::new(),
+            tool_group_layout: Vec::new(),
             live_item_layout: Vec::new(),
             render_cache: RenderCache::default(),
             frame_count: 0,
@@ -323,11 +352,13 @@ impl ConversationPanel {
         offset: u16,
         item_layout: Vec<(usize, u16, u16)>,
         live_item_layout: Vec<(usize, u16, u16)>,
+        tool_group_layout: Vec<ToolGroupLayout>,
     ) {
         self.view_area = area;
         self.view_offset = offset;
         self.item_layout = item_layout;
         self.live_item_layout = live_item_layout;
+        self.tool_group_layout = tool_group_layout;
     }
 
     /// Handles a left click at the given screen coordinates: if it lands on a
@@ -365,6 +396,32 @@ impl ConversationPanel {
             }
             if !self.live_expanded_items.remove(&live_idx) {
                 self.live_expanded_items.insert(live_idx);
+            }
+            return;
+        }
+
+        // A grouped entry owns its full extent. The first row toggles the
+        // outer group; when open, each nested call header toggles that call's
+        // existing detail state. Clicking result text is left to selection.
+        if let Some(group) = self
+            .tool_group_layout
+            .iter()
+            .find(|group| buffer_y >= group.top && buffer_y < group.bottom)
+        {
+            if buffer_y == group.top {
+                let key = group.key.clone();
+                if !self.expanded_tool_groups.remove(&key) {
+                    self.expanded_tool_groups.insert(key);
+                }
+            } else if let Some(header) = group
+                .member_headers
+                .iter()
+                .find(|header| buffer_y >= header.top && buffer_y < header.bottom)
+            {
+                let index = header.index;
+                if !self.expanded_items.remove(&index) {
+                    self.expanded_items.insert(index);
+                }
             }
             return;
         }
@@ -647,6 +704,7 @@ impl ConversationPanel {
         self.conversation.lock().unwrap().clear();
         self.pending_message = None;
         self.expanded_items.clear();
+        self.expanded_tool_groups.clear();
         self.live_expanded_items.clear();
         self.selection = None;
         self.stick_to_bottom = true;
@@ -655,6 +713,8 @@ impl ConversationPanel {
     /// Restore a previous session's items into the conversation.
     pub fn restore_items(&mut self, items: Vec<MessageItem>) {
         self.conversation.lock().unwrap().restore_items(items);
+        self.expanded_items.clear();
+        self.expanded_tool_groups.clear();
         self.stick_to_bottom = true;
     }
 
