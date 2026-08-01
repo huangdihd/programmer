@@ -18,7 +18,7 @@
 //!
 //! Run with `programmer --mcp-server`. This entrypoint is headless — a client
 //! launches it as a subprocess with no terminal — so it only accepts the
-//! non-interactive `--mcp-mode` values:
+//! non-interactive `--work-mode` values (`--mcp-mode` remains an alias):
 //! - `auto` (default) sends dangerous calls to the LLM classifier (needs a
 //!   configured model) and runs them only if it approves.
 //! - `yolo` runs everything.
@@ -26,7 +26,7 @@
 //! The [`McpServer`] gate below still implements `plan` (refuse mutations) and
 //! `manual` (confirm through MCP **elicitation**) for completeness, but those
 //! belong to `--mcp-http`, which has a console; `--mcp-server` rejects them at
-//! startup (see `mcp_server_mode_ok` in `main`).
+//! startup (see `Args::validate` in `main`).
 //!
 //! Nothing but protocol messages is written to stdout.
 
@@ -219,7 +219,7 @@ impl McpServer {
         match self.mode {
             WorkMode::Yolo => Gate::Allow,
             WorkMode::Plan => Gate::Deny(format!(
-                "plan mode refuses state-mutating tools like {name}; use --mcp-mode auto or yolo"
+                "plan mode refuses state-mutating tools like {name}; use --work-mode auto or yolo"
             )),
             WorkMode::Auto => Gate::Llm,
             WorkMode::Manual => {
@@ -228,7 +228,7 @@ impl McpServer {
                 } else {
                     Gate::Deny(format!(
                         "manual mode needs a client that supports MCP elicitation to confirm \
-                         {name}; use --mcp-mode auto or yolo instead"
+                         {name}; use --work-mode auto or yolo instead"
                     ))
                 }
             }
@@ -366,4 +366,3 @@ pub(crate) fn tool_content(text: String, is_error: bool) -> Value {
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
-

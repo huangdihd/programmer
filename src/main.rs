@@ -17,6 +17,7 @@ use crate::config::programmer_config::ProgrammerConfig;
 use crate::session::SessionManager;
 use ::config::{Config, Environment, File};
 use app::App;
+use clap::{CommandFactory, Parser};
 use std::path::Path;
 
 mod app;
@@ -44,106 +45,86 @@ mod tools;
 mod ui;
 
 /// Parsed command-line arguments.
+#[derive(Debug, Parser)]
+#[command(
+    name = "programmer",
+    version,
+    about = "A coding agent written in Rust",
+    group(
+        clap::ArgGroup::new("headless")
+            .args(["print", "mcp_server", "mcp_http"])
+            .multiple(false)
+    )
+)]
 struct Args {
-    resume: Option<Option<String>>,
-    help: bool,
+    /// Resume a saved session; without a UUID, open the session picker.
+    #[arg(
+        long,
+        value_name = "UUID",
+        num_args = 0..=1,
+        default_missing_value = "",
+        conflicts_with = "session",
+        conflicts_with = "headless"
+    )]
+    resume: Option<String>,
+
+    /// Open the session management panel on startup.
+    #[arg(long, conflicts_with = "headless")]
     session: bool,
+
+    /// Open the provider management panel on startup.
+    #[arg(long, conflicts_with = "headless")]
     providers: bool,
+
+    /// Serve local tools over stdio JSON-RPC without a TUI (Auto/YOLO only).
+    #[arg(long, visible_alias = "serve-mcp")]
     mcp_server: bool,
-    /// `--mcp-http [addr]`: run the HTTP MCP server + console. Carries the bind
-    /// address (default 127.0.0.1:8765).
-    mcp_http: Option<String>,
-    /// Work mode for MCP tool gating (default Auto).
+
+    /// Run the HTTP MCP server with an approval console (default 127.0.0.1:8765).
+    #[arg(
+        long,
+        value_name = "ADDR",
+        num_args = 0..=1,
+        default_missing_value = "127.0.0.1:8765"
+    )]
+    mcp_http: Option<std::net::SocketAddr>,
+
+    /// Tool-gating mode for headless runs and the HTTP MCP console.
+    #[arg(
+        long,
+        visible_alias = "mcp-mode",
+        value_enum,
+        default_value_t = crate::classifier::WorkMode::Auto
+    )]
     work_mode: crate::classifier::WorkMode,
-    /// `-p/--print <prompt>`: run one headless turn, print the final answer, and
-    /// exit. No TUI, no session persistence.
+
+    /// Run one headless turn with Auto/YOLO, print the answer, and exit.
+    #[arg(short = 'p', long, value_name = "TEXT")]
     print: Option<String>,
 }
 
-const HELP_TEXT: &str = "\
-programmer — a coding agent in your terminal
+impl Args {
+    fn validate(self) -> Result<Self, clap::Error> {
+        let non_interactive_flag = if self.print.is_some() {
+            Some("-p/--print")
+        } else if self.mcp_server {
+            Some("--mcp-server")
+        } else {
+            None
+        };
 
-Usage: programmer [OPTIONS]
-
-Options:
-  --resume [uuid]   Resume a saved session; without a uuid, opens the
-                    session management panel to pick one
-  --session         Open the session management panel
-  --providers       Open the provider management panel on startup
-  --mcp-server      Run as an MCP server on stdio, exposing programmer's local
-                    tools to any MCP client. Headless (no terminal), so it only
-                    accepts --work-mode auto (default) or yolo
-  --mcp-http [addr] Run an HTTP MCP server (default 127.0.0.1:8765) with a
-                    ratatui approval console; the operator approves manual-mode
-                    calls and switches mode (Ctrl+T) live
-  --work-mode <mode> Tool-gating mode for the MCP server: auto (default; LLM
-                    confirms dangerous tools), yolo (run everything). --mcp-http
-                    also accepts manual (console approval) and plan (read-only)
-  -p, --print <text> Run one headless turn on <text>, print the answer, and exit.
-                    No TUI or session. Honors --work-mode auto (default) or yolo
-  -h, --help        Show this help and exit";
-
-fn parse_args() -> Args {
-    let args: Vec<String> = std::env::args().collect();
-    let mut parsed = Args {
-        resume: None,
-        help: false,
-        session: false,
-        providers: false,
-        mcp_server: false,
-        mcp_http: None,
-        work_mode: crate::classifier::WorkMode::Auto,
-        print: None,
-    };
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--resume" => {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    parsed.resume = Some(Some(args[i + 1].clone()));
-                    i += 1;
-                } else {
-                    parsed.resume = Some(None);
-                }
-            }
-            "--session" => parsed.session = true,
-            "--providers" => parsed.providers = true,
-            "--mcp-server" | "--serve-mcp" => parsed.mcp_server = true,
-            "--mcp-http" => {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    parsed.mcp_http = Some(args[i + 1].clone());
-                    i += 1;
-                } else {
-                    parsed.mcp_http = Some(String::new());
-                }
-            }
-            "--work-mode" => {
-                if let Some(m) = args.get(i + 1) {
-                    parsed.work_mode = parse_work_mode(m);
-                    i += 1;
-                }
-            }
-            "-p" | "--print" => {
-                if let Some(prompt) = args.get(i + 1) {
-                    parsed.print = Some(prompt.clone());
-                    i += 1;
-                }
-            }
-            "-h" | "--help" => parsed.help = true,
-            _ => {}
+        if let Some(flag) = non_interactive_flag
+            && !non_interactive_mode_ok(self.work_mode)
+        {
+            let mut command = Self::command();
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidValue,
+                format!("{flag} is non-interactive and supports only --work-mode auto or yolo"),
+            )
+            .format(&mut command));
         }
-        i += 1;
-    }
-    parsed
-}
 
-fn parse_work_mode(s: &str) -> crate::classifier::WorkMode {
-    use crate::classifier::WorkMode;
-    match s.to_ascii_lowercase().as_str() {
-        "manual" => WorkMode::Manual,
-        "yolo" => WorkMode::Yolo,
-        "plan" => WorkMode::Plan,
-        _ => WorkMode::Auto,
+        Ok(self)
     }
 }
 
@@ -151,7 +132,7 @@ fn parse_work_mode(s: &str) -> crate::classifier::WorkMode {
 /// only accepts non-interactive gating: `auto` (LLM classifier decides) or
 /// `yolo` (run everything). `manual` needs an approval surface and `plan` just
 /// refuses every mutation — both belong to the `--mcp-http` console instead.
-fn mcp_server_mode_ok(mode: crate::classifier::WorkMode) -> bool {
+fn non_interactive_mode_ok(mode: crate::classifier::WorkMode) -> bool {
     use crate::classifier::WorkMode;
     matches!(mode, WorkMode::Auto | WorkMode::Yolo)
 }
@@ -187,13 +168,6 @@ async fn run_print_mode(
     use async_openai::types::responses::{
         InputContent, InputMessage, InputRole, MessageItem as ApiMessageItem, OutputStatus,
     };
-
-    if !mcp_server_mode_ok(mode) {
-        eprintln!(
-            "-p/--print is non-interactive and supports only --work-mode auto (default) or yolo"
-        );
-        std::process::exit(2);
-    }
 
     let (config, _) = load_config()?;
     let security = std::sync::Arc::new(
@@ -415,20 +389,16 @@ fn main() -> color_eyre::Result<()> {
     #[cfg(windows)]
     crate::tasks::harden_dll_search();
     crate::security::sandbox::run_worker_if_requested();
+    let args = Args::try_parse()
+        .and_then(Args::validate)
+        .unwrap_or_else(|error| error.exit());
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(async_main())
+        .block_on(async_main(args))
 }
 
-async fn async_main() -> color_eyre::Result<()> {
-    let args = parse_args();
-
-    if args.help {
-        println!("{HELP_TEXT}");
-        return Ok(());
-    }
-
+async fn async_main(args: Args) -> color_eyre::Result<()> {
     // Print mode: one headless turn to stdout, no TUI.
     if let Some(prompt) = args.print {
         return run_print_mode(prompt, args.work_mode).await;
@@ -436,15 +406,8 @@ async fn async_main() -> color_eyre::Result<()> {
 
     // MCP server mode: no TUI, stdout is reserved for the JSON-RPC protocol.
     // Launched by an MCP client as a subprocess, so there is no terminal — only
-    // the non-interactive gating modes make sense here (see `mcp_server_mode_ok`).
+    // the non-interactive gating modes make sense here (validated by `Args`).
     if args.mcp_server {
-        if !mcp_server_mode_ok(args.work_mode) {
-            eprintln!(
-                "--mcp-server is headless (stdio, no terminal) and supports only \
-                 --work-mode auto or yolo; use --mcp-http for a console (manual/plan)"
-            );
-            std::process::exit(2);
-        }
         let classifier = build_mcp_classifier().await;
         let (config, _) = load_config()?;
         let security = crate::security::SecurityManager::for_current_dir(config.security)
@@ -458,18 +421,7 @@ async fn async_main() -> color_eyre::Result<()> {
     }
 
     // HTTP MCP server + ratatui approval console.
-    if let Some(addr_arg) = args.mcp_http {
-        let addr: std::net::SocketAddr = if addr_arg.trim().is_empty() {
-            ([127, 0, 0, 1], 8765).into()
-        } else {
-            match addr_arg.parse() {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("invalid --mcp-http address '{addr_arg}': {e}");
-                    std::process::exit(1);
-                }
-            }
-        };
+    if let Some(addr) = args.mcp_http {
         let classifier = build_mcp_classifier().await;
         let config = load_config().map(|(config, _)| config).unwrap_or_default();
         let allow_yolo = config.allow_yolo;
@@ -481,10 +433,11 @@ async fn async_main() -> color_eyre::Result<()> {
         return Ok(());
     }
 
-    let resume = if args.session && args.resume.is_none() {
-        Some(None)
-    } else {
-        args.resume
+    let resume = match args.resume {
+        Some(uuid) if uuid.is_empty() => Some(None),
+        Some(uuid) => Some(Some(uuid)),
+        None if args.session => Some(None),
+        None => None,
     };
 
     let bootstrap = resolve_session(resume);
@@ -533,18 +486,68 @@ mod tests {
     use crate::classifier::WorkMode;
 
     #[test]
-    fn mcp_server_accepts_only_auto_and_yolo() {
-        assert!(mcp_server_mode_ok(WorkMode::Auto));
-        assert!(mcp_server_mode_ok(WorkMode::Yolo));
-        assert!(!mcp_server_mode_ok(WorkMode::Manual));
-        assert!(!mcp_server_mode_ok(WorkMode::Plan));
+    fn non_interactive_runs_accept_only_auto_and_yolo() {
+        assert!(non_interactive_mode_ok(WorkMode::Auto));
+        assert!(non_interactive_mode_ok(WorkMode::Yolo));
+        assert!(!non_interactive_mode_ok(WorkMode::Manual));
+        assert!(!non_interactive_mode_ok(WorkMode::Plan));
     }
 
     #[test]
-    fn mcp_mode_defaults_to_auto() {
-        assert!(matches!(
-            parse_work_mode("something-unknown"),
-            WorkMode::Auto
-        ));
+    fn cli_defaults_work_mode_to_auto() {
+        let args = Args::try_parse_from(["programmer"])
+            .and_then(Args::validate)
+            .expect("default arguments should parse");
+        assert_eq!(args.work_mode, WorkMode::Auto);
+    }
+
+    #[test]
+    fn cli_accepts_legacy_mcp_mode_alias() {
+        let args = Args::try_parse_from(["programmer", "--mcp-server", "--mcp-mode", "yolo"])
+            .and_then(Args::validate)
+            .expect("legacy MCP command should remain valid");
+        assert!(args.mcp_server);
+        assert_eq!(args.work_mode, WorkMode::Yolo);
+    }
+
+    #[test]
+    fn cli_rejects_unknown_arguments_and_modes() {
+        assert!(Args::try_parse_from(["programmer", "--unknown"]).is_err());
+        assert!(
+            Args::try_parse_from(["programmer", "--mcp-server", "--work-mode", "bananas"]).is_err()
+        );
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_launch_modes() {
+        assert!(Args::try_parse_from(["programmer", "--mcp-server", "--mcp-http"]).is_err());
+        assert!(Args::try_parse_from(["programmer", "--print", "hi", "--session"]).is_err());
+    }
+
+    #[test]
+    fn cli_validates_mode_against_the_selected_surface() {
+        assert!(
+            Args::try_parse_from(["programmer", "--mcp-server", "--work-mode", "manual",])
+                .and_then(Args::validate)
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["programmer", "--mcp-http", "--work-mode", "manual",])
+                .and_then(Args::validate)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn cli_supplies_optional_argument_defaults() {
+        let resume = Args::try_parse_from(["programmer", "--resume"])
+            .and_then(Args::validate)
+            .expect("resume without a UUID should open the picker");
+        assert_eq!(resume.resume.as_deref(), Some(""));
+
+        let http = Args::try_parse_from(["programmer", "--mcp-http"])
+            .and_then(Args::validate)
+            .expect("HTTP MCP should use the default bind address");
+        assert_eq!(http.mcp_http, Some(([127, 0, 0, 1], 8765).into()));
     }
 }

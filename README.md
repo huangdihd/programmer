@@ -319,14 +319,16 @@ programmer --mcp-server
 
 `--mcp-server` is **headless**: a client launches it as a subprocess with no
 terminal, so it only accepts the non-interactive gating modes. Tool calls are
-gated by the same classifier as the TUI, via `--mcp-mode`. Read-only tools
+gated by the same classifier as the TUI, via `--work-mode`. Read-only tools
 always run; dangerous ones (`command`, `write_file`, `edit_file`, mutating
 `task` actions, …) are gated:
 
-| `--mcp-mode` | Behavior for dangerous tools |
+| `--work-mode` | Behavior for dangerous tools |
 |---|---|
 | `auto` (default) | The **LLM classifier** decides (needs a configured `classifier_model`/default model); runs only if it approves |
 | `yolo` | Everything runs without gating |
+
+The former `--mcp-mode` spelling remains available as a compatibility alias.
 
 `manual` (human confirmation) and `plan` (read-only) need an approval surface, so
 `--mcp-server` rejects them at startup — use `--mcp-http` (below), which has a
@@ -337,7 +339,7 @@ Register it with a client by pointing at the binary, e.g.:
 ```json
 {
   "mcpServers": {
-    "programmer": { "command": "programmer", "args": ["--mcp-server", "--mcp-mode", "yolo"] }
+    "programmer": { "command": "programmer", "args": ["--mcp-server", "--work-mode", "yolo"] }
   }
 }
 ```
@@ -348,7 +350,7 @@ The tools run in the server process's working directory.
 
 ```sh
 programmer --mcp-http            # default 127.0.0.1:8765
-programmer --mcp-http 0.0.0.0:9000 --mcp-mode manual
+programmer --mcp-http 0.0.0.0:9000 --work-mode manual
 ```
 
 `--mcp-http` serves the same tools over plain-HTTP JSON-RPC (`POST /mcp`) and,

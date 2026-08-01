@@ -153,20 +153,17 @@ impl Classifier for YoloClassifier {
 // ---------------------------------------------------------------------------
 
 /// The current safety/work mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkMode {
-    /// Every write/edit/command tool call requires user approval.
+    /// Require interactive approval for state-mutating tool calls.
     Manual,
     /// An LLM classifier decides per tool call whether to auto-approve.
     #[default]
     Auto,
-    /// All tool calls execute without any interception. Gated behind
-    /// `allow_yolo` in the config.
+    /// Run all tool calls without classifier review.
     Yolo,
-    /// Plan-first mode: agent explores and outputs a plan before executing.
-    /// In Planning phase only read-only tools are allowed; after user
-    /// approval, execution uses the selected execution mode.
+    /// Start in a read-only planning mode.
     Plan,
 }
 
