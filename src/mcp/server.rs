@@ -16,17 +16,17 @@
 //! MCP server: expose programmer's own local tools to any MCP client over the
 //! stdio transport (newline-delimited JSON-RPC 2.0).
 //!
-//! Run with `programmer --mcp-server`. This entrypoint is headless — a client
+//! Run with `programmer mcp stdio`. This entrypoint is headless — a client
 //! launches it as a subprocess with no terminal — so it only accepts the
-//! non-interactive `--work-mode` values (`--mcp-mode` remains an alias):
+//! non-interactive `--work-mode` values:
 //! - `auto` (default) sends dangerous calls to the LLM classifier (needs a
 //!   configured model) and runs them only if it approves.
 //! - `yolo` runs everything.
 //!
 //! The [`McpServer`] gate below still implements `plan` (refuse mutations) and
 //! `manual` (confirm through MCP **elicitation**) for completeness, but those
-//! belong to `--mcp-http`, which has a console; `--mcp-server` rejects them at
-//! startup (see `Args::validate` in `main`).
+//! belong to `programmer mcp http`, which has a console; the stdio command
+//! rejects them during CLI validation.
 //!
 //! Nothing but protocol messages is written to stdout.
 
@@ -361,7 +361,6 @@ pub(crate) fn tool_content(text: String, is_error: bool) -> Value {
         "isError": is_error,
     })
 }
-
 
 #[cfg(test)]
 #[path = "server_tests.rs"]

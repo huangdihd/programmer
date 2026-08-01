@@ -189,7 +189,10 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                     // The Cancelling phase already showed the message; stay
                     // silent here to avoid a duplicate.
                 }
-                Err(e @ crate::runner::RunnerError::EmptyResponse) => {
+                Err(
+                    e @ (crate::runner::RunnerError::EmptyResponse
+                    | crate::runner::RunnerError::StepLimit { .. }),
+                ) => {
                     app.conversation_panel.add_error_string(e.to_string());
                 }
                 Ok(_) => {}
@@ -312,6 +315,7 @@ fn take_pending_request(
 
 async fn start_queued_work(app: &mut App<'_>) {
     let pending_user = take_pending_request(&mut app.conversation_panel, &mut app.pending_images);
+    app.task_notifications.discard_consumed();
     if app.task_notifications.pending.is_empty() {
         if let Some((text, images)) = pending_user {
             commands::start_request_with_images(app, text, images).await;

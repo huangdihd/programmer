@@ -344,7 +344,8 @@ async fn run_inner(
         "wait" => {
             let id = require_id(args.id, "wait")?;
             let timeout = args.timeout.unwrap_or(DEFAULT_WAIT_SECS).min(MAX_WAIT_SECS);
-            let (snap, still_running) = tasks::wait(id, Duration::from_secs(timeout)).await?;
+            let (snap, still_running) =
+                tasks::wait_for_agent(id, Duration::from_secs(timeout)).await?;
             let mut text = render_full(&snap, args.tail.unwrap_or(DEFAULT_TAIL_CHARS));
             if still_running {
                 text.push_str(&format!(
@@ -357,7 +358,7 @@ async fn run_inner(
 
         "kill" => {
             let id = require_id(args.id, "kill")?;
-            tasks::kill(id)?;
+            tasks::kill_for_agent(id)?;
             Ok(format!("kill signal sent to task {id}"))
         }
 

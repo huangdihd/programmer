@@ -86,12 +86,6 @@ pub enum TaskOrigin {
     Restored,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskNotificationPolicy {
-    Agent,
-    Silent,
-}
-
 /// A terminal state transition delivered to the application. The output is
 /// copied into the event after the process readers have drained, so clearing a
 /// finished task cannot erase a notification that is already in flight.
@@ -110,6 +104,13 @@ pub struct TaskLifecycleEvent {
     pub stdout_tail: String,
     pub stderr_tail: String,
     pub transcript_tail: String,
+    pub(crate) notify_agent: Arc<AtomicBool>,
+}
+
+impl TaskLifecycleEvent {
+    pub(crate) fn should_notify_agent(&self) -> bool {
+        self.notify_agent.load(Ordering::Acquire)
+    }
 }
 
 /// Interactive-task state: a child running in a real PTY, its output parsed
@@ -146,7 +147,7 @@ struct TaskEntry {
     id: u64,
     kind: TaskKind,
     origin: TaskOrigin,
-    notification_policy: TaskNotificationPolicy,
+    notify_agent: Arc<AtomicBool>,
     generation: u64,
     /// Tool-call id for a foreground `command`, used by live conversation
     /// rendering. Background tasks leave this unset.
@@ -521,16 +522,16 @@ fn spawn_pipe(
     };
 
     {
-        let (origin, notification_policy) = match kind {
-            TaskKind::Background => (TaskOrigin::TaskTool, TaskNotificationPolicy::Agent),
-            TaskKind::Command => (TaskOrigin::Command, TaskNotificationPolicy::Silent),
+        let (origin, notify_agent) = match kind {
+            TaskKind::Background => (TaskOrigin::TaskTool, true),
+            TaskKind::Command => (TaskOrigin::Command, false),
         };
         let mut reg = registry().lock().unwrap();
         reg.push(TaskEntry {
             id,
             kind,
             origin,
-            notification_policy,
+            notify_agent: Arc::new(AtomicBool::new(notify_agent)),
             generation: current_generation(),
             call_id: call_id.map(str::to_string),
             name: name
@@ -625,7 +626,7 @@ pub fn promote_command(id: u64) -> Result<(), String> {
 
     entry.kind = TaskKind::Background;
     entry.origin = TaskOrigin::PromotedCommand;
-    entry.notification_policy = TaskNotificationPolicy::Agent;
+    entry.notify_agent.store(true, Ordering::Release);
     entry.call_id = None;
     entry.max_output = MAX_TASK_OUTPUT;
     cap_buffer(&mut entry.output, MAX_TASK_OUTPUT);
@@ -847,7 +848,7 @@ fn spawn_interactive_with_origin(
             id,
             kind: TaskKind::Background,
             origin,
-            notification_policy: TaskNotificationPolicy::Agent,
+            notify_agent: Arc::new(AtomicBool::new(true)),
             generation: current_generation(),
             call_id: None,
             name: name
@@ -1330,11 +1331,22 @@ pub fn write_stdin(id: u64, text: &str, eof: bool) -> Result<(), String> {
 /// Request termination of a running task. Returns an error if the id is
 /// unknown or the task already finished.
 pub fn kill(id: u64) -> Result<(), String> {
+    kill_inner(id, false)
+}
+
+/// Terminate a task on the agent's request without reporting the resulting
+/// terminal state back to that same agent.
+pub fn kill_for_agent(id: u64) -> Result<(), String> {
+    kill_inner(id, true)
+}
+
+fn kill_inner(id: u64, consume_notification: bool) -> Result<(), String> {
     let mut reg = registry().lock().unwrap();
     let entry = reg
         .iter_mut()
         .find(|e| e.id == id)
         .ok_or_else(|| format!("error: no task with id {id}"))?;
+    let notify_agent = Arc::clone(&entry.notify_agent);
     // Interactive tasks are killed through the PTY child killer; the waiter
     // thread records the exit.
     let status = entry.status;
@@ -1346,14 +1358,21 @@ pub fn kill(id: u64) -> Result<(), String> {
             ));
         }
         pty.killed.store(true, Ordering::Relaxed);
-        return pty
+        let result = pty
             .killer
             .kill()
             .map_err(|e| format!("error: failed to kill task {id}: {e}"));
+        if result.is_ok() && consume_notification {
+            notify_agent.store(false, Ordering::Release);
+        }
+        return result;
     }
     match entry.kill.take() {
         Some(tx) => {
             let _ = tx.send(());
+            if consume_notification {
+                notify_agent.store(false, Ordering::Release);
+            }
             Ok(())
         }
         None => Err(format!(
@@ -1400,6 +1419,55 @@ pub async fn wait(id: u64, timeout: Duration) -> Result<(TaskSnapshot, bool), St
             return Ok((snap, true));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Wait for a task result requested by the agent. A terminal result returned
+/// here consumes the automatic lifecycle notification; a timeout or cancelled
+/// future restores the task's previous notification state.
+pub async fn wait_for_agent(id: u64, timeout: Duration) -> Result<(TaskSnapshot, bool), String> {
+    let notify_agent = {
+        let reg = registry().lock().unwrap();
+        Arc::clone(
+            &reg.iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| format!("error: no task with id {id}"))?
+                .notify_agent,
+        )
+    };
+    let suppression = NotificationSuppression::new(notify_agent);
+    let result = wait(id, timeout).await?;
+    if result.1 {
+        return Ok(result);
+    }
+    suppression.consume();
+    Ok(result)
+}
+
+struct NotificationSuppression {
+    notify_agent: Arc<AtomicBool>,
+    restore_to: Option<bool>,
+}
+
+impl NotificationSuppression {
+    fn new(notify_agent: Arc<AtomicBool>) -> Self {
+        let restore_to = notify_agent.swap(false, Ordering::AcqRel);
+        Self {
+            notify_agent,
+            restore_to: Some(restore_to),
+        }
+    }
+
+    fn consume(mut self) {
+        self.restore_to = None;
+    }
+}
+
+impl Drop for NotificationSuppression {
+    fn drop(&mut self) {
+        if let Some(restore_to) = self.restore_to {
+            self.notify_agent.store(restore_to, Ordering::Release);
+        }
     }
 }
 
@@ -1515,7 +1583,7 @@ pub fn restore(saved: &[PersistedTask]) {
             id: t.id,
             kind: TaskKind::Background,
             origin: TaskOrigin::Restored,
-            notification_policy: TaskNotificationPolicy::Silent,
+            notify_agent: Arc::new(AtomicBool::new(false)),
             generation: current_generation(),
             call_id: None,
             name: t.name.clone(),
@@ -1692,9 +1760,7 @@ fn lifecycle_event(
     exit_code: Option<i32>,
     finished: Instant,
 ) -> Option<TaskLifecycleEvent> {
-    if entry.kind != TaskKind::Background
-        || entry.notification_policy != TaskNotificationPolicy::Agent
-    {
+    if entry.kind != TaskKind::Background {
         return None;
     }
     let transcript = entry
@@ -1716,6 +1782,7 @@ fn lifecycle_event(
         stdout_tail: tail_chars(&strip_ansi(&entry.output), 8_000),
         stderr_tail: tail_chars(&strip_ansi(&entry.stderr_output), 4_000),
         transcript_tail: tail_chars(&transcript, 8_000),
+        notify_agent: Arc::clone(&entry.notify_agent),
     })
 }
 

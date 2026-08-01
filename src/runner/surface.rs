@@ -66,7 +66,7 @@ pub(crate) trait AgentSurface: Send + Sync {
     ) -> ReviewDecision;
 
     // --- Front-end context (defaulted; the headless surface takes the None /
-    // headless answer, so `-p` behaviour is unchanged). ---
+    // headless answer). ---
 
     /// The channel tools use to reach the front-end — `ask_user`'s prompt, live
     /// task updates. `None` (the default) means there is no interactive
@@ -105,10 +105,11 @@ pub(crate) trait AgentSurface: Send + Sync {
     }
 }
 
-/// The surface for non-interactive runs (the `-p` print mode): progress events
+/// The basic surface for non-interactive tests: progress events
 /// are dropped, and any `Ask` is denied because there is no one to ask. This
 /// preserves the pre-surface headless behaviour, where `Ask` verdicts folded
 /// straight into denials carrying the classifier's own reason.
+#[allow(dead_code)]
 pub(crate) struct HeadlessSurface;
 
 #[async_trait::async_trait]

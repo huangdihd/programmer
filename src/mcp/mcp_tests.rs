@@ -134,11 +134,12 @@ fn mock_route(headers: &str, body: &str) -> String {
         serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
     };
     let error = |msg: &str| {
-        serde_json::json!({
+        let body = serde_json::json!({
             "jsonrpc": "2.0", "id": id,
             "error": {"code": -32000, "message": msg},
         })
-        .to_string()
+        .to_string();
+        http_json("", &body)
     };
 
     match method {
@@ -163,7 +164,10 @@ fn mock_route(headers: &str, body: &str) -> String {
         }
         // The session issued at initialize must be echoed back.
         "tools/call" => {
-            if !headers.contains("Mcp-Session-Id: sess-1") {
+            if !headers
+                .to_ascii_lowercase()
+                .contains("mcp-session-id: sess-1")
+            {
                 return error("missing session id");
             }
             let params = req
@@ -197,10 +201,29 @@ fn mock_route(headers: &str, body: &str) -> String {
     }
 }
 
+async fn initialize_mock_http_client(client: &McpHttpClient) {
+    client
+        .call(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            })),
+        )
+        .await
+        .expect("initialize");
+    client
+        .send_notification("notifications/initialized", None)
+        .await
+        .expect("initialized notification");
+}
+
 #[tokio::test]
 async fn http_client_echo_roundtrip() {
     let (url, _jh) = spawn_mock_http_server().await;
     let client = McpHttpClient::new(&url, &HashMap::new()).expect("connect to mock");
+    initialize_mock_http_client(&client).await;
     let tools_raw = client.call("tools/list", None).await.expect("list tools");
     let tools: Vec<McpTool> = serde_json::from_value(
         tools_raw.get("tools").cloned().unwrap_or_default(),
@@ -232,6 +255,7 @@ async fn http_client_echo_roundtrip() {
 async fn http_client_error_surfaces_failure() {
     let (url, _jh) = spawn_mock_http_server().await;
     let client = McpHttpClient::new(&url, &HashMap::new()).expect("connect to mock");
+    initialize_mock_http_client(&client).await;
     let err = client
         .call(
             "tools/call",

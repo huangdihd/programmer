@@ -15,8 +15,12 @@
 - sandbox
   - ~~macOS Seatbelt and Linux Landlock/seccomp process sandbox~~
   - Windows AppContainer process launcher
-- optimize headless mode
-- ~~refactor args parsing to clap~~
+- ~~optimize headless mode~~
+  - ~~refactor args parsing to clap~~
+  - ~~replace flat headless flags with run/init/diagnostics/mcp subcommands~~
+  - ~~support model, classifier model, thinking, work mode, cwd, timeout, and step limits~~
+  - ~~run automatic post-edit diagnostics and optional final checks~~
+  - ~~support text, JSON, and JSONL output~~
 - ~~store too long outputs as files~~
 - ~~display full output when commands are running~~
 - ~~default classifier model~~

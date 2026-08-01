@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Interactive dashboard for the `--mcp-http` server.
+//! Interactive dashboard for the `programmer mcp http` server.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;

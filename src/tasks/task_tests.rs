@@ -36,6 +36,17 @@ fn echo_cmd() -> &'static str {
     "echo task-out"
 }
 
+fn notification_enabled(id: u64) -> bool {
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("task exists")
+        .notify_agent
+        .load(Ordering::Acquire)
+}
+
 #[test]
 fn sidebar_output_keeps_only_a_bounded_tail() {
     let text: String = (1..=13)
@@ -49,13 +60,13 @@ fn sidebar_output_keeps_only_a_bounded_tail() {
 }
 
 #[test]
-fn lifecycle_event_is_emitted_only_for_agent_owned_background_tasks() {
+fn lifecycle_events_only_cover_background_tasks_and_can_be_consumed() {
     let started = Instant::now();
     let mut entry = TaskEntry {
         id: 41,
         kind: TaskKind::Background,
         origin: TaskOrigin::TaskTool,
-        notification_policy: TaskNotificationPolicy::Agent,
+        notify_agent: Arc::new(AtomicBool::new(true)),
         generation: 7,
         call_id: None,
         name: "tests".to_string(),
@@ -86,6 +97,9 @@ fn lifecycle_event_is_emitted_only_for_agent_owned_background_tasks() {
     assert_eq!(event.new_status, TaskStatus::Completed);
     assert_eq!(event.stdout_tail, "ok\n");
 
+    entry.notify_agent.store(false, Ordering::Release);
+    assert!(!event.should_notify_agent());
+
     entry.kind = TaskKind::Command;
     assert!(
         lifecycle_event(
@@ -98,7 +112,6 @@ fn lifecycle_event_is_emitted_only_for_agent_owned_background_tasks() {
         .is_none()
     );
     entry.kind = TaskKind::Background;
-    entry.notification_policy = TaskNotificationPolicy::Silent;
     assert!(
         lifecycle_event(
             &entry,
@@ -107,7 +120,7 @@ fn lifecycle_event_is_emitted_only_for_agent_owned_background_tasks() {
             None,
             started,
         )
-        .is_none()
+        .is_some()
     );
 }
 
@@ -229,11 +242,11 @@ async fn pipe_stderr_is_kept_separate_from_stdout() {
 
 #[test]
 fn persist_all_excludes_foreground_commands() {
-    let mut entry = TaskEntry {
+    let entry = TaskEntry {
         id: 99,
         kind: TaskKind::Command,
         origin: TaskOrigin::Command,
-        notification_policy: TaskNotificationPolicy::Agent,
+        notify_agent: Arc::new(AtomicBool::new(true)),
         generation: 1,
         call_id: Some("persist-filter".into()),
         name: "test".into(),
@@ -264,6 +277,7 @@ async fn closed_stdin_exits_process() {
     let command = if cfg!(windows) { "findstr ." } else { "cat" };
     let id = spawn(command, None, None).expect("spawn");
     // Close stdin immediately — the process should exit quickly.
+    write_stdin(id, "", true).expect("close stdin");
     let (snap, _) = wait(id, Duration::from_secs(10)).await.expect("wait");
     assert_eq!(snap.status, TaskStatus::Completed);
 }
@@ -287,13 +301,14 @@ async fn screen_snapshot_clone_is_standalone() {
     let id = spawn_interactive("echo snapshot-test", None, None, 24, 80).expect("spawn");
     let _ = wait(id, Duration::from_secs(10)).await.expect("wait");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let snap1 = screen_snapshot(id).expect("first snapshot");
+    let mut snap1 = screen_snapshot(id).expect("first snapshot");
     assert!(!snap1.text.is_empty());
-    // The second snapshot is a fresh clone, not sharing the same screen.
+    let original_text = snap1.text.clone();
+    snap1.text.push_str(" locally mutated");
+    // A fresh snapshot must not share the first snapshot's owned text.
     let snap2 = screen_snapshot(id).expect("second snapshot");
-    assert_eq!(snap1.text, snap2.text);
-    forget_command(id);
-    assert!(screen_snapshot(id).is_err());
+    assert_eq!(snap2.text, original_text);
+    registry().lock().unwrap().retain(|entry| entry.id != id);
 }
 
 #[tokio::test]
@@ -308,6 +323,59 @@ async fn wait_times_out_on_running_task() {
     assert!(still_running);
     assert_eq!(snap.status, TaskStatus::Running);
     let _ = kill(id);
+}
+
+#[tokio::test]
+async fn agent_wait_consumes_completion_but_timeout_restores_notification() {
+    let completed_id = spawn(echo_cmd(), None, None).expect("spawn completed task");
+    let (_, still_running) = wait_for_agent(completed_id, Duration::from_secs(10))
+        .await
+        .expect("wait for completed task");
+    assert!(!still_running);
+    assert!(!notification_enabled(completed_id));
+
+    let long = if cfg!(windows) {
+        "ping -n 30 127.0.0.1"
+    } else {
+        "sleep 30"
+    };
+    let running_id = spawn(long, None, None).expect("spawn running task");
+    let (_, still_running) = wait_for_agent(running_id, Duration::from_millis(10))
+        .await
+        .expect("timed wait");
+    assert!(still_running);
+    assert!(notification_enabled(running_id));
+    kill(running_id).expect("clean up running task");
+}
+
+#[tokio::test]
+async fn cancelled_agent_wait_restores_notification() {
+    let long = if cfg!(windows) {
+        "ping -n 30 127.0.0.1"
+    } else {
+        "sleep 30"
+    };
+    let id = spawn(long, None, None).expect("spawn");
+    let wait = wait_for_agent(id, Duration::from_secs(30));
+    assert!(tokio::time::timeout(Duration::from_millis(10), wait)
+        .await
+        .is_err());
+    assert!(notification_enabled(id));
+    kill(id).expect("clean up cancelled wait");
+}
+
+#[tokio::test]
+async fn agent_kill_consumes_terminal_notification() {
+    let long = if cfg!(windows) {
+        "ping -n 30 127.0.0.1"
+    } else {
+        "sleep 30"
+    };
+    let id = spawn(long, None, None).expect("spawn");
+    kill_for_agent(id).expect("agent kill");
+    let snap = wait_until_finished(id).await.expect("task stops");
+    assert_eq!(snap.status, TaskStatus::Killed);
+    assert!(!notification_enabled(id));
 }
 
 #[test]

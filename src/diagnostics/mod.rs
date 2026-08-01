@@ -32,6 +32,7 @@ pub use parse::{Parser, parse_output};
 pub use profile::{Checker, CheckerKind, DiagnosticsProfile, PROFILE_PATH};
 pub use runner::run_checker;
 
+use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -41,7 +42,8 @@ use std::path::Path;
 
 /// How serious a single diagnostic is. Ordered most-severe first so a sorted
 /// list surfaces errors before warnings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
     Warning,
@@ -88,7 +90,7 @@ impl Severity {
 /// One normalized problem reported by a checker. Two diagnostics are considered
 /// the *same* problem when every field matches — that identity is what lets
 /// [`diff`] tell a genuinely new error from one that was already present.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Diagnostic {
     /// File the problem is in, as reported (usually project-relative).
     pub file: String,

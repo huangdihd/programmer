@@ -152,6 +152,14 @@ impl TaskNotificationState {
         self.flush_requested = false;
         true
     }
+
+    pub(crate) fn discard_consumed(&mut self) {
+        self.pending.retain(|event| event.should_notify_agent());
+        if self.pending.is_empty() {
+            self.ready_at = None;
+            self.flush_requested = false;
+        }
+    }
 }
 
 /// Application.
@@ -444,8 +452,6 @@ impl App<'_> {
     /// Called at the start of every turn; the runner is immutable during a turn
     /// and is dropped when the spawned task finishes.
     pub(crate) fn build_runner(&self) -> Option<crate::runner::TurnRunner> {
-        use crate::consts::OVERVIEW_REMINDER_EVERY;
-        use crate::runner::hooks::{DiagnosticsHook, OverviewReminderHook};
         use crate::runner::{LlmPolicy, RunnerPolicy, TurnRunner};
         use std::sync::Arc;
 
@@ -499,16 +505,9 @@ impl App<'_> {
             coauthor: self.config.git_coauthor.clone(),
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,
-            hooks: vec![
-                Arc::new(DiagnosticsHook {
-                    state: self.diagnostics_state.clone(),
-                }),
-                Arc::new(OverviewReminderHook {
-                    state: self.diagnostics_state.clone(),
-                    every: OVERVIEW_REMINDER_EVERY,
-                }),
-            ],
+            hooks: crate::runner::hooks::standard_hooks(self.diagnostics_state.clone()),
             stream_retrying: self.cancel.stream_retrying.clone(),
+            max_steps: None,
         })
     }
 
@@ -586,6 +585,8 @@ pub(crate) fn build_mcp_policy_map(
 #[cfg(test)]
 mod tests {
     use super::TaskNotificationState;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     fn event(sequence: u64) -> crate::tasks::TaskLifecycleEvent {
@@ -603,6 +604,7 @@ mod tests {
             stdout_tail: String::new(),
             stderr_tail: String::new(),
             transcript_tail: String::new(),
+            notify_agent: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -613,6 +615,13 @@ mod tests {
         assert!(!state.push(event(1)));
         assert_eq!(state.pending.len(), 1);
         assert!(state.ready_at.is_some());
+
+        state.pending[0]
+            .notify_agent
+            .store(false, Ordering::Release);
+        state.discard_consumed();
+        assert!(state.pending.is_empty());
+        assert!(state.ready_at.is_none());
 
         state.clear();
         assert!(state.pending.is_empty());

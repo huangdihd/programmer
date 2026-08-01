@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// `Auto` deliberately omits the API field so each provider/model can use its
 /// own default. Every other variant sends an explicit OpenAI-compatible value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ThinkingLevel {
     #[default]

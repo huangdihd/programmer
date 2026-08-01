@@ -17,7 +17,7 @@
 //! classification, tool execution) that both the TUI event loop and a headless
 //! driver share, plus the driver itself. Extracted incrementally from the
 //! `app` event handlers so the TUI keeps working unchanged while the same logic
-//! becomes reusable for a print mode and, later, in-process sub-agents.
+//! becomes reusable for headless CLI commands and, later, in-process sub-agents.
 
 pub(crate) mod classify;
 pub(crate) mod hooks;
@@ -26,7 +26,9 @@ pub(crate) mod stream;
 pub(crate) mod surface;
 pub(crate) mod tools;
 
-pub(crate) use surface::{AgentSurface, HeadlessSurface, ReviewDecision};
+#[cfg(test)]
+pub(crate) use surface::HeadlessSurface;
+pub(crate) use surface::{AgentSurface, ReviewDecision};
 
 use crate::cancel::CancellationToken;
 use crate::classifier::Classifier;
@@ -69,7 +71,7 @@ pub(crate) enum RunnerPolicy {
 }
 
 /// A headless agent runner: everything needed to run a turn to completion with
-/// no UI. Reused by the `-p` print mode and, later, in-process sub-agents.
+/// no UI. Reused by CLI headless runs and, later, in-process sub-agents.
 pub(crate) struct TurnRunner {
     /// Client + resolved model id for the chat/completion calls.
     pub client: Client<OpenAIConfig>,
@@ -88,12 +90,14 @@ pub(crate) struct TurnRunner {
     /// Reasoning effort for main chat requests.
     pub thinking_level: crate::thinking::ThinkingLevel,
     /// Pluggable turn hooks (post-edit diagnostics, the PROGRAMMER.md reminder,
-    /// and any future check) run around each tool batch. Empty by default, so
-    /// `-p` runs stay lean.
+    /// and any future check) run around each tool batch.
     pub hooks: Vec<Arc<dyn hooks::TurnHook>>,
     /// Set while the stream layer is retrying a dropped connection; shared so
     /// a front-end can show a "retrying" indicator.
     pub stream_retrying: Arc<AtomicBool>,
+    /// Maximum number of model responses in one turn. A tool-call response
+    /// consumes one step; `None` leaves the agent loop unbounded.
+    pub max_steps: Option<usize>,
 }
 
 /// Cross-turn mutable state shared between the runner's hooks and the front-end
@@ -132,6 +136,8 @@ pub enum RunnerError {
     Cancelled,
     #[error("the model returned no output")]
     EmptyResponse,
+    #[error("maximum model response count reached ({limit})")]
+    StepLimit { limit: usize },
 }
 
 /// A coarse turn phase, surfaced so a front-end can show a status indicator.
@@ -226,11 +232,19 @@ impl TurnRunner {
     ) -> Result<TurnResult, RunnerError> {
         let retrying = &self.stream_retrying;
 
+        let mut steps = 0usize;
         loop {
             if cancel.is_cancelled() {
                 ensure_tool_output_pairing(conversation);
                 return Err(RunnerError::Cancelled);
             }
+            if let Some(limit) = self.max_steps
+                && steps >= limit
+            {
+                ensure_tool_output_pairing(conversation);
+                return Err(RunnerError::StepLimit { limit });
+            }
+            steps += 1;
 
             // ---- stream one response, folding it locally ----
             // The conversation is shared with the front-end (the TUI renders it
@@ -329,7 +343,7 @@ impl TurnRunner {
                 surface.on_event(RunnerEvent::ToolCall { name: &call.name });
             }
             // Snapshot the batch metadata the hooks self-gate on — but only when
-            // any are attached, so a headless `-p` run does no extra work. We need
+            // any are attached, so a hook-free headless run does no extra work. We need
             // the edit call-ids to tell afterwards whether a file was actually
             // written; the tool names go into the summary handed to each hook.
             let hook_meta: Option<(Vec<String>, HashSet<String>)> =
@@ -735,6 +749,7 @@ mod tests {
             thinking_level: crate::thinking::ThinkingLevel::Auto,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
+            max_steps: None,
         }
     }
 
@@ -815,6 +830,37 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["input", "call", "output", "message"]);
+    }
+
+    #[tokio::test]
+    async fn run_turn_stops_at_the_model_response_limit() {
+        let body1 = format!(
+            "{}{}",
+            item_added_frame(
+                1,
+                0,
+                &call_item("c1", "read_file", "{\"path\":\"Cargo.toml\"}")
+            ),
+            completed_frame(2),
+        );
+        let body2 = format!(
+            "{}{}",
+            item_added_frame(1, 0, &message_item("should not be requested")),
+            completed_frame(2),
+        );
+        let (base, _server) = spawn_mock_responses(vec![body1, body2]).await;
+
+        let mut runner = engine_for(&base);
+        runner.max_steps = Some(1);
+        let mut conversation = Conversation::new();
+        conversation.add_input_message(user("read once"));
+        let conversation = Mutex::new(conversation);
+        let error = runner
+            .run_turn(&conversation, &CancellationToken::new(), &HeadlessSurface)
+            .await
+            .expect_err("a second model response should be rejected");
+
+        assert!(matches!(error, RunnerError::StepLimit { limit: 1 }));
     }
 
     #[tokio::test]
@@ -973,6 +1019,7 @@ mod tests {
             thinking_level: crate::thinking::ThinkingLevel::Auto,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
+            max_steps: None,
         }
     }
 
@@ -1134,7 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_diagnostics_inject_nothing_after_an_edit() {
-        // With the feedback switch off (the default, i.e. `-p`), a write_file
+        // With the feedback hooks disabled, a write_file
         // batch must leave the conversation exactly as before: no system note
         // and no "Post-edit check" appended to the write output.
         let tmp = std::env::temp_dir().join(format!("engine_diag_off_{}", std::process::id()));

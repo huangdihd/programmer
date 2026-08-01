@@ -304,6 +304,43 @@ Open with `/providers manage` or the `--providers` flag.
 | `Enter` | Save provider |
 | `Esc` | Cancel |
 
+### Headless mode
+
+Use `run` for a one-shot agent operation without starting the TUI:
+
+```sh
+programmer run "fix the failing tests"
+programmer run --model openai/gpt-5 --thinking high --check "refactor this module"
+programmer run --init --format json "implement the first todo item"
+printf 'explain this repository' | programmer run -
+```
+
+`run --init` first executes the same hidden Developer initialization turn as
+`/init`, then sends the user prompt in the same conversation. Automatic
+post-edit diagnostics are enabled whenever
+`.programmer/diagnostics.toml` exists; use `--no-diagnostics` to disable the
+hook or `--check` for an additional final snapshot. Other controls include
+`--classifier-model`, `--work-mode auto|plan|yolo`, `--cwd`,
+`--timeout`, `--max-steps`, and `--prompt-file`.
+
+`--format text` prints only the final answer to stdout, `json` emits one
+versioned result document, and `jsonl` emits progress events followed by a
+result event. Diagnostics from a text-mode final check go to stderr so stdout
+remains pipe-friendly.
+
+Project setup and model-free checks are also standalone commands:
+
+```sh
+programmer init --model openai/gpt-5
+programmer diagnostics
+programmer diagnostics --format json --fail-on warning
+```
+
+`diagnostics` reads the project profile and runs its checkers without
+initializing an LLM provider. It exits unsuccessfully when a checker fails, no
+profile exists, or a finding meets the `--fail-on error|warning|lint`
+threshold.
+
 ### As an MCP server
 
 `programmer` can also run as an [MCP](https://modelcontextprotocol.io) server,
@@ -314,10 +351,10 @@ client — another agent, Claude Desktop, etc. It speaks JSON-RPC 2.0 over stdio
 session.
 
 ```sh
-programmer --mcp-server
+programmer mcp stdio
 ```
 
-`--mcp-server` is **headless**: a client launches it as a subprocess with no
+`programmer mcp stdio` is **headless**: a client launches it as a subprocess with no
 terminal, so it only accepts the non-interactive gating modes. Tool calls are
 gated by the same classifier as the TUI, via `--work-mode`. Read-only tools
 always run; dangerous ones (`command`, `write_file`, `edit_file`, mutating
@@ -328,10 +365,8 @@ always run; dangerous ones (`command`, `write_file`, `edit_file`, mutating
 | `auto` (default) | The **LLM classifier** decides (needs a configured `classifier_model`/default model); runs only if it approves |
 | `yolo` | Everything runs without gating |
 
-The former `--mcp-mode` spelling remains available as a compatibility alias.
-
 `manual` (human confirmation) and `plan` (read-only) need an approval surface, so
-`--mcp-server` rejects them at startup — use `--mcp-http` (below), which has a
+`mcp stdio` rejects them at startup — use `mcp http` (below), which has a
 console, for those.
 
 Register it with a client by pointing at the binary, e.g.:
@@ -339,7 +374,7 @@ Register it with a client by pointing at the binary, e.g.:
 ```json
 {
   "mcpServers": {
-    "programmer": { "command": "programmer", "args": ["--mcp-server", "--work-mode", "yolo"] }
+    "programmer": { "command": "programmer", "args": ["mcp", "stdio", "--work-mode", "yolo"] }
   }
 }
 ```
@@ -349,11 +384,11 @@ The tools run in the server process's working directory.
 #### Over HTTP, with an approval console
 
 ```sh
-programmer --mcp-http            # default 127.0.0.1:8765
-programmer --mcp-http 0.0.0.0:9000 --work-mode manual
+programmer mcp http
+programmer mcp http 0.0.0.0:9000 --work-mode manual
 ```
 
-`--mcp-http` serves the same tools over plain-HTTP JSON-RPC (`POST /mcp`) and,
+`programmer mcp http` serves the same tools over plain-HTTP JSON-RPC (`POST /mcp`) and,
 because the transport isn't stdio, keeps the terminal for a small **ratatui
 approval console**. The dashboard keeps a selectable call history with full
 arguments, results, and approval status. Use `↑`/`↓` or `j`/`k` to inspect

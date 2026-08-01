@@ -32,6 +32,19 @@ use super::{AgentSurface, DiagnosticsState, RunnerEvent, RunnerPhase};
 use crate::conversation::Conversation;
 use std::sync::{Arc, Mutex};
 
+/// Hooks shared by the TUI and headless agent surfaces.
+pub(crate) fn standard_hooks(state: Arc<Mutex<DiagnosticsState>>) -> Vec<Arc<dyn TurnHook>> {
+    vec![
+        Arc::new(DiagnosticsHook {
+            state: state.clone(),
+        }),
+        Arc::new(OverviewReminderHook {
+            state,
+            every: crate::consts::OVERVIEW_REMINDER_EVERY,
+        }),
+    ]
+}
+
 /// A summary of the tool batch a hook is reacting to.
 pub(crate) struct BatchSummary {
     /// The tool names in this batch, in call order.

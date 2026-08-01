@@ -611,6 +611,8 @@ mod tests {
         ordered_message_content, queue_pending_request,
     };
     use async_openai::types::responses::{ImageDetail, InputContent, InputImageContent};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::{collections::BTreeSet, time::Duration};
 
     #[derive(Clone, Copy, Debug)]
@@ -833,6 +835,7 @@ mod tests {
             stdout_tail: "building".to_string(),
             stderr_tail: "compiler error".to_string(),
             transcript_tail: String::new(),
+            notify_agent: Arc::new(AtomicBool::new(true)),
         }]);
 
         assert!(prompt.contains("<background_task_updates>"));

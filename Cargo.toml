@@ -38,7 +38,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] 
 # pseudo-terminal cross-platform; vt100 parses their output into a screen grid.
 portable-pty = "0.9"
 vt100 = "0.15"
-# HTTP MCP server (`--mcp-http`): a plain-HTTP JSON-RPC endpoint served alongside
+# HTTP MCP server (`programmer mcp http`): a plain-HTTP JSON-RPC endpoint served alongside
 # a ratatui approval console.
 axum = "0.8"
 base64 = "0.22.1"

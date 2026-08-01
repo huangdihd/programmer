@@ -292,7 +292,7 @@ pub(crate) async fn run_local_tool_secure(
     }
 }
 
-/// The local tools exposed when running as an MCP server (`--mcp-server`).
+/// The local tools exposed by `programmer mcp stdio` and `programmer mcp http`.
 /// Excludes `ask_user` (needs the interactive UI) and MCP passthrough tools.
 pub(crate) fn mcp_server_tools() -> Vec<Tool> {
     vec![
