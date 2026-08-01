@@ -23,8 +23,8 @@ use crate::ui::components::messages::assistant::detail_style;
 use crate::ui::components::messages::assistant_message::EXPANDED_BG;
 use crate::ui::markdown_theme::palette;
 
-const PAD_LEFT: u16 = 2;
-const PAD_RIGHT: u16 = 2;
+const PAD_LEFT: u16 = 1;
+const PAD_RIGHT: u16 = 1;
 
 /// Renders the result of a tool call (a `function_call_output`). Collapsed it is
 /// a single line showing the first line of output; expanded it shows the full

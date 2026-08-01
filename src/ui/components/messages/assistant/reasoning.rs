@@ -24,7 +24,7 @@ use super::muted_style;
 
 /// Combined horizontal padding of the parent [`AssistantMessage`] block
 /// (`PAD_LEFT` + `PAD_RIGHT`).
-const BLOCK_PAD: u16 = 4;
+const BLOCK_PAD: u16 = 2;
 /// Extra left indent applied to expanded reasoning lines, keeping a visual
 /// nesting relationship under the "✻ Thought" header.
 const INDENT: u16 = 2;

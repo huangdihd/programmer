@@ -21,8 +21,8 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use crate::ui::markdown_theme::palette;
 
-const PAD_LEFT: u16 = 2;
-const PAD_RIGHT: u16 = 2;
+const PAD_LEFT: u16 = 1;
+const PAD_RIGHT: u16 = 1;
 
 /// Renders an error (an API error or an internal message) as a distinct,
 /// red-accented block so failures stand out from normal conversation.

@@ -191,7 +191,16 @@ fn build_item_paragraph(
 impl Widget for &mut ConversationPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.frame_count = self.frame_count.wrapping_add(1);
-        let content_width = area.width.saturating_sub(1);
+        // Layout: one blank column of margin on the left and one on the right
+        // (the right column doubles as the overlay scrollbar's track), so the
+        // scrollbar never overlaps content.
+        let left_margin = u16::from(area.width >= 3);
+        let content_width = area.width.saturating_sub(left_margin + 1);
+        let content_area = Rect {
+            x: area.x + left_margin,
+            width: content_width,
+            ..area
+        };
         let stick_to_bottom = self.stick_to_bottom;
         let welcome_message = WelcomeMessage;
         let welcome_height = welcome_message.line_count(content_width);
@@ -427,6 +436,17 @@ impl Widget for &mut ConversationPanel {
 
         content_height = content_height.max(area.height);
 
+        // New content arriving while the user is scrolled up shifts their view
+        // relative to the content — count that as scroll activity so the
+        // scrollbar appears as a "new messages" cue. (Field-level mutation:
+        // `cache` below still holds a mutable borrow of `self`.)
+        if !stick_to_bottom && content_height > self.last_content_height {
+            crate::ui::components::conversation_panel::conversation_panel::note_scroll_activity_field(
+                &mut self.last_scroll_activity_at,
+            );
+        }
+        self.last_content_height = content_height;
+
         // Follow the bottom while the user hasn't scrolled up. Doing this here
         // (rather than re-snapping on every incoming chunk) is what lets manual
         // scrolling stick during streaming.
@@ -487,15 +507,17 @@ impl Widget for &mut ConversationPanel {
         {
             scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
         }
-        scroll_view.render(area, buf, &mut self.scroll_view_state);
+        scroll_view.render(content_area, buf, &mut self.scroll_view_state);
 
         // The scroll view has now clamped the offset to its real value; store it
         // and the layout for click hit-testing on the next event.
         let offset = self.scroll_view_state.offset().y;
 
-        // Draw a minimal custom scrollbar: no background, thin gray thumb.
-        if area.height > 0 && content_height > area.height {
-            let scrollbar_x = area.x + area.width.saturating_sub(1);
+        // Draw a minimal custom scrollbar: no background, thin gray thumb. It
+        // lives in the right margin column (never overlapping content) and only
+        // appears for a short window after the user scrolls.
+        if area.height > 0 && content_height > area.height && self.scrollbar_recently_active() {
+            let scrollbar_x = content_area.right();
             let viewport_h = area.height as f64;
             let content_h = content_height as f64;
             let thumb_h = ((viewport_h / content_h) * viewport_h).max(1.0) as u16;
@@ -522,7 +544,8 @@ impl Widget for &mut ConversationPanel {
                 let buffer_row = offset.saturating_add(screen_row);
                 if let Some((from, to)) = sel.row_range(buffer_row, content_width) {
                     for x in from..=to {
-                        if let Some(cell) = buf.cell_mut((area.x + x, area.y + screen_row)) {
+                        if let Some(cell) = buf.cell_mut((content_area.x + x, area.y + screen_row))
+                        {
                             cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
                         }
                     }
@@ -531,12 +554,12 @@ impl Widget for &mut ConversationPanel {
         }
 
         // "Jump to bottom" indicator: shown only while scrolled up, at the
-        // bottom-right of the view. Clickable (see the mouse handler).
+        // bottom-right of the content area. Clickable (see the mouse handler).
         if area.height > 0 && !self.scroll_view_state.is_at_bottom() {
             let label = " \u{2193} latest ";
             let w = label.chars().count() as u16;
-            if area.width >= w {
-                let x = area.x + area.width - w;
+            if content_area.width >= w {
+                let x = content_area.right().saturating_sub(w);
                 let y = area.y + area.height - 1;
                 buf.set_string(
                     x,
@@ -560,7 +583,7 @@ impl Widget for &mut ConversationPanel {
             self.set_jump_button(None);
         }
 
-        self.set_layout(area, offset, layout, live_layout);
+        self.set_layout(content_area, offset, layout, live_layout);
     }
 }
 

@@ -21,8 +21,8 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use crate::ui::markdown_theme::palette;
 
-const PAD_LEFT: u16 = 2;
-const PAD_RIGHT: u16 = 2;
+const PAD_LEFT: u16 = 1;
+const PAD_RIGHT: u16 = 1;
 
 /// Renders an informational message (command output, status updates) as a
 /// distinct, cyan-accented block so it stands out from errors and conversation.

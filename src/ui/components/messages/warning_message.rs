@@ -21,8 +21,8 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use crate::ui::markdown_theme::palette;
 
-const PAD_LEFT: u16 = 2;
-const PAD_RIGHT: u16 = 2;
+const PAD_LEFT: u16 = 1;
+const PAD_RIGHT: u16 = 1;
 
 /// Renders a warning message as a yellow-accented block.
 pub struct WarningMessage {

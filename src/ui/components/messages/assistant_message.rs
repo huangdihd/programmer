@@ -28,8 +28,10 @@ use crate::ui::components::messages::assistant::tool_call::ToolCallMessage;
 use crate::ui::components::messages::assistant::unsupported::UnsupportedMessage;
 use crate::ui::markdown_theme::palette;
 
-const PAD_LEFT: u16 = 2;
-const PAD_RIGHT: u16 = 2;
+// The conversation panel adds a 1-column margin on each side; keep one more
+// column of breathing room inside the message block.
+const PAD_LEFT: u16 = 1;
+const PAD_RIGHT: u16 = 1;
 /// Gray panel behind expanded reasoning/tool details.
 pub(crate) const EXPANDED_BG: Color = palette::SURFACE;
 

@@ -64,6 +64,16 @@ const SCROLL_LINES_BASE: usize = 1;
 const SCROLL_LINES_MAX: usize = 5;
 /// Time window (ms) for consecutive scrolls to count as "fast" scrolling.
 const SCROLL_ACCEL_WINDOW_MS: u128 = 150;
+/// How long (ms) the scrollbar thumb stays visible after the last scroll
+/// interaction. It is an overlay on the last content column, so hiding it
+/// costs no layout space.
+pub(crate) const SCROLLBAR_VISIBLE_MS: u128 = 1200;
+
+/// Field-level helper behind [`ConversationPanel::note_scroll_activity`], so the
+/// renderer can mark scroll activity while other fields are mutably borrowed.
+pub(crate) fn note_scroll_activity_field(at: &mut Option<std::time::Instant>) {
+    *at = Some(std::time::Instant::now());
+}
 
 /// Renders one region (a message's vertical extent) into an off-screen buffer
 /// and copies the selected rows' text into `lines` (indexed relative to
@@ -236,6 +246,10 @@ pub struct ConversationPanel {
     pub(crate) stick_to_bottom: bool,
     /// Timestamp of the last mouse-wheel scroll, for scroll acceleration.
     last_scroll_at: Option<std::time::Instant>,
+    /// Timestamp of the last scroll activity of any kind (wheel, keys, jump to
+    /// bottom). Drives the auto-hiding scrollbar: the thumb is only painted
+    /// for a short window after this.
+    pub(crate) last_scroll_activity_at: Option<std::time::Instant>,
     /// Indices into `items` that the user has expanded. Foldable items (reasoning,
     /// tool calls, tool results) render collapsed unless their index is here.
     pub(crate) expanded_items: HashSet<usize>,
@@ -267,6 +281,10 @@ pub struct ConversationPanel {
     /// Vertical extent `(top, height)` of the pending-message note in the last
     /// render, for selection extraction.
     pub(crate) pending_layout: Option<(u16, u16)>,
+    /// Total content height from the previous render. Used to detect new
+    /// content arriving while the user is scrolled up (which counts as scroll
+    /// activity for the auto-hiding scrollbar).
+    pub(crate) last_content_height: u16,
 }
 
 impl ConversationPanel {
@@ -281,6 +299,7 @@ impl ConversationPanel {
             phase: ActivePhase::None,
             stick_to_bottom: true,
             last_scroll_at: None,
+            last_scroll_activity_at: None,
             expanded_items: HashSet::new(),
             view_area: Rect::ZERO,
             view_offset: 0,
@@ -293,6 +312,7 @@ impl ConversationPanel {
             selection: None,
             live_paragraphs: Vec::new(),
             pending_layout: None,
+            last_content_height: 0,
         }
     }
 
@@ -704,6 +724,7 @@ impl ConversationPanel {
     pub fn scroll_to_bottom(&mut self) {
         self.stick_to_bottom = true;
         self.scroll_view_state.scroll_to_bottom();
+        self.note_scroll_activity();
     }
 
     pub fn is_at_bottom(&self) -> bool {
@@ -729,6 +750,7 @@ impl ConversationPanel {
         for _ in 0..lines {
             self.scroll_view_state.scroll_up();
         }
+        self.note_scroll_activity();
     }
 
     pub fn scroll_down(&mut self) {
@@ -740,6 +762,21 @@ impl ConversationPanel {
         if self.scroll_view_state.is_at_bottom() {
             self.stick_to_bottom = true;
         }
+        self.note_scroll_activity();
+    }
+
+    /// Mark that the user just scrolled, so the overlay scrollbar stays visible
+    /// for a short window (see [`SCROLLBAR_VISIBLE_MS`]). Field-only so the
+    /// renderer can call it while other fields are mutably borrowed.
+    pub(crate) fn note_scroll_activity(&mut self) {
+        note_scroll_activity_field(&mut self.last_scroll_activity_at);
+    }
+
+    /// Whether the scrollbar thumb should be painted this frame: only while
+    /// the last scroll interaction is still recent.
+    pub(crate) fn scrollbar_recently_active(&self) -> bool {
+        self.last_scroll_activity_at
+            .is_some_and(|t| t.elapsed().as_millis() < SCROLLBAR_VISIBLE_MS)
     }
 
     /// Return the number of lines to scroll, accelerating if scrolls are
@@ -761,6 +798,7 @@ impl ConversationPanel {
     pub fn scroll_page_up(&mut self) {
         self.stick_to_bottom = false;
         self.scroll_view_state.scroll_page_up();
+        self.note_scroll_activity();
     }
 
     /// Scroll down by roughly one viewport page.
@@ -769,6 +807,7 @@ impl ConversationPanel {
         if self.scroll_view_state.is_at_bottom() {
             self.stick_to_bottom = true;
         }
+        self.note_scroll_activity();
     }
 
     /// Fold a streaming chunk into the live view. Rendering-only: the runner
