@@ -4,8 +4,9 @@
 
 **programmer** is a terminal-based AI coding agent TUI written in Rust. It
 connects to OpenAI-compatible APIs (Responses API), streams responses, and
-gives the model ten tools: `command`, `read_file`, `write_file`, `edit_file`,
-`grep`, `blob`, `ask_user`, `configure_diagnostics`, `fetch`, `task`, `todo`,
+gives the model local tools including `command`, `read_file`, `write_file`,
+`edit_file`, `grep`, `blob`, `ask_user`, `configure_diagnostics`, `fetch`,
+`task`, `todo`, and `agent`,
 plus MCP-bridged external tools. The TUI is built with Ratatui and crossterm.
 The binary is a single crate at the repo root.
 
@@ -17,6 +18,8 @@ Key features beyond the chat loop:
   their tools are advertised to the model as `mcp__<server>__<tool>`.
 - **Skills**: user-authored `SKILL.md` files that inject prompt segments (Vercel Labs compatible).
 - **Background tasks**: shell commands that run detached; shown in the sidebar.
+- **Multi-agent**: up to three in-process child runners with independent conversations,
+  parent-forwarded approvals, completion delivery, and live sidebar inspection.
 - **Todo list**: per-session task tracking with a `todo` tool and a sidebar panel.
 - **Diagnostics pipeline**: IDE-style error/warning feedback after edits (command + LSP backends).
 - **Slash-commands**: `/init`, `/model`, `/mode`, `/skills`, `/mcp`, `/todo`, etc. with tab-completion.
@@ -70,6 +73,7 @@ The binary runs a fullscreen TUI. On exit it prints a resume hint:
 
 src/
 ├── main.rs                   # Entry: arg parsing, terminal init, config load, App::run
+├── agents/                   # In-process sub-agent registry, runtime, and lifecycle
 ├── consts.rs                 # Tunable constants (output length, concurrency, tick rate, …)
 ├── prompts.rs                # Centralised system prompt + classifier instructions
 ├── cancel.rs                 # CancellationToken for request lifecycle
@@ -147,6 +151,7 @@ src/
 │   ├── diagnostics.rs        #   Run diagnostics + return current errors/warnings
 │   ├── fetch.rs              #   HTTP fetch (html2text conversion)
 │   ├── task.rs               #   Background task management (create/list/output/write/wait/kill)
+│   ├── agent.rs              #   Sub-agent spawn/list/result/wait/cancel lifecycle
 │   ├── todo.rs               #   Todo list management (add/list/update/delete)
 │   └── mcp_bridge.rs         #   Internal: route MCP-prefixed calls to McpManager
 │
@@ -160,6 +165,7 @@ src/
     ├── tool_details.rs       #   Tool-call detail popup (arguments + output)
     └── components/
         ├── mod.rs
+        ├── agent_panel.rs        # Live read-only child conversation viewer
         ├── conversation_panel/   # Scrollable chat history
         │   ├── mod.rs
         │   ├── conversation_panel.rs

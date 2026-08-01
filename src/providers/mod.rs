@@ -24,6 +24,7 @@ const MODEL_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Manages multiple OpenAI-compatible providers, each with its own API key,
 /// base URL, and model list (auto-discovered or manually configured).
+#[derive(Clone)]
 pub struct ProviderManager {
     clients: HashMap<String, Client<OpenAIConfig>>,
     /// Resolved models per provider.

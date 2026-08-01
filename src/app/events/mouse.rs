@@ -133,6 +133,17 @@ fn handle_sidebar_click(app: &mut App<'_>, target: &ClickTarget) {
                 s.toggle_task(*id);
             }
         }
+        ClickTarget::Agent(id) => {
+            if let (Some(snapshot), Some(conversation)) =
+                (app.agents.snapshot(*id), app.agents.conversation(*id))
+            {
+                app.agent_panel = Some(crate::ui::components::agent_panel::AgentPanel::new(
+                    *id,
+                    snapshot.name,
+                    conversation,
+                ));
+            }
+        }
         ClickTarget::Diagnostic(_idx) => {
             // Could jump to file location in the future.
         }

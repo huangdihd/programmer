@@ -197,7 +197,7 @@ pub(crate) struct SecurityManager {
     config: SecurityConfig,
     rules: Vec<CompiledRule>,
     session_grants: RwLock<HashSet<(AccessKind, PathBuf)>>,
-    snapshots: Mutex<HashMap<PathBuf, blake3::Hash>>,
+    snapshots: Mutex<HashMap<(u64, PathBuf), blake3::Hash>>,
     dirty: Arc<Mutex<HashSet<PathBuf>>>,
     _watcher: Option<notify::RecommendedWatcher>,
 }
@@ -414,19 +414,39 @@ impl SecurityManager {
     }
 
     pub(crate) fn record_read(&self, path: &Path, contents: &[u8]) {
+        self.record_read_scoped(0, path, contents);
+    }
+
+    pub(crate) fn record_read_scoped(&self, scope: u64, path: &Path, contents: &[u8]) {
         if !self.config.enabled || !self.config.protect_file_changes {
             return;
         }
         if let Ok(mut snapshots) = self.snapshots.lock() {
-            snapshots.insert(path.to_path_buf(), blake3::hash(contents));
+            snapshots.insert((scope, path.to_path_buf()), blake3::hash(contents));
         }
         if let Ok(mut dirty) = self.dirty.lock() {
             dirty.remove(path);
         }
     }
 
+    pub(crate) fn clear_file_scope(&self, scope: u64) {
+        if let Ok(mut snapshots) = self.snapshots.lock() {
+            snapshots.retain(|(snapshot_scope, _), _| *snapshot_scope != scope);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn validate_write(
         &self,
+        path: &Path,
+        contents: Option<&[u8]>,
+    ) -> Result<(), String> {
+        self.validate_write_scoped(0, path, contents)
+    }
+
+    pub(crate) fn validate_write_scoped(
+        &self,
+        scope: u64,
         path: &Path,
         contents: Option<&[u8]>,
     ) -> Result<(), String> {
@@ -437,7 +457,7 @@ impl SecurityManager {
             .snapshots
             .lock()
             .map_err(|_| "file snapshot store is unavailable".to_string())?
-            .get(path)
+            .get(&(scope, path.to_path_buf()))
             .copied()
             .ok_or_else(|| {
                 format!(

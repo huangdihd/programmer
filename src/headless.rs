@@ -32,7 +32,7 @@ use crate::runner::{
     AgentSurface, DiagnosticsState, LlmPolicy, ReviewDecision, RunnerEvent, RunnerPhase,
     RunnerPolicy, TurnResult, TurnRunner,
 };
-use crate::tools::provider::{LocalToolProvider, ToolRegistry};
+use crate::tools::provider::{AgentToolProvider, LocalToolProvider, ToolProvider, ToolRegistry};
 
 const OUTPUT_SCHEMA_VERSION: u32 = 1;
 
@@ -140,6 +140,13 @@ struct HeadlessAgent {
     cancel: CancellationToken,
     model: String,
     mode: WorkMode,
+    agents: crate::agents::AgentManager,
+}
+
+impl Drop for HeadlessAgent {
+    fn drop(&mut self) {
+        self.agents.cancel_all();
+    }
 }
 
 impl HeadlessAgent {
@@ -157,14 +164,18 @@ impl HeadlessAgent {
             .map(|(client, name)| (client.clone(), name))
             .ok_or_else(|| color_eyre::eyre::eyre!("unknown provider/model: {model}"))?;
 
-        let tools = Arc::new(ToolRegistry::new(vec![Arc::new(LocalToolProvider::new(
-            Arc::new(Mutex::new(Default::default())),
-            Arc::new(crate::security::SecurityHandle::new(security)),
-        ))]));
+        let todo_store = Arc::new(Mutex::new(Default::default()));
+        let security = Arc::new(crate::security::SecurityHandle::new(security));
+        let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(
+            LocalToolProvider::new(todo_store.clone(), security.clone()),
+        )];
 
-        let policy = match args.work_mode {
-            WorkMode::Yolo => RunnerPolicy::Yolo,
-            WorkMode::Plan => RunnerPolicy::Sync(args.work_mode.classifier()),
+        let (policy, child_policy) = match args.work_mode {
+            WorkMode::Yolo => (RunnerPolicy::Yolo, crate::agents::AgentPolicyFactory::Yolo),
+            WorkMode::Plan => (
+                RunnerPolicy::Sync(args.work_mode.classifier()),
+                crate::agents::AgentPolicyFactory::Sync(args.work_mode),
+            ),
             WorkMode::Auto => {
                 let classifier_model = args
                     .classifier_model
@@ -179,11 +190,19 @@ impl HeadlessAgent {
                             "unknown classifier provider/model: {classifier_model}"
                         )
                     })?;
-                RunnerPolicy::Llm(Box::new(LlmPolicy {
-                    client: classifier_client,
-                    model_name: classifier_name,
-                    no_logprobs: Arc::new(Mutex::new(HashSet::new())),
-                }))
+                let no_logprobs = Arc::new(Mutex::new(HashSet::new()));
+                (
+                    RunnerPolicy::Llm(Box::new(LlmPolicy {
+                        client: classifier_client.clone(),
+                        model_name: classifier_name.clone(),
+                        no_logprobs: no_logprobs.clone(),
+                    })),
+                    crate::agents::AgentPolicyFactory::Llm(Box::new(LlmPolicy {
+                        client: classifier_client,
+                        model_name: classifier_name,
+                        no_logprobs,
+                    })),
+                )
             }
             WorkMode::Manual => {
                 return Err(color_eyre::eyre::eyre!(
@@ -191,6 +210,32 @@ impl HeadlessAgent {
                 ));
             }
         };
+
+        let agents = crate::agents::AgentManager::default();
+        let child_runtime = crate::agents::AgentRuntime {
+            provider_manager: Arc::new(provider_manager.clone()),
+            client: client.clone(),
+            model_name: model_name.clone(),
+            model_str: model.clone(),
+            todos: todo_store,
+            security,
+            mcp_manager: None,
+            policy: child_policy,
+            coauthor: config.git_coauthor.clone(),
+            vision_enabled: false,
+            thinking_level: args.thinking,
+            skill_prompt: None,
+            approval_label: format!(
+                "{} approved by {} mode (headless sub-agent)",
+                args.work_mode.icon(),
+                args.work_mode.label()
+            ),
+        };
+        base_providers.push(Arc::new(AgentToolProvider::new(
+            agents.clone(),
+            child_runtime,
+        )));
+        let tools = Arc::new(ToolRegistry::new(base_providers));
 
         let diagnostics_state = Arc::new(Mutex::new(DiagnosticsState::default()));
         let hooks: Vec<Arc<dyn crate::runner::hooks::TurnHook>> = if args.no_diagnostics {
@@ -220,6 +265,7 @@ impl HeadlessAgent {
             cancel,
             model,
             mode: args.work_mode,
+            agents,
         })
     }
 

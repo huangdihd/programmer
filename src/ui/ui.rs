@@ -78,12 +78,7 @@ impl App<'_> {
     /// input, footer, overlays). Called either full-screen or in the left
     /// portion when the sidebar is open.  The logo/title is rendered at the
     /// top level so it spans the full width even when the sidebar is open.
-    fn render_main(
-        &mut self,
-        area: Rect,
-        buf: &mut Buffer,
-        bottom_height: u16,
-    ) {
+    fn render_main(&mut self, area: Rect, buf: &mut Buffer, bottom_height: u16) {
         // Named indices into the constraint array so they don't drift when
         // rows are added or removed.
         const POS_CONV: usize = 0;
@@ -333,6 +328,10 @@ impl Widget for &mut App<'_> {
             terminal_panel::render(pane, area, buf);
             return;
         }
+        if let Some(panel) = &mut self.agent_panel {
+            panel.render(area, buf);
+            return;
+        }
 
         // Resolve the single status the footer should show, then let the
         // status bar track its own busy timer.
@@ -440,6 +439,7 @@ impl Widget for &mut App<'_> {
                 .map(|sidebar| sidebar.expanded_task_ids().clone())
                 .unwrap_or_default();
             let sidebar_tasks = crate::tasks::snapshot_for_sidebar(&expanded_task_ids);
+            let sidebar_agents = self.agents.snapshot_all();
             self.sidebar.as_mut().unwrap().render(
                 horiz[1],
                 buf,
@@ -453,14 +453,11 @@ impl Widget for &mut App<'_> {
                 &self.mcp_server_statuses,
                 &self.todo_list,
                 &sidebar_tasks,
+                &sidebar_agents,
             );
         } else {
             self.sidebar_area = None;
-            self.render_main(
-                content_area,
-                buf,
-                bottom_height,
-            );
+            self.render_main(content_area, buf, bottom_height);
         }
     }
 }

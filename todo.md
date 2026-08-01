@@ -6,12 +6,19 @@
 - ~~edit_file tool diff-style message~~
 - ~~lint~~
 - remote control(?)
-- improve command and task system
+- ~~improve command and task system~~
   - ~~stream command output in the TUI while it is running~~
   - ~~view interactive and non-interactive tasks with `/terminal`~~
 - ~~convert a command into a task~~
 - ~~configurable restricted access control rule system~~
-- multi agents(traditional sub agents or use interactive background task system to launch itself again?)
+- multi-agent system
+  - ~~in-process sub-agent runner and registry~~
+  - ~~agent spawn/list/result/wait/cancel tool~~
+  - ~~forward permission requests to the parent surface~~
+  - ~~independent child conversations and result delivery~~
+  - ~~Agents sidebar and conversation viewer~~
+  - ~~concurrency, cancellation, and stale-edit protection~~
+  - optional nested agents and worktree isolation
 - sandbox
   - ~~macOS Seatbelt and Linux Landlock/seccomp process sandbox~~
   - Windows AppContainer process launcher
@@ -23,6 +30,7 @@
   - ~~support text, JSON, and JSONL output~~
 - ~~store too long outputs as files~~
 - ~~display full output when commands are running~~
+- ~~fold consecutive tool calls with context-aware group titles~~
 - ~~default classifier model~~
 - ~~monitor local file changes and prevent modifications after changes before read~~
 - ~~after switch sessions using /new, task can't be cleaned and todos can't update as expectations~~

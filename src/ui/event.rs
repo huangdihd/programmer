@@ -68,6 +68,8 @@ pub enum AppEvent {
         position: (usize, usize),
         reply: ReplyTx,
         operation_id: u64,
+        agent_id: Option<u64>,
+        agent_generation: Option<u64>,
     },
     /// The runner's turn ended, successfully or not. All end-of-turn bookkeeping
     /// (usage flush, session save, pending-message start) hangs off this.
@@ -83,8 +85,15 @@ pub enum AppEvent {
     CompactFinished(u64, Result<String, String>, CancellationToken),
     /// A background process entered a terminal state.
     TaskStateChanged(crate::tasks::TaskLifecycleEvent),
+    /// An in-process sub-agent entered a terminal state.
+    AgentStateChanged {
+        generation: u64,
+        id: u64,
+    },
     /// Debounced request to hand accumulated task updates to the agent.
     FlushTaskNotifications(u64),
+    /// Debounced request to hand completed sub-agent results to the parent.
+    FlushAgentNotifications(u64),
     /// Cancel the current in-flight request (streaming or tool calls).
     Cancel,
     /// Quit the application.
@@ -183,8 +192,17 @@ impl std::fmt::Debug for AppEvent {
                 .field(&event.task_id)
                 .field(&event.new_status)
                 .finish(),
+            Self::AgentStateChanged { generation, id } => f
+                .debug_struct("AgentStateChanged")
+                .field("generation", generation)
+                .field("id", id)
+                .finish(),
             Self::FlushTaskNotifications(token) => f
                 .debug_tuple("FlushTaskNotifications")
+                .field(token)
+                .finish(),
+            Self::FlushAgentNotifications(token) => f
+                .debug_tuple("FlushAgentNotifications")
                 .field(token)
                 .finish(),
             Self::Cancel => write!(f, "Cancel"),

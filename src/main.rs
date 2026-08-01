@@ -19,6 +19,7 @@ use ::config::{Config, Environment, File};
 use app::App;
 use std::path::Path;
 
+mod agents;
 mod app;
 mod cancel;
 mod classifier;

@@ -67,6 +67,8 @@ impl AgentSurface for TuiSurface {
             position,
             reply: ReplyTx(reply_tx),
             operation_id: self.operation_id,
+            agent_id: None,
+            agent_generation: None,
         }));
         // Race the user's approval against Esc (cancel). If the cancel token
         // fires first, the ReplyTx is dropped and `reply_rx` sees a closed

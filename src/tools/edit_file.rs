@@ -74,6 +74,14 @@ pub(crate) async fn run_with_security(
     arguments: &str,
     security: &crate::security::SecurityManager,
 ) -> Result<String, String> {
+    run_with_security_scope(arguments, security, 0).await
+}
+
+pub(crate) async fn run_with_security_scope(
+    arguments: &str,
+    security: &crate::security::SecurityManager,
+    scope: u64,
+) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
         Err(error) => return Err(format!("error: invalid arguments: {error}")),
@@ -84,7 +92,7 @@ pub(crate) async fn run_with_security(
         Ok(contents) => contents,
         Err(error) => return Err(format!("error: could not read {}: {error}", args.path)),
     };
-    security.validate_write(&path, Some(&bytes))?;
+    security.validate_write_scoped(scope, &path, Some(&bytes))?;
     let contents = String::from_utf8(bytes)
         .map_err(|error| format!("error: could not read {}: {error}", path.display()))?;
 
@@ -138,7 +146,7 @@ pub(crate) async fn run_with_security(
     let updated = contents.replacen(&old_normalized, &args.new_string, 1);
     match tokio::fs::write(&path, &updated).await {
         Ok(()) => {
-            security.record_read(&path, updated.as_bytes());
+            security.record_read_scoped(scope, &path, updated.as_bytes());
             Ok(format!("edited {}", args.path))
         }
         Err(error) => Err(format!(

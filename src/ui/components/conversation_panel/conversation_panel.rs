@@ -316,10 +316,16 @@ pub struct ConversationPanel {
 
 impl ConversationPanel {
     pub fn new() -> Self {
+        Self::from_shared(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::conversation::Conversation::new(),
+        )))
+    }
+
+    pub(crate) fn from_shared(
+        conversation: std::sync::Arc<std::sync::Mutex<crate::conversation::Conversation>>,
+    ) -> Self {
         ConversationPanel {
-            conversation: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::conversation::Conversation::new(),
-            )),
+            conversation,
             scroll_view_state: ScrollViewState::new(),
             pending_message: None,
             receiving_response: None,
@@ -784,6 +790,30 @@ impl ConversationPanel {
     pub fn scroll_to_bottom(&mut self) {
         self.stick_to_bottom = true;
         self.scroll_view_state.scroll_to_bottom();
+        self.note_scroll_activity();
+    }
+
+    pub(crate) fn scroll_to_top(&mut self) {
+        self.stick_to_bottom = false;
+        self.scroll_view_state.scroll_to_top();
+        self.note_scroll_activity();
+    }
+
+    pub(crate) fn scroll_up_by(&mut self, lines: usize) {
+        self.stick_to_bottom = false;
+        for _ in 0..lines {
+            self.scroll_view_state.scroll_up();
+        }
+        self.note_scroll_activity();
+    }
+
+    pub(crate) fn scroll_down_by(&mut self, lines: usize) {
+        for _ in 0..lines {
+            self.scroll_view_state.scroll_down();
+        }
+        if self.scroll_view_state.is_at_bottom() {
+            self.stick_to_bottom = true;
+        }
         self.note_scroll_activity();
     }
 

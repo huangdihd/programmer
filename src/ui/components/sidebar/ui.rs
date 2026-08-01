@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::{ClickTarget, Sidebar, SidebarSection};
+use crate::agents::{AgentSnapshot, AgentStatus};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::mcp::{McpConnectionState, McpServerStatus};
 use crate::tasks::{SidebarTaskSnapshot, TaskStatus};
@@ -31,6 +32,16 @@ const VISIBLE_PER_SECTION: usize = 6;
 /// Continuation-line indent in spaces.
 const CONT_INDENT: &str = "    ";
 
+#[derive(Clone, Copy)]
+struct SidebarData<'a> {
+    diagnostics: &'a [Diagnostic],
+    lsp_configured: bool,
+    mcp_servers: &'a [McpServerStatus],
+    todo_list: &'a TodoList,
+    tasks: &'a [SidebarTaskSnapshot],
+    agents: &'a [AgentSnapshot],
+}
+
 impl Sidebar {
     /// Render the sidebar into `area`. Populates `self.click_map` so the
     /// caller can resolve mouse clicks back to section titles or items.
@@ -44,6 +55,7 @@ impl Sidebar {
         mcp_servers: &[McpServerStatus],
         todo_list: &TodoList,
         tasks: &[SidebarTaskSnapshot],
+        agents: &[AgentSnapshot],
     ) {
         let block = Block::default()
             .borders(Borders::LEFT)
@@ -57,14 +69,15 @@ impl Sidebar {
         }
 
         // Build all lines + click targets before scrolling.
-        let (all_lines, click_targets) = self.build_lines(
-            inner.width,
+        let data = SidebarData {
             diagnostics,
             lsp_configured,
             mcp_servers,
             todo_list,
             tasks,
-        );
+            agents,
+        };
+        let (all_lines, click_targets) = self.build_lines(inner.width, data);
 
         // Clamp scroll.
         let visible_height = inner.height as usize;
@@ -134,11 +147,7 @@ impl Sidebar {
     fn build_lines(
         &self,
         width: u16,
-        diagnostics: &[Diagnostic],
-        lsp_configured: bool,
-        mcp_servers: &[McpServerStatus],
-        todo_list: &TodoList,
-        tasks: &[SidebarTaskSnapshot],
+        data: SidebarData<'_>,
     ) -> (Vec<Line<'static>>, Vec<ClickTarget>) {
         let mut lines: Vec<Line> = Vec::new();
         let mut targets: Vec<ClickTarget> = Vec::new();
@@ -148,14 +157,7 @@ impl Sidebar {
             // Skip sections with nothing to show (e.g. no todos, no tasks, no
             // MCP servers, no diagnostics configured) so the sidebar only lists
             // what's actually present.
-            if !self.section_has_content(
-                section.key,
-                diagnostics,
-                lsp_configured,
-                mcp_servers,
-                todo_list,
-                tasks,
-            ) {
+            if !self.section_has_content(section.key, data) {
                 continue;
             }
 
@@ -170,14 +172,7 @@ impl Sidebar {
             rendered_any = true;
 
             // Title line.
-            let title = self.section_title(
-                section,
-                diagnostics,
-                lsp_configured,
-                mcp_servers,
-                todo_list,
-                tasks,
-            );
+            let title = self.section_title(section, data);
             let title_line = self.make_title_line(&title, section.key, section.collapsed);
             lines.push(title_line);
             targets.push(ClickTarget::Section(section.key));
@@ -189,18 +184,21 @@ impl Sidebar {
                             &mut lines,
                             &mut targets,
                             width,
-                            diagnostics,
-                            lsp_configured,
+                            data.diagnostics,
+                            data.lsp_configured,
                         );
                     }
                     SidebarSection::Mcp => {
-                        self.render_mcp(&mut lines, &mut targets, width, mcp_servers);
+                        self.render_mcp(&mut lines, &mut targets, width, data.mcp_servers);
                     }
                     SidebarSection::Todos => {
-                        self.render_todos(&mut lines, &mut targets, width, todo_list);
+                        self.render_todos(&mut lines, &mut targets, width, data.todo_list);
                     }
                     SidebarSection::Tasks => {
-                        self.render_tasks(&mut lines, &mut targets, width, tasks);
+                        self.render_tasks(&mut lines, &mut targets, width, data.tasks);
+                    }
+                    SidebarSection::Agents => {
+                        self.render_agents(&mut lines, &mut targets, width, data.agents);
                     }
                 }
             }
@@ -221,54 +219,48 @@ impl Sidebar {
 
     /// Whether a section has anything worth showing. Empty sections are hidden
     /// entirely (title included) to keep the sidebar uncluttered.
-    fn section_has_content(
-        &self,
-        key: SidebarSection,
-        diagnostics: &[Diagnostic],
-        lsp_configured: bool,
-        mcp_servers: &[McpServerStatus],
-        todo_list: &TodoList,
-        tasks: &[SidebarTaskSnapshot],
-    ) -> bool {
+    fn section_has_content(&self, key: SidebarSection, data: SidebarData<'_>) -> bool {
         match key {
             // Show when diagnostics exist or a live LSP is configured.
-            SidebarSection::Diagnostics => lsp_configured || !diagnostics.is_empty(),
-            SidebarSection::Mcp => !mcp_servers.is_empty(),
-            SidebarSection::Todos => !todo_list.todos.is_empty(),
-            SidebarSection::Tasks => !tasks.is_empty(),
+            SidebarSection::Diagnostics => data.lsp_configured || !data.diagnostics.is_empty(),
+            SidebarSection::Mcp => !data.mcp_servers.is_empty(),
+            SidebarSection::Todos => !data.todo_list.todos.is_empty(),
+            SidebarSection::Tasks => !data.tasks.is_empty(),
+            SidebarSection::Agents => !data.agents.is_empty(),
         }
     }
 
     // -- section title helpers --
 
-    fn section_title(
-        &self,
-        section: &super::SectionState,
-        diagnostics: &[Diagnostic],
-        lsp_configured: bool,
-        mcp_servers: &[McpServerStatus],
-        todo_list: &TodoList,
-        tasks: &[SidebarTaskSnapshot],
-    ) -> String {
+    fn section_title(&self, section: &super::SectionState, data: SidebarData<'_>) -> String {
         match section.key {
+            SidebarSection::Agents => {
+                let running = data
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.status == AgentStatus::Running)
+                    .count();
+                format!("Agents ({running} running, {} total)", data.agents.len())
+            }
             SidebarSection::Tasks => {
-                if tasks.is_empty() {
+                if data.tasks.is_empty() {
                     "Tasks".to_string()
                 } else {
-                    let running = tasks
+                    let running = data
+                        .tasks
                         .iter()
                         .filter(|t| t.status == TaskStatus::Running)
                         .count();
-                    format!("Tasks ({running} running, {} total)", tasks.len())
+                    format!("Tasks ({running} running, {} total)", data.tasks.len())
                 }
             }
             SidebarSection::Diagnostics => {
-                if !lsp_configured && diagnostics.is_empty() {
+                if !data.lsp_configured && data.diagnostics.is_empty() {
                     "Diagnostics".to_string()
                 } else {
                     // Compact counts (only non-zero) so the title fits the
                     // narrow sidebar: e.g. "Diagnostics (2E 5W 12L)".
-                    let count = |s| diagnostics.iter().filter(|d| d.severity == s).count();
+                    let count = |s| data.diagnostics.iter().filter(|d| d.severity == s).count();
                     let mut parts = Vec::new();
                     for (n, letter) in [
                         (count(Severity::Error), 'E'),
@@ -288,15 +280,18 @@ impl Sidebar {
             }
             SidebarSection::Mcp => {
                 let mut parts = Vec::new();
-                let ready = mcp_servers
+                let ready = data
+                    .mcp_servers
                     .iter()
                     .filter(|server| matches!(server.state, McpConnectionState::Connected { .. }))
                     .count();
-                let connecting = mcp_servers
+                let connecting = data
+                    .mcp_servers
                     .iter()
                     .filter(|server| matches!(server.state, McpConnectionState::Connecting))
                     .count();
-                let failed = mcp_servers
+                let failed = data
+                    .mcp_servers
                     .iter()
                     .filter(|server| matches!(server.state, McpConnectionState::Failed { .. }))
                     .count();
@@ -312,17 +307,19 @@ impl Sidebar {
                 format!("MCP ({})", parts.join(", "))
             }
             SidebarSection::Todos => {
-                let pending = todo_list
+                let pending = data
+                    .todo_list
                     .todos
                     .iter()
                     .filter(|t| t.status == TodoStatus::Pending)
                     .count();
-                let done = todo_list
+                let done = data
+                    .todo_list
                     .todos
                     .iter()
                     .filter(|t| t.status == TodoStatus::Completed)
                     .count();
-                if todo_list.todos.is_empty() {
+                if data.todo_list.todos.is_empty() {
                     "Todos".to_string()
                 } else {
                     format!("Todos ({pending} pending, {done} done)")
@@ -345,6 +342,7 @@ impl Sidebar {
             SidebarSection::Mcp => Color::Magenta,
             SidebarSection::Todos => Color::Yellow,
             SidebarSection::Tasks => Color::Cyan,
+            SidebarSection::Agents => Color::Blue,
         };
 
         let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
@@ -605,6 +603,49 @@ impl Sidebar {
         }
     }
 
+    fn render_agents(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        targets: &mut Vec<ClickTarget>,
+        width: u16,
+        agents: &[AgentSnapshot],
+    ) {
+        for agent in agents {
+            let (icon, color) = match agent.status {
+                AgentStatus::Running => ("▶", Color::Yellow),
+                AgentStatus::Completed => ("✓", Color::Green),
+                AgentStatus::Failed => ("✗", Color::Red),
+                AgentStatus::Cancelled => ("⊘", Color::DarkGray),
+            };
+            let prefix_spans = vec![
+                Span::raw("  "),
+                Span::styled(
+                    icon.to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" #{} ", agent.id),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            let prefix_width = spans_width(&prefix_spans);
+            let before = lines.len();
+            wrapped_item(
+                lines,
+                prefix_spans,
+                &format!("{} ({})", agent.name, format_duration_secs(agent.elapsed)),
+                width,
+                prefix_width,
+                CONT_INDENT,
+                Style::default().fg(Color::White),
+                Style::default().fg(Color::DarkGray),
+            );
+            for _ in 0..(lines.len() - before) {
+                targets.push(ClickTarget::Agent(agent.id));
+            }
+        }
+    }
+
     /// The expanded output view under a task header: exit code (when
     /// finished) and the last few output lines.
     fn render_task_output(
@@ -730,6 +771,7 @@ mod tests {
             statuses,
             &crate::todos::TodoList::default(),
             &[],
+            &[],
         );
         buffer_text(&buf)
     }
@@ -794,6 +836,7 @@ mod tests {
             &[],
             &crate::todos::TodoList::default(),
             &tasks,
+            &[],
         );
 
         let text = buffer_text(&buf);
@@ -831,6 +874,7 @@ mod tests {
             &[],
             &crate::todos::TodoList::default(),
             &tasks,
+            &[],
         );
 
         let text = buffer_text(&buf);
@@ -851,7 +895,38 @@ mod tests {
             &[],
             &crate::todos::TodoList::default(),
             &tasks,
+            &[],
         );
         assert!(!buffer_text(&buf2).contains("exit 101"));
+    }
+
+    #[test]
+    fn agents_section_shows_live_status_and_label() {
+        let mut sidebar = Sidebar::new();
+        let area = Rect::new(0, 0, 40, 20);
+        let mut buf = Buffer::empty(area);
+        let agents = vec![crate::agents::AgentSnapshot {
+            id: 2,
+            name: "Review diagnostics".to_string(),
+            prompt: "review diagnostics".to_string(),
+            status: crate::agents::AgentStatus::Running,
+            elapsed: Duration::from_secs(3),
+            result: None,
+        }];
+
+        sidebar.render(
+            area,
+            &mut buf,
+            &[],
+            false,
+            &[],
+            &crate::todos::TodoList::default(),
+            &[],
+            &agents,
+        );
+
+        let text = buffer_text(&buf);
+        assert!(text.contains("Agents (1 running, 1 total)"), "got:\n{text}");
+        assert!(text.contains("#2 Review diagnostics"), "got:\n{text}");
     }
 }

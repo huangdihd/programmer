@@ -62,6 +62,14 @@ pub(crate) async fn run_with_security(
     arguments: &str,
     security: &crate::security::SecurityManager,
 ) -> Result<String, String> {
+    run_with_security_scope(arguments, security, 0).await
+}
+
+pub(crate) async fn run_with_security_scope(
+    arguments: &str,
+    security: &crate::security::SecurityManager,
+    scope: u64,
+) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
         Err(error) => return Err(format!("error: invalid arguments: {error}")),
@@ -74,7 +82,7 @@ pub(crate) async fn run_with_security(
     let contents = std::str::from_utf8(&bytes)
         .map_err(|error| format!("error: could not read {}: {error}", path.display()))?
         .to_owned();
-    security.record_read(&path, &bytes);
+    security.record_read_scoped(scope, &path, &bytes);
 
     Ok(slice_lines(contents, args.offset, args.limit))
 }

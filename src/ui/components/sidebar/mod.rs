@@ -27,6 +27,7 @@ use std::collections::HashSet;
 /// Identifies one collapsible section within the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarSection {
+    Agents,
     Diagnostics,
     Mcp,
     Todos,
@@ -54,6 +55,8 @@ pub enum ClickTarget {
     Diagnostic(usize),
     /// A background task header; click toggles its output view.
     Task(u64),
+    /// A sub-agent header; click opens its live conversation.
+    Agent(u64),
 }
 
 /// The sidebar panel itself.
@@ -75,6 +78,10 @@ pub struct Sidebar {
 impl Sidebar {
     pub fn new() -> Self {
         let sections = vec![
+            SectionState {
+                key: SidebarSection::Agents,
+                collapsed: false,
+            },
             SectionState {
                 key: SidebarSection::Mcp,
                 collapsed: false,

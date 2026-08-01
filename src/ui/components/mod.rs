@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod agent_panel;
 pub mod completion_popup;
 pub mod conversation_panel;
 pub mod footer;

@@ -114,6 +114,9 @@ fn new(app: &mut App<'_>) -> CommandOutcome {
     app.pending_images.clear();
     let killed = crate::tasks::kill_all();
     app.task_notifications.clear();
+    app.agents.cancel_all();
+    app.agents = crate::agents::AgentManager::default();
+    app.agent_notifications = crate::app::AgentNotificationState::new();
     if let Some(manager) = &app.session.mgr {
         let new_session = manager.create();
         app.session.uuid = new_session.uuid;

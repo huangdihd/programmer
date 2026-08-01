@@ -67,6 +67,11 @@ pub(crate) struct PendingReview {
     pub(crate) reply: crate::ui::event::ReplyTx,
     /// Which approval option is highlighted (0=Approve, 1=Deny).
     pub(crate) selected: usize,
+    /// Main-turn operation id, or zero for an independently running sub-agent.
+    pub(crate) operation_id: u64,
+    /// Child id for a sub-agent review; absent for the main turn.
+    pub(crate) agent_id: Option<u64>,
+    pub(crate) agent_generation: Option<u64>,
 }
 
 /// UI-only diagnostics bookkeeping. The mutable state (baseline + edit-turn
@@ -121,6 +126,43 @@ pub(crate) struct TaskNotificationState {
     pub(crate) ready_at: Option<Instant>,
     pub(crate) flush_token: u64,
     pub(crate) flush_requested: bool,
+}
+
+pub(crate) struct AgentNotificationState {
+    pub(crate) pending: VecDeque<u64>,
+    seen: HashSet<u64>,
+    pub(crate) ready_at: Option<Instant>,
+    pub(crate) flush_token: u64,
+    pub(crate) flush_requested: bool,
+}
+
+impl AgentNotificationState {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            seen: HashSet::new(),
+            ready_at: None,
+            flush_token: 0,
+            flush_requested: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, id: u64) {
+        if self.seen.insert(id) {
+            self.pending.push_back(id);
+            self.ready_at = Some(Instant::now() + std::time::Duration::from_millis(200));
+            self.flush_token = self.flush_token.wrapping_add(1);
+            self.flush_requested = false;
+        }
+    }
+
+    pub(crate) fn discard_consumed(&mut self, manager: &crate::agents::AgentManager) {
+        self.pending.retain(|id| manager.should_notify_parent(*id));
+        if self.pending.is_empty() {
+            self.ready_at = None;
+            self.flush_requested = false;
+        }
+    }
 }
 
 impl TaskNotificationState {
@@ -199,8 +241,14 @@ pub struct App<'a> {
     pub todo_panel: Option<TodoPanel>,
     /// Full-screen interactive terminal panel, when open (`/terminal`).
     pub terminal_pane: Option<crate::ui::components::terminal_panel::TerminalPane>,
+    /// Full-screen read-only child conversation, opened from the Agents sidebar.
+    pub(crate) agent_panel: Option<crate::ui::components::agent_panel::AgentPanel>,
     /// Terminal task events waiting to be delivered to the agent.
     pub(crate) task_notifications: TaskNotificationState,
+    /// Completed sub-agents waiting to be delivered to the parent agent.
+    pub(crate) agent_notifications: AgentNotificationState,
+    /// Per-application in-process sub-agent registry.
+    pub(crate) agents: crate::agents::AgentManager,
     /// Right-hand sidebar panel (toggled with Ctrl+B).
     pub sidebar: Option<Sidebar>,
     /// The sidebar's screen area from the last render, used to route mouse
@@ -225,6 +273,8 @@ pub struct App<'a> {
     /// Manual-mode pending tool-call review (per-call, no batch). `None` when
     /// no review is in progress.
     pub(crate) pending_review: Option<PendingReview>,
+    /// Concurrent sub-agent reviews waiting for the single approval surface.
+    pub(crate) review_queue: VecDeque<PendingReview>,
     /// Classifier models discovered not to support logprobs, so Auto mode skips
     /// the single-token fast path and goes straight to the merged reasoned call.
     pub(crate) classifier_no_logprobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -359,7 +409,10 @@ impl App<'_> {
             question_panel: None,
             todo_panel: None,
             terminal_pane: None,
+            agent_panel: None,
             task_notifications: TaskNotificationState::new(),
+            agent_notifications: AgentNotificationState::new(),
+            agents: crate::agents::AgentManager::default(),
             sidebar: Some(Sidebar::new()),
             sidebar_area: None,
             todo_list,
@@ -367,6 +420,7 @@ impl App<'_> {
             work_mode,
             security,
             pending_review: None,
+            review_queue: VecDeque::new(),
             classifier_no_logprobs: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
@@ -463,21 +517,18 @@ impl App<'_> {
         let model_str = self.current_model.clone();
         // Unify every tool source behind the registry: the local built-ins are
         // one provider, all connected MCP servers another.
-        let mut providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(LocalToolProvider::new(
-            self.todo_store.clone(),
-            self.security.clone(),
-        ))];
+        let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(
+            LocalToolProvider::new(self.todo_store.clone(), self.security.clone()),
+        )];
         if let Some(mcp) = &self.mcp_manager {
-            providers.push(Arc::new(McpToolProvider::new(mcp.clone())));
+            base_providers.push(Arc::new(McpToolProvider::new(mcp.clone())));
         }
-        let tools = Arc::new(ToolRegistry::new(providers));
-
-        let policy = match self.work_mode {
-            WorkMode::Yolo => RunnerPolicy::Yolo,
-            WorkMode::Manual | WorkMode::Plan => {
-                let classifier = self.work_mode.classifier();
-                RunnerPolicy::Sync(classifier)
-            }
+        let (policy, child_policy) = match self.work_mode {
+            WorkMode::Yolo => (RunnerPolicy::Yolo, crate::agents::AgentPolicyFactory::Yolo),
+            WorkMode::Manual | WorkMode::Plan => (
+                RunnerPolicy::Sync(self.work_mode.classifier()),
+                crate::agents::AgentPolicyFactory::Sync(self.work_mode),
+            ),
             WorkMode::Auto => {
                 let model_str = self
                     .config
@@ -485,13 +536,45 @@ impl App<'_> {
                     .clone()
                     .unwrap_or_else(|| self.provider_manager.default_classifier_model());
                 let (c_client, c_model_name) = self.provider_manager.resolve(&model_str)?;
-                RunnerPolicy::Llm(Box::new(LlmPolicy {
-                    client: c_client.clone(),
-                    model_name: c_model_name,
-                    no_logprobs: self.classifier_no_logprobs.clone(),
-                }))
+                (
+                    RunnerPolicy::Llm(Box::new(LlmPolicy {
+                        client: c_client.clone(),
+                        model_name: c_model_name.clone(),
+                        no_logprobs: self.classifier_no_logprobs.clone(),
+                    })),
+                    crate::agents::AgentPolicyFactory::Llm(Box::new(LlmPolicy {
+                        client: c_client.clone(),
+                        model_name: c_model_name,
+                        no_logprobs: self.classifier_no_logprobs.clone(),
+                    })),
+                )
             }
         };
+
+        let child_runtime = crate::agents::AgentRuntime {
+            provider_manager: Arc::new(self.provider_manager.clone()),
+            client: client.clone(),
+            model_name: model_name.clone(),
+            model_str: model_str.clone(),
+            todos: self.todo_store.clone(),
+            security: self.security.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            policy: child_policy,
+            coauthor: self.config.git_coauthor.clone(),
+            vision_enabled: self.vision_enabled,
+            thinking_level: self.thinking_level,
+            skill_prompt: self.skill_registry.combined_prompt(),
+            approval_label: format!(
+                "{} approved by {} mode (sub-agent)",
+                self.work_mode.icon(),
+                self.work_mode.label()
+            ),
+        };
+        base_providers.push(Arc::new(crate::tools::provider::AgentToolProvider::new(
+            self.agents.clone(),
+            child_runtime,
+        )));
+        let tools = Arc::new(ToolRegistry::new(base_providers));
 
         Some(TurnRunner {
             client: client.clone(),
@@ -563,6 +646,7 @@ impl App<'_> {
     }
 
     pub fn quit(&mut self) {
+        self.agents.cancel_all();
         session::save_session(self);
         self.running = false;
     }

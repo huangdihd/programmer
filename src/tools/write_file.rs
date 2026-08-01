@@ -56,6 +56,14 @@ pub(crate) async fn run_with_security(
     arguments: &str,
     security: &crate::security::SecurityManager,
 ) -> Result<String, String> {
+    run_with_security_scope(arguments, security, 0).await
+}
+
+pub(crate) async fn run_with_security_scope(
+    arguments: &str,
+    security: &crate::security::SecurityManager,
+    scope: u64,
+) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
         Err(error) => return Err(format!("error: invalid arguments: {error}")),
@@ -72,7 +80,7 @@ pub(crate) async fn run_with_security(
             ));
         }
     };
-    security.validate_write(&path, current.as_deref())?;
+    security.validate_write_scoped(scope, &path, current.as_deref())?;
 
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -86,7 +94,7 @@ pub(crate) async fn run_with_security(
 
     match tokio::fs::write(&path, &args.content).await {
         Ok(()) => {
-            security.record_read(&path, args.content.as_bytes());
+            security.record_read_scoped(scope, &path, args.content.as_bytes());
             Ok(format!(
                 "wrote {} bytes to {}",
                 args.content.len(),
@@ -128,5 +136,36 @@ mod tests {
         assert!(stale.contains("changed after the last read"));
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "external");
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn independent_agent_scopes_reject_stale_parallel_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "programmer-agent-write-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("file.txt");
+        tokio::fs::write(&path, "initial").await.unwrap();
+        let security =
+            crate::security::SecurityManager::new(Default::default(), root.clone()).unwrap();
+        let read = serde_json::json!({"path": path}).to_string();
+        crate::tools::read_file::run_with_security_scope(&read, &security, 1)
+            .await
+            .unwrap();
+        crate::tools::read_file::run_with_security_scope(&read, &security, 2)
+            .await
+            .unwrap();
+
+        let first = serde_json::json!({"path": path, "content": "first"}).to_string();
+        run_with_security_scope(&first, &security, 1).await.unwrap();
+
+        let second = serde_json::json!({"path": path, "content": "second"}).to_string();
+        let error = run_with_security_scope(&second, &security, 2)
+            .await
+            .unwrap_err();
+        assert!(error.contains("changed after the last read"));
+
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

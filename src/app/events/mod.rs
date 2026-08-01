@@ -71,6 +71,11 @@ async fn handle_crossterm(
         crossterm::event::Event::Mouse(mouse) if app.terminal_pane.is_some() => {
             keys::handle_terminal_mouse(app, mouse);
         }
+        crossterm::event::Event::Mouse(mouse) if app.agent_panel.is_some() => {
+            if let Some(panel) = app.agent_panel.as_mut() {
+                panel.handle_mouse(mouse);
+            }
+        }
         crossterm::event::Event::Mouse(mouse) => mouse::handle_mouse(app, mouse),
         _ => {}
     }
@@ -147,19 +152,38 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             position,
             reply,
             operation_id,
+            agent_id,
+            agent_generation,
         } => {
             if !is_live_turn(app, operation_id) {
                 // Drop the sender so the runner's review() gets a closed-channel
                 // denial instead of hanging.
                 return;
             }
-            app.pending_review = Some(PendingReview {
+            if let (Some(generation), Some(id)) = (agent_generation, agent_id)
+                && (generation != app.agents.generation()
+                    || app
+                        .agents
+                        .snapshot(id)
+                        .is_none_or(|agent| agent.status.is_terminal()))
+            {
+                return;
+            }
+            let review = PendingReview {
                 call,
                 reason,
                 position,
                 reply,
                 selected: 0,
-            });
+                operation_id,
+                agent_id,
+                agent_generation,
+            };
+            if app.pending_review.is_none() {
+                app.pending_review = Some(review);
+            } else {
+                app.review_queue.push_back(review);
+            }
             app.conversation_panel.phase = ActivePhase::None;
         }
         AppEvent::TurnFinished(op_id, result) => {
@@ -172,7 +196,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             app.cancel.active_id = None;
             // A prompt may have been installed just before cancellation won the
             // race. Turn completion is the final defensive cleanup boundary.
-            app.pending_review = None;
+            discard_reviews_for_operation(app, op_id);
             app.question_panel = None;
             app.conversation_panel.abort_receiving();
             app.conversation_panel.phase = ActivePhase::None;
@@ -217,8 +241,14 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         }
         AppEvent::StartInit => handle_start_init(app),
         AppEvent::TaskStateChanged(event) => handle_task_state_changed(app, event),
+        AppEvent::AgentStateChanged { generation, id } => {
+            handle_agent_state_changed(app, generation, id)
+        }
         AppEvent::FlushTaskNotifications(token) => {
             flush_task_notifications(app, token).await;
+        }
+        AppEvent::FlushAgentNotifications(token) => {
+            flush_agent_notifications(app, token).await;
         }
         AppEvent::CompactFinished(op_id, result, cancel_token) => {
             if !is_current_turn(app, op_id) {
@@ -316,7 +346,8 @@ fn take_pending_request(
 async fn start_queued_work(app: &mut App<'_>) {
     let pending_user = take_pending_request(&mut app.conversation_panel, &mut app.pending_images);
     app.task_notifications.discard_consumed();
-    if app.task_notifications.pending.is_empty() {
+    app.agent_notifications.discard_consumed(&app.agents);
+    if app.task_notifications.pending.is_empty() && app.agent_notifications.pending.is_empty() {
         if let Some((text, images)) = pending_user {
             commands::start_request_with_images(app, text, images).await;
         }
@@ -334,8 +365,25 @@ async fn start_queued_work(app: &mut App<'_>) {
             event.new_status.label()
         ));
     }
+    let agent_ids: Vec<_> = app.agent_notifications.pending.drain(..).collect();
+    app.agent_notifications.ready_at = None;
+    app.agent_notifications.flush_requested = false;
+    let agents: Vec<_> = agent_ids
+        .into_iter()
+        .filter_map(|id| {
+            let snapshot = app.agents.snapshot(id)?;
+            app.agents.consume_notification(id);
+            app.conversation_panel.add_info_string(format!(
+                "Sub-agent #{} {} {} — notifying parent agent.",
+                snapshot.id,
+                snapshot.name,
+                snapshot.status.label()
+            ));
+            Some(snapshot)
+        })
+        .collect();
     session::mark_dirty(app);
-    commands::start_task_update_request(app, events, pending_user).await;
+    commands::start_runtime_update_request(app, events, agents, pending_user).await;
 }
 
 fn handle_task_state_changed(app: &mut App<'_>, event: crate::tasks::TaskLifecycleEvent) {
@@ -343,6 +391,16 @@ fn handle_task_state_changed(app: &mut App<'_>, event: crate::tasks::TaskLifecyc
         return;
     }
     app.task_notifications.push(event);
+}
+
+fn handle_agent_state_changed(app: &mut App<'_>, generation: u64, id: u64) {
+    if generation != app.agents.generation() {
+        return;
+    }
+    discard_reviews_for_agent(app, generation, id);
+    if app.agents.should_notify_parent(id) {
+        app.agent_notifications.push(id);
+    }
 }
 
 async fn flush_task_notifications(app: &mut App<'_>, token: u64) {
@@ -359,6 +417,20 @@ async fn flush_task_notifications(app: &mut App<'_>, token: u64) {
     start_queued_work(app).await;
 }
 
+async fn flush_agent_notifications(app: &mut App<'_>, token: u64) {
+    if token != app.agent_notifications.flush_token {
+        return;
+    }
+    app.agent_notifications.flush_requested = false;
+    if app.cancel.active_id.is_some()
+        || app.agent_notifications.pending.is_empty()
+        || has_blocking_surface(app)
+    {
+        return;
+    }
+    start_queued_work(app).await;
+}
+
 fn has_blocking_surface(app: &App<'_>) -> bool {
     app.pending_review.is_some()
         || app.question_panel.is_some()
@@ -368,8 +440,38 @@ fn has_blocking_surface(app: &App<'_>) -> bool {
         || app.security_panel.is_some()
         || app.todo_panel.is_some()
         || app.terminal_pane.is_some()
+        || app.agent_panel.is_some()
         || (app.work_mode == WorkMode::Plan
             && app.plan_phase == crate::classifier::PlanPhase::Reviewing)
+}
+
+fn discard_reviews_for_operation(app: &mut App<'_>, operation_id: u64) {
+    if app
+        .pending_review
+        .as_ref()
+        .is_some_and(|review| review.operation_id == operation_id)
+    {
+        app.pending_review = None;
+    }
+    app.review_queue
+        .retain(|review| review.operation_id != operation_id);
+    if app.pending_review.is_none() {
+        app.pending_review = app.review_queue.pop_front();
+    }
+}
+
+fn discard_reviews_for_agent(app: &mut App<'_>, generation: u64, agent_id: u64) {
+    if app.pending_review.as_ref().is_some_and(|review| {
+        review.agent_generation == Some(generation) && review.agent_id == Some(agent_id)
+    }) {
+        app.pending_review = None;
+    }
+    app.review_queue.retain(|review| {
+        review.agent_generation != Some(generation) || review.agent_id != Some(agent_id)
+    });
+    if app.pending_review.is_none() {
+        app.pending_review = app.review_queue.pop_front();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +500,9 @@ async fn handle_cancel(app: &mut App<'_>) {
         .add_info_string("Request cancelled by user.".to_string());
     // Release any blocking UI prompts so the runner's review() / ask_user
     // futures unblock and can reach the next cancel check-point.
-    app.pending_review = None;
+    if let Some(operation_id) = app.cancel.active_id {
+        discard_reviews_for_operation(app, operation_id);
+    }
     app.question_panel = None;
     session::mark_dirty(app);
     // Do NOT start queued requests here — wait for TurnFinished.
@@ -641,6 +745,21 @@ pub(crate) fn tick(app: &mut App<'_>) {
         app.task_notifications.flush_requested = true;
         app.events.send(AppEvent::FlushTaskNotifications(
             app.task_notifications.flush_token,
+        ));
+    }
+    app.agent_notifications.discard_consumed(&app.agents);
+    if app.cancel.active_id.is_none()
+        && !app.agent_notifications.pending.is_empty()
+        && !app.agent_notifications.flush_requested
+        && !has_blocking_surface(app)
+        && app
+            .agent_notifications
+            .ready_at
+            .is_some_and(|ready| std::time::Instant::now() >= ready)
+    {
+        app.agent_notifications.flush_requested = true;
+        app.events.send(AppEvent::FlushAgentNotifications(
+            app.agent_notifications.flush_token,
         ));
     }
 }

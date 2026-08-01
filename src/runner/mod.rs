@@ -48,6 +48,7 @@ use std::sync::{Arc, Mutex};
 
 /// The Auto-mode LLM classifier's inputs, boxed into [`RunnerPolicy::Llm`] so
 /// that variant isn't far larger than the others.
+#[derive(Clone)]
 pub(crate) struct LlmPolicy {
     pub client: Client<OpenAIConfig>,
     pub model_name: String,

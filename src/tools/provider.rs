@@ -24,7 +24,7 @@
 //! never sniffs prefixes.
 
 use super::{
-    ask_user, blob, command, configure_diagnostics, diagnostics, edit_file, fetch, grep,
+    agent, ask_user, blob, command, configure_diagnostics, diagnostics, edit_file, fetch, grep,
     mcp_bridge, read_file, read_image, request_permission, run_local_tool, task, todo, write_file,
 };
 use crate::mcp::McpManager;
@@ -45,6 +45,53 @@ pub(crate) enum ToolApproval {
     /// Must go through the work-mode classifier (mutating built-ins and MCP
     /// tools without an explicit read-only hint).
     Classify,
+}
+
+/// The parent-only provider for the `agent` lifecycle tool. Child runners use
+/// the base registry stored in `runtime`, which omits this provider and thereby
+/// cannot create grandchildren.
+pub(crate) struct AgentToolProvider {
+    manager: crate::agents::AgentManager,
+    runtime: crate::agents::AgentRuntime,
+}
+
+impl AgentToolProvider {
+    pub(crate) fn new(
+        manager: crate::agents::AgentManager,
+        runtime: crate::agents::AgentRuntime,
+    ) -> Self {
+        Self { manager, runtime }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolProvider for AgentToolProvider {
+    fn tools(&self) -> Vec<Tool> {
+        vec![agent::tool()]
+    }
+
+    fn approval(&self, name: &str, arguments: &str) -> ToolApproval {
+        if name == agent::NAME && agent::is_observational(arguments) {
+            ToolApproval::AutoApprove
+        } else {
+            ToolApproval::Classify
+        }
+    }
+
+    async fn call(
+        &self,
+        call: &FunctionToolCall,
+        ctx: &ToolCtx<'_>,
+    ) -> Result<FunctionCallOutput, String> {
+        agent::run(
+            &call.arguments,
+            &self.manager,
+            &self.runtime,
+            ctx.sender.clone(),
+        )
+        .await
+        .map(FunctionCallOutput::Text)
+    }
 }
 
 /// What a provider needs at call time beyond the call itself. Currently just the
@@ -97,6 +144,7 @@ pub(crate) trait ToolProvider: Send + Sync {
 pub(crate) struct LocalToolProvider {
     todos: Arc<Mutex<crate::todos::TodoList>>,
     security: Arc<crate::security::SecurityHandle>,
+    file_scope: u64,
 }
 
 impl LocalToolProvider {
@@ -104,7 +152,23 @@ impl LocalToolProvider {
         todos: Arc<Mutex<crate::todos::TodoList>>,
         security: Arc<crate::security::SecurityHandle>,
     ) -> Self {
-        Self { todos, security }
+        Self {
+            todos,
+            security,
+            file_scope: 0,
+        }
+    }
+
+    pub(crate) fn new_scoped(
+        todos: Arc<Mutex<crate::todos::TodoList>>,
+        security: Arc<crate::security::SecurityHandle>,
+        file_scope: u64,
+    ) -> Self {
+        Self {
+            todos,
+            security,
+            file_scope,
+        }
     }
 }
 
@@ -204,17 +268,17 @@ impl ToolProvider for LocalToolProvider {
             read_image::run_with_security(&call.arguments, &security).await
         } else if call.name == read_file::NAME {
             let security = self.security.snapshot();
-            read_file::run_with_security(&call.arguments, &security)
+            read_file::run_with_security_scope(&call.arguments, &security, self.file_scope)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == write_file::NAME {
             let security = self.security.snapshot();
-            write_file::run_with_security(&call.arguments, &security)
+            write_file::run_with_security_scope(&call.arguments, &security, self.file_scope)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == edit_file::NAME {
             let security = self.security.snapshot();
-            edit_file::run_with_security(&call.arguments, &security)
+            edit_file::run_with_security_scope(&call.arguments, &security, self.file_scope)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == task::NAME {

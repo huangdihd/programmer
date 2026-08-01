@@ -49,6 +49,13 @@ pub(crate) async fn handle_key_events(
         return Ok(());
     }
 
+    if let Some(panel) = app.agent_panel.as_mut() {
+        if panel.handle_key(key_event) {
+            app.agent_panel = None;
+        }
+        return Ok(());
+    }
+
     // ---- tool-call approval (Manual mode) ----
     if app.pending_review.is_some() {
         return handle_approval_key(app, key_event);
@@ -572,22 +579,31 @@ fn handle_approval_key(app: &mut App<'_>, key_event: KeyEvent) -> color_eyre::Re
                         output: crate::tools::ToolOutput {
                             param: FunctionCallOutputItemParam {
                                 call_id: review.call.call_id.clone(),
-                                output: FunctionCallOutput::Text(format!(
-                                    "error: tool call denied by user in Manual mode — {}",
-                                    review.reason,
-                                )),
+                                output: FunctionCallOutput::Text(if review.agent_id.is_some() {
+                                    format!(
+                                        "error: sub-agent tool call denied by user — {}",
+                                        review.reason
+                                    )
+                                } else {
+                                    format!(
+                                        "error: tool call denied by user in Manual mode — {}",
+                                        review.reason,
+                                    )
+                                }),
                                 id: None,
                                 status: None,
                             },
                             failed: true,
-                            approval_label: Some(format!(
-                                "{} denied in Manual mode by user",
-                                WorkMode::Manual.icon()
-                            )),
+                            approval_label: Some(if review.agent_id.is_some() {
+                                "✖ denied by user (sub-agent)".to_string()
+                            } else {
+                                format!("{} denied in Manual mode by user", WorkMode::Manual.icon())
+                            }),
                         },
                     },
                 };
                 let _ = review.reply.0.send(decision);
+                app.pending_review = app.review_queue.pop_front();
             }
         }
         _ => {}
