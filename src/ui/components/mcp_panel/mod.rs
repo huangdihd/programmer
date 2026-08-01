@@ -22,7 +22,7 @@
 
 use crate::config::programmer_config::ProgrammerConfig;
 use crate::mcp::McpManager;
-use crate::mcp::types::{McpPolicy, McpServerConfig};
+use crate::mcp::types::McpServerConfig;
 use crate::ui::components::panel_search::{PanelSearch, SearchKey};
 use crate::ui::text::truncate_to_width;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -44,23 +44,20 @@ pub enum PanelAction {
 }
 
 /// Editable form fields, in focus order.
-const FORM_LABELS: [&str; 6] = [
+const FORM_LABELS: [&str; 5] = [
     "name",
     "command (stdio)",
     "url (remote http server)",
     "args (space-separated)",
     "env K=V (http: headers)",
-    "policy (trusted|review)",
 ];
-/// Index of the policy field, which toggles instead of taking text.
-const POLICY_FIELD: usize = 5;
 
 #[derive(Debug, Default)]
 struct Form {
     /// `Some(original_name)` when editing an existing server.
     original: Option<String>,
-    /// name, command, url, args, env, policy.
-    fields: [String; 6],
+    /// name, command, url, args, env.
+    fields: [String; 5],
     focus: usize,
     error: Option<String>,
 }
@@ -150,10 +147,6 @@ impl McpPanel {
                 if let Some(name) = names.get(self.selected)
                     && let Some(cfg) = config.mcp_servers.iter().find(|s| &s.name == name)
                 {
-                    let policy_str = match cfg.auto_approve {
-                        McpPolicy::Trusted => "trusted",
-                        McpPolicy::Review => "review",
-                    };
                     self.mode = Mode::Form(Form {
                         original: Some(cfg.name.clone()),
                         fields: [
@@ -166,7 +159,6 @@ impl McpPanel {
                                 .map(|(k, v)| format!("{k}={v}"))
                                 .collect::<Vec<_>>()
                                 .join(" "),
-                            policy_str.to_string(),
                         ],
                         focus: 0,
                         error: None,
@@ -208,32 +200,6 @@ impl McpPanel {
         let Mode::Form(form) = &mut self.mode else {
             return PanelAction::None;
         };
-        // The policy field toggles with Space/Enter; other keys are ignored
-        // while it's focused (it's not a free-text field).
-        if form.focus == POLICY_FIELD {
-            match key.code {
-                KeyCode::Esc => {
-                    self.mode = Mode::List;
-                }
-                KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
-                    form.focus = 0; // wrap to first field
-                }
-                KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
-                    form.focus = POLICY_FIELD - 1; // prev field
-                }
-                KeyCode::Char(' ') | KeyCode::Enter => {
-                    // Toggle: trusted ↔ review
-                    form.fields[POLICY_FIELD] = if form.fields[POLICY_FIELD].trim() == "review" {
-                        "trusted".to_string()
-                    } else {
-                        "review".to_string()
-                    };
-                }
-                _ => {}
-            }
-            return PanelAction::None;
-        }
-
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::List;
@@ -299,18 +265,12 @@ impl McpPanel {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
             })
             .collect();
-        let auto_approve = match form.fields[POLICY_FIELD].trim() {
-            "review" => McpPolicy::Review,
-            _ => McpPolicy::Trusted,
-        };
-
         let new_cfg = McpServerConfig {
             name: name.clone(),
             command,
             args,
             env,
             url: (!url.is_empty()).then_some(url),
-            auto_approve,
         };
 
         match &form.original {
@@ -580,8 +540,6 @@ impl McpPanel {
                 lines.push(Line::from(vec![
                     Span::styled("  Tab/↑↓", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" next field  ", Style::default().fg(Color::Gray)),
-                    Span::styled("Space", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" toggle policy  ", Style::default().fg(Color::Gray)),
                     Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" save  ", Style::default().fg(Color::Gray)),
                     Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
@@ -719,7 +677,6 @@ mod tests {
             args: vec![],
             env: Default::default(),
             url: None,
-            auto_approve: Default::default(),
         });
         panel.handle_key(ch('d'), &mut config);
         assert_eq!(panel.handle_key(ch('y'), &mut config), PanelAction::Saved);
@@ -749,38 +706,5 @@ mod tests {
             PanelAction::Saved
         );
         assert_eq!(config.mcp_servers[0].env.get("API_KEY").unwrap(), "secret");
-    }
-
-    #[test]
-    fn policy_toggle() {
-        let mut panel = McpPanel::new();
-        let mut config = ProgrammerConfig::default();
-        panel.handle_key(ch('a'), &mut config);
-        // name
-        for c in "srv".chars() {
-            panel.handle_key(ch(c), &mut config);
-        }
-        panel.handle_key(key(KeyCode::Tab), &mut config);
-        // command
-        for c in "cmd".chars() {
-            panel.handle_key(ch(c), &mut config);
-        }
-        panel.handle_key(key(KeyCode::Tab), &mut config); // url
-        panel.handle_key(key(KeyCode::Tab), &mut config); // args
-        panel.handle_key(key(KeyCode::Tab), &mut config); // env
-        panel.handle_key(key(KeyCode::Tab), &mut config); // policy (default: trusted)
-        // Toggle to review.
-        panel.handle_key(ch(' '), &mut config);
-        // Tab wraps to name, then Enter saves.
-        panel.handle_key(key(KeyCode::Tab), &mut config);
-        assert_eq!(
-            panel.handle_key(key(KeyCode::Enter), &mut config),
-            PanelAction::Saved
-        );
-        assert_eq!(config.mcp_servers[0].name, "srv");
-        assert!(matches!(
-            config.mcp_servers[0].auto_approve,
-            McpPolicy::Review
-        ));
     }
 }

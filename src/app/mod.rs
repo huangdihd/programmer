@@ -468,10 +468,7 @@ impl App<'_> {
             self.security.clone(),
         ))];
         if let Some(mcp) = &self.mcp_manager {
-            providers.push(Arc::new(McpToolProvider {
-                manager: mcp.clone(),
-                policies: build_mcp_policy_map(self),
-            }));
+            providers.push(Arc::new(McpToolProvider::new(mcp.clone())));
         }
         let tools = Arc::new(ToolRegistry::new(providers));
 
@@ -571,17 +568,6 @@ impl App<'_> {
     }
 }
 
-/// Build a map of MCP server name → [`crate::mcp::types::McpPolicy`] from the config.
-pub(crate) fn build_mcp_policy_map(
-    app: &App<'_>,
-) -> std::collections::HashMap<String, crate::mcp::types::McpPolicy> {
-    app.config
-        .mcp_servers
-        .iter()
-        .map(|s| (s.name.clone(), s.auto_approve))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::TaskNotificationState;
@@ -639,7 +625,6 @@ mod tests {
             args: Vec::new(),
             env: std::collections::HashMap::new(),
             url: None,
-            auto_approve: crate::mcp::types::McpPolicy::Trusted,
         });
 
         let app = tokio::time::timeout(

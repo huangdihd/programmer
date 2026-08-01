@@ -345,6 +345,7 @@ fn tool_to_spec(tool: &Tool) -> Option<Value> {
     let Tool::Function(f) = tool else {
         return None;
     };
+    let read_only = crate::tools::is_read_only_builtin(&f.name);
     Some(json!({
         "name": f.name,
         "description": f.description.clone().unwrap_or_default(),
@@ -352,6 +353,9 @@ fn tool_to_spec(tool: &Tool) -> Option<Value> {
             .parameters
             .clone()
             .unwrap_or_else(|| json!({ "type": "object" })),
+        "annotations": {
+            "readOnlyHint": read_only,
+        },
     }))
 }
 

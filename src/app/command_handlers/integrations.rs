@@ -157,17 +157,13 @@ fn format_mcp_server(server: &crate::mcp::types::McpServerConfig, connected: boo
         Some(_) => "HTTP".to_string(),
         None => format!("stdio: {}", server.command),
     };
-    let policy = match server.auto_approve {
-        crate::mcp::types::McpPolicy::Trusted => "trusted",
-        crate::mcp::types::McpPolicy::Review => "review",
-    };
-    format!("  {} [{status}] ({transport}, {policy})", server.name)
+    format!("  {} [{status}] ({transport})", server.name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::format_mcp_server;
-    use crate::mcp::types::{McpPolicy, McpServerConfig};
+    use crate::mcp::types::McpServerConfig;
     use std::collections::HashMap;
 
     fn server(command: &str, url: Option<&str>) -> McpServerConfig {
@@ -177,7 +173,6 @@ mod tests {
             args: Vec::new(),
             env: HashMap::new(),
             url: url.map(str::to_string),
-            auto_approve: McpPolicy::Trusted,
         }
     }
 
@@ -185,7 +180,7 @@ mod tests {
     fn mcp_status_formats_stdio_servers() {
         assert_eq!(
             format_mcp_server(&server("example-mcp", None), true),
-            "  example [connected] (stdio: example-mcp, trusted)"
+            "  example [connected] (stdio: example-mcp)"
         );
     }
 
@@ -193,7 +188,7 @@ mod tests {
     fn mcp_status_formats_http_servers_without_an_empty_command() {
         assert_eq!(
             format_mcp_server(&server("", Some("https://example.com/mcp")), false),
-            "  example [disconnected] (HTTP, trusted)"
+            "  example [disconnected] (HTTP)"
         );
     }
 }

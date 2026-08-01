@@ -187,6 +187,30 @@ fn suffixed_server<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
     name.strip_prefix("mcp__")?.strip_suffix(suffix)
 }
 
+/// Whether `name` is one of the read-only resource/prompt tools synthesized by
+/// this bridge. A real MCP tool with the same fully-qualified name is present
+/// in `McpToolProvider::declared_tool_read_only`, so this fallback is only reached
+/// for names the bridge generated itself.
+pub(crate) fn is_synthetic_read_only(name: &str, mgr: &McpManager) -> bool {
+    if let Some(server) = suffixed_server(name, "__resources_list")
+        .or_else(|| suffixed_server(name, "__resources_read"))
+    {
+        return mgr
+            .all_resources()
+            .iter()
+            .any(|(_, resource_server, _)| resource_server == server);
+    }
+    if let Some(server) =
+        suffixed_server(name, "__prompts_list").or_else(|| suffixed_server(name, "__prompts_get"))
+    {
+        return mgr
+            .all_prompts()
+            .iter()
+            .any(|(_, prompt_server, _)| prompt_server == server);
+    }
+    false
+}
+
 fn resources_list(mgr: &McpManager, server: &str) -> Result<String, String> {
     let resources = mgr.all_resources();
     let server_resources: Vec<_> = resources.iter().filter(|(_, s, _)| s == server).collect();

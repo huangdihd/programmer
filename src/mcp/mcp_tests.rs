@@ -14,7 +14,6 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::*;
-use super::types::McpPolicy;
 
 impl McpManager {
     /// Initialise all configured MCP servers. Spawns each, runs the handshake,
@@ -91,10 +90,9 @@ async fn spawn_mock_http_server() -> (String, tokio::task::JoinHandle<()>) {
                         if buf.len() < body_start + content_length {
                             break; // body incomplete — read more first.
                         }
-                        let body = String::from_utf8_lossy(
-                            &buf[body_start..body_start + content_length],
-                        )
-                        .to_string();
+                        let body =
+                            String::from_utf8_lossy(&buf[body_start..body_start + content_length])
+                                .to_string();
                         buf.drain(..body_start + content_length);
                         let response = mock_route(&headers, &body);
                         if sock.write_all(response.as_bytes()).await.is_err() {
@@ -154,7 +152,21 @@ fn mock_route(headers: &str, body: &str) -> String {
         // tools/list answers over SSE to exercise the stream path.
         "tools/list" => {
             let msg = reply(serde_json::json!({
-                "tools": [{"name": "echo", "inputSchema": {"type": "object"}}],
+                "tools": [
+                    {
+                        "name": "echo",
+                        "inputSchema": {"type": "object"},
+                        "annotations": {
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "openWorldHint": false
+                        }
+                    },
+                    {
+                        "name": "mutate",
+                        "inputSchema": {"type": "object"}
+                    }
+                ],
             }));
             let body = format!(": keep-alive comment\n\ndata: {msg}\n\n");
             format!(
@@ -170,9 +182,7 @@ fn mock_route(headers: &str, body: &str) -> String {
             {
                 return error("missing session id");
             }
-            let params = req
-                .get("params")
-                .and_then(|p| p.as_object());
+            let params = req.get("params").and_then(|p| p.as_object());
             let tool_name = params
                 .and_then(|p| p.get("name"))
                 .and_then(|n| n.as_str())
@@ -192,9 +202,7 @@ fn mock_route(headers: &str, body: &str) -> String {
                     )
                 }
                 "fail" => error("intentional failure"),
-                _ => {
-                    http_json("", &reply(serde_json::json!({"content": [],})))
-                }
+                _ => http_json("", &reply(serde_json::json!({"content": [],}))),
             }
         }
         _ => error("unknown method"),
@@ -225,12 +233,13 @@ async fn http_client_echo_roundtrip() {
     let client = McpHttpClient::new(&url, &HashMap::new()).expect("connect to mock");
     initialize_mock_http_client(&client).await;
     let tools_raw = client.call("tools/list", None).await.expect("list tools");
-    let tools: Vec<McpTool> = serde_json::from_value(
-        tools_raw.get("tools").cloned().unwrap_or_default(),
-    )
-    .unwrap_or_default();
-    assert_eq!(tools.len(), 1);
+    let tools: Vec<McpTool> =
+        serde_json::from_value(tools_raw.get("tools").cloned().unwrap_or_default())
+            .unwrap_or_default();
+    assert_eq!(tools.len(), 2);
     assert_eq!(tools[0].name, "echo");
+    assert!(tools[0].is_read_only());
+    assert!(!tools[1].is_read_only());
     let result = client
         .call(
             "tools/call",
@@ -249,6 +258,34 @@ async fn http_client_echo_roundtrip() {
         .and_then(|t| t.as_str())
         .unwrap_or("");
     assert_eq!(text, "echo: hello-http");
+}
+
+#[tokio::test]
+async fn mcp_read_only_hint_drives_provider_policy() {
+    use crate::tools::provider::{McpToolProvider, ToolApproval, ToolProvider};
+    use std::sync::Arc;
+
+    let (url, _jh) = spawn_mock_http_server().await;
+    let config = McpServerConfig {
+        name: "mock".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        env: HashMap::new(),
+        url: Some(url),
+    };
+    let manager = Arc::new(McpManager::from_config(&[config], ".").await);
+    let provider = McpToolProvider::new(manager);
+
+    assert!(provider.is_read_only("mcp__mock__echo"));
+    assert_eq!(
+        provider.approval("mcp__mock__echo", "{}"),
+        ToolApproval::AutoApprove
+    );
+    assert!(!provider.is_read_only("mcp__mock__mutate"));
+    assert_eq!(
+        provider.approval("mcp__mock__mutate", "{}"),
+        ToolApproval::Classify
+    );
 }
 
 #[tokio::test]
@@ -294,7 +331,6 @@ async fn full_integration_stdio_and_http_with_progress_and_roots() {
         args: vec!["index.mjs".into()],
         env: std::collections::HashMap::new(),
         url: None,
-        auto_approve: McpPolicy::Trusted,
     };
     let mgr = McpManager::from_config(&[cfg], ".").await;
     assert!(mgr.startup_errors.is_empty());

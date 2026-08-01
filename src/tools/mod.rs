@@ -308,6 +308,15 @@ pub(crate) fn mcp_server_tools() -> Vec<Tool> {
     ]
 }
 
+/// Built-ins that are always side-effect-free, independent of their arguments.
+/// Shared by the local provider and the MCP server's `readOnlyHint` metadata.
+pub(crate) fn is_read_only_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        read_file::NAME | read_image::NAME | grep::NAME | blob::NAME | fetch::NAME
+    )
+}
+
 /// Archive long output before returning a bounded head/tail excerpt.
 fn archive_and_truncate(tool_name: &str, call_id: &str, output: String) -> String {
     let len = output.chars().count();

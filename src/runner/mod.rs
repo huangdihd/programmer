@@ -444,7 +444,8 @@ impl TurnRunner {
 
         // Front gate: the owning provider's policy decides whether each call
         // needs the classifier at all. Auto-approved calls (read-only built-ins,
-        // trusted MCP servers) skip it entirely; only the rest are classified.
+        // explicitly read-only MCP tools) skip it entirely; only the rest are
+        // classified.
         let mut auto_allowed: Vec<FunctionToolCall> = Vec::new();
         let mut to_classify: Vec<FunctionToolCall> = Vec::new();
         for call in classifiable {

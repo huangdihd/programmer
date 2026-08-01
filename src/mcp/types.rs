@@ -65,21 +65,6 @@ pub(crate) struct JsonRpcError {
 // MCP server configuration
 // ---------------------------------------------------------------------------
 
-/// Per-MCP-server tool-approval policy for the classifier.
-///
-/// Controls how tools from this server are handled across all work modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum McpPolicy {
-    /// Tools from this server are trusted: auto-approved in every mode except
-    /// Manual, where all tools require confirmation regardless.
-    #[default]
-    Trusted,
-    /// Tools from this server must be reviewed: Auto mode sends them through
-    /// the LLM classifier, Allow Edits and Manual pop up an approval prompt.
-    Review,
-}
-
 /// A configured MCP server entry, deserialized from `programmer.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct McpServerConfig {
@@ -102,10 +87,6 @@ pub(crate) struct McpServerConfig {
     /// and `command`/`args` are ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) url: Option<String>,
-    /// Per-server tool-approval policy. Defaults to `auto` (defer to the
-    /// current work mode's classifier).
-    #[serde(default)]
-    pub(crate) auto_approve: McpPolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +130,35 @@ pub(crate) struct McpTool {
     #[serde(default)]
     pub(crate) description: Option<String>,
     pub(crate) inputSchema: serde_json::Value,
+    #[serde(default)]
+    pub(crate) annotations: Option<McpToolAnnotations>,
+}
+
+impl McpTool {
+    /// MCP annotations are hints, so only an explicit `true` opts a tool into
+    /// the read-only fast path. Missing annotations keep the conservative
+    /// mutating/default-review behaviour required by the protocol.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.annotations
+            .as_ref()
+            .is_some_and(|annotations| annotations.read_only_hint)
+    }
+}
+
+/// Optional behavioural hints supplied with an MCP tool definition.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct McpToolAnnotations {
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) read_only_hint: bool,
+    #[serde(default)]
+    pub(crate) destructive_hint: Option<bool>,
+    #[serde(default)]
+    pub(crate) idempotent_hint: Option<bool>,
+    #[serde(default)]
+    pub(crate) open_world_hint: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

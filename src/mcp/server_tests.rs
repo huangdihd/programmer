@@ -104,6 +104,22 @@ fn tools_list_excludes_ask_user() {
     assert!(!names.contains(&"ask_user"));
 }
 
+#[test]
+fn tools_list_advertises_read_only_annotations() {
+    let value = tools_list_result();
+    let tools = value["tools"].as_array().unwrap();
+    let read = tools
+        .iter()
+        .find(|tool| tool["name"] == "read_file")
+        .unwrap();
+    let write = tools
+        .iter()
+        .find(|tool| tool["name"] == "write_file")
+        .unwrap();
+    assert_eq!(read["annotations"]["readOnlyHint"], true);
+    assert_eq!(write["annotations"]["readOnlyHint"], false);
+}
+
 #[tokio::test]
 async fn manual_elicitation_accept_allows() {
     // Simulate a client that accepts the elicitation.

@@ -108,7 +108,7 @@ src/
 │
 ├── mcp/                      # Model Context Protocol integration
 │   ├── mod.rs                #   McpManager: connect, discover tools, route calls
-│   ├── types.rs              #   JSON-RPC types, McpTool, McpServerConfig, McpPolicy
+│   ├── types.rs              #   JSON-RPC types, McpTool, McpServerConfig, tool annotations
 │   ├── client.rs             #   Stdio transport (spawn + JSON-RPC over stdin/stdout)
 │   └── http_client.rs        #   HTTP SSE transport
 │

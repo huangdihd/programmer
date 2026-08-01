@@ -260,7 +260,6 @@ mod tests {
             ],
             env: std::collections::HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
             url: None,
-            auto_approve: Default::default(),
         });
 
         let serialized = toml::to_string(&config).expect("serialize");

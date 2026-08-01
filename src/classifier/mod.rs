@@ -20,11 +20,7 @@
 //! Adding a new mode (e.g. "Paranoid" with parameter-level rules) only
 //! requires implementing the trait and wiring up a new variant.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
-
-use crate::mcp::types::McpPolicy;
 
 // ---------------------------------------------------------------------------
 // Verdict
@@ -61,11 +57,9 @@ pub trait Classifier: Send + Sync {
 /// `configure_diagnostics` writes a profile and test-runs its checker commands,
 /// so it is gated like `command`.
 ///
-/// MCP tools (names starting with `mcp__`) are not listed here because we can't
-/// know their semantics at compile time. Instead they are routed through
-/// [`classify_mcp_policy`] first, which resolves per-server policies.
-/// A [`McpPolicy::Trusted`] tool is allowed immediately; a [`McpPolicy::Review`]
-/// tool falls through to the normal classifier.
+/// MCP tools (names starting with `mcp__`) are not listed here because their
+/// read-only metadata is resolved by the MCP tool provider before a classifier
+/// sees them.
 const DANGEROUS_TOOLS: &[&str] = &[
     "command",
     "write_file",
@@ -83,34 +77,10 @@ fn is_mutating(tool_name: &str, arguments: &str) -> bool {
     DANGEROUS_TOOLS.contains(&tool_name)
 }
 
-/// Extract the MCP server name from a fully-qualified tool name like
-/// `mcp__codegraph__search` → `"codegraph"`. Returns `None` for built-in tools.
-pub fn mcp_server_name(tool_name: &str) -> Option<&str> {
-    tool_name
-        .strip_prefix("mcp__")
-        .and_then(|rest| rest.split_once("__"))
-        .map(|(server, _tool)| server)
-}
-
-/// Resolve the [`Verdict`] for an MCP tool based on its server's configured
-/// [`McpPolicy`]. Returns `Some(Allow)` for [`McpPolicy::Trusted`]; returns
-/// `None` for [`McpPolicy::Review`], meaning the caller should fall through
-/// to the normal classifier (sync or LLM, depending on the current work mode).
-pub(crate) fn classify_mcp_policy(
-    tool_name: &str,
-    policies: &HashMap<String, McpPolicy>,
-) -> Option<Verdict> {
-    let server = mcp_server_name(tool_name)?;
-    match policies.get(server).unwrap_or(&McpPolicy::Review) {
-        McpPolicy::Trusted => Some(Verdict::Allow),
-        McpPolicy::Review => None,
-    }
-}
-
 /// Manual mode. By the time a call reaches a sync classifier, the provider
 /// front gate ([`crate::tools::provider::ToolProvider::approval`]) has already
-/// auto-approved everything safe — read-only built-ins and tools on a trusted
-/// MCP server — so every remaining call is one the user must decide on.
+/// auto-approved everything safe — read-only built-ins and MCP tools — so every
+/// remaining call is one the user must decide on.
 pub struct ManualClassifier;
 
 impl Classifier for ManualClassifier {
@@ -240,10 +210,8 @@ impl WorkMode {
 
 /// Whether a tool call needs LLM review in Auto mode. Read-only tools are
 /// always safe; only state-mutating tools are sent to the classifier.
-/// MCP tools are always treated as potentially dangerous (we can't know their
-/// semantics at compile time), but their server's [`McpPolicy`] is checked
-/// first in [`spawn_auto_classification`] — a [`McpPolicy::Trusted`] server
-/// bypasses the LLM entirely.
+/// MCP tools that reach this fallback did not explicitly declare themselves
+/// read-only, so they are treated as potentially mutating.
 pub fn needs_review(tool_name: &str, arguments: &str) -> bool {
     is_mutating(tool_name, arguments) || tool_name.starts_with("mcp__")
 }
@@ -282,7 +250,7 @@ mod tests {
     #[test]
     fn manual_asks_for_every_call_it_receives() {
         // The provider front gate has already auto-approved the safe calls
-        // (read-only built-ins, trusted MCP), so Manual asks about the rest —
+        // (read-only built-ins and MCP tools), so Manual asks about the rest —
         // whatever the tool.
         assert!(matches!(
             classify(WorkMode::Manual, "command"),
@@ -381,44 +349,4 @@ mod tests {
         assert_eq!(WorkMode::Yolo.label(), "YOLO");
         assert_eq!(WorkMode::Plan.label(), "Plan");
     }
-
-    #[test]
-    fn mcp_policy_trusted_returns_allow() {
-        let mut policies = HashMap::new();
-        policies.insert("codegraph".to_string(), McpPolicy::Trusted);
-        assert!(matches!(
-            classify_mcp_policy("mcp__codegraph__search", &policies),
-            Some(Verdict::Allow)
-        ));
-    }
-
-    #[test]
-    fn mcp_policy_review_returns_none() {
-        let mut policies = HashMap::new();
-        policies.insert("codegraph".to_string(), McpPolicy::Review);
-        assert!(classify_mcp_policy("mcp__codegraph__search", &policies).is_none());
-    }
-
-    #[test]
-    fn mcp_server_name_parsing() {
-        assert_eq!(mcp_server_name("mcp__codegraph__search"), Some("codegraph"));
-        assert_eq!(mcp_server_name("command"), None);
-        assert_eq!(mcp_server_name("mcp__"), None);
-    }
-
-    #[test]
-    fn builtin_tool_not_affected_by_mcp_policy() {
-        let mut policies = HashMap::new();
-        policies.insert("command".to_string(), McpPolicy::Trusted);
-        // "command" is a built-in tool, not an MCP tool — policy doesn't apply.
-        let v = classify_mcp_policy("command", &policies);
-        assert!(v.is_none());
-    }
-
-    // The per-server MCP trust behaviour that used to be tested through the
-    // classifiers (trusted → allowed, review → asked/denied even in Manual/Plan)
-    // now lives in the provider front gate: `classify_mcp_policy` resolves the
-    // verdict (covered above) and `McpToolProvider::approval` turns it into
-    // AutoApprove / Classify. The sync classifiers only ever see calls that
-    // already need review, so they no longer carry a policy map.
 }

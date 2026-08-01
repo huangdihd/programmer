@@ -28,7 +28,6 @@ use super::{
     mcp_bridge, read_file, read_image, request_permission, run_local_tool, task, todo, write_file,
 };
 use crate::mcp::McpManager;
-use crate::mcp::types::McpPolicy;
 use crate::ui::event::Event;
 use async_openai::types::responses::{FunctionCallOutput, FunctionToolCall, Tool};
 use std::collections::HashMap;
@@ -41,10 +40,10 @@ use tokio::sync::mpsc::UnboundedSender;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolApproval {
     /// Safe to run without review — bypass the classifier entirely (read-only
-    /// built-ins, tools on a trusted MCP server).
+    /// built-ins and MCP tools declaring `readOnlyHint: true`).
     AutoApprove,
-    /// Must go through the work-mode classifier (mutating built-ins, tools on an
-    /// MCP server marked for review).
+    /// Must go through the work-mode classifier (mutating built-ins and MCP
+    /// tools without an explicit read-only hint).
     Classify,
 }
 
@@ -146,10 +145,7 @@ impl ToolProvider for LocalToolProvider {
     }
 
     fn is_read_only(&self, name: &str) -> bool {
-        matches!(
-            name,
-            read_file::NAME | read_image::NAME | grep::NAME | blob::NAME | fetch::NAME
-        )
+        super::is_read_only_builtin(name)
     }
 
     fn requires_interaction(&self, name: &str) -> bool {
@@ -241,9 +237,24 @@ impl ToolProvider for LocalToolProvider {
 /// routes calls back through [`mcp_bridge`].
 pub(crate) struct McpToolProvider {
     pub manager: Arc<McpManager>,
-    /// Per-server trust policy (server name → policy). A tool on a `Trusted`
-    /// server auto-approves; one on a `Review` server (the default) is classified.
-    pub policies: HashMap<String, McpPolicy>,
+    /// Read-only hints captured from the server's current `tools/list` result.
+    /// The registry is rebuilt at the start of every turn, so refreshed MCP
+    /// metadata is picked up without mutating a runner already in flight.
+    declared_tool_read_only: HashMap<String, bool>,
+}
+
+impl McpToolProvider {
+    pub(crate) fn new(manager: Arc<McpManager>) -> Self {
+        let declared_tool_read_only = manager
+            .all_tools()
+            .into_iter()
+            .map(|(name, tool)| (name, tool.is_read_only()))
+            .collect();
+        Self {
+            manager,
+            declared_tool_read_only,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -254,12 +265,18 @@ impl ToolProvider for McpToolProvider {
         tools
     }
 
+    fn is_read_only(&self, name: &str) -> bool {
+        self.declared_tool_read_only
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| mcp_bridge::is_synthetic_read_only(name, &self.manager))
+    }
+
     fn approval(&self, name: &str, _arguments: &str) -> ToolApproval {
-        // Trusted server → skip the classifier; Review (or unknown) → classify.
-        // This is the classifier's old `classify_mcp_policy`, now owned here.
-        match crate::classifier::classify_mcp_policy(name, &self.policies) {
-            Some(crate::classifier::Verdict::Allow) => ToolApproval::AutoApprove,
-            _ => ToolApproval::Classify,
+        if self.is_read_only(name) {
+            ToolApproval::AutoApprove
+        } else {
+            ToolApproval::Classify
         }
     }
 
@@ -511,9 +528,6 @@ mod tests {
         // Unknown tool: classify (safe default).
         assert_eq!(reg.approval("nope", "{}"), ToolApproval::Classify);
     }
-
-    // (McpToolProvider::approval is a thin wrapper over the classifier's
-    // `classify_mcp_policy`, which is covered by its own Trusted/Review tests.)
 
     #[tokio::test]
     async fn registry_dispatches_a_local_call_and_rejects_unknown() {
