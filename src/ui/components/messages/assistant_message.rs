@@ -129,7 +129,12 @@ impl<'a> AssistantMessage<'a> {
             self.output_item,
             OutputItem::Reasoning(_) | OutputItem::FunctionCall(_)
         );
-        let mut block = Block::default().padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 1));
+        // Text already has natural separation from the items around it. Keep
+        // the extra row only for compact reasoning/tool indicators, where it
+        // visually separates status lines from the next transcript item.
+        let bottom_padding = u16::from(!matches!(self.output_item, OutputItem::Message(_)));
+        let mut block =
+            Block::default().padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, bottom_padding));
         if self.expanded && foldable {
             block = block.style(Style::new().bg(EXPANDED_BG));
         }
@@ -170,4 +175,31 @@ fn scan_copy_buttons(text: &Text<'_>, codes: &[String]) -> Vec<CodeCopyButton> {
         }
     }
     buttons
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::responses::{
+        AssistantRole, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent,
+    };
+
+    #[test]
+    fn text_message_has_no_trailing_padding_row() {
+        let item = OutputItem::Message(OutputMessage {
+            content: vec![OutputMessageContent::OutputText(OutputTextContent {
+                annotations: Vec::new(),
+                logprobs: None,
+                text: "hello".into(),
+            })],
+            id: "message-1".into(),
+            role: AssistantRole::Assistant,
+            phase: None,
+            status: OutputStatus::Completed,
+        });
+
+        let (paragraph, _) = AssistantMessage::new(&item, 80).into_paragraph();
+
+        assert_eq!(paragraph.line_count(80), 1);
+    }
 }

@@ -89,9 +89,11 @@ pub(crate) struct MemberHeader {
 }
 
 /// Find maximal runs of non-interactive function calls and retain runs with at
-/// least [`MIN_TOOL_GROUP_SIZE`] members. `ask_user` and `request_permission`
-/// stay standalone because they are interaction boundaries rather than batch
-/// work.
+/// least [`MIN_TOOL_GROUP_SIZE`] members. Reasoning items are transparent: the
+/// Responses API may interleave them between calls from the same assistant
+/// batch, but they do not represent a user-visible interaction boundary.
+/// `ask_user` and `request_permission` stay standalone because they are real
+/// interaction boundaries rather than batch work.
 pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     let mut groups = Vec::new();
     let mut run = Vec::new();
@@ -115,6 +117,7 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     for (index, item) in items.iter().enumerate() {
         match function_call(item) {
             Some(call) if !is_interactive(call) => run.push(index),
+            None if matches!(item, MessageItem::Output(OutputItem::Reasoning(_))) => {}
             _ => flush(&mut run, &mut groups),
         }
     }
@@ -340,6 +343,7 @@ fn text_height(text: &Text<'static>, width: u16, wrap: bool) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_openai::types::responses::ReasoningItem;
 
     fn call(index: usize, name: &str) -> MessageItem {
         MessageItem::Output(OutputItem::FunctionCall(FunctionToolCall {
@@ -386,6 +390,32 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].member_indices, [3, 4, 5]);
+    }
+
+    #[test]
+    fn reasoning_does_not_break_a_tool_group() {
+        let reasoning = || {
+            MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
+                id: None,
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+                status: None,
+            }))
+        };
+        let items = vec![
+            call(0, "grep"),
+            reasoning(),
+            call(1, "blob"),
+            reasoning(),
+            call(2, "read_file"),
+        ];
+
+        let groups = discover_tool_groups(&items);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_indices, [0, 2, 4]);
+        assert_eq!(groups[0].title(3, 0), "Explored · 3 calls");
     }
 
     #[test]
