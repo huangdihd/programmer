@@ -649,6 +649,7 @@ impl Widget for &mut ConversationPanel {
             scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
         }
         scroll_view.render(content_area, buf, &mut self.scroll_view_state);
+        crate::ui::image_preview::render_protocol_images(content_area, buf);
 
         // The scroll view has now clamped the offset to its real value; store it
         // and the layout for click hit-testing on the next event.

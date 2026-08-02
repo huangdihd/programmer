@@ -622,14 +622,22 @@ mod tests {
         assert!(
             !plain(&collapsed.lines)
                 .iter()
-                .any(|line| line.contains('▀'))
+                .any(|line| line.chars().any(is_image_marker))
         );
 
         let expanded = ToolCallMessage::new(&call, 80)
             .output(Some(&output))
             .expanded(true)
             .into_text();
-        assert!(plain(&expanded.lines).iter().any(|line| line.contains('▀')));
+        assert!(
+            plain(&expanded.lines)
+                .iter()
+                .any(|line| line.chars().any(is_image_marker))
+        );
+    }
+
+    fn is_image_marker(c: char) -> bool {
+        ('\u{e000}'..='\u{f8ff}').contains(&c)
     }
 
     fn plain(lines: &[Line<'static>]) -> Vec<String> {

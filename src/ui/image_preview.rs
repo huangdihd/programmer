@@ -15,15 +15,52 @@
 
 use async_openai::types::responses::{FunctionCallOutput, InputContent};
 use base64::Engine;
-use image::{DynamicImage, GenericImageView, Rgba, imageops::FilterType};
-use ratatui::style::{Color, Style};
+use image::{DynamicImage, GenericImageView};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Rect, Size};
 use ratatui::text::{Line, Span};
-
-use crate::ui::markdown_theme::palette;
+use ratatui::widgets::Widget;
+use ratatui_image::picker::Picker;
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
+use ratatui_image::Resize;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 const MAX_PREVIEW_COLUMNS: u32 = 64;
 const MAX_PREVIEW_ROWS: u32 = 18;
 const PREVIEW_INDENT: &str = "      ";
+
+const MARKER_START: u32 = 0xE000;
+const MARKER_END: u32 = 0xF8FF;
+
+static PICKER: OnceLock<Picker> = OnceLock::new();
+static IMAGES: LazyLock<Mutex<ImageRegistry>> =
+    LazyLock::new(|| Mutex::new(ImageRegistry::default()));
+
+#[derive(Default)]
+struct ImageRegistry {
+    next_marker: u32,
+    by_key: HashMap<(blake3::Hash, u16, u16), usize>,
+    markers: HashMap<char, (usize, u16)>,
+    images: Vec<StoredImage>,
+}
+
+struct StoredImage {
+    protocol: SlicedProtocol,
+    markers: Vec<char>,
+}
+
+/// Detect the best graphics protocol (Kitty, iTerm2, Sixel, ...). This is
+/// intentionally called by terminal setup before crossterm starts consuming
+/// input; tests and non-interactive users retain the deterministic fallback.
+pub(crate) fn detect_terminal_protocol() {
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let _ = PICKER.set(picker);
+}
+
+fn picker() -> &'static Picker {
+    PICKER.get_or_init(Picker::halfblocks)
+}
 
 pub(crate) fn estimated_rows(content: &[InputContent]) -> u16 {
     let image_count = content
@@ -78,7 +115,7 @@ pub(crate) fn content_preview_lines(
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.extend(render_halfblocks(&image, available_width));
+        lines.extend(render_image_lines(image, available_width));
     }
     lines
 }
@@ -94,63 +131,100 @@ fn decode_data_url(url: &str) -> Option<DynamicImage> {
     image::load_from_memory(&bytes).ok()
 }
 
-fn render_halfblocks(image: &DynamicImage, available_width: u16) -> Vec<Line<'static>> {
+fn preview_size(image: &DynamicImage, available_width: u16) -> Size {
     let max_width = u32::from(available_width.saturating_sub(PREVIEW_INDENT.len() as u16))
         .clamp(1, MAX_PREVIEW_COLUMNS);
     let (source_width, source_height) = image.dimensions();
     if source_width == 0 || source_height == 0 {
-        return Vec::new();
+        return Size::ZERO;
     }
 
-    let width_scale = max_width as f64 / source_width as f64;
-    let height_scale = (MAX_PREVIEW_ROWS * 2) as f64 / source_height as f64;
+    let font = picker().font_size();
+    let source_columns = source_width as f64 / f64::from(font.width.max(1));
+    let source_rows = source_height as f64 / f64::from(font.height.max(1));
+    let width_scale = max_width as f64 / source_columns;
+    let height_scale = MAX_PREVIEW_ROWS as f64 / source_rows;
     let scale = width_scale.min(height_scale).min(1.0);
-    let width = (source_width as f64 * scale).round().max(1.0) as u32;
-    let height = (source_height as f64 * scale).round().max(1.0) as u32;
-    let pixels = image
-        .resize_exact(width, height, FilterType::Triangle)
-        .to_rgba8();
+    Size::new(
+        (source_columns * scale).ceil().max(1.0) as u16,
+        (source_rows * scale).ceil().max(1.0) as u16,
+    )
+}
 
-    (0..height.div_ceil(2))
+fn render_image_lines(image: DynamicImage, available_width: u16) -> Vec<Line<'static>> {
+    let size = preview_size(&image, available_width);
+    if size == Size::ZERO {
+        return Vec::new();
+    }
+    let encoded = image.to_rgba8();
+    let key = (blake3::hash(encoded.as_raw()), size.width, size.height);
+    let mut registry = IMAGES.lock().unwrap();
+    let image_id = if let Some(image_id) = registry.by_key.get(&key) {
+        *image_id
+    } else {
+        if MARKER_START + registry.next_marker + u32::from(size.height) > MARKER_END + 1 {
+            return Vec::new();
+        }
+        let Ok(protocol) = SlicedProtocol::new_with_resize(
+            picker(),
+            image,
+            size,
+            Resize::Fit(None),
+        ) else {
+            return Vec::new();
+        };
+        let image_id = registry.images.len();
+        let markers = (0..size.height)
+            .map(|row| {
+                let marker = char::from_u32(MARKER_START + registry.next_marker + u32::from(row))
+                    .expect("private-use marker is valid");
+                registry.markers.insert(marker, (image_id, row));
+                marker
+            })
+            .collect();
+        registry.next_marker += u32::from(size.height);
+        registry.images.push(StoredImage { protocol, markers });
+        registry.by_key.insert(key, image_id);
+        image_id
+    };
+    let markers = &registry.images[image_id].markers;
+
+    (0..size.height)
         .map(|row| {
-            let mut spans = Vec::with_capacity(width as usize + 1);
-            spans.push(Span::raw(PREVIEW_INDENT));
-            for column in 0..width {
-                let upper = composite(pixels.get_pixel(column, row * 2));
-                let lower = if row * 2 + 1 < height {
-                    composite(pixels.get_pixel(column, row * 2 + 1))
-                } else {
-                    surface_rgb()
-                };
-                spans.push(Span::styled(
-                    "▀",
-                    Style::new()
-                        .fg(Color::Rgb(upper.0, upper.1, upper.2))
-                        .bg(Color::Rgb(lower.0, lower.1, lower.2)),
-                ));
-            }
-            Line::from(spans)
+            Line::from(vec![
+                Span::raw(PREVIEW_INDENT),
+                Span::raw(markers[usize::from(row)].to_string()),
+            ])
         })
         .collect()
 }
 
-fn composite(pixel: &Rgba<u8>) -> (u8, u8, u8) {
-    let (background_red, background_green, background_blue) = surface_rgb();
-    let alpha = u16::from(pixel[3]);
-    let blend = |foreground: u8, background: u8| {
-        ((u16::from(foreground) * alpha + u16::from(background) * (255 - alpha)) / 255) as u8
-    };
-    (
-        blend(pixel[0], background_red),
-        blend(pixel[1], background_green),
-        blend(pixel[2], background_blue),
-    )
-}
-
-fn surface_rgb() -> (u8, u8, u8) {
-    match palette::SURFACE {
-        Color::Rgb(red, green, blue) => (red, green, blue),
-        _ => (0, 0, 0),
+/// Replace visible private-use placeholders with protocol-native, vertically
+/// sliced images. Slicing is essential inside the scrolling transcript: iTerm2
+/// cannot clip a whole inline image after it has been emitted.
+pub(crate) fn render_protocol_images(area: Rect, buf: &mut Buffer) {
+    let registry = IMAGES.lock().unwrap();
+    let mut placements: HashMap<usize, (u16, u16, u16)> = HashMap::new();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let Some(cell) = buf.cell((x, y)) else {
+                continue;
+            };
+            let mut chars = cell.symbol().chars();
+            let Some(marker) = chars.next() else { continue };
+            if chars.next().is_none()
+                && let Some(&(image_id, row)) = registry.markers.get(&marker)
+            {
+                placements.entry(image_id).or_insert((x, y, row));
+            }
+        }
+    }
+    for (image_id, (x, y, first_visible_row)) in placements {
+        let position = SignedPosition::from((
+            x.saturating_sub(area.x) as i16,
+            y.saturating_sub(area.y) as i16 - first_visible_row as i16,
+        ));
+        SlicedImage::new(&registry.images[image_id].protocol, position).render(area, buf);
     }
 }
 
@@ -191,17 +265,40 @@ mod tests {
     }
 
     #[test]
-    fn preview_uses_colored_halfblocks() {
+    fn preview_reserves_rows_for_a_protocol_image() {
         let lines = preview_lines(&output(), 80);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].spans[1].content.as_ref(), "▀");
-        assert!(matches!(
-            lines[0].spans[1].style.fg,
-            Some(Color::Rgb(255, 0, 0))
-        ));
-        assert!(matches!(
-            lines[0].spans[1].style.bg,
-            Some(Color::Rgb(0, 0, 255))
-        ));
+        let marker = lines[0].spans[1].content.chars().next().unwrap();
+        assert!((MARKER_START..=MARKER_END).contains(&(marker as u32)));
+
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buffer = Buffer::empty(area);
+        ratatui::widgets::Paragraph::new(lines).render(area, &mut buffer);
+        render_protocol_images(area, &mut buffer);
+        assert!((0..area.width).all(|x| buffer[(x, 0)].symbol() != marker.to_string()));
+    }
+
+    #[test]
+    fn partially_scrolled_image_still_renders() {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(40, 160, Rgb([255, 0, 0])));
+        let lines = render_image_lines(image, 40);
+        assert!(lines.len() > 2);
+
+        // Simulate ScrollView clipping the first two image rows: the remaining
+        // row markers must be enough to reconstruct the correct slice.
+        let visible = lines.into_iter().skip(2).collect::<Vec<_>>();
+        let area = Rect::new(0, 0, 40, visible.len() as u16);
+        let mut buffer = Buffer::empty(area);
+        ratatui::widgets::Paragraph::new(visible).render(area, &mut buffer);
+        render_protocol_images(area, &mut buffer);
+
+        assert!((0..area.height).all(|y| {
+            (0..area.width).all(|x| {
+                !buffer[(x, y)]
+                    .symbol()
+                    .chars()
+                    .any(|c| (MARKER_START..=MARKER_END).contains(&(c as u32)))
+            })
+        }));
     }
 }

@@ -67,6 +67,10 @@ impl TerminalGuard {
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
+        // ratatui-image must query stdio after entering the alternate screen
+        // and before the event reader starts. Unsupported terminals (or a
+        // failed query) deliberately fall back to its half-block protocol.
+        crate::ui::image_preview::detect_terminal_protocol();
         let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
         if keyboard_enhanced {
             execute!(

@@ -184,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn sent_image_renders_as_colored_halfblocks() {
+    fn sent_image_renders_through_the_selected_protocol() {
         let input = pasted_image_message(png_data_url());
         let area = Rect::new(0, 0, 40, 8);
         let mut buffer = Buffer::empty(area);
@@ -192,13 +192,18 @@ mod tests {
         UserMessage::new(&input, area.width)
             .into_paragraph()
             .render(area, &mut buffer);
+        crate::ui::image_preview::render_protocol_images(area, &mut buffer);
 
         let rendered = (0..area.height)
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
             .filter_map(|position| buffer.cell(position))
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains('▀'));
+        assert!(
+            !rendered
+                .chars()
+                .any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c))
+        );
         assert!(!rendered.contains("Pasted image"));
     }
 
@@ -213,7 +218,14 @@ mod tests {
             .render(area, &mut buffer);
 
         let image_row = (0..area.height)
-            .find(|&y| (0..area.width).any(|x| buffer[(x, y)].symbol() == "▀"))
+            .find(|&y| {
+                (0..area.width).any(|x| {
+                    buffer[(x, y)]
+                        .symbol()
+                        .chars()
+                        .any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c))
+                })
+            })
             .expect("image preview row");
         let text_row = (0..area.height)
             .find(|&y| (0..area.width).any(|x| buffer[(x, y)].symbol() == "C"))
