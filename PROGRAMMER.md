@@ -129,8 +129,9 @@ src/
 │   └── mod.rs                #   SessionManager, Session struct (JSON on disk), list/pick
 │
 ├── skills/                   # Agent skills (Vercel Labs compatible)
-│   ├── mod.rs                #   Skill discovery (project + global), shadowing
-│   └── skill.rs              #   Skill: name, description, body, constraints
+│   ├── builtin/              #   SKILL.md files compiled into the binary
+│   ├── mod.rs                #   Skill discovery (built-in + global + project), shadowing
+│   └── skill.rs              #   Skill: name, description, body, source, constraints
 │
 ├── tasks/                    # Background task system
 │   └── mod.rs                #   TaskRegistry (global), TaskHandle, status/io/kill
@@ -222,4 +223,4 @@ src/
 - **Constants** live in `src/consts.rs` — tunable values like output length limits, concurrency caps, tick rate, and classifier budgets.
 - **Prompts** are centralised in `src/prompts.rs`: system prompt, classifier instructions, and plan-mode injection.
 - **MCP integration** supports both stdio and HTTP transports. Tools are prefixed `mcp__<server>__<tool>` and merged into the advertised tool list.
-- **Skills** are discovered from `.programmer/skills/<name>/SKILL.md` (project) and `~/.config/programmer/skills/<name>/SKILL.md` (global). Project skills shadow global ones.
+- **Skills** are compiled from `src/skills/builtin/<name>/SKILL.md` or discovered from `.programmer/skills/<name>/SKILL.md` (project) and the platform config directory's `programmer/skills/<name>/SKILL.md` (global). Project skills shadow global skills, which shadow built-ins.

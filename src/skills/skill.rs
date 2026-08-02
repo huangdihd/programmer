@@ -32,11 +32,14 @@
 use std::path::Path;
 
 /// Where a skill file was loaded from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkillSource {
+    /// Shipped inside the `programmer` binary.
+    BuiltIn,
     /// Project-scoped: `.programmer/skills/<name>/SKILL.md`.
     Project,
-    /// User-global: `~/.config/programmer/skills/<name>/SKILL.md`.
+    /// User-global: the platform config directory's
+    /// `programmer/skills/<name>/SKILL.md`.
     Global,
 }
 
@@ -62,14 +65,23 @@ impl Skill {
         };
 
         let raw = std::fs::read_to_string(&file).ok()?;
-        let (front, body) = split_frontmatter(&raw)?;
+        Self::from_raw(&raw, SkillSource::Project)
+    }
+
+    /// Parse a skill embedded in the binary at compile time.
+    pub(crate) fn from_builtin(raw: &str) -> Option<Self> {
+        Self::from_raw(raw, SkillSource::BuiltIn)
+    }
+
+    fn from_raw(raw: &str, source: SkillSource) -> Option<Self> {
+        let (front, body) = split_frontmatter(raw)?;
         let (name, description) = parse_frontmatter(front)?;
 
         Some(Skill {
             name,
             description,
             body: body.to_string(),
-            source: SkillSource::Project,
+            source,
         })
     }
 

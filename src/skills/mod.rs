@@ -18,32 +18,39 @@
 //! ecosystem](https://github.com/vercel-labs/skills).
 //!
 //! Skills are discovered in:
+//! - Built-in: compiled into the `programmer` binary
 //! - Project: `.programmer/skills/<name>/SKILL.md`
-//! - Global:  `~/.config/programmer/skills/<name>/SKILL.md`
+//! - Global: the platform config directory's `programmer/skills/<name>/SKILL.md`
 //!
-//! Project skills shadow global skills with the same name.
+//! Project skills shadow global and built-in skills with the same name; global
+//! skills shadow built-ins.
 
 pub mod skill;
 
 use skill::Skill;
 use std::path::PathBuf;
 
-/// Manages installled and activated skills for the session.
+const BUILTIN_SKILLS: &[&str] = &[include_str!("builtin/programmer-guide/SKILL.md")];
+
+/// Manages installed and activated skills for the session.
 #[derive(Debug, Clone, Default)]
 pub struct SkillRegistry {
-    /// All discovered skills, keyed by name. Project skills shadow global.
+    /// All discovered skills, keyed by name. Project skills shadow global and
+    /// built-in skills; global skills shadow built-ins.
     skills: std::collections::HashMap<String, Skill>,
     /// Names of currently activated skills (in activation order).
     activated: Vec<String>,
 }
 
 impl SkillRegistry {
-    /// Scan both the global and project skill directories and build the
-    /// registry. Project skills take precedence over global.
+    /// Load built-in skills, scan global and project skill directories, and
+    /// build the registry in increasing precedence order.
     pub(crate) fn load() -> Self {
         let mut registry = SkillRegistry::default();
 
-        // Global skills first (so project can override).
+        // Built-ins are the lowest-precedence source.
+        registry.load_builtins();
+        // Global skills next (so project can override them).
         if let Some(dir) = global_skills_dir() {
             registry.scan_dir(&dir, true);
         }
@@ -52,6 +59,14 @@ impl SkillRegistry {
         registry.scan_dir(&project_dir, false);
 
         registry
+    }
+
+    fn load_builtins(&mut self) {
+        for &raw in BUILTIN_SKILLS {
+            if let Some(skill) = Skill::from_builtin(raw) {
+                self.skills.insert(skill.name.clone(), skill);
+            }
+        }
     }
 
     /// Scan a directory for skills. Each subdirectory containing a `SKILL.md`
@@ -213,6 +228,24 @@ mod tests {
     fn combined_prompt_empty_when_no_active_skills() {
         let reg = SkillRegistry::default();
         assert!(reg.combined_prompt().is_none());
+    }
+
+    #[test]
+    fn built_in_programmer_guide_is_available() {
+        let mut reg = SkillRegistry::default();
+        reg.load_builtins();
+
+        let skill = reg
+            .get("programmer-guide")
+            .expect("built-in skill should load");
+        assert_eq!(skill.source, skill::SkillSource::BuiltIn);
+        assert!(skill.body.contains("Programmer's identity"));
+        assert!(reg.activate("programmer-guide"));
+        assert!(
+            reg.combined_prompt()
+                .unwrap()
+                .contains("## Skill: programmer-guide")
+        );
     }
 
     #[test]

@@ -179,8 +179,8 @@ Cycle with `Ctrl+T` or `/mode <name>`.
 | Mode | Icon | Behaviour |
 |---|---|---|
 | **Manual** | 🛡 | Every write/edit/command call shows an approval prompt. Read-only tools run automatically. |
-| **Allow Edits** | ✏️ | All tool calls auto-approve — no prompts, no LLM overhead. Default mode. |
-| **Auto** | 🤖 | Write/edit/command calls are classified by a separate LLM each turn. See below. |
+| **Auto** | 🤖 | Calls that need review are classified by a separate LLM each turn. Default mode; see below. |
+| **Plan** | 📋 | The agent explores read-only, presents a plan, and waits for approval before execution. |
 | **YOLO** | ⚡ | Everything runs unchecked. Gated behind `allow_yolo = true` in config. |
 
 ### Auto mode classifier
@@ -245,7 +245,7 @@ programmer
 | Key | Action |
 |---|---|
 | `Enter` | Send message |
-| `Ctrl+T` | Cycle work mode (Manual → AllowEdits → Auto) |
+| `Ctrl+T` | Cycle work mode (Manual → Auto → Plan → optional YOLO) |
 | `Ctrl+C` / `Ctrl+Q` | Quit |
 | Mouse scroll | Scroll conversation history |
 | `!<command>` + `Enter` | Run a command interactively in a terminal panel (Ctrl+O releases input) |
@@ -255,7 +255,7 @@ programmer
 | Command | Action |
 |---|---|
 | `/model <provider/model>` | Switch to a different model |
-| `/mode <manual\|edits\|auto>` | Set work mode (or cycle with `Ctrl+T`) |
+| `/mode <manual\|auto\|plan>` | Set work mode (or cycle with `Ctrl+T`) |
 | `/mode yolo` | Enter YOLO mode (requires `allow_yolo = true`) |
 | `/classifier [provider/model]` | Set/show the Auto-mode classifier model |
 | `/classifier clear` | Reset classifier to the chat model |
@@ -303,6 +303,23 @@ Open with `/providers manage` or the `--providers` flag.
 | `Shift+Tab` / `↑` | Previous field |
 | `Enter` | Save provider |
 | `Esc` | Cancel |
+
+### Skills
+
+Activate reusable instruction modules with `/skill <name>` or manage them in
+the `/skill manage` panel. Programmer ships with a built-in
+`programmer-guide` skill that explains Programmer's own features, controls,
+paths, security model, and architecture; activate it with:
+
+```text
+/skill programmer-guide
+```
+
+Additional skills are loaded from `.programmer/skills/<name>/SKILL.md` in the
+current project and from the platform config directory's
+`programmer/skills/<name>/SKILL.md`. Project skills override global skills with
+the same name, and global skills override built-ins. The active skill set is
+saved with the session.
 
 ### Headless mode
 

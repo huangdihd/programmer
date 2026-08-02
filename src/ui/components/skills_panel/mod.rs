@@ -17,9 +17,10 @@
 //!
 //! Opened with `/skills manage` inside the app. Lists every discovered skill
 //! and lets the user activate/deactivate them. Skills themselves are read-only
-//! (loaded from `SKILL.md` files on disk), so this panel only toggles the
-//! active set. Every change is reported via [`PanelAction::Saved`] so the app
-//! can persist `activated_skills` with the session.
+//! (either built into the binary or loaded from `SKILL.md` files on disk), so
+//! this panel only toggles the active set. Every change is reported via
+//! [`PanelAction::Saved`] so the app can persist `activated_skills` with the
+//! session.
 
 use crate::skills::SkillRegistry;
 use crate::skills::skill::SkillSource;
@@ -246,10 +247,11 @@ impl SkillsPanel {
 }
 
 /// A short label for where a skill was loaded from.
-fn source_label(source: &SkillSource) -> String {
+fn source_label(source: &SkillSource) -> &'static str {
     match source {
-        SkillSource::Project => "project".to_string(),
-        SkillSource::Global => "global".to_string(),
+        SkillSource::BuiltIn => "built-in",
+        SkillSource::Project => "project",
+        SkillSource::Global => "global",
     }
 }
 
