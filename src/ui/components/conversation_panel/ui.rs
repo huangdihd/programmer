@@ -127,7 +127,7 @@ fn build_item_paragraph(
             // Only reached for orphan results whose call is missing; results
             // with a call render inside that call's item.
             (
-                ToolResultMessage::new(output)
+                ToolResultMessage::new(output, content_width)
                     .failed(*failed)
                     .expanded(expanded)
                     .into_paragraph(),
