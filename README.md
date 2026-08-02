@@ -315,11 +315,12 @@ paths, security model, and architecture; activate it with:
 /skill programmer-guide
 ```
 
-Additional skills are loaded from `.programmer/skills/<name>/SKILL.md` in the
-current project and from the platform config directory's
-`programmer/skills/<name>/SKILL.md`. Project skills override global skills with
-the same name, and global skills override built-ins. The active skill set is
-saved with the session.
+Additional skills are loaded from the cross-agent `~/.agents/skills/<name>/`
+directory, from the platform config directory's
+`programmer/skills/<name>/SKILL.md`, and from
+`.programmer/skills/<name>/SKILL.md` in the current project. Name collisions
+resolve in this order: project > Programmer global > shared > built-in. The
+active skill set is saved with the session.
 
 ### Headless mode
 

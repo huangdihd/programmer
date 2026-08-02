@@ -80,15 +80,17 @@ completion for the exact controls in the installed version.
 - Project instructions: `PROGRAMMER.md`.
 - Project diagnostics: `.programmer/diagnostics.toml`.
 - Project skills: `.programmer/skills/<name>/SKILL.md`.
+- Cross-agent shared skills: `~/.agents/skills/<name>/SKILL.md`.
 - Long tool-output archives: `.programmer/outputs/`.
 - Global configuration, sessions, todos, and skills live below the platform's
   standard application config directory under `programmer/`. On macOS this is
   normally `~/Library/Application Support/programmer/`; on Linux it is normally
   `~/.config/programmer/`; on Windows it is normally `%APPDATA%\programmer\`.
 
-Built-in skills are compiled into Programmer. Global skills can override a
-built-in with the same name, and project skills can override both. Skills are
-activated explicitly and the active set is saved with the session.
+Built-in skills are compiled into Programmer. Shared `~/.agents/skills` can
+override built-ins, Programmer-global skills can override shared skills, and
+project skills can override all other sources. Skills are activated explicitly
+and the active set is saved with the session.
 
 ## Other interfaces
 

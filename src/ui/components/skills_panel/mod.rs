@@ -250,8 +250,9 @@ impl SkillsPanel {
 fn source_label(source: &SkillSource) -> &'static str {
     match source {
         SkillSource::BuiltIn => "built-in",
-        SkillSource::Project => "project",
+        SkillSource::Shared => "shared",
         SkillSource::Global => "global",
+        SkillSource::Project => "project",
     }
 }
 

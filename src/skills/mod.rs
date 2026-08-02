@@ -19,15 +19,17 @@
 //!
 //! Skills are discovered in:
 //! - Built-in: compiled into the `programmer` binary
-//! - Project: `.programmer/skills/<name>/SKILL.md`
+//! - Shared: `~/.agents/skills/<name>/SKILL.md`
 //! - Global: the platform config directory's `programmer/skills/<name>/SKILL.md`
+//! - Project: `.programmer/skills/<name>/SKILL.md`
 //!
-//! Project skills shadow global and built-in skills with the same name; global
-//! skills shadow built-ins.
+//! Project skills shadow global, shared, and built-in skills with the same
+//! name. Global skills shadow shared and built-in skills; shared skills shadow
+//! built-ins.
 
 pub mod skill;
 
-use skill::Skill;
+use skill::{Skill, SkillSource};
 use std::path::PathBuf;
 
 const BUILTIN_SKILLS: &[&str] = &[include_str!("builtin/programmer-guide/SKILL.md")];
@@ -35,28 +37,31 @@ const BUILTIN_SKILLS: &[&str] = &[include_str!("builtin/programmer-guide/SKILL.m
 /// Manages installed and activated skills for the session.
 #[derive(Debug, Clone, Default)]
 pub struct SkillRegistry {
-    /// All discovered skills, keyed by name. Project skills shadow global and
-    /// built-in skills; global skills shadow built-ins.
+    /// All discovered skills, keyed by name, with later sources overriding
+    /// earlier ones in built-in → shared → global → project order.
     skills: std::collections::HashMap<String, Skill>,
     /// Names of currently activated skills (in activation order).
     activated: Vec<String>,
 }
 
 impl SkillRegistry {
-    /// Load built-in skills, scan global and project skill directories, and
-    /// build the registry in increasing precedence order.
+    /// Load every skill source in increasing precedence order.
     pub(crate) fn load() -> Self {
         let mut registry = SkillRegistry::default();
 
         // Built-ins are the lowest-precedence source.
         registry.load_builtins();
-        // Global skills next (so project can override them).
-        if let Some(dir) = global_skills_dir() {
-            registry.scan_dir(&dir, true);
+        // Cross-agent skills are available without Programmer-specific setup.
+        if let Some(dir) = shared_skills_dir() {
+            registry.scan_dir(&dir, SkillSource::Shared);
         }
-        // Project skills override global.
+        // Programmer-global skills override shared ones.
+        if let Some(dir) = global_skills_dir() {
+            registry.scan_dir(&dir, SkillSource::Global);
+        }
+        // Project skills override every other source.
         let project_dir = project_skills_dir();
-        registry.scan_dir(&project_dir, false);
+        registry.scan_dir(&project_dir, SkillSource::Project);
 
         registry
     }
@@ -71,20 +76,18 @@ impl SkillRegistry {
 
     /// Scan a directory for skills. Each subdirectory containing a `SKILL.md`
     /// counts as one skill. Direct `.md` files also work.
-    fn scan_dir(&mut self, dir: &std::path::Path, is_global: bool) {
+    fn scan_dir(&mut self, dir: &std::path::Path, source: SkillSource) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let mut skill = match Skill::from_path(&path) {
+            let skill = match Skill::from_path(&path) {
                 Some(s) => s,
                 None => continue,
-            };
-            if is_global {
-                skill = skill.with_global_source();
             }
-            // Project skills replace global ones with the same name.
+            .with_source(source);
+            // Later sources replace earlier ones with the same name.
             self.skills.insert(skill.name.clone(), skill);
         }
     }
@@ -200,7 +203,13 @@ fn project_skills_dir() -> PathBuf {
     PathBuf::from(".programmer").join("skills")
 }
 
-/// Global skill directory: `~/.config/programmer/skills/`.
+/// Cross-agent shared skill directory: `~/.agents/skills/`.
+fn shared_skills_dir() -> Option<PathBuf> {
+    let dir = dirs::home_dir()?.join(".agents").join("skills");
+    Some(dir)
+}
+
+/// Programmer-global skill directory under the platform config directory.
 fn global_skills_dir() -> Option<PathBuf> {
     let dir = dirs::config_dir()?.join("programmer").join("skills");
     Some(dir)
@@ -238,7 +247,7 @@ mod tests {
         let skill = reg
             .get("programmer-guide")
             .expect("built-in skill should load");
-        assert_eq!(skill.source, skill::SkillSource::BuiltIn);
+        assert_eq!(skill.source, SkillSource::BuiltIn);
         assert!(skill.body.contains("Programmer's identity"));
         assert!(reg.activate("programmer-guide"));
         assert!(
@@ -281,7 +290,7 @@ mod tests {
         writeln!(file, "Use React.memo").unwrap();
 
         let mut reg = SkillRegistry::default();
-        reg.scan_dir(&skills_dir, false);
+        reg.scan_dir(&skills_dir, SkillSource::Project);
 
         let mut names = reg.names();
         names.sort();
@@ -310,5 +319,42 @@ mod tests {
         assert!(!reg.has_active());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_skill_sources_follow_shared_global_project_precedence() {
+        fn write_skill(dir: &std::path::Path, body: &str) {
+            let skill_dir = dir.join("same-name");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: same-name\ndescription: precedence test\n---\n\n{body}\n"),
+            )
+            .unwrap();
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "programmer_skill_precedence_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = root.join("shared");
+        let global = root.join("global");
+        let project = root.join("project");
+        write_skill(&shared, "shared body");
+        write_skill(&global, "global body");
+        write_skill(&project, "project body");
+
+        let mut reg = SkillRegistry::default();
+        reg.scan_dir(&shared, SkillSource::Shared);
+        assert_eq!(reg.get("same-name").unwrap().source, SkillSource::Shared);
+        reg.scan_dir(&global, SkillSource::Global);
+        assert_eq!(reg.get("same-name").unwrap().source, SkillSource::Global);
+        reg.scan_dir(&project, SkillSource::Project);
+        let selected = reg.get("same-name").unwrap();
+        assert_eq!(selected.source, SkillSource::Project);
+        assert!(selected.body.contains("project body"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

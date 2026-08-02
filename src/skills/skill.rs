@@ -36,11 +36,13 @@ use std::path::Path;
 pub(crate) enum SkillSource {
     /// Shipped inside the `programmer` binary.
     BuiltIn,
-    /// Project-scoped: `.programmer/skills/<name>/SKILL.md`.
-    Project,
+    /// Cross-agent shared: `~/.agents/skills/<name>/SKILL.md`.
+    Shared,
     /// User-global: the platform config directory's
     /// `programmer/skills/<name>/SKILL.md`.
     Global,
+    /// Project-scoped: `.programmer/skills/<name>/SKILL.md`.
+    Project,
 }
 
 /// A skill loaded from a `SKILL.md` file.
@@ -85,9 +87,9 @@ impl Skill {
         })
     }
 
-    /// Re-tag the source as global.
-    pub(crate) fn with_global_source(mut self) -> Self {
-        self.source = SkillSource::Global;
+    /// Re-tag a disk-loaded skill with the directory it came from.
+    pub(crate) fn with_source(mut self, source: SkillSource) -> Self {
+        self.source = source;
         self
     }
 

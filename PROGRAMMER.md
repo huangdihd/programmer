@@ -223,4 +223,4 @@ src/
 - **Constants** live in `src/consts.rs` — tunable values like output length limits, concurrency caps, tick rate, and classifier budgets.
 - **Prompts** are centralised in `src/prompts.rs`: system prompt, classifier instructions, and plan-mode injection.
 - **MCP integration** supports both stdio and HTTP transports. Tools are prefixed `mcp__<server>__<tool>` and merged into the advertised tool list.
-- **Skills** are compiled from `src/skills/builtin/<name>/SKILL.md` or discovered from `.programmer/skills/<name>/SKILL.md` (project) and the platform config directory's `programmer/skills/<name>/SKILL.md` (global). Project skills shadow global skills, which shadow built-ins.
+- **Skills** are compiled from `src/skills/builtin/<name>/SKILL.md` or discovered from `~/.agents/skills/<name>/SKILL.md` (shared), the platform config directory's `programmer/skills/<name>/SKILL.md` (global), and `.programmer/skills/<name>/SKILL.md` (project). Precedence is project > global > shared > built-in.
