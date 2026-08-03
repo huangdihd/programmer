@@ -24,8 +24,12 @@
 //! (once reasoning is involved) rather than waiting for the full run to close.
 //! This is what lets a streaming thought be absorbed into its group the moment
 //! the first call of the run appears, instead of lingering standalone until
-//! enough calls have piled up. Closed runs keep the [`MIN_TOOL_GROUP_SIZE`]
-//! threshold so short, finished sequences stay easy to scan as ordinary calls.
+//! enough calls have piled up. Groups stay collapsed by default; while
+//! collapsed, a group with absorbed reasoning shows the current thought as a
+//! muted summary line under its header, so a streaming thought stays visible
+//! without forcing the whole group open. Closed runs keep the
+//! [`MIN_TOOL_GROUP_SIZE`] threshold so short, finished sequences stay easy to
+//! scan as ordinary calls.
 
 use async_openai::types::responses::{
     FunctionCallOutputItemParam, FunctionToolCall, OutputItem,
@@ -46,6 +50,10 @@ use async_openai::types::responses::ReasoningItem;
 /// Small sequences stay easier to scan as ordinary calls.
 pub(crate) const MIN_TOOL_GROUP_SIZE: usize = 3;
 
+/// How many tool names the collapsed summary shows before abbreviating with
+/// `…`, keeping the muted detail line short enough to rarely wrap.
+const SUMMARY_TOOL_CAP: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolGroup {
     /// Stable view-state key: the first call's protocol identifier.
@@ -58,8 +66,8 @@ pub(crate) struct ToolGroup {
     /// where the model actually emitted them.
     pub absorbed: Vec<usize>,
     /// True when this run still extends to the end of the transcript, so more
-    /// calls may be appended. Open groups render expanded (their streaming
-    /// members stay visible) until a boundary item closes the run.
+    /// calls may be appended. Open groups are grouped from their first member
+    /// but render collapsed by default, same as closed ones.
     pub open: bool,
     kind: ToolGroupKind,
 }
@@ -255,12 +263,19 @@ fn mcp_server(name: &str) -> Option<&str> {
 }
 
 impl ToolGroup {
-    pub(crate) fn title(&self, completed: usize, failed: usize) -> String {
-        let total = self.member_indices.len();
+    /// The shared MCP server when this group runs tools of a single server.
+    fn mcp_server(&self) -> Option<&str> {
+        match &self.kind {
+            ToolGroupKind::Mcp(server) => Some(server),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn title(&self, completed: usize, failed: usize) -> String {        let total = self.member_indices.len();
         let mut title = if completed < total {
             format!("{}… · {completed}/{total}", self.kind.active_title())
         } else {
-            format!("{} · {total} calls", self.kind.completed_title())
+            self.kind.completed_title().to_string()
         };
         if failed > 0 {
             title.push_str(&format!(" · {failed} failed"));
@@ -303,12 +318,20 @@ impl ToolGroupKind {
 
 /// Render a group header and, when open, its individually foldable calls and
 /// absorbed reasoning items (in conversation order).
+///
+/// Collapsed, the header is followed by a muted summary line describing the
+/// run — the tool names, the MCP server when the group is uniform, and the
+/// current thought state last (`✻ Thinking…` while streaming, `✻ Thought` once
+/// done) — so absorbed reasoning stays visible without expanding the group.
+/// `thought_in_progress` reflects the live streaming state of the absorbed
+/// reasoning (committed groups pass `false`).
 pub(crate) fn build_tool_group_paragraph<'a>(
     group: &ToolGroup,
     members: &[ToolGroupMember<'a>],
     absorbed: &[(usize, &'a ReasoningItem, bool)],
     width: u16,
     expanded: bool,
+    thought_in_progress: bool,
 ) -> (Paragraph<'static>, Vec<MemberHeader>) {
     let completed = members
         .iter()
@@ -334,6 +357,14 @@ pub(crate) fn build_tool_group_paragraph<'a>(
             Style::new().fg(color).add_modifier(Modifier::BOLD),
         ),
     ])];
+    // Collapsed groups get a muted summary line: which tools, the MCP server
+    // when the group is uniform, and the thought state last.
+    if !expanded {
+        lines.push(Line::from(Span::styled(
+            collapsed_summary(group, members, thought_in_progress),
+            muted,
+        )));
+    }
     let mut headers = Vec::new();
     let wrap = members.iter().any(|member| member.expanded)
         || absorbed.iter().any(|(_, _, expanded)| *expanded);
@@ -411,6 +442,45 @@ fn text_height(text: &Text<'static>, width: u16, wrap: bool) -> u16 {
     paragraph.line_count(width) as u16
 }
 
+/// The muted detail line under a collapsed group header: the tool names, the
+/// MCP server when the group is uniform, and the thought state last.
+fn collapsed_summary(
+    group: &ToolGroup,
+    members: &[ToolGroupMember<'_>],
+    thought_in_progress: bool,
+) -> String {
+    let mut parts = Vec::with_capacity(4);
+    let names: Vec<String> = members
+        .iter()
+        .map(|member| display_tool_name(&member.call.name))
+        .collect();
+    if names.len() > SUMMARY_TOOL_CAP {
+        parts.push(format!("{}, …", names[..SUMMARY_TOOL_CAP].join(", ")));
+    } else {
+        parts.push(names.join(", "));
+    }
+    if let Some(server) = group.mcp_server() {
+        parts.push(format!("via {server}"));
+    }
+    if !group.absorbed.is_empty() {
+        parts.push(if thought_in_progress {
+            "✻ Thinking…".into()
+        } else {
+            "✻ Thought".into()
+        });
+    }
+    parts.join(" · ")
+}
+
+/// The tool name as shown in the collapsed summary: MCP calls drop their
+/// `mcp__<server>__` prefix, local calls keep their name.
+fn display_tool_name(name: &str) -> String {
+    name.strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        .map(|(_, tool)| tool.to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,7 +516,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].key, "call-0");
         assert_eq!(groups[0].member_indices, [0, 1, 2]);
-        assert_eq!(groups[0].title(3, 0), "Explored · 3 calls");
+        assert_eq!(groups[0].title(3, 0), "Explored");
     }
 
     #[test]
@@ -581,7 +651,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].member_indices, [0, 2, 4]);
         assert_eq!(groups[0].absorbed, [1, 3]);
-        assert_eq!(groups[0].title(3, 0), "Explored · 3 calls");
+        assert_eq!(groups[0].title(3, 0), "Explored");
     }
 
     #[test]
@@ -615,7 +685,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].member_indices, [0, 2, 4]);
         assert_eq!(groups[0].absorbed, Vec::<usize>::new());
-        assert_eq!(groups[0].title(3, 0), "Explored · 3 calls");
+        assert_eq!(groups[0].title(3, 0), "Explored");
     }
 
     #[test]
@@ -628,7 +698,7 @@ mod tests {
         let group = discover_tool_groups(&items).pop().unwrap();
 
         assert_eq!(group.title(1, 0), "Implementing… · 1/3");
-        assert_eq!(group.title(3, 1), "Implemented · 3 calls · 1 failed");
+        assert_eq!(group.title(3, 1), "Implemented · 1 failed");
     }
 
     #[test]
@@ -673,7 +743,7 @@ mod tests {
             })
             .collect();
 
-        let (paragraph, _) = build_tool_group_paragraph(&group, &members, &absorbed, 80, true);
+        let (paragraph, _) = build_tool_group_paragraph(&group, &members, &absorbed, 80, true, false);
         let rendered = render_paragraph(&paragraph, 80, 40);
         let grep_row = rendered.lines().position(|l| l.contains("grep")).unwrap();
         let thought_rows = rendered
@@ -688,12 +758,18 @@ mod tests {
         assert!(thought_rows[0] > grep_row && thought_rows[0] < blob_row);
         assert!(thought_rows[1] > blob_row);
 
-        // Folded: the thoughts disappear into the header.
-        let (paragraph, _) = build_tool_group_paragraph(&group, &members, &absorbed, 80, false);
+        // Folded: the calls and thoughts disappear into the header, which now
+        // carries a muted summary line: tool names, then the thought state.
+        let (paragraph, _) = build_tool_group_paragraph(&group, &members, &absorbed, 80, false, false);
         let rendered = render_paragraph(&paragraph, 80, 40);
-        assert!(!rendered.contains("✻ Thought"));
-        assert!(!rendered.contains("grep"));
-        assert!(rendered.contains("Exploring… · 0/3"));
+        assert!(!rendered.contains("grep  {}"), "{rendered}");
+        assert!(rendered.contains("Exploring… · 0/3"), "{rendered}");
+        let summary = rendered.lines().find(|line| line.contains("✻ Thought")).unwrap();
+        assert!(summary.contains("grep, blob, read_file"), "{summary}");
+        // The thought state is the last piece of the summary.
+        let grep_pos = summary.find("read_file").unwrap();
+        let thought_pos = summary.find("✻").unwrap();
+        assert!(thought_pos > grep_pos, "{summary}");
     }
 
     fn render_paragraph(paragraph: &Paragraph<'static>, width: u16, height: u16) -> String {
@@ -726,7 +802,7 @@ mod tests {
 
         assert_eq!(
             discover_tool_groups(&same_server)[0].title(3, 0),
-            "Used browser tools · 3 calls"
+            "Used browser tools"
         );
         assert_eq!(
             discover_tool_groups(&mixed_servers)[0].title(0, 0),

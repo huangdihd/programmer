@@ -278,8 +278,7 @@ impl Widget for &mut ConversationPanel {
                 let group = &tool_groups[group_index];
                 if group.member_indices[0] != index {
                     0
-                } else if (group.open && !group.absorbed.is_empty())
-                    || self.expanded_tool_groups.contains(&group.key)
+                } else if self.expanded_tool_groups.contains(&group.key)
                 {
                     1 + group
                         .member_indices
@@ -387,11 +386,9 @@ impl Widget for &mut ConversationPanel {
             };
             let in_viewport = index >= build_from || in_window[index];
             let group_render_key = group.filter(|_| is_group_start).map(|group| {
-                // An open run with absorbed reasoning stays expanded so a
-                // streaming thought never vanishes; plain call batches keep
-                // the user's collapse state (default collapsed).
-                let group_expanded = (group.open && !group.absorbed.is_empty())
-                    || self.expanded_tool_groups.contains(&group.key);
+                // Open runs stay collapsed by default, same as closed ones;
+                // only the user's explicit expansion opens a group.
+                let group_expanded = self.expanded_tool_groups.contains(&group.key);
                 let member_states = group.member_indices.iter().map(|&member_index| {
                     let call = function_call(&conv.items[member_index]).unwrap();
                     let output = outputs_by_call.get(call.call_id.as_str());
@@ -461,8 +458,7 @@ impl Widget for &mut ConversationPanel {
                             }),
                     }
                 } else if let Some(group) = group.filter(|_| is_group_start) {
-                    let group_expanded = (group.open && !group.absorbed.is_empty())
-                        || self.expanded_tool_groups.contains(&group.key);
+                    let group_expanded = self.expanded_tool_groups.contains(&group.key);
                     let live_outputs: Vec<Option<String>> = group
                         .member_indices
                         .iter()
@@ -506,6 +502,7 @@ impl Widget for &mut ConversationPanel {
                         &absorbed,
                         content_width,
                         group_expanded,
+                        false,
                     );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
@@ -620,10 +617,22 @@ impl Widget for &mut ConversationPanel {
                         (index, item, self.live_expanded_items.contains(&index))
                     })
                     .collect();
-                // Open runs are forced expanded so the streaming thought and
-                // calls stay visible as they arrive.
-                let (paragraph, member_headers) =
-                    build_tool_group_paragraph(group, &members, &absorbed, content_width, true);
+                // Live groups stay collapsed by default, same as committed
+                // ones; the streaming thought state rides on the muted summary
+                // line under the header.
+                let group_expanded = self.live_expanded_groups.contains(&group.key);
+                let thought_in_progress = group
+                    .absorbed
+                    .iter()
+                    .any(|&index| receiving_items[index].1);
+                let (paragraph, member_headers) = build_tool_group_paragraph(
+                    group,
+                    &members,
+                    &absorbed,
+                    content_width,
+                    group_expanded,
+                    thought_in_progress,
+                );
                 let height = paragraph.line_count(content_width) as u16;
                 live_group_headers.push(Some((group.key.clone(), member_headers)));
                 live_paragraphs.push((paragraph, height, Vec::new()));
@@ -923,7 +932,7 @@ mod tests {
             });
         }
         let completed = render_text(&mut panel, area);
-        assert!(completed.contains("Explored · 3 calls · 1 failed"));
+        assert!(completed.contains("Explored · 1 failed"));
     }
 
     fn tool_call(index: usize, name: &str) -> FunctionToolCall {
@@ -956,11 +965,13 @@ mod tests {
         // A thought plus a single call arrive in the live stream. Before this
         // fix the thought rendered standalone until the whole response was
         // committed; now the open run groups immediately and the thought is
-        // absorbed into the group's paragraph.
+        // absorbed into the group's muted summary line. The group stays
+        // collapsed by default.
         use crate::cancel::CancellationToken;
         use async_openai::types::responses::{
             ReasoningItem, ResponseOutputItemAddedEvent, ResponseStreamEvent,
-        };        let mut panel = ConversationPanel::new();
+        };
+        let mut panel = ConversationPanel::new();
         panel.receiving_response =
             Some(crate::response::partial_response::PartialResponse::new(
                 CancellationToken::new(),
@@ -988,14 +999,26 @@ mod tests {
 
         let area = Rect::new(0, 0, 80, 24);
         let rendered = render_text(&mut panel, area);
-        // Group header present, and the call sits under it rather than the
-        // thought standing alone above a flat call item.
+        // The group header is there and the group is collapsed: the call's
+        // detail text is hidden behind the folded header.
         assert!(rendered.contains("Exploring… · 0/1"), "{rendered}");
-        assert!(rendered.contains("grep  {}"), "{rendered}");
-        assert!(rendered.contains("✻ Thought"), "{rendered}");
-        // The thought renders inside the group: it comes after the header.
+        assert!(!rendered.contains("grep  {}"), "{rendered}");
+        // The thought was absorbed into the group: it appears on the muted
+        // summary line right under the header, still streaming, and its
+        // status string is the last piece of that line.
         let header_row = rendered.lines().position(|l| l.contains("Exploring")).unwrap();
-        let thought_row = rendered.lines().position(|l| l.contains("✻")).unwrap();
-        assert!(thought_row > header_row, "{rendered}");
+        let summary_row = rendered.lines().position(|l| l.contains("✻")).unwrap();
+        assert_eq!(summary_row, header_row + 1, "{rendered}");
+        let summary = rendered.lines().nth(summary_row).unwrap();
+        assert!(summary.contains("grep"), "{summary}");
+        let grep_pos = summary.find("grep").unwrap();
+        let thought_pos = summary.find("✻").unwrap();
+        assert!(thought_pos > grep_pos, "{summary}");
+        assert!(summary.contains("✻ Thinking"), "{summary}");
+
+        // Clicking the header expands the live group, showing the call.
+        panel.handle_click(2, header_row as u16);
+        let expanded = render_text(&mut panel, area);
+        assert!(expanded.contains("grep  {}"), "{expanded}");
     }
 }

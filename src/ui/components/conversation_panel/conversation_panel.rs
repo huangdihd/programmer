@@ -304,6 +304,10 @@ pub struct ConversationPanel {
     /// Indices into the live (streaming) items that the user has expanded.
     /// Cleared when a new stream starts.
     pub(crate) live_expanded_items: HashSet<usize>,
+    /// Group keys of live (streaming) tool groups the user has expanded.
+    /// Mirrors [`Self::expanded_tool_groups`] for the in-flight view; live
+    /// groups stay collapsed by default.
+    pub(crate) live_expanded_groups: HashSet<String>,
     /// The current mouse text selection, if any.
     pub(crate) selection: Option<Selection>,
     /// The streaming items' paragraphs from the last render (paragraph, height,
@@ -349,6 +353,7 @@ impl ConversationPanel {
             render_cache: RenderCache::default(),
             frame_count: 0,
             live_expanded_items: HashSet::new(),
+            live_expanded_groups: HashSet::new(),
             selection: None,
             live_paragraphs: Vec::new(),
             pending_layout: None,
@@ -393,14 +398,19 @@ impl ConversationPanel {
 
         // Live groups sit after finished content in the scroll buffer; check
         // their member hit regions before the flat live-item layout so a click
-        // on a member row toggles that member (the group's own header is a
-        // no-op: open runs stay expanded while streaming).
+        // on the header row toggles the group and a click on a member row
+        // toggles that member.
         if let Some(group) = self
             .live_tool_group_layout
             .iter()
             .find(|group| buffer_y >= group.top && buffer_y < group.bottom)
         {
-            if let Some(header) = group
+            if buffer_y == group.top {
+                let key = group.key.clone();
+                if !self.live_expanded_groups.remove(&key) {
+                    self.live_expanded_groups.insert(key);
+                }
+            } else if let Some(header) = group
                 .member_headers
                 .iter()
                 .find(|header| buffer_y >= header.top && buffer_y < header.bottom)
@@ -741,6 +751,7 @@ impl ConversationPanel {
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
         self.live_expanded_items.clear();
+        self.live_expanded_groups.clear();
         self.selection = None;
         self.stick_to_bottom = true;
     }
@@ -780,6 +791,9 @@ impl ConversationPanel {
                 self.expanded_items.insert(base_index + live_idx);
             }
             self.live_expanded_items.clear();
+            // Live groups carry the same keys (first call's protocol id) as
+            // the committed ones, so keep any user expansion across the swap.
+            self.expanded_tool_groups.extend(self.live_expanded_groups.drain());
         }
     }
 
@@ -796,6 +810,7 @@ impl ConversationPanel {
             for &live_idx in &self.live_expanded_items {
                 self.expanded_items.insert(base_index + live_idx);
             }
+            self.expanded_tool_groups.extend(self.live_expanded_groups.drain());
             let cancelled = partial.cancelled.is_cancelled();
             let items: Vec<OutputItem> = if cancelled {
                 // When the user cancelled, drop all function calls so they
