@@ -37,9 +37,10 @@ static PICKER: OnceLock<Picker> = OnceLock::new();
 static IMAGES: LazyLock<Mutex<ImageRegistry>> =
     LazyLock::new(|| Mutex::new(ImageRegistry::default()));
 
-static PREVIEW_LINE_CACHE: LazyLock<
-    Mutex<HashMap<(blake3::Hash, u16), Vec<Line<'static>>>>
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+type PreviewLineCache = Mutex<HashMap<(blake3::Hash, u16), Vec<Line<'static>>>>;
+
+static PREVIEW_LINE_CACHE: LazyLock<PreviewLineCache> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Default)]
 struct ImageRegistry {
@@ -61,9 +62,6 @@ pub(crate) fn detect_terminal_protocol() {
     let mut picker =
         Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
-    // iTerm2 currently responds positively to the Kitty graphics query, but
-    // its Unicode-placeholder implementation is not fully compatible with
-    // ratatui-image. Force the native OSC 1337 protocol instead.
     let running_in_iterm = std::env::var("TERM_PROGRAM")
         .is_ok_and(|value| value.contains("iTerm"))
         || std::env::var("LC_TERMINAL")
@@ -71,16 +69,26 @@ pub(crate) fn detect_terminal_protocol() {
         || std::env::var("ITERM_SESSION_ID")
         .is_ok_and(|value| !value.is_empty());
 
-    // Useful when running through SSH, where iTerm2 environment variables
-    // are usually not forwarded to the remote host.
-    let forced_iterm = std::env::var("PROGRAMMER_IMAGE_PROTOCOL")
-        .is_ok_and(|value| {
-            value.eq_ignore_ascii_case("iterm")
-                || value.eq_ignore_ascii_case("iterm2")
-        });
+    let forced_protocol =
+        std::env::var("PROGRAMMER_IMAGE_PROTOCOL").ok();
 
-    if running_in_iterm || forced_iterm {
-        picker.set_protocol_type(ProtocolType::Iterm2);
+    match forced_protocol.as_deref() {
+        Some("sixel") => {
+            picker.set_protocol_type(ProtocolType::Sixel);
+        }
+        Some("kitty") => {
+            picker.set_protocol_type(ProtocolType::Kitty);
+        }
+        Some("iterm") | Some("iterm2") => {
+            picker.set_protocol_type(ProtocolType::Iterm2);
+        }
+        Some("halfblocks") => {
+            picker.set_protocol_type(ProtocolType::Halfblocks);
+        }
+        _ if running_in_iterm => {
+            picker.set_protocol_type(ProtocolType::Iterm2);
+        }
+        _ => {}
     }
 
     let _ = PICKER.set(picker);
