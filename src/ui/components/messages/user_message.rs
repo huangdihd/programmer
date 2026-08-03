@@ -27,6 +27,8 @@ use crate::ui::markdown_theme::palette;
 
 const PAD_LEFT: u16 = 1;
 const PAD_RIGHT: u16 = 1;
+const PAD_TOP: u16 = 1;
+const PAD_BOTTOM: u16 = 1;
 
 static PASTED_IMAGE_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[Pasted image #\d+ \d+x\d+\]").expect("valid pasted-image placeholder regex")
@@ -60,8 +62,8 @@ impl<'a> UserMessage<'a> {
                 Block::default().padding(Padding::new(
                     PAD_LEFT,
                     PAD_RIGHT,
-                    0,
-                    0,
+                    PAD_TOP,
+                    PAD_BOTTOM,
                 )),
             )
             .wrap(Wrap { trim: false })
