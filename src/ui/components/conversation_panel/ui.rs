@@ -33,7 +33,7 @@ use crate::ui::markdown_code_block::CodeCopyButton;
 use crate::ui::markdown_theme::palette;
 use async_openai::types::responses::{
     FunctionCallOutputItemParam, InputItem, InputRole, Item, MessageItem as ApiMessageItem,
-    OutputItem,
+    OutputItem, ReasoningItem,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
@@ -245,7 +245,7 @@ impl Widget for &mut ConversationPanel {
         let tool_groups = discover_tool_groups(&conv.items);
         let mut group_by_item = vec![None; conv.items.len()];
         for (group_index, group) in tool_groups.iter().enumerate() {
-            for &item_index in &group.member_indices {
+            for &item_index in group.member_indices.iter().chain(group.absorbed.iter()) {
                 group_by_item[item_index] = Some(group_index);
             }
         }
@@ -282,6 +282,7 @@ impl Widget for &mut ConversationPanel {
                     1 + group
                         .member_indices
                         .iter()
+                        .chain(group.absorbed.iter())
                         .map(|&member| estimate_item_height(&conv.items[member], content_width))
                         .sum::<u16>()
                 } else {
@@ -394,10 +395,14 @@ impl Widget for &mut ConversationPanel {
                         output.map_or('p', |(_, failed, _)| if *failed { 'f' } else { 's' })
                     )
                 });
+                let absorbed_states = group.absorbed.iter().map(|&index| {
+                    usize::from(self.expanded_items.contains(&index)).to_string()
+                });
                 format!(
-                    "{}:{}",
+                    "{}:{}:{}",
                     usize::from(group_expanded),
-                    member_states.collect::<String>()
+                    member_states.collect::<String>(),
+                    absorbed_states.collect::<String>()
                 )
             });
             let group_has_live_output = group.filter(|_| is_group_start).is_some_and(|group| {
@@ -477,8 +482,24 @@ impl Widget for &mut ConversationPanel {
                             }
                         })
                         .collect();
-                    let (paragraph, member_headers) =
-                        build_tool_group_paragraph(group, &members, content_width, group_expanded);
+                    let absorbed: Vec<(usize, &ReasoningItem, bool)> = group
+                        .absorbed
+                        .iter()
+                        .map(|&index| {
+                            let item = match &conv.items[index] {
+                                MessageItem::Output(OutputItem::Reasoning(item)) => item,
+                                _ => unreachable!("absorbed items are reasoning"),
+                            };
+                            (index, item, self.expanded_items.contains(&index))
+                        })
+                        .collect();
+                    let (paragraph, member_headers) = build_tool_group_paragraph(
+                        group,
+                        &members,
+                        &absorbed,
+                        content_width,
+                        group_expanded,
+                    );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
                         paragraph,

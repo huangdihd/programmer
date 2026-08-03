@@ -19,7 +19,9 @@
 //! groups from that transcript for display, so grouping cannot reorder calls or
 //! affect the request sent back to the model.
 
-use async_openai::types::responses::{FunctionCallOutputItemParam, FunctionToolCall, OutputItem};
+use async_openai::types::responses::{
+    FunctionCallOutputItemParam, FunctionToolCall, OutputItem,
+};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Wrap;
@@ -27,9 +29,11 @@ use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::Paragraph;
 
 use crate::response::message_item::MessageItem;
+use crate::ui::components::messages::assistant::reasoning::ReasoningMessage;
 use crate::ui::components::messages::assistant::tool_call::ToolCallMessage;
 use crate::ui::components::messages::assistant_message::EXPANDED_BG;
 use crate::ui::markdown_theme::palette;
+use async_openai::types::responses::ReasoningItem;
 
 /// Small sequences stay easier to scan as ordinary calls.
 pub(crate) const MIN_TOOL_GROUP_SIZE: usize = 3;
@@ -38,7 +42,13 @@ pub(crate) const MIN_TOOL_GROUP_SIZE: usize = 3;
 pub(crate) struct ToolGroup {
     /// Stable view-state key: the first call's protocol identifier.
     pub key: String,
+    /// Call indices, in conversation order.
     pub member_indices: Vec<usize>,
+    /// Reasoning-item indices absorbed into this group (in conversation
+    /// order). They render inside the group's paragraph — interleaved with the
+    /// calls — so a folded group hides them and an expanded one shows them
+    /// where the model actually emitted them.
+    pub absorbed: Vec<usize>,
     kind: ToolGroupKind,
 }
 
@@ -89,16 +99,19 @@ pub(crate) struct MemberHeader {
 }
 
 /// Find maximal runs of non-interactive function calls and retain runs with at
-/// least [`MIN_TOOL_GROUP_SIZE`] members. Reasoning items are transparent: the
-/// Responses API may interleave them between calls from the same assistant
-/// batch, but they do not represent a user-visible interaction boundary.
-/// `ask_user` and `request_permission` stay standalone because they are real
-/// interaction boundaries rather than batch work.
+/// least [`MIN_TOOL_GROUP_SIZE`] members. Reasoning and tool outputs are
+/// transparent: the Responses API may interleave reasoning between calls from
+/// the same assistant batch, and a tool result is the machine-generated echo of
+/// a call in the same run (rendered inside that call), so neither is a
+/// user-visible interaction boundary. `ask_user` and `request_permission` stay
+/// standalone because they are real interaction boundaries rather than batch
+/// work.
 pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     let mut groups = Vec::new();
     let mut run = Vec::new();
+    let mut absorbed = Vec::new();
 
-    let flush = |run: &mut Vec<usize>, groups: &mut Vec<ToolGroup>| {
+    let flush = |run: &mut Vec<usize>, absorbed: &mut Vec<usize>, groups: &mut Vec<ToolGroup>| {
         if run.len() >= MIN_TOOL_GROUP_SIZE {
             let calls: Vec<&FunctionToolCall> = run
                 .iter()
@@ -107,21 +120,26 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
             groups.push(ToolGroup {
                 key: calls[0].call_id.clone(),
                 member_indices: std::mem::take(run),
+                absorbed: std::mem::take(absorbed),
                 kind: classify_group(&calls),
             });
         } else {
             run.clear();
+            absorbed.clear();
         }
     };
 
     for (index, item) in items.iter().enumerate() {
         match function_call(item) {
             Some(call) if !is_interactive(call) => run.push(index),
-            None if matches!(item, MessageItem::Output(OutputItem::Reasoning(_))) => {}
-            _ => flush(&mut run, &mut groups),
+            None if matches!(item, MessageItem::Output(OutputItem::Reasoning(_))) => {
+                absorbed.push(index)
+            }
+            None if matches!(item, MessageItem::ToolOutput { .. }) => {}
+            _ => flush(&mut run, &mut absorbed, &mut groups),
         }
     }
-    flush(&mut run, &mut groups);
+    flush(&mut run, &mut absorbed, &mut groups);
     groups
 }
 
@@ -260,10 +278,12 @@ impl ToolGroupKind {
     }
 }
 
-/// Render a group header and, when open, its individually foldable calls.
-pub(crate) fn build_tool_group_paragraph(
+/// Render a group header and, when open, its individually foldable calls and
+/// absorbed reasoning items (in conversation order).
+pub(crate) fn build_tool_group_paragraph<'a>(
     group: &ToolGroup,
-    members: &[ToolGroupMember<'_>],
+    members: &[ToolGroupMember<'a>],
+    absorbed: &[(usize, &'a ReasoningItem, bool)],
     width: u16,
     expanded: bool,
 ) -> (Paragraph<'static>, Vec<MemberHeader>) {
@@ -292,27 +312,55 @@ pub(crate) fn build_tool_group_paragraph(
         ),
     ])];
     let mut headers = Vec::new();
-    let wrap = members.iter().any(|member| member.expanded);
+    let wrap = members.iter().any(|member| member.expanded)
+        || absorbed.iter().any(|(_, _, expanded)| *expanded);
     let inner_width = width.saturating_sub(2).max(1);
     let mut rendered_rows = text_height(&Text::from(lines.clone()), inner_width, wrap);
 
     if expanded {
-        for member in members {
-            let text = ToolCallMessage::new(member.call, width)
-                .output(member.output.map(|(output, _, _)| output))
-                .failed(member.output.map(|(_, failed, _)| failed).unwrap_or(false))
-                .approval_label(member.output.and_then(|(_, _, label)| label))
-                .live_output(member.live_output)
-                .expanded(member.expanded)
-                .into_text();
-            let height = text_height(&text, inner_width, wrap);
-            headers.push(MemberHeader {
-                index: member.index,
-                top: rendered_rows,
-                bottom: rendered_rows.saturating_add(1),
-            });
-            rendered_rows = rendered_rows.saturating_add(height);
-            lines.extend(text.lines);
+        // Calls and reasoning interleave in the transcript; render them in
+        // conversation order so each thought sits next to the calls around it.
+        let mut entries: Vec<(usize, &ToolGroupMember<'a>)> = Vec::with_capacity(members.len());
+        entries.extend(members.iter().map(|member| (member.index, member)));
+        let mut reasoning: Vec<(usize, &'a ReasoningItem, bool)> = absorbed.to_vec();
+        entries.sort_by_key(|(index, _)| *index);
+        reasoning.sort_by_key(|(index, _, _)| *index);
+        let mut calls = entries.into_iter().peekable();
+        let mut thoughts = reasoning.into_iter().peekable();
+        while calls.peek().is_some() || thoughts.peek().is_some() {
+            let next_call = calls.peek().map(|(index, _)| *index);
+            let next_thought = thoughts.peek().map(|(index, _, _)| *index);
+            if next_call.is_some_and(|call| next_thought.is_none_or(|thought| call < thought)) {
+                let (_, member) = calls.next().unwrap();
+                let text = ToolCallMessage::new(member.call, width)
+                    .output(member.output.map(|(output, _, _)| output))
+                    .failed(member.output.map(|(_, failed, _)| failed).unwrap_or(false))
+                    .approval_label(member.output.and_then(|(_, _, label)| label))
+                    .live_output(member.live_output)
+                    .expanded(member.expanded)
+                    .into_text();
+                let height = text_height(&text, inner_width, wrap);
+                headers.push(MemberHeader {
+                    index: member.index,
+                    top: rendered_rows,
+                    bottom: rendered_rows.saturating_add(1),
+                });
+                rendered_rows = rendered_rows.saturating_add(height);
+                lines.extend(text.lines);
+            } else {
+                let (index, item, thought_expanded) = thoughts.next().unwrap();
+                let (text, _) = ReasoningMessage::new(false, item, width)
+                    .expanded(thought_expanded)
+                    .into_parts();
+                let height = text_height(&text, inner_width, wrap);
+                headers.push(MemberHeader {
+                    index,
+                    top: rendered_rows,
+                    bottom: rendered_rows.saturating_add(1),
+                });
+                rendered_rows = rendered_rows.saturating_add(height);
+                lines.extend(text.lines);
+            }
         }
     }
 
@@ -343,7 +391,10 @@ fn text_height(text: &Text<'static>, width: u16, wrap: bool) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::responses::ReasoningItem;
+    use async_openai::types::responses::{FunctionCallOutput, ReasoningItem};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
 
     fn call(index: usize, name: &str) -> MessageItem {
         MessageItem::Output(OutputItem::FunctionCall(FunctionToolCall {
@@ -415,6 +466,41 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].member_indices, [0, 2, 4]);
+        assert_eq!(groups[0].absorbed, [1, 3]);
+        assert_eq!(groups[0].title(3, 0), "Explored · 3 calls");
+    }
+
+    #[test]
+    fn serial_tool_outputs_do_not_break_a_tool_group() {
+        // Real interleaved turn: each call streams back, is approved, runs, and
+        // its result is committed before the next call arrives. The outputs are
+        // machine-generated echoes of the same run, so they must not split it.
+        let output = |index: usize| {
+            MessageItem::ToolOutput {
+                output: FunctionCallOutputItemParam {
+                    call_id: format!("call-{index}"),
+                    output: FunctionCallOutput::Text("ok".into()),
+                    id: None,
+                    status: None,
+                },
+                failed: false,
+                approval_label: Some("approved by Auto mode".into()),
+            }
+        };
+        let items = vec![
+            call(0, "grep"),
+            output(0),
+            call(1, "blob"),
+            output(1),
+            call(2, "read_file"),
+            output(2),
+        ];
+
+        let groups = discover_tool_groups(&items);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_indices, [0, 2, 4]);
+        assert_eq!(groups[0].absorbed, Vec::<usize>::new());
         assert_eq!(groups[0].title(3, 0), "Explored · 3 calls");
     }
 
@@ -429,6 +515,86 @@ mod tests {
 
         assert_eq!(group.title(1, 0), "Implementing… · 1/3");
         assert_eq!(group.title(3, 1), "Implemented · 3 calls · 1 failed");
+    }
+
+    #[test]
+    fn expanded_group_renders_absorbed_reasoning_in_conversation_order() {
+        let reasoning = || {
+            MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
+                id: None,
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+                status: None,
+            }))
+        };
+        let items = vec![
+            call(0, "grep"),
+            reasoning(),
+            call(1, "blob"),
+            reasoning(),
+            call(2, "read_file"),
+        ];
+        let group = discover_tool_groups(&items).pop().unwrap();
+        let members: Vec<ToolGroupMember<'_>> = group
+            .member_indices
+            .iter()
+            .map(|&index| {
+                let call = function_call(&items[index]).unwrap();
+                ToolGroupMember {
+                    index,
+                    call,
+                    output: None,
+                    live_output: None,
+                    expanded: false,
+                }
+            })
+            .collect();
+        let absorbed: Vec<(usize, &ReasoningItem, bool)> = group
+            .absorbed
+            .iter()
+            .map(|&index| match &items[index] {
+                MessageItem::Output(OutputItem::Reasoning(item)) => (index, item, false),
+                _ => unreachable!(),
+            })
+            .collect();
+
+        let (paragraph, _) = build_tool_group_paragraph(&group, &members, &absorbed, 80, true);
+        let rendered = render_paragraph(&paragraph, 80, 40);
+        let grep_row = rendered.lines().position(|l| l.contains("grep")).unwrap();
+        let thought_rows = rendered
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("✻ Thought"))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        let blob_row = rendered.lines().position(|l| l.contains("blob")).unwrap();
+        assert_eq!(thought_rows.len(), 2);
+        // Interleaving: each thought sits between its surrounding calls.
+        assert!(thought_rows[0] > grep_row && thought_rows[0] < blob_row);
+        assert!(thought_rows[1] > blob_row);
+
+        // Folded: the thoughts disappear into the header.
+        let (paragraph, _) = build_tool_group_paragraph(&group, &members, &absorbed, 80, false);
+        let rendered = render_paragraph(&paragraph, 80, 40);
+        assert!(!rendered.contains("✻ Thought"));
+        assert!(!rendered.contains("grep"));
+        assert!(rendered.contains("Exploring… · 0/3"));
+    }
+
+    fn render_paragraph(paragraph: &Paragraph<'static>, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        paragraph.clone().render(area, &mut buffer);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter_map(|x| buffer.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
