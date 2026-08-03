@@ -37,6 +37,10 @@ static PICKER: OnceLock<Picker> = OnceLock::new();
 static IMAGES: LazyLock<Mutex<ImageRegistry>> =
     LazyLock::new(|| Mutex::new(ImageRegistry::default()));
 
+static PREVIEW_LINE_CACHE: LazyLock<
+    Mutex<HashMap<(blake3::Hash, u16), Vec<Line<'static>>>>
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 #[derive(Default)]
 struct ImageRegistry {
     next_marker: u32,
@@ -132,15 +136,47 @@ pub(crate) fn content_preview_lines(
     available_width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for image in content.iter().filter_map(|part| match part {
-        InputContent::InputImage(image) => image.image_url.as_deref().and_then(decode_data_url),
+
+    for url in content.iter().filter_map(|part| match part {
+        InputContent::InputImage(image) => image.image_url.as_deref(),
         _ => None,
     }) {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.extend(render_image_lines(image, available_width));
+
+        lines.extend(cached_data_url_lines(url, available_width));
     }
+
+    lines
+}
+
+fn cached_data_url_lines(
+    url: &str,
+    available_width: u16,
+) -> Vec<Line<'static>> {
+    let key = (
+        blake3::hash(url.as_bytes()),
+        available_width,
+    );
+
+    {
+        let cache = PREVIEW_LINE_CACHE.lock().unwrap();
+
+        if let Some(lines) = cache.get(&key) {
+            return lines.clone();
+        }
+    }
+
+    let lines = decode_data_url(url)
+        .map(|image| render_image_lines(image, available_width))
+        .unwrap_or_default();
+
+    PREVIEW_LINE_CACHE
+        .lock()
+        .unwrap()
+        .insert(key, lines.clone());
+
     lines
 }
 
