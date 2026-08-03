@@ -18,6 +18,14 @@
 //! The conversation remains a flat protocol transcript. This module derives
 //! groups from that transcript for display, so grouping cannot reorder calls or
 //! affect the request sent back to the model.
+//!
+//! A run that still extends to the end of the transcript is *open*: the model
+//! may append more calls to it, so it is grouped as soon as it has a member
+//! (once reasoning is involved) rather than waiting for the full run to close.
+//! This is what lets a streaming thought be absorbed into its group the moment
+//! the first call of the run appears, instead of lingering standalone until
+//! enough calls have piled up. Closed runs keep the [`MIN_TOOL_GROUP_SIZE`]
+//! threshold so short, finished sequences stay easy to scan as ordinary calls.
 
 use async_openai::types::responses::{
     FunctionCallOutputItemParam, FunctionToolCall, OutputItem,
@@ -49,6 +57,10 @@ pub(crate) struct ToolGroup {
     /// calls — so a folded group hides them and an expanded one shows them
     /// where the model actually emitted them.
     pub absorbed: Vec<usize>,
+    /// True when this run still extends to the end of the transcript, so more
+    /// calls may be appended. Open groups render expanded (their streaming
+    /// members stay visible) until a boundary item closes the run.
+    pub open: bool,
     kind: ToolGroupKind,
 }
 
@@ -106,13 +118,23 @@ pub(crate) struct MemberHeader {
 /// user-visible interaction boundary. `ask_user` and `request_permission` stay
 /// standalone because they are real interaction boundaries rather than batch
 /// work.
+///
+/// The final run (the one still extending to the end of the transcript) is
+/// *open* — more calls may still be appended. An open run is grouped as soon
+/// as it has any member once reasoning is involved, so a thought is absorbed
+/// the moment its first call appears instead of waiting for a full-size run.
 pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     let mut groups = Vec::new();
     let mut run = Vec::new();
     let mut absorbed = Vec::new();
 
-    let flush = |run: &mut Vec<usize>, absorbed: &mut Vec<usize>, groups: &mut Vec<ToolGroup>| {
-        if run.len() >= MIN_TOOL_GROUP_SIZE {
+    let flush = |run: &mut Vec<usize>, absorbed: &mut Vec<usize>, open: bool, groups: &mut Vec<ToolGroup>| {
+        let min = if open && !absorbed.is_empty() {
+            1
+        } else {
+            MIN_TOOL_GROUP_SIZE
+        };
+        if run.len() >= min {
             let calls: Vec<&FunctionToolCall> = run
                 .iter()
                 .filter_map(|&index| function_call(&items[index]))
@@ -121,6 +143,7 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
                 key: calls[0].call_id.clone(),
                 member_indices: std::mem::take(run),
                 absorbed: std::mem::take(absorbed),
+                open,
                 kind: classify_group(&calls),
             });
         } else {
@@ -136,10 +159,10 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
                 absorbed.push(index)
             }
             None if matches!(item, MessageItem::ToolOutput { .. }) => {}
-            _ => flush(&mut run, &mut absorbed, &mut groups),
+            _ => flush(&mut run, &mut absorbed, false, &mut groups),
         }
     }
-    flush(&mut run, &mut absorbed, &mut groups);
+    flush(&mut run, &mut absorbed, true, &mut groups);
     groups
 }
 
@@ -424,6 +447,97 @@ mod tests {
         assert_eq!(groups[0].key, "call-0");
         assert_eq!(groups[0].member_indices, [0, 1, 2]);
         assert_eq!(groups[0].title(3, 0), "Explored · 3 calls");
+    }
+
+    #[test]
+    fn open_run_with_reasoning_groups_from_the_first_call() {
+        // The transcript ends mid-run: only the thought and its first call have
+        // arrived. The run is still open (more calls may follow), so the
+        // thought must already be absorbed instead of lingering standalone.
+        let reasoning = || {
+            MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
+                id: None,
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+                status: None,
+            }))
+        };
+        let items = vec![reasoning(), call(0, "grep")];
+
+        let groups = discover_tool_groups(&items);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_indices, [1]);
+        assert_eq!(groups[0].absorbed, [0]);
+        assert!(groups[0].open);
+    }
+
+    #[test]
+    fn open_run_without_reasoning_still_needs_three_calls() {
+        // Bare calls (no interleaved reasoning) keep the size threshold even
+        // while the run is open, so a lone call never gets a group header.
+        let two_calls = vec![call(0, "grep"), call(1, "blob")];
+        assert!(discover_tool_groups(&two_calls).is_empty());
+
+        let three_calls = vec![call(0, "grep"), call(1, "blob"), call(2, "read_file")];
+        let groups = discover_tool_groups(&three_calls);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_indices, [0, 1, 2]);
+        assert!(groups[0].open);
+    }
+
+    #[test]
+    fn closed_run_with_reasoning_still_needs_three_calls() {
+        // Once a boundary closes a short run, it reverts to individual items:
+        // a thought above its single call reads naturally, and small sequences
+        // stay easy to scan as ordinary calls.
+        let reasoning = || {
+            MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
+                id: None,
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+                status: None,
+            }))
+        };
+        let items = vec![
+            reasoning(),
+            call(0, "grep"),
+            MessageItem::Info("boundary".into()),
+        ];
+
+        let groups = discover_tool_groups(&items);
+
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn open_run_with_reasoning_dissolves_once_a_boundary_closes_it_short() {
+        // A short open run groups so its thought is absorbed promptly; once a
+        // boundary closes it below the size threshold, it dissolves back into
+        // ordinary items.
+        let reasoning = || {
+            MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
+                id: None,
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+                status: None,
+            }))
+        };
+        let items = vec![reasoning(), call(0, "grep"), call(1, "blob")];
+        let groups = discover_tool_groups(&items);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_indices, [1, 2]);
+        assert_eq!(groups[0].absorbed, [0]);
+        assert!(groups[0].open);
+
+        // Same run once a boundary closes it: below the size threshold, so it
+        // reverts to a standalone thought above its ordinary calls.
+        let mut closed = items;
+        closed.push(MessageItem::Info("boundary".into()));
+        assert!(discover_tool_groups(&closed).is_empty());
     }
 
     #[test]

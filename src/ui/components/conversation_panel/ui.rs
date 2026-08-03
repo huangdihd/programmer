@@ -18,7 +18,7 @@ use crate::ui::components::conversation_panel::conversation_panel::{
     CachedParagraph, CachedToolGroup, ConversationPanel, ToolGroupLayout,
 };
 use crate::ui::components::conversation_panel::tool_group::{
-    ToolGroupMember, build_tool_group_paragraph, discover_tool_groups, function_call,
+    MemberHeader, ToolGroupMember, build_tool_group_paragraph, discover_tool_groups, function_call,
 };
 use crate::ui::components::messages::assistant_message::AssistantMessage;
 use crate::ui::components::messages::error_message::ErrorMessage;
@@ -278,7 +278,9 @@ impl Widget for &mut ConversationPanel {
                 let group = &tool_groups[group_index];
                 if group.member_indices[0] != index {
                     0
-                } else if self.expanded_tool_groups.contains(&group.key) {
+                } else if (group.open && !group.absorbed.is_empty())
+                    || self.expanded_tool_groups.contains(&group.key)
+                {
                     1 + group
                         .member_indices
                         .iter()
@@ -385,7 +387,11 @@ impl Widget for &mut ConversationPanel {
             };
             let in_viewport = index >= build_from || in_window[index];
             let group_render_key = group.filter(|_| is_group_start).map(|group| {
-                let group_expanded = self.expanded_tool_groups.contains(&group.key);
+                // An open run with absorbed reasoning stays expanded so a
+                // streaming thought never vanishes; plain call batches keep
+                // the user's collapse state (default collapsed).
+                let group_expanded = (group.open && !group.absorbed.is_empty())
+                    || self.expanded_tool_groups.contains(&group.key);
                 let member_states = group.member_indices.iter().map(|&member_index| {
                     let call = function_call(&conv.items[member_index]).unwrap();
                     let output = outputs_by_call.get(call.call_id.as_str());
@@ -455,7 +461,8 @@ impl Widget for &mut ConversationPanel {
                             }),
                     }
                 } else if let Some(group) = group.filter(|_| is_group_start) {
-                    let group_expanded = self.expanded_tool_groups.contains(&group.key);
+                    let group_expanded = (group.open && !group.absorbed.is_empty())
+                        || self.expanded_tool_groups.contains(&group.key);
                     let live_outputs: Vec<Option<String>> = group
                         .member_indices
                         .iter()
@@ -545,25 +552,93 @@ impl Widget for &mut ConversationPanel {
         }
 
         // The streaming response is the only content that changes between frames,
-        // so it is the only thing re-rendered here.
+        // so it is the only thing re-rendered here. Streaming items use the same
+        // tool-run grouping as the committed transcript (a run still growing is
+        // open), so a thought is absorbed into its group as soon as the first
+        // call of the run appears instead of standing alone until the response
+        // is committed.
         let receiving_items = self
             .receiving_response
             .as_ref()
             .map(|receiving_response| receiving_response.get_message_items())
             .unwrap_or_default();
-        self.live_paragraphs = receiving_items
+        let live_message_items: Vec<MessageItem> = receiving_items
             .iter()
-            .enumerate()
-            .map(|(i, (output_item, in_progress))| {
+            .map(|(output_item, _)| MessageItem::Output(output_item.clone()))
+            .collect();
+        let live_groups = discover_tool_groups(&live_message_items);
+        let mut live_group_by_item = vec![None; receiving_items.len()];
+        for (group_index, group) in live_groups.iter().enumerate() {
+            for &item_index in group.member_indices.iter().chain(group.absorbed.iter()) {
+                live_group_by_item[item_index] = Some(group_index);
+            }
+        }
+        // Parallel to `live_paragraphs`: the group's key and clickable member
+        // header rows (relative to that paragraph) when the slot is a group.
+        let mut live_group_headers: Vec<Option<(String, Vec<MemberHeader>)>> =
+            Vec::with_capacity(receiving_items.len());
+        let mut live_paragraphs = Vec::with_capacity(receiving_items.len());
+        for i in 0..receiving_items.len() {
+            let (output_item, in_progress) = &receiving_items[i];
+            let expanded = self.live_expanded_items.contains(&i);
+            if let Some(group_index) = live_group_by_item[i] {
+                let group = &live_groups[group_index];
+                if group.member_indices[0] != i {
+                    // Hidden inside the group's own paragraph. Keep a
+                    // zero-height slot so `live_group_headers` and
+                    // `live_paragraphs` stay index-aligned with
+                    // `receiving_items` (clicks toggle live indices directly).
+                    live_group_headers.push(None);
+                    live_paragraphs.push((Paragraph::new(""), 0, Vec::new()));
+                    continue;
+                }
+                let members: Vec<ToolGroupMember<'_>> = group
+                    .member_indices
+                    .iter()
+                    .map(|&member_index| {
+                        let call = match &receiving_items[member_index].0 {
+                            OutputItem::FunctionCall(call) => call,
+                            _ => unreachable!("group members are calls"),
+                        };
+                        ToolGroupMember {
+                            index: member_index,
+                            call,
+                            output: None,
+                            live_output: None,
+                            expanded: self.live_expanded_items.contains(&member_index),
+                        }
+                    })
+                    .collect();
+                let absorbed: Vec<(usize, &ReasoningItem, bool)> = group
+                    .absorbed
+                    .iter()
+                    .map(|&index| {
+                        let item = match &receiving_items[index].0 {
+                            OutputItem::Reasoning(item) => item,
+                            _ => unreachable!("absorbed items are reasoning"),
+                        };
+                        (index, item, self.live_expanded_items.contains(&index))
+                    })
+                    .collect();
+                // Open runs are forced expanded so the streaming thought and
+                // calls stay visible as they arrive.
+                let (paragraph, member_headers) =
+                    build_tool_group_paragraph(group, &members, &absorbed, content_width, true);
+                let height = paragraph.line_count(content_width) as u16;
+                live_group_headers.push(Some((group.key.clone(), member_headers)));
+                live_paragraphs.push((paragraph, height, Vec::new()));
+            } else {
+                live_group_headers.push(None);
                 let (paragraph, copy_buttons) = AssistantMessage::new(output_item, content_width)
                     .in_progress(*in_progress)
-                    .expanded(self.live_expanded_items.contains(&i))
+                    .expanded(expanded)
                     .frame_count(self.frame_count)
                     .into_paragraph();
                 let height = paragraph.line_count(content_width) as u16;
-                (paragraph, height, copy_buttons)
-            })
-            .collect();
+                live_paragraphs.push((paragraph, height, copy_buttons));
+            }
+        }
+        self.live_paragraphs = live_paragraphs;
         for (_, height, _) in &self.live_paragraphs {
             content_height = content_height.saturating_add(*height);
         }
@@ -656,8 +731,24 @@ impl Widget for &mut ConversationPanel {
         }
         let mut live_layout: Vec<(usize, u16, u16)> =
             Vec::with_capacity(self.live_paragraphs.len());
+        let mut live_tool_group_layout = Vec::new();
         for (i, (paragraph, height, _)) in self.live_paragraphs.iter().enumerate() {
             live_layout.push((i, y, y.saturating_add(*height)));
+            if let Some((key, headers)) = &live_group_headers[i] {
+                live_tool_group_layout.push(ToolGroupLayout {
+                    key: key.clone(),
+                    top: y,
+                    bottom: y.saturating_add(*height),
+                    member_headers: headers
+                        .iter()
+                        .map(|header| MemberHeader {
+                            index: header.index,
+                            top: y.saturating_add(header.top),
+                            bottom: y.saturating_add(header.bottom),
+                        })
+                        .collect(),
+                });
+            }
             if visible(y, *height) {
                 scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
             }
@@ -746,7 +837,14 @@ impl Widget for &mut ConversationPanel {
             self.set_jump_button(None);
         }
 
-        self.set_layout(content_area, offset, layout, live_layout, tool_group_layout);
+        self.set_layout(
+            content_area,
+            offset,
+            layout,
+            live_layout,
+            tool_group_layout,
+            live_tool_group_layout,
+        );
     }
 }
 
@@ -851,5 +949,53 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn streaming_thought_is_absorbed_into_the_tool_group() {
+        // A thought plus a single call arrive in the live stream. Before this
+        // fix the thought rendered standalone until the whole response was
+        // committed; now the open run groups immediately and the thought is
+        // absorbed into the group's paragraph.
+        use crate::cancel::CancellationToken;
+        use async_openai::types::responses::{
+            ReasoningItem, ResponseOutputItemAddedEvent, ResponseStreamEvent,
+        };        let mut panel = ConversationPanel::new();
+        panel.receiving_response =
+            Some(crate::response::partial_response::PartialResponse::new(
+                CancellationToken::new(),
+            ));
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
+            ResponseOutputItemAddedEvent {
+                sequence_number: 0,
+                output_index: 0,
+                item: OutputItem::Reasoning(ReasoningItem {
+                    id: None,
+                    summary: Vec::new(),
+                    content: None,
+                    encrypted_content: None,
+                    status: None,
+                }),
+            },
+        ));
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
+            ResponseOutputItemAddedEvent {
+                sequence_number: 1,
+                output_index: 1,
+                item: OutputItem::FunctionCall(tool_call(0, "grep")),
+            },
+        ));
+
+        let area = Rect::new(0, 0, 80, 24);
+        let rendered = render_text(&mut panel, area);
+        // Group header present, and the call sits under it rather than the
+        // thought standing alone above a flat call item.
+        assert!(rendered.contains("Exploring… · 0/1"), "{rendered}");
+        assert!(rendered.contains("grep  {}"), "{rendered}");
+        assert!(rendered.contains("✻ Thought"), "{rendered}");
+        // The thought renders inside the group: it comes after the header.
+        let header_row = rendered.lines().position(|l| l.contains("Exploring")).unwrap();
+        let thought_row = rendered.lines().position(|l| l.contains("✻")).unwrap();
+        assert!(thought_row > header_row, "{rendered}");
     }
 }

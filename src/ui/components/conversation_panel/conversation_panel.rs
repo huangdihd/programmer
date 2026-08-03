@@ -290,6 +290,10 @@ pub struct ConversationPanel {
     /// from `item_layout`, which remains one entry per cached paragraph for
     /// selection extraction.
     tool_group_layout: Vec<ToolGroupLayout>,
+    /// Live (streaming) group hit regions from the last render, checked before
+    /// `live_item_layout` so a click on a member row toggles that member
+    /// instead of the group paragraph's slot.
+    live_tool_group_layout: Vec<ToolGroupLayout>,
     /// Per-live-item vertical extent: `(live_index, top, bottom)`. Recorded
     /// alongside `item_layout` so clicks on streaming items can be mapped.
     live_item_layout: Vec<(usize, u16, u16)>,
@@ -341,6 +345,7 @@ impl ConversationPanel {
             item_layout: Vec::new(),
             tool_group_layout: Vec::new(),
             live_item_layout: Vec::new(),
+            live_tool_group_layout: Vec::new(),
             render_cache: RenderCache::default(),
             frame_count: 0,
             live_expanded_items: HashSet::new(),
@@ -359,12 +364,14 @@ impl ConversationPanel {
         item_layout: Vec<(usize, u16, u16)>,
         live_item_layout: Vec<(usize, u16, u16)>,
         tool_group_layout: Vec<ToolGroupLayout>,
+        live_tool_group_layout: Vec<ToolGroupLayout>,
     ) {
         self.view_area = area;
         self.view_offset = offset;
         self.item_layout = item_layout;
         self.live_item_layout = live_item_layout;
         self.tool_group_layout = tool_group_layout;
+        self.live_tool_group_layout = live_tool_group_layout;
     }
 
     /// Handles a left click at the given screen coordinates: if it lands on a
@@ -383,6 +390,28 @@ impl ConversationPanel {
 
         let buffer_y = (row - area.y).saturating_add(self.view_offset);
         let x_rel = column - area.x;
+
+        // Live groups sit after finished content in the scroll buffer; check
+        // their member hit regions before the flat live-item layout so a click
+        // on a member row toggles that member (the group's own header is a
+        // no-op: open runs stay expanded while streaming).
+        if let Some(group) = self
+            .live_tool_group_layout
+            .iter()
+            .find(|group| buffer_y >= group.top && buffer_y < group.bottom)
+        {
+            if let Some(header) = group
+                .member_headers
+                .iter()
+                .find(|header| buffer_y >= header.top && buffer_y < header.bottom)
+            {
+                let index = header.index;
+                if !self.live_expanded_items.remove(&index) {
+                    self.live_expanded_items.insert(index);
+                }
+            }
+            return;
+        }
 
         // Live items sit after finished items in the scroll buffer; check them
         // first so they take priority when layout ranges overlap (they shouldn't,
