@@ -39,7 +39,9 @@ use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::Paragraph;
 
 use crate::response::message_item::MessageItem;
-use crate::ui::components::messages::assistant::reasoning::ReasoningMessage;
+use crate::ui::components::messages::assistant::reasoning::{
+    ReasoningMessage, reasoning_summary_title,
+};
 use crate::ui::components::messages::assistant::tool_call::ToolCallMessage;
 use crate::ui::components::messages::assistant_message::EXPANDED_BG;
 use crate::ui::markdown_theme::palette;
@@ -442,7 +444,7 @@ pub(crate) fn build_tool_group_paragraph<'a>(
     // when the group is uniform, and the thought state last.
     if !expanded {
         lines.push(Line::from(Span::styled(
-            collapsed_summary(group, members, thought_in_progress),
+            collapsed_summary(group, members, absorbed, thought_in_progress),
             muted,
         )));
     }
@@ -528,6 +530,7 @@ fn text_height(text: &Text<'static>, width: u16, wrap: bool) -> u16 {
 fn collapsed_summary(
     group: &ToolGroup,
     members: &[ToolGroupMember<'_>],
+    absorbed: &[(usize, &ReasoningItem, bool)],
     thought_in_progress: bool,
 ) -> String {
     let mut parts = Vec::with_capacity(4);
@@ -544,11 +547,20 @@ fn collapsed_summary(
         parts.push(format!("via {server}"));
     }
     if !group.absorbed.is_empty() {
-        parts.push(if thought_in_progress {
+        let mut thought: String = if thought_in_progress {
             "✻ Thinking…".into()
         } else {
             "✻ Thought".into()
-        });
+        };
+        if let Some(summary) = absorbed
+            .iter()
+            .rev()
+            .find_map(|(_, item, _)| reasoning_summary_title(item))
+        {
+            thought.push_str(" · ");
+            thought.push_str(&summary);
+        }
+        parts.push(thought);
     }
     parts.join(" · ")
 }
@@ -565,7 +577,9 @@ fn display_tool_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::responses::{FunctionCallOutput, ReasoningItem};
+    use async_openai::types::responses::{
+        FunctionCallOutput, ReasoningItem, SummaryPart, SummaryTextContent,
+    };
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::widgets::Widget;
@@ -873,6 +887,52 @@ mod tests {
         let grep_pos = summary.find("read_file").unwrap();
         let thought_pos = summary.find("✻").unwrap();
         assert!(thought_pos > grep_pos, "{summary}");
+    }
+
+    #[test]
+    fn collapsed_group_shows_reasoning_summary_while_thinking_and_when_done() {
+        let items = vec![
+            MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
+                id: None,
+                summary: vec![SummaryPart::SummaryText(SummaryTextContent {
+                    text: "Inspecting parser state".into(),
+                })],
+                content: None,
+                encrypted_content: None,
+                status: None,
+            })),
+            call(0, "grep"),
+        ];
+        let group = discover_tool_groups(&items).pop().unwrap();
+        let call = function_call(&items[1]).unwrap();
+        let members = [ToolGroupMember {
+            index: 1,
+            call,
+            output: None,
+            live_output: None,
+            expanded: false,
+        }];
+        let reasoning = match &items[0] {
+            MessageItem::Output(OutputItem::Reasoning(item)) => item,
+            _ => unreachable!(),
+        };
+        let absorbed = [(0, reasoning, false)];
+
+        let (thinking, _) =
+            build_tool_group_paragraph(&group, &members, &absorbed, 80, false, true);
+        let thinking = render_paragraph(&thinking, 80, 10);
+        assert!(
+            thinking.contains("✻ Thinking… · Inspecting parser state"),
+            "{thinking}"
+        );
+
+        let (thought, _) =
+            build_tool_group_paragraph(&group, &members, &absorbed, 80, false, false);
+        let thought = render_paragraph(&thought, 80, 10);
+        assert!(
+            thought.contains("✻ Thought · Inspecting parser state"),
+            "{thought}"
+        );
     }
 
     fn render_paragraph(paragraph: &Paragraph<'static>, width: u16, height: u16) -> String {

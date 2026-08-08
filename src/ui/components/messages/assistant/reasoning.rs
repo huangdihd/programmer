@@ -79,11 +79,15 @@ impl<'a> ReasoningMessage<'a> {
             String::new()
         };
 
-        let label = if self.in_progress {
+        let mut label = if self.in_progress {
             format!("✻ Thinking{dots}")
         } else {
             "✻ Thought".to_string()
         };
+        if let Some(summary) = reasoning_summary_title(self.item) {
+            label.push_str(" · ");
+            label.push_str(&summary);
+        }
 
         let text = reasoning_text(self.item);
         let caret = if text.is_empty() {
@@ -124,6 +128,21 @@ impl<'a> ReasoningMessage<'a> {
     }
 }
 
+/// A compact, single-line title from the API's reasoning summary. Raw
+/// reasoning content is intentionally excluded: it belongs in the expanded
+/// body and can be much less suitable as a heading.
+pub(crate) fn reasoning_summary_title(item: &ReasoningItem) -> Option<String> {
+    let title = item
+        .summary
+        .iter()
+        .map(|SummaryPart::SummaryText(summary)| summary.text.as_str())
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    (!title.is_empty()).then_some(title)
+}
+
 /// The reasoning text, preferring the summary and falling back to the raw
 /// reasoning content.
 fn reasoning_text(item: &ReasoningItem) -> String {
@@ -143,4 +162,44 @@ fn reasoning_text(item: &ReasoningItem) -> String {
     }
 
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::responses::SummaryTextContent;
+
+    fn reasoning_with_summary(summary: &str) -> ReasoningItem {
+        ReasoningItem {
+            id: None,
+            summary: vec![SummaryPart::SummaryText(SummaryTextContent {
+                text: summary.to_string(),
+            })],
+            content: None,
+            encrypted_content: None,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn completed_thought_title_includes_summary() {
+        let item = reasoning_with_summary("Reviewing\n  parser state");
+        let (text, _) = ReasoningMessage::new(false, &item, 80).into_parts();
+
+        assert_eq!(
+            text.lines[0].to_string(),
+            "▸ ✻ Thought · Reviewing parser state"
+        );
+    }
+
+    #[test]
+    fn streaming_thinking_title_includes_partial_summary() {
+        let item = reasoning_with_summary("Checking tool grouping");
+        let (text, _) = ReasoningMessage::new(true, &item, 80).into_parts();
+
+        assert_eq!(
+            text.lines[0].to_string(),
+            "▸ ✻ Thinking... · Checking tool grouping"
+        );
+    }
 }
