@@ -36,6 +36,10 @@ fn echo_cmd() -> &'static str {
     "echo task-out"
 }
 
+fn stdin_reader_cmd() -> &'static str {
+    if cfg!(windows) { "sort" } else { "cat" }
+}
+
 fn notification_enabled(id: u64) -> bool {
     registry()
         .lock()
@@ -136,8 +140,8 @@ async fn spawn_completes_and_captures_output() {
 
 #[tokio::test]
 async fn command_task_is_hidden_and_closes_stdin() {
-    let command = if cfg!(windows) { "findstr ." } else { "cat" };
-    let id = spawn_command(command, None, Some("command-hidden")).expect("spawn command");
+    let id =
+        spawn_command(stdin_reader_cmd(), None, Some("command-hidden")).expect("spawn command");
     let snap = wait_until_finished(id).await.expect("closed stdin exits");
     assert_eq!(snap.status, TaskStatus::Completed);
     assert!(
@@ -277,8 +281,7 @@ fn persist_all_excludes_foreground_commands() {
 
 #[tokio::test]
 async fn closed_stdin_exits_process() {
-    let command = if cfg!(windows) { "findstr ." } else { "cat" };
-    let id = spawn(command, None, None).expect("spawn");
+    let id = spawn(stdin_reader_cmd(), None, None).expect("spawn");
     // Close stdin immediately — the process should exit quickly.
     write_stdin(id, "", true).expect("close stdin");
     let (snap, _) = wait(id, Duration::from_secs(10)).await.expect("wait");

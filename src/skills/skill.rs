@@ -116,10 +116,17 @@ impl Skill {
 /// Split raw file content into (frontmatter, body). Returns `None` if the
 /// file doesn't start with `---`.
 fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
-    let rest = raw.strip_prefix("---\n")?;
-    let (front, body) = rest.split_once("\n---")?;
-    // body may start with a newline; trim exactly one leading \n.
-    let body = body.strip_prefix('\n').unwrap_or(body);
+    let rest = raw
+        .strip_prefix("---\r\n")
+        .or_else(|| raw.strip_prefix("---\n"))?;
+    let (front, body) = rest
+        .split_once("\r\n---")
+        .or_else(|| rest.split_once("\n---"))?;
+    // Body may start with a line ending; trim exactly one.
+    let body = body
+        .strip_prefix("\r\n")
+        .or_else(|| body.strip_prefix('\n'))
+        .unwrap_or(body);
     Some((front, body))
 }
 
@@ -187,6 +194,16 @@ mod tests {
         let (name, desc) = parse_frontmatter(front).unwrap();
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test skill");
+    }
+
+    #[test]
+    fn parse_skill_with_windows_line_endings() {
+        let raw = "---\r\nname: windows-skill\r\ndescription: Works on Windows\r\n---\r\n\r\n# Body\r\nInstructions.";
+        let skill = Skill::from_builtin(raw).expect("CRLF skill should parse");
+
+        assert_eq!(skill.name, "windows-skill");
+        assert_eq!(skill.description, "Works on Windows");
+        assert!(skill.body.contains("# Body"));
     }
 
     #[test]
