@@ -1,5 +1,7 @@
 # programmer
+
 A coding agent written in Rust
+
 > Initially, computer means a person who computes.   
 > When will we pass programmer to coding agents?
 
@@ -13,49 +15,78 @@ TUI built with [Ratatui](https://ratatui.rs).
 
 ## Features
 
-- **Streaming responses** — see the model's answer as it is generated, token by
-  token.
-- **Tool use** — the model can invoke eight built-in tools:
-
-  | Tool | Description |
-  |---|---|
-  | `command` | Run a shell command and capture stdout/stderr. |
-  | `read_file` | Read a file, optionally with offset and line limit. |
-  | `write_file` | Create or overwrite a file (with parent directories). |
-  | `edit_file` | Replace an exact substring in a file — minimal, safe edits. |
-  | `grep` | Search a regex pattern across files, returning path:lineno:match. |
-  | `blob` | Find files by filename regex, returning matching paths. |
-  | `ask_user` | Prompt the user with yes/no, multiple choice, or free-text questions. |
-  | `configure_diagnostics` | Set up the project's IDE-style diagnostics (language-agnostic checkers). |
-- **Markdown rendering** — model responses are rendered with syntax-highlighted
-  code blocks, lists, and formatting.
-- **IDE-style diagnostics** — after every code edit, the TUI runs a predefined
-  set of checkers (e.g. `cargo check`, `tsc --noEmit`) and reports which errors
-  were introduced or resolved. Language-agnostic — works with any checker that
-  outputs parseable diagnostics (rustc JSON, GNU-style, TypeScript, or custom
-  regex patterns). Configured via `/init` or the `configure_diagnostics` tool
-  and stored in `.programmer/diagnostics.toml`.
-- **Conversation panel** — scrollable chat history with distinct bubbles for
-  user, assistant, tool calls, tool results, and errors.
-- **Pending messages** — if you type while the model is still responding, your
-  input is queued and sent automatically when the turn finishes.
-- **Multi-provider** — configure multiple API backends (different keys, base URLs,
-  models) and switch between them. Manage via `/providers manage` or `--providers`
-  flag.
-- **Configurable** — set model, API base URL, and API key via a TOML config
-  file or environment variables.
-- **Session management** — multi-session support with UUIDs, auto-save on each
-  turn, resume with `--resume [uuid]`, restart with `/new`.
+- **Multi-provider model access** — connect to OpenAI-compatible Responses API
+  endpoints, manage providers and their models in the TUI, and use a separate
+  lightweight model for tool-call classification.
+- **Complete coding toolset** — read, search, edit, and write files; run commands;
+  fetch web pages; inspect images; ask questions; manage todos; run diagnostics;
+  control background or interactive tasks; and request scoped permissions.
+- **Safety modes and native sandboxing** — choose Manual, Auto, Plan, or optional
+  YOLO mode. File freshness checks, configurable access rules, named security
+  profiles, and native process sandboxing protect the workspace.
+- **IDE-style diagnostics** — automatically run configured checkers after edits,
+  compare findings against a baseline, and integrate persistent LSP diagnostics.
+  `/init` can create both `PROGRAMMER.md` and `.programmer/diagnostics.toml`.
+- **MCP and skills** — connect stdio or HTTP MCP servers, expose Programmer's own
+  tools as an MCP server, and extend the agent with built-in, shared, global, or
+  project-local skills.
+- **Tasks and sub-agents** — stream command output, promote long-running commands
+  to background tasks, drive interactive PTYs from the TUI, and delegate bounded
+  work to independent in-process agents.
+- **Multimodal terminal UI** — paste or reference images, render supported images
+  with terminal graphics protocols, group related tool calls and reasoning, and
+  keep providers, MCP servers, skills, todos, tasks, diagnostics, and agents in a
+  scrollable sidebar.
+- **Persistent sessions and context control** — resume UUID-keyed conversations,
+  track per-turn token usage, queue pending messages, and compact older history
+  without losing its summary.
+- **Headless automation** — run one-shot jobs with text, JSON, or JSONL output,
+  initialize projects, execute diagnostics without a model, and enforce time,
+  step, and diagnostic-failure limits from the CLI.
 
 ## Installation
 
-### Prerequisites
+### Prebuilt release
 
-- [Rust toolchain](https://rustup.rs) (MSRV: latest stable)
-- An OpenAI-compatible API endpoint and key (e.g. OpenAI, Anthropic via proxy,
-  local LLM)
+On macOS or Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/huangdihd/programmer/main/scripts/install.sh | sh
+```
+
+On Windows PowerShell:
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/huangdihd/programmer/main/scripts/install.ps1" `
+  -OutFile "install.ps1"
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Both installers select the release asset for the current OS and architecture.
+Use `--version v0.2.0` with `install.sh`, or `-Version v0.2.0` with
+`install.ps1`, to install a specific release.
+
+### Update or uninstall
+
+Once installed, Programmer can update or remove its own executable:
+
+```sh
+programmer upgrade --check
+programmer upgrade
+programmer upgrade --tag v0.2.0
+programmer uninstall
+programmer uninstall --purge
+```
+
+`--purge` also deletes Programmer's configuration, sessions, and global skills.
+It cannot be undone.
 
 ### Build from source
+
+Prerequisites:
+
+- [Rust toolchain](https://rustup.rs) (MSRV: latest stable)
 
 ```sh
 git clone https://github.com/huangdihd/programmer.git
@@ -65,6 +96,9 @@ cargo build --release
 
 The binary will be at `target/release/programmer` (or `programmer.exe` on
 Windows).
+
+At runtime, configure an OpenAI-compatible Responses API endpoint and key, or a
+compatible local server such as Ollama, LM Studio, or vLLM.
 
 ## Configuration
 
@@ -95,6 +129,9 @@ classifier_model = "openai/gpt-4o-mini"
 
 # Gate YOLO mode behind this flag so it can't be entered by accident.
 allow_yolo = true
+
+# Check GitHub Releases at startup and show a notice when an update exists.
+auto_update_check = true
 
 # Co-author trailer added to git commits the agent writes. For the co-author to
 # show a GitHub avatar, use an email tied to a GitHub account — e.g. a machine
@@ -142,6 +179,7 @@ api_key = "sk-your-key-here"
 | `default_provider` | `"openai"` | Active provider at startup. |
 | `classifier_model` | (chat model) | `provider/model` for the Auto-mode classifier. Must be a **non-reasoning** model (see [Auto mode](#work-modes)). |
 | `allow_yolo` | `false` | Whether `/mode yolo` and `Ctrl+T` can reach YOLO mode. |
+| `auto_update_check` | `true` | Check GitHub Releases at startup and show a non-blocking update notice. |
 | `git_coauthor` | `programmer <noreply@programmer.local>` | `Co-Authored-By:` trailer added to the agent's git commits. Use a GitHub-linked email for an avatar; `""` disables. |
 | `security.protect_file_changes` | `true` | Require an existing file to be read before overwrite and reject writes if it changed after that read. |
 | `security.allow_read_outside_workspace` | `true` | Permit direct read tools outside the project unless a rule denies the path. |
@@ -246,7 +284,8 @@ programmer
 |---|---|
 | `Enter` | Send message |
 | `Ctrl+T` | Cycle work mode (Manual → Auto → Plan → optional YOLO) |
-| `Ctrl+C` / `Ctrl+Q` | Quit |
+| `Ctrl+C` / `Ctrl+Q` twice | Quit |
+| `Ctrl+V` | Paste an image from the clipboard |
 | Mouse scroll | Scroll conversation history |
 | `!<command>` + `Enter` | Run a command interactively in a terminal panel (Ctrl+O releases input) |
 
@@ -257,17 +296,29 @@ programmer
 | `/model <provider/model>` | Switch to a different model |
 | `/mode <manual\|auto\|plan>` | Set work mode (or cycle with `Ctrl+T`) |
 | `/mode yolo` | Enter YOLO mode (requires `allow_yolo = true`) |
+| `/plan <approve\|cancel>` | Approve or cancel the current Plan-mode proposal |
 | `/classifier [provider/model]` | Set/show the Auto-mode classifier model |
 | `/classifier clear` | Reset classifier to the chat model |
+| `/init` | Create or refresh `PROGRAMMER.md` and project diagnostics |
+| `/thinking [level]` | Set/show reasoning effort for chat and compaction |
+| `/compact [provider/model]` | Summarize older history to reduce context usage |
 | `/vision <on\|off>` | Enable/disable `@image` attachments for this session |
+| `/select [on\|off]` | Toggle native terminal text selection and copying |
 | `/permission` `/sandbox` | Show sandbox, file protection, and permission status |
 | `/todo` `/t` | Open this session's todo list |
+| `/skill <name\|list\|off>` | Activate, list, or clear skills |
+| `/skill manage` | Open the skills management panel |
+| `/mcp show` | List MCP server status |
+| `/mcp manage` | Open the MCP management panel |
+| `/terminal [id]` | Open a running or completed task's terminal viewer |
+| `/terminal clear` | Remove completed, failed, and killed tasks |
+| `/usage` | Show token usage for the session and latest turn |
 | `/new` `/n` | Start a new session (auto-saves current) |
 | `/session` `/s` | Show current session UUID and info |
 | `/providers show` | List all configured providers and models |
 | `/providers manage` | Open the provider management panel |
 | `/providers refresh [provider]` | Refetch auto-discovered model lists (optionally for one provider) |
-| `/clear` `/c` | Clear the conversation history |
+| `/clear` `/c` | Delete the current session and reset its chat, todos, images, and diagnostics |
 | `/quit` `/q` | Exit the application |
 | `/help` `/?` | Show all commands |
 
@@ -455,24 +506,24 @@ Terminal emulators generally reserve `Cmd+V` for text paste, so image paste uses
 
 ```
 src/
-├── main.rs           # Entry point, terminal setup, config loading
-├── app.rs            # Application state, event loop, stream management
-├── config/           # Configuration struct + deserialization
-├── classifier.rs     # Tool-call classifier (Auto mode, fast + reasoned paths)
-├── commands/         # Slash-command parsing + tab completion
-├── session/          # Multi-session persistence (UUID-keyed JSON)
-├── clipboard.rs      # Copy-to-clipboard support
-├── response/         # Parsing OpenAI response stream events
-├── tools/            # Tool definitions + execution (command, read_file, etc.)
-├── diagnostics/      # Project diagnostics pipeline (profile, parser, runner, diff)
-└── ui/               # Terminal UI (ratatui)
-    ├── components/
-    │   ├── conversation_panel/   # Chat history rendering
-    │   ├── input_panel/          # User input textarea
-    │   ├── footer/               # Status bar (mode, model, session)
-    │   └── messages/             # Individual message bubble renderers
-    ├── markdown_code_block.rs    # Code block rendering
-    └── markdown_theme.rs         # Markdown colour theme
+├── main.rs           # Entry point and subcommand dispatch
+├── cli.rs            # Clap CLI definitions and validation
+├── app/              # TUI application state, events, sessions, and surfaces
+├── runner/           # Shared model/tool turn engine for TUI and headless modes
+├── conversation.rs   # UI-independent conversation and request history
+├── classifier/       # Manual, Auto, Plan, and YOLO tool-call policies
+├── security/         # Access rules, named profiles, and process sandboxing
+├── tools/            # Built-in tool definitions, policies, and execution
+├── tasks/            # Background commands and interactive PTY lifecycle
+├── agents/           # In-process sub-agent registry and lifecycle
+├── mcp/              # MCP client, server, HTTP transport, and approval console
+├── skills/           # Built-in and filesystem-discovered agent skills
+├── diagnostics/      # Checker profiles, parsers, baselines, and LSP support
+├── session/          # UUID-keyed persistent conversations
+├── providers/        # Provider/model discovery and selection
+├── headless.rs       # Non-interactive run, init, and diagnostics surfaces
+├── upgrade.rs        # Release checks, self-update, and uninstall
+└── ui/               # Ratatui components, rendering, and terminal images
 ```
 
 ## License
