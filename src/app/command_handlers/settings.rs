@@ -21,11 +21,47 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
     match command {
         Command::Model(name) => model(app, name),
         Command::Vision(arg) => vision(app, &arg),
+        Command::Select(arg) => select(app, &arg),
         Command::Mode(arg) => mode(app, &arg),
         Command::Classifier(arg) => classifier(app, &arg),
         Command::Thinking(arg) => thinking(app, &arg),
         Command::Permission(arg) => permission(app, &arg),
         _ => unreachable!("settings handler received a command from another domain"),
+    }
+}
+
+fn select(app: &mut App<'_>, arg: &str) -> CommandOutcome {
+    let enabled = match selection_mode_target(app.native_selection_mode, arg) {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            app.conversation_panel.add_error_string(error);
+            return CommandOutcome::handled(false);
+        }
+    };
+    if let Err(error) = crate::terminal::set_mouse_capture(!enabled) {
+        app.conversation_panel
+            .add_error_string(format!("could not change terminal selection mode: {error}"));
+        return CommandOutcome::handled(false);
+    }
+
+    app.native_selection_mode = enabled;
+    let message = if enabled {
+        "Selection mode enabled. Drag to select text and use your terminal's copy shortcut; mouse scrolling and clicks are paused. Run /select off to restore them."
+    } else {
+        "Selection mode disabled. Mouse scrolling and clicks are restored."
+    };
+    app.conversation_panel.add_info_string(message);
+    CommandOutcome::handled(false)
+}
+
+fn selection_mode_target(current: bool, argument: &str) -> Result<bool, String> {
+    match argument.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(!current),
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!(
+            "unknown selection setting '{other}' — use /select, /select on, or /select off"
+        )),
     }
 }
 
@@ -515,6 +551,15 @@ fn thinking(app: &mut App<'_>, arg: &str) -> CommandOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_mode_toggles_and_accepts_explicit_states() {
+        assert_eq!(selection_mode_target(false, ""), Ok(true));
+        assert_eq!(selection_mode_target(true, ""), Ok(false));
+        assert_eq!(selection_mode_target(false, "ON"), Ok(true));
+        assert_eq!(selection_mode_target(true, "off"), Ok(false));
+        assert!(selection_mode_target(false, "maybe").is_err());
+    }
 
     #[test]
     fn permission_updates_boolean_settings() {

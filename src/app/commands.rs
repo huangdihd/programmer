@@ -623,6 +623,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         | Command::Help) => command_handlers::session::execute(app, command),
         command @ (Command::Model(_)
         | Command::Vision(_)
+        | Command::Select(_)
         | Command::Mode(_)
         | Command::Classifier(_)
         | Command::Thinking(_)
@@ -727,6 +728,11 @@ mod tests {
                 ExpectedCommandEffect::AppendedMessage,
             ),
             ("vision", "/vision", ExpectedCommandEffect::AppendedMessage),
+            (
+                "select",
+                "/select invalid",
+                ExpectedCommandEffect::AppendedMessage,
+            ),
             (
                 "permission",
                 "/permission manage",

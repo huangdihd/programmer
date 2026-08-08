@@ -63,6 +63,8 @@ pub enum Command {
     Thinking(String),
     /// `/vision <on|off>` — enable or disable image attachments for this session.
     Vision(String),
+    /// `/select [on|off]` — toggle native terminal text selection and copying.
+    Select(String),
     /// `/permission` (or `/sandbox`) — inspect or configure mandatory
     /// filesystem and process isolation.
     Permission(String),
@@ -89,6 +91,7 @@ enum CommandKind {
     Compact,
     Thinking,
     Vision,
+    Select,
     Permission,
 }
 
@@ -159,6 +162,7 @@ impl CommandKind {
             Self::Compact => Command::Compact(args),
             Self::Thinking => Command::Thinking(args),
             Self::Vision => Command::Vision(args),
+            Self::Select => Command::Select(args),
             Self::Permission => Command::Permission(args),
         }
     }
@@ -188,7 +192,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["n"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 19,
+            order: 20,
             usage: "/new | /n",
             description: "Start a new session (saves current)",
         }],
@@ -200,17 +204,17 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Providers,
         help: &[
             HelpEntry {
-                order: 20,
+                order: 21,
                 usage: "/providers show",
                 description: "List all configured providers and models",
             },
             HelpEntry {
-                order: 21,
+                order: 22,
                 usage: "/providers manage",
                 description: "Open the provider management panel",
             },
             HelpEntry {
-                order: 22,
+                order: 23,
                 usage: "/providers refresh [provider]",
                 description: "Refetch auto-discovered provider models",
             },
@@ -222,7 +226,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["s"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 23,
+            order: 24,
             usage: "/session | /s",
             description: "Show current session info",
         }],
@@ -233,7 +237,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 24,
+            order: 25,
             usage: "/usage",
             description: "Show token usage for the current session",
         }],
@@ -277,7 +281,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["t"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 18,
+            order: 19,
             usage: "/todo | /t",
             description: "Open the todo list panel",
         }],
@@ -388,23 +392,34 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         }],
     },
     CommandSpec {
+        kind: CommandKind::Select,
+        name: "select",
+        aliases: &[],
+        completion: CompletionKind::Fixed(&["on", "off"]),
+        help: &[HelpEntry {
+            order: 15,
+            usage: "/select [on|off]",
+            description: "Toggle native terminal text selection and copying",
+        }],
+    },
+    CommandSpec {
         kind: CommandKind::Permission,
         name: "permission",
         aliases: &["sandbox"],
         completion: CompletionKind::Permission,
         help: &[
             HelpEntry {
-                order: 15,
+                order: 16,
                 usage: "/permission show | manage",
                 description: "Show security status or open the profile management panel",
             },
             HelpEntry {
-                order: 16,
+                order: 17,
                 usage: "/permission profile <list|use|create|rename|delete>",
                 description: "List, switch, or manage named security profiles",
             },
             HelpEntry {
-                order: 17,
+                order: 18,
                 usage: "/permission mode <restricted|network|off> | <setting> <on|off>",
                 description: "Configure the active profile mode, settings, paths, and environment",
             },
@@ -416,7 +431,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["c"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 25,
+            order: 26,
             usage: "/clear | /c",
             description: "Delete this session; reset chat, todos, images, and diagnostics",
         }],
@@ -427,7 +442,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["q", "exit"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 26,
+            order: 27,
             usage: "/quit | /q",
             description: "Exit the application",
         }],
@@ -438,7 +453,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["?"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 27,
+            order: 28,
             usage: "/help | /?",
             description: "Show this help",
         }],
@@ -1486,6 +1501,25 @@ mod tests {
     }
 
     #[test]
+    fn select_command_parses_and_completes_explicit_states() {
+        assert_eq!(
+            Command::parse("/select on"),
+            Some(Command::Select("on".to_string()))
+        );
+
+        let state = CompletionEngine::complete_subcommand("select o", "select", &["on", "off"])
+            .expect("selection state completion");
+        assert_eq!(
+            state
+                .candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["on", "off"]
+        );
+    }
+
+    #[test]
     fn command_catalog_preserves_names_aliases_and_argument_parsing() {
         let expected_names = [
             "model",
@@ -1504,6 +1538,7 @@ mod tests {
             "compact",
             "thinking",
             "vision",
+            "select",
             "permission",
             "clear",
             "quit",
@@ -1578,6 +1613,10 @@ mod tests {
             (
                 "/vision <on|off>",
                 "Enable or disable image attachments for this session",
+            ),
+            (
+                "/select [on|off]",
+                "Toggle native terminal text selection and copying",
             ),
             (
                 "/permission show | manage",

@@ -67,8 +67,10 @@ Important TUI commands include:
 - `/skill <name>`, `/skill list`, `/skill manage`, and `/skill off` for skills.
 - `/mcp show|manage` for external MCP servers.
 - `/init` and diagnostics tooling for project understanding and checks.
-- `/todo`, `/terminal`, `/compact`, `/vision`, `/session`, `/usage`, `/new`,
-  `/clear`, `/help`, and `/quit` for session and UI workflows.
+- `/todo`, `/terminal`, `/compact`, `/vision`, `/select`, `/session`, `/usage`,
+  `/new`, `/clear`, `/help`, and `/quit` for session and UI workflows. `/select`
+  temporarily gives mouse drags to the terminal for native text selection and
+  copying; run it again or use `/select off` to restore TUI mouse controls.
 
 Common controls include `Enter` to send, `Ctrl+T` to cycle work modes,
 `Ctrl+C` or `Ctrl+Q` to quit, mouse scrolling for conversation history, and

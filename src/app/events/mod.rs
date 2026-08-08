@@ -59,8 +59,9 @@ async fn handle_crossterm(
 ) -> color_eyre::Result<()> {
     match event {
         crossterm::event::Event::FocusGained => {
-            // Restore mouse capture explicitly on focus regain.
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+            // External programs can alter mouse reporting. Restore whichever
+            // mode the user selected when the terminal regains focus.
+            let _ = crate::terminal::set_mouse_capture(!app.native_selection_mode);
         }
         crossterm::event::Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
             handle_key_events(app, key_event).await?
@@ -233,8 +234,9 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             }
             app.sync_todos_from_store();
             session::mark_dirty(app);
-            // Restore mouse capture — external commands may disable it.
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+            // External commands may alter mouse capture. Restore the user's
+            // current TUI/native-selection choice.
+            let _ = crate::terminal::set_mouse_capture(!app.native_selection_mode);
             start_queued_work(app).await;
         }
         AppEvent::Start => {

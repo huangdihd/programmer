@@ -218,6 +218,9 @@ pub struct App<'a> {
     pub current_model: String,
     /// Whether supported `@image` references are sent as multimodal inputs.
     pub vision_enabled: bool,
+    /// Whether the terminal emulator owns mouse drags for native text
+    /// selection instead of the TUI receiving mouse events.
+    pub(crate) native_selection_mode: bool,
     /// Reasoning effort for main chat and compaction requests.
     pub(crate) thinking_level: crate::thinking::ThinkingLevel,
     /// Images belonging to the queued follow-up message while a turn is busy.
@@ -398,6 +401,7 @@ impl App<'_> {
             provider_model_statuses,
             current_model,
             vision_enabled,
+            native_selection_mode: false,
             thinking_level,
             pending_images: Vec::new(),
             events: EventHandler::new(),

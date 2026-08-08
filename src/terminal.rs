@@ -54,6 +54,17 @@ pub(crate) struct TerminalGuard {
     keyboard_enhanced: bool,
 }
 
+/// Enable or disable terminal mouse reporting while the TUI is running.
+/// Disabling it returns mouse drags to the terminal emulator so text can be
+/// selected and copied with the emulator's native controls.
+pub(crate) fn set_mouse_capture(enabled: bool) -> io::Result<()> {
+    if enabled {
+        execute!(io::stdout(), EnableMouseCapture)
+    } else {
+        execute!(io::stdout(), DisableMouseCapture)
+    }
+}
+
 impl TerminalGuard {
     pub(crate) fn enter(
         project_name: &str,
