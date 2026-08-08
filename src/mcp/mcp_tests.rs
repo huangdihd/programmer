@@ -309,7 +309,7 @@ async fn http_client_error_surfaces_failure() {
 }
 
 #[tokio::test]
-async fn full_integration_stdio_and_http_with_progress_and_roots() {
+async fn full_integration_stdio_and_http_with_roots() {
     // Find the integration test harness — the crate-relative path is fixed
     // (mcp/test-harness/), so walk up from the source file location.
     let harness_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -335,29 +335,12 @@ async fn full_integration_stdio_and_http_with_progress_and_roots() {
     let mgr = McpManager::from_config(&[cfg], ".").await;
     assert!(mgr.startup_errors.is_empty());
 
-    // --- Progress ---
-    // long_task sends 3 progress notifications while it runs. Progress is
-    // observable during the call and cleared once it completes.
-    let (call_result, observed) = tokio::join!(
-        mgr.call_tool("mcp__a__long_task", serde_json::json!({"token":"p1"})),
-        async {
-            for _ in 0..200 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                if let Some((server, info)) = mgr.active_progress() {
-                    return Some((server, info));
-                }
-            }
-            None
-        }
-    );
-    call_result.unwrap();
-    let (server, info) = observed.expect("progress visible while the call runs");
-    assert_eq!(server, "a");
-    assert_eq!(info.total, Some(3.0));
-    assert!(info.progress >= 1.0);
-    assert!(info.message.as_deref().unwrap_or("").starts_with("step"));
-    // Finished call leaves no stale progress for the footer to show.
-    assert!(mgr.active_progress().is_none());
+    // Progress notifications from a long-running call are ignored now that
+    // the footer no longer exposes MCP loading state, but they must not
+    // interfere with the call response.
+    mgr.call_tool("mcp__a__long_task", serde_json::json!({"token":"p1"}))
+        .await
+        .unwrap();
 
     // --- Roots ---
     // roots_probe sends roots/list to client, reads response.

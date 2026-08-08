@@ -116,6 +116,7 @@ pub enum AppEvent {
     /// Background model discovery finished: apply the fresh model lists and
     /// errors to the provider manager without blocking the event loop.
     ProviderModelsRefreshed {
+        requested_providers: Vec<String>,
         models: std::collections::HashMap<String, Vec<String>>,
         startup_errors: Vec<String>,
         notify: bool,

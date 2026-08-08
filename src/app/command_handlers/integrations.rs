@@ -50,8 +50,6 @@ fn providers(app: &mut App<'_>, arg: &str) {
         }
         "manage" => app.provider_panel = Some(ProviderPanel::new()),
         "refresh" => {
-            app.conversation_panel
-                .add_info_string("Refreshing provider model lists...");
             app.events.send(AppEvent::RefreshProviderModels {
                 name: None,
                 notify: true,
@@ -64,9 +62,6 @@ fn providers(app: &mut App<'_>, arg: &str) {
                     .add_info_string("usage: /providers refresh [provider]");
                 return;
             }
-            app.conversation_panel.add_info_string(format!(
-                "Refreshing model list for provider '{provider_name}'..."
-            ));
             app.events.send(AppEvent::RefreshProviderModels {
                 name: Some(provider_name),
                 notify: true,

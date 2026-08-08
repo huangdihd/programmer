@@ -109,18 +109,6 @@ impl McpConn {
         }
     }
 
-    fn clear_progress(&self) {
-        match self {
-            McpConn::Stdio(c) => c.clear_progress(),
-            McpConn::Http(c) => c.clear_progress(),
-        }
-    }
-    fn progress_snapshot(&self) -> HashMap<String, client::ProgressInfo> {
-        match self {
-            McpConn::Stdio(c) => c.progress_snapshot(),
-            McpConn::Http(c) => c.progress_snapshot(),
-        }
-    }
     fn stderr_snapshot(&self) -> Vec<String> {
         match self {
             McpConn::Stdio(c) => c.stderr_snapshot(),
@@ -184,10 +172,6 @@ impl McpServer {
 
     fn stderr_snapshot(&self) -> Vec<String> {
         self.client.stderr_snapshot()
-    }
-
-    fn progress_snapshot(&self) -> HashMap<String, client::ProgressInfo> {
-        self.client.progress_snapshot()
     }
 }
 
@@ -341,9 +325,6 @@ impl McpManager {
 
     // -- queries --
 
-    pub(crate) fn server_count(&self) -> usize {
-        self.servers.len()
-    }
     pub(crate) fn has_server(&self, name: &str) -> bool {
         self.servers.contains_key(name)
     }
@@ -381,18 +362,6 @@ impl McpManager {
     /// The most recent stderr lines from a server (non-destructive).
     pub(crate) fn server_stderr(&self, server_name: &str) -> Option<Vec<String>> {
         self.servers.get(server_name).map(|s| s.stderr_snapshot())
-    }
-
-    /// The first in-flight progress report across all servers, for the
-    /// footer status bar. Progress state is cleared when its call finishes,
-    /// so `Some` means a call is actively reporting.
-    pub(crate) fn active_progress(&self) -> Option<(String, client::ProgressInfo)> {
-        for (name, s) in &self.servers {
-            if let Some(info) = s.progress_snapshot().into_values().next() {
-                return Some((name.clone(), info));
-            }
-        }
-        None
     }
 
     // -- resource / prompt access --
@@ -454,14 +423,6 @@ impl McpManager {
             .get(server_name)
             .ok_or_else(|| format!("MCP server '{server_name}' not found"))?;
 
-        // Attach a progress token so servers that support
-        // `notifications/progress` can report progress; the sidebar shows it
-        // while the call runs.
-        static PROGRESS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let token = format!(
-            "call-{}",
-            PROGRESS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
         let raw = s
             .client
             .call_with_timeout(
@@ -469,16 +430,10 @@ impl McpManager {
                 Some(serde_json::json!({
                     "name": tool_name,
                     "arguments": arguments,
-                    "_meta": { "progressToken": token },
                 })),
                 TOOL_CALL_TIMEOUT_SECS,
             )
-            .await;
-        // The call is over either way — drop progress state so the UI never
-        // shows stale progress (also covers servers that report under a
-        // token of their own instead of the one we attached).
-        s.client.clear_progress();
-        let raw = raw?;
+            .await?;
 
         s.refresh_if_stale().await;
         s.refresh_resources_if_stale().await;
@@ -491,7 +446,6 @@ fn parse_fqn(fqn: &str) -> Option<(&str, &str)> {
     let rest = fqn.strip_prefix("mcp__")?;
     rest.split_once("__")
 }
-
 
 #[cfg(test)]
 #[path = "mcp_tests.rs"]

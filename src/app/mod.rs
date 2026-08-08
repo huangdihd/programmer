@@ -28,7 +28,7 @@ use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
 use crate::config::programmer_config::ProgrammerConfig;
 use crate::mcp::McpServerStatus;
-use crate::providers::ProviderManager;
+use crate::providers::{ProviderManager, ProviderModelStatus};
 use crate::response::message_item::MessageItem;
 use crate::session::SessionManager;
 use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
@@ -212,6 +212,8 @@ pub struct App<'a> {
     pub(crate) quit_requested_at: Option<std::time::Instant>,
     /// Multi-provider manager (replaces the single OpenAI client).
     pub provider_manager: ProviderManager,
+    /// Per-provider model-list state rendered in the right sidebar.
+    pub(crate) provider_model_statuses: Vec<ProviderModelStatus>,
     /// Currently active model in `provider/model` format.
     pub current_model: String,
     /// Whether supported `@image` references are sent as multimodal inputs.
@@ -386,10 +388,12 @@ impl App<'_> {
             .iter()
             .map(|server| McpServerStatus::connecting(server.name.clone()))
             .collect();
+        let provider_model_statuses = ProviderModelStatus::from_config(&config);
         let mut app = Self {
             running: true,
             quit_requested_at: None,
             provider_manager,
+            provider_model_statuses,
             current_model,
             vision_enabled,
             thinking_level,

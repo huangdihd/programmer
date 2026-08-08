@@ -342,32 +342,7 @@ impl Widget for &mut App<'_> {
             self.footer.status.status.emoji_label(),
             self.project_name,
         ));
-        // Live MCP progress rides along as status detail while a call runs
-        // (progress state is cleared when the call finishes).
-        self.footer.status.detail = self
-            .mcp_manager
-            .as_deref()
-            .and_then(|m| m.active_progress())
-            .map(|(server, info)| {
-                let pct = info
-                    .total
-                    .filter(|t| *t > 0.0)
-                    .map(|t| format!("{:.0}% ", (info.progress / t * 100.0).min(100.0)))
-                    .unwrap_or_default();
-                let msg = info.message.unwrap_or_default();
-                let text = format!("{server}: {pct}{msg}");
-                let mut trimmed: String = text.trim_end().chars().take(60).collect();
-                if trimmed.chars().count() == 60 {
-                    trimmed.push('…');
-                }
-                trimmed
-            })
-            .or_else(|| {
-                let count = self.provider_manager.startup_errors.len();
-                (count > 0).then(|| {
-                    format!("⚠ Model list refresh incomplete ({count}) · /providers manage")
-                })
-            });
+        self.footer.status.detail = None;
         self.footer.work_mode = self.work_mode;
         self.footer.sandbox_mode = self.security.sandbox_mode();
         self.footer.sandbox_profile = self.config.active_security_profile.clone();
@@ -446,6 +421,10 @@ impl Widget for &mut App<'_> {
                 .unwrap_or_default();
             let sidebar_tasks = crate::tasks::snapshot_for_sidebar(&expanded_task_ids);
             let sidebar_agents = self.agents.snapshot_all();
+            let active_provider = self
+                .current_model
+                .split_once('/')
+                .map_or(self.config.default_provider.as_str(), |(provider, _)| provider);
             self.sidebar.as_mut().unwrap().render(
                 horiz[1],
                 buf,
@@ -457,6 +436,8 @@ impl Widget for &mut App<'_> {
                     .unwrap_or(&[]),
                 self.diag.lsp_configured,
                 &self.mcp_server_statuses,
+                &self.provider_model_statuses,
+                active_provider,
                 &self.todo_list,
                 &sidebar_tasks,
                 &sidebar_agents,

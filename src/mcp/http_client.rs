@@ -24,9 +24,8 @@
 //! Not implemented (not needed for tool calling): the standalone GET
 //! listening stream, stream resumability, server→client requests, and
 //! explicit DELETE session teardown. Notifications that arrive on a POST's
-//! SSE stream (progress, list_changed) are handled.
+//! SSE stream (`list_changed`, etc.) are handled.
 
-use super::client::ProgressInfo;
 use super::types::{JsonRpcRequest, JsonRpcResponse};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex as StdMutex;
@@ -52,8 +51,6 @@ pub(crate) struct McpHttpClient {
     resources_list_changed: AtomicBool,
     resources_updated: AtomicBool,
     prompts_list_changed: AtomicBool,
-    // --- progress ---
-    progress: StdMutex<HashMap<String, ProgressInfo>>,
     // --- transport log (the panel's "stderr" pane) ---
     log: StdMutex<VecDeque<String>>,
 }
@@ -98,7 +95,6 @@ impl McpHttpClient {
             resources_list_changed: AtomicBool::new(false),
             resources_updated: AtomicBool::new(false),
             prompts_list_changed: AtomicBool::new(false),
-            progress: StdMutex::new(HashMap::new()),
             log: StdMutex::new(VecDeque::new()),
         })
     }
@@ -287,7 +283,6 @@ impl McpHttpClient {
         let Some(method) = raw.get("method").and_then(|v| v.as_str()) else {
             return;
         };
-        let params = raw.get("params");
         match method {
             "notifications/tools/list_changed" => {
                 self.tools_list_changed.store(true, Ordering::Relaxed);
@@ -300,24 +295,6 @@ impl McpHttpClient {
             }
             "notifications/prompts/list_changed" => {
                 self.prompts_list_changed.store(true, Ordering::Relaxed);
-            }
-            "notifications/progress" => {
-                if let Some(p) = params {
-                    let token = match p.get("progressToken") {
-                        Some(serde_json::Value::Number(n)) => n.to_string(),
-                        Some(serde_json::Value::String(s)) => s.clone(),
-                        _ => return,
-                    };
-                    let info = ProgressInfo {
-                        progress: p.get("progress").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        total: p.get("total").and_then(|v| v.as_f64()),
-                        message: p
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                    };
-                    self.progress.lock().unwrap().insert(token, info);
-                }
             }
             _ => {}
         }
@@ -358,16 +335,6 @@ impl McpHttpClient {
     }
     pub(crate) fn take_prompts_list_changed(&self) -> bool {
         self.prompts_list_changed.swap(false, Ordering::Relaxed)
-    }
-
-    // --- progress ---
-
-    pub(crate) fn clear_progress(&self) {
-        self.progress.lock().unwrap().clear();
-    }
-
-    pub(crate) fn progress_snapshot(&self) -> HashMap<String, ProgressInfo> {
-        self.progress.lock().unwrap().clone()
     }
 
     // --- transport log (the panel's "stderr" pane) ---

@@ -17,6 +17,7 @@ use super::{ClickTarget, Sidebar, SidebarSection};
 use crate::agents::{AgentSnapshot, AgentStatus};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::mcp::{McpConnectionState, McpServerStatus};
+use crate::providers::{ProviderModelState, ProviderModelStatus};
 use crate::tasks::{SidebarTaskSnapshot, TaskStatus};
 use crate::todos::{TodoList, TodoStatus};
 use crate::ui::text::{format_duration_secs, truncate_to_width, wrap_to_width};
@@ -37,6 +38,8 @@ struct SidebarData<'a> {
     diagnostics: &'a [Diagnostic],
     lsp_configured: bool,
     mcp_servers: &'a [McpServerStatus],
+    provider_models: &'a [ProviderModelStatus],
+    active_provider: &'a str,
     todo_list: &'a TodoList,
     tasks: &'a [SidebarTaskSnapshot],
     agents: &'a [AgentSnapshot],
@@ -53,6 +56,8 @@ impl Sidebar {
         diagnostics: &[Diagnostic],
         lsp_configured: bool,
         mcp_servers: &[McpServerStatus],
+        provider_models: &[ProviderModelStatus],
+        active_provider: &str,
         todo_list: &TodoList,
         tasks: &[SidebarTaskSnapshot],
         agents: &[AgentSnapshot],
@@ -73,6 +78,8 @@ impl Sidebar {
             diagnostics,
             lsp_configured,
             mcp_servers,
+            provider_models,
+            active_provider,
             todo_list,
             tasks,
             agents,
@@ -191,6 +198,14 @@ impl Sidebar {
                     SidebarSection::Mcp => {
                         self.render_mcp(&mut lines, &mut targets, width, data.mcp_servers);
                     }
+                    SidebarSection::Providers => {
+                        self.render_providers(
+                            &mut lines,
+                            &mut targets,
+                            data.provider_models,
+                            data.active_provider,
+                        );
+                    }
                     SidebarSection::Todos => {
                         self.render_todos(&mut lines, &mut targets, width, data.todo_list);
                     }
@@ -224,6 +239,7 @@ impl Sidebar {
             // Show when diagnostics exist or a live LSP is configured.
             SidebarSection::Diagnostics => data.lsp_configured || !data.diagnostics.is_empty(),
             SidebarSection::Mcp => !data.mcp_servers.is_empty(),
+            SidebarSection::Providers => !data.provider_models.is_empty(),
             SidebarSection::Todos => !data.todo_list.todos.is_empty(),
             SidebarSection::Tasks => !data.tasks.is_empty(),
             SidebarSection::Agents => !data.agents.is_empty(),
@@ -306,6 +322,34 @@ impl Sidebar {
                 }
                 format!("MCP ({})", parts.join(", "))
             }
+            SidebarSection::Providers => {
+                let ready = data
+                    .provider_models
+                    .iter()
+                    .filter(|provider| matches!(provider.state, ProviderModelState::Ready { .. }))
+                    .count();
+                let refreshing = data
+                    .provider_models
+                    .iter()
+                    .filter(|provider| provider.state == ProviderModelState::Refreshing)
+                    .count();
+                let failed = data
+                    .provider_models
+                    .iter()
+                    .filter(|provider| provider.state == ProviderModelState::Failed)
+                    .count();
+                let mut parts = Vec::new();
+                for (amount, label) in [
+                    (ready, "ready"),
+                    (refreshing, "refreshing"),
+                    (failed, "failed"),
+                ] {
+                    if amount > 0 {
+                        parts.push(format!("{amount} {label}"));
+                    }
+                }
+                format!("Providers ({})", parts.join(", "))
+            }
             SidebarSection::Todos => {
                 let pending = data
                     .todo_list
@@ -340,6 +384,7 @@ impl Sidebar {
         let color = match section {
             SidebarSection::Diagnostics => Color::Red,
             SidebarSection::Mcp => Color::Magenta,
+            SidebarSection::Providers => Color::Green,
             SidebarSection::Todos => Color::Yellow,
             SidebarSection::Tasks => Color::Cyan,
             SidebarSection::Agents => Color::Blue,
@@ -351,6 +396,44 @@ impl Sidebar {
     }
 
     // -- per-section content renderers --
+
+    fn render_providers(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        targets: &mut Vec<ClickTarget>,
+        providers: &[ProviderModelStatus],
+        active_provider: &str,
+    ) {
+        for provider in providers {
+            let (dot_color, label, label_color) = match provider.state {
+                ProviderModelState::Refreshing => {
+                    (Color::Yellow, "refreshing…".to_string(), Color::Yellow)
+                }
+                ProviderModelState::Ready { model_count } => (
+                    Color::Green,
+                    format!("{model_count} models"),
+                    Color::DarkGray,
+                ),
+                ProviderModelState::Failed => {
+                    (Color::Red, "refresh failed".to_string(), Color::Red)
+                }
+            };
+            let active_marker = if provider.name == active_provider {
+                " [current]"
+            } else {
+                ""
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("●", Style::default().fg(dot_color)),
+                Span::raw(" "),
+                Span::styled(provider.name.clone(), Style::default().fg(Color::White)),
+                Span::styled(active_marker, Style::default().fg(Color::Yellow)),
+                Span::styled(format!(" ({label})"), Style::default().fg(label_color)),
+            ]));
+            targets.push(ClickTarget::None);
+        }
+    }
 
     fn render_diagnostics(
         &self,
@@ -769,6 +852,27 @@ mod tests {
             &[],
             false,
             statuses,
+            &[],
+            "",
+            &crate::todos::TodoList::default(),
+            &[],
+            &[],
+        );
+        buffer_text(&buf)
+    }
+
+    fn render_provider_statuses(statuses: &[ProviderModelStatus], active: &str) -> String {
+        let mut sidebar = Sidebar::new();
+        let area = Rect::new(0, 0, 48, 20);
+        let mut buf = Buffer::empty(area);
+        sidebar.render(
+            area,
+            &mut buf,
+            &[],
+            false,
+            &[],
+            statuses,
+            active,
             &crate::todos::TodoList::default(),
             &[],
             &[],
@@ -813,6 +917,57 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_states_are_visible_in_the_sidebar() {
+        let text = render_provider_statuses(
+            &[
+                ProviderModelStatus {
+                    name: "openai".to_string(),
+                    state: ProviderModelState::Ready { model_count: 12 },
+                },
+                ProviderModelStatus {
+                    name: "deepseek".to_string(),
+                    state: ProviderModelState::Refreshing,
+                },
+                ProviderModelStatus {
+                    name: "offline".to_string(),
+                    state: ProviderModelState::Failed,
+                },
+            ],
+            "deepseek",
+        );
+
+        assert!(
+            text.contains("Providers (1 ready, 1 refreshing, 1 failed)"),
+            "got:\n{text}"
+        );
+        assert!(text.contains("openai (12 models)"), "got:\n{text}");
+        assert!(
+            text.contains("deepseek [current] (refreshing…)"),
+            "got:\n{text}"
+        );
+        assert!(!text.contains("openai [current]"), "got:\n{text}");
+        assert!(text.contains("offline (refresh failed)"), "got:\n{text}");
+    }
+
+    #[test]
+    fn all_provider_model_states_are_visible_in_the_sidebar() {
+        let statuses: Vec<_> = (1..=10)
+            .map(|index| ProviderModelStatus {
+                name: format!("provider-{index}"),
+                state: ProviderModelState::Ready { model_count: index },
+            })
+            .collect();
+
+        let text = render_provider_statuses(&statuses, "provider-10");
+
+        assert!(
+            text.contains("provider-10 [current] (10 models)"),
+            "got:\n{text}"
+        );
+        assert!(!text.contains(" more"), "got:\n{text}");
+    }
+
+    #[test]
     fn tasks_section_renders_above_diagnostics() {
         let mut sidebar = Sidebar::new();
         let area = Rect::new(0, 0, 32, 40);
@@ -834,6 +989,8 @@ mod tests {
             &[],
             true,
             &[],
+            &[],
+            "",
             &crate::todos::TodoList::default(),
             &tasks,
             &[],
@@ -872,6 +1029,8 @@ mod tests {
             &[],
             false,
             &[],
+            &[],
+            "",
             &crate::todos::TodoList::default(),
             &tasks,
             &[],
@@ -893,6 +1052,8 @@ mod tests {
             &[],
             false,
             &[],
+            &[],
+            "",
             &crate::todos::TodoList::default(),
             &tasks,
             &[],
@@ -920,6 +1081,8 @@ mod tests {
             &[],
             false,
             &[],
+            &[],
+            "",
             &crate::todos::TodoList::default(),
             &[],
             &agents,

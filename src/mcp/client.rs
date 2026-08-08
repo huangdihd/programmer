@@ -23,7 +23,7 @@
 //! read loop.
 
 use super::types::{JsonRpcRequest, JsonRpcResponse};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -34,14 +34,6 @@ use tokio::task::JoinHandle;
 
 const STDERR_BUFFER_LINES: usize = 200;
 type StderrBuffer = Arc<StdMutex<VecDeque<String>>>;
-
-/// Progress info tracked per `progressToken` from `notifications/progress`.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ProgressInfo {
-    pub progress: f64,
-    pub total: Option<f64>,
-    pub message: Option<String>,
-}
 
 /// A connected MCP server child process, ready for JSON-RPC calls.
 pub(crate) struct McpClient {
@@ -58,9 +50,6 @@ pub(crate) struct McpClient {
     // --- cancellation ---
     /// Currently-cancelled request id, set by `notifications/cancelled`.
     cancelled_id: StdMutex<Option<u64>>,
-    // --- progress ---
-    /// Progress info keyed by `progressToken` (stringified).
-    progress: StdMutex<HashMap<String, ProgressInfo>>,
     // --- roots ---
     /// Workspace root path reported via `roots/list`.
     workspace_root: String,
@@ -152,7 +141,6 @@ impl McpClient {
             resources_updated: AtomicBool::new(false),
             prompts_list_changed: AtomicBool::new(false),
             cancelled_id: StdMutex::new(None),
-            progress: StdMutex::new(HashMap::new()),
             workspace_root: workspace_root.to_string(),
             stderr_buf,
             _stderr_task: stderr_task,
@@ -340,24 +328,6 @@ impl McpClient {
                     *self.cancelled_id.lock().unwrap() = Some(rid);
                 }
             }
-            "notifications/progress" => {
-                if let Some(p) = params {
-                    let token = match p.get("progressToken") {
-                        Some(serde_json::Value::Number(n)) => n.to_string(),
-                        Some(serde_json::Value::String(s)) => s.clone(),
-                        _ => return,
-                    };
-                    let info = ProgressInfo {
-                        progress: p.get("progress").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        total: p.get("total").and_then(|v| v.as_f64()),
-                        message: p
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                    };
-                    self.progress.lock().unwrap().insert(token, info);
-                }
-            }
             _ => {}
         }
     }
@@ -375,21 +345,6 @@ impl McpClient {
     }
     pub(crate) fn take_prompts_list_changed(&self) -> bool {
         self.prompts_list_changed.swap(false, Ordering::Relaxed)
-    }
-
-    // --- progress ---
-
-    /// Drop all tracked progress. Called when a tool call finishes so the UI
-    /// never shows stale progress — this covers servers that report under
-    /// their own token instead of the one we attached (tool calls are
-    /// sequential, so there is nothing else in flight to clobber).
-    pub(crate) fn clear_progress(&self) {
-        self.progress.lock().unwrap().clear();
-    }
-
-    /// All currently tracked progress tokens and their info (non-destructive).
-    pub(crate) fn progress_snapshot(&self) -> HashMap<String, ProgressInfo> {
-        self.progress.lock().unwrap().clone()
     }
 
     // --- stderr ---

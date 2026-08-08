@@ -268,10 +268,17 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             handle_provider_models_refresh(app, name, notify)
         }
         AppEvent::ProviderModelsRefreshed {
+            requested_providers,
             models,
             startup_errors,
             notify,
-        } => handle_provider_models_refreshed(app, models, startup_errors, notify),
+        } => handle_provider_models_refreshed(
+            app,
+            requested_providers,
+            models,
+            startup_errors,
+            notify,
+        ),
         AppEvent::McpChanged => handle_mcp_changed(app),
         AppEvent::McpServerConnectionUpdated {
             generation,
@@ -597,6 +604,7 @@ fn handle_compact_finished(
 /// Providers changed: rebuild the manager and reset the model if it vanished.
 fn reload_provider_manager(app: &mut App<'_>) {
     app.provider_manager = crate::providers::ProviderManager::from_config(&app.config);
+    app.provider_model_statuses = crate::providers::ProviderModelStatus::from_config(&app.config);
     if app.provider_manager.resolve(&app.current_model).is_none() {
         app.current_model = app.provider_manager.default_model();
         app.conversation_panel
@@ -633,6 +641,16 @@ fn handle_provider_models_refresh(app: &mut App<'_>, name: Option<String>, notif
     } else {
         app.config.providers.clone()
     };
+    let requested_providers = providers
+        .iter()
+        .filter(|(_, provider)| provider.models.is_none())
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    for status in &mut app.provider_model_statuses {
+        if requested_providers.contains(&status.name) {
+            status.state = crate::providers::ProviderModelState::Refreshing;
+        }
+    }
 
     let clients = app.provider_manager.clients().clone();
     let tx = app.events.sender.clone();
@@ -640,6 +658,7 @@ fn handle_provider_models_refresh(app: &mut App<'_>, name: Option<String>, notif
         let (models, startup_errors) =
             crate::providers::ProviderManager::discover_models(&providers, &clients).await;
         let _ = tx.send(Event::App(AppEvent::ProviderModelsRefreshed {
+            requested_providers,
             models,
             startup_errors,
             notify,
@@ -650,6 +669,7 @@ fn handle_provider_models_refresh(app: &mut App<'_>, name: Option<String>, notif
 /// Background model discovery finished: apply the fresh lists and report.
 fn handle_provider_models_refreshed(
     app: &mut App<'_>,
+    requested_providers: Vec<String>,
     models: std::collections::HashMap<String, Vec<String>>,
     startup_errors: Vec<String>,
     notify: bool,
@@ -657,6 +677,16 @@ fn handle_provider_models_refreshed(
     let model_count = models.values().map(|v| v.len()).sum::<usize>();
     let provider_count = models.len();
     let error_count = startup_errors.len();
+    for status in &mut app.provider_model_statuses {
+        if requested_providers.contains(&status.name) {
+            status.state = models.get(&status.name).map_or(
+                crate::providers::ProviderModelState::Failed,
+                |models| crate::providers::ProviderModelState::Ready {
+                    model_count: models.len(),
+                },
+            );
+        }
+    }
     app.provider_manager
         .apply_model_refresh(models, startup_errors);
     if !notify {
@@ -694,8 +724,6 @@ fn handle_mcp_changed(app: &mut App<'_>) {
         return;
     }
 
-    app.conversation_panel
-        .add_info_string("Connecting MCP servers...");
     let configs = app.config.mcp_servers.clone();
     let tx = app.events.sender.clone();
     tokio::spawn(async move {
@@ -745,11 +773,6 @@ fn handle_mcp_reloaded(app: &mut App<'_>, generation: u64, manager: crate::mcp::
     for error in &manager.startup_errors {
         app.conversation_panel.add_error_string(error.clone());
     }
-    app.conversation_panel.add_info_string(format!(
-        "MCP: connected {} server(s), {} tool(s) available",
-        manager.server_count(),
-        manager.all_tools().len(),
-    ));
     app.mcp_manager = Some(std::sync::Arc::new(manager));
 }
 

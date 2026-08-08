@@ -22,6 +22,41 @@ use std::time::Duration;
 /// startup never hangs when there is no network.
 const MODEL_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Current model-list discovery state for one configured provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderModelState {
+    Refreshing,
+    Ready { model_count: usize },
+    Failed,
+}
+
+/// Sidebar-facing model-list status for one provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderModelStatus {
+    pub(crate) name: String,
+    pub(crate) state: ProviderModelState,
+}
+
+impl ProviderModelStatus {
+    pub(crate) fn from_config(config: &ProgrammerConfig) -> Vec<Self> {
+        let mut statuses = config
+            .providers
+            .iter()
+            .map(|(name, provider)| Self {
+                name: name.clone(),
+                state: match &provider.models {
+                    Some(models) => ProviderModelState::Ready {
+                        model_count: models.len(),
+                    },
+                    None => ProviderModelState::Refreshing,
+                },
+            })
+            .collect::<Vec<_>>();
+        statuses.sort_by(|left, right| left.name.cmp(&right.name));
+        statuses
+    }
+}
+
 /// Manages multiple OpenAI-compatible providers, each with its own API key,
 /// base URL, and model list (auto-discovered or manually configured).
 #[derive(Clone)]
