@@ -79,6 +79,23 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # skarn-sandbox 1.0.1 infers libc::c_long as i32 on 32-bit Linux,
+      # while seccompiler requires i64 syscall numbers. Remove this once the
+      # upstream crate includes the same conversion.
+      - name: Patch skarn-sandbox for 32-bit Linux
+        if: >-
+          runner.os == 'Linux' &&
+          (matrix.target == 'armv7-unknown-linux-gnueabihf' ||
+           matrix.target == 'i686-unknown-linux-gnu')
+        shell: bash
+        run: |
+          cargo fetch --locked --target "${{ matrix.target }}"
+          skarn_linux="$(find "$CARGO_HOME/registry/src" -path '*/skarn-sandbox-1.0.1/src/linux.rs' -print -quit)"
+          test -n "$skarn_linux"
+          grep -Fq 'rules.insert(sysno, Vec::new());' "$skarn_linux"
+          sed -i 's/rules\.insert(sysno, Vec::new());/rules.insert(i64::from(sysno), Vec::new());/' "$skarn_linux"
+          grep -Fq 'rules.insert(i64::from(sysno), Vec::new());' "$skarn_linux"
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
