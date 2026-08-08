@@ -24,7 +24,7 @@ use super::muted_style;
 
 /// Combined horizontal padding of the parent [`AssistantMessage`] block
 /// (`PAD_LEFT` + `PAD_RIGHT`).
-const BLOCK_PAD: u16 = 4;
+const BLOCK_PAD: u16 = 2;
 /// Extra left indent applied to expanded reasoning lines, keeping a visual
 /// nesting relationship under the "✻ Thought" header.
 const INDENT: u16 = 2;
@@ -66,7 +66,9 @@ impl<'a> ReasoningMessage<'a> {
         self
     }
 
-    pub fn into_text(self) -> Text<'static> {
+    /// Renders the reasoning block, also returning the raw content of every
+    /// code block (in render order) so copy buttons can be wired up.
+    pub fn into_parts(self) -> (Text<'static>, Vec<String>) {
         // Cycle through 0..=3 dots every ~8 frames → ~133 ms per state at 60 fps.
         let dots = if self.in_progress {
             match self.frame_count {
@@ -77,11 +79,15 @@ impl<'a> ReasoningMessage<'a> {
             String::new()
         };
 
-        let label = if self.in_progress {
+        let mut label = if self.in_progress {
             format!("✻ Thinking{dots}")
         } else {
             "✻ Thought".to_string()
         };
+        if let Some(summary) = reasoning_summary_title(self.item) {
+            label.push_str(" · ");
+            label.push_str(&summary);
+        }
 
         let text = reasoning_text(self.item);
         let caret = if text.is_empty() {
@@ -97,13 +103,13 @@ impl<'a> ReasoningMessage<'a> {
             muted_style(),
         ))];
 
+        let mut codes = Vec::new();
         if self.expanded && !text.is_empty() {
-            let render_width = self
-                .width
-                .saturating_sub(BLOCK_PAD + INDENT)
-                .min(100);
-            let renderer = MarkdownRenderer::new(render_width as usize)
-                .with_render_hooks(Box::new(CodeBlockHooks::new(render_width as usize)));
+            let render_width = self.width.saturating_sub(BLOCK_PAD + INDENT).min(100);
+            let hooks = CodeBlockHooks::new(render_width as usize);
+            let codes_handle = hooks.codes();
+            let renderer =
+                MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
             let blocks = renderer.parse(&text);
             let md_lines = renderer.render(&blocks, &AppTheme);
             for line in md_lines {
@@ -115,10 +121,26 @@ impl<'a> ReasoningMessage<'a> {
                 );
                 lines.push(Line::from(spans));
             }
+            codes = codes_handle.lock().map(|c| c.clone()).unwrap_or_default();
         }
 
-        Text::from(lines)
+        (Text::from(lines), codes)
     }
+}
+
+/// A compact, single-line title from the API's reasoning summary. Raw
+/// reasoning content is intentionally excluded: it belongs in the expanded
+/// body and can be much less suitable as a heading.
+pub(crate) fn reasoning_summary_title(item: &ReasoningItem) -> Option<String> {
+    let title = item
+        .summary
+        .iter()
+        .map(|SummaryPart::SummaryText(summary)| summary.text.as_str())
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    (!title.is_empty()).then_some(title)
 }
 
 /// The reasoning text, preferring the summary and falling back to the raw
@@ -130,14 +152,54 @@ fn reasoning_text(item: &ReasoningItem) -> String {
         .map(|SummaryPart::SummaryText(summary)| summary.text.clone())
         .collect();
 
-    if parts.is_empty() {
-        if let Some(contents) = &item.content {
-            parts = contents
-                .iter()
-                .map(|ReasoningItemContent::ReasoningText(content)| content.text.clone())
-                .collect();
-        }
+    if parts.is_empty()
+        && let Some(contents) = &item.content
+    {
+        parts = contents
+            .iter()
+            .map(|ReasoningItemContent::ReasoningText(content)| content.text.clone())
+            .collect();
     }
 
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::responses::SummaryTextContent;
+
+    fn reasoning_with_summary(summary: &str) -> ReasoningItem {
+        ReasoningItem {
+            id: None,
+            summary: vec![SummaryPart::SummaryText(SummaryTextContent {
+                text: summary.to_string(),
+            })],
+            content: None,
+            encrypted_content: None,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn completed_thought_title_includes_summary() {
+        let item = reasoning_with_summary("Reviewing\n  parser state");
+        let (text, _) = ReasoningMessage::new(false, &item, 80).into_parts();
+
+        assert_eq!(
+            text.lines[0].to_string(),
+            "▸ ✻ Thought · Reviewing parser state"
+        );
+    }
+
+    #[test]
+    fn streaming_thinking_title_includes_partial_summary() {
+        let item = reasoning_with_summary("Checking tool grouping");
+        let (text, _) = ReasoningMessage::new(true, &item, 80).into_parts();
+
+        assert_eq!(
+            text.lines[0].to_string(),
+            "▸ ✻ Thinking... · Checking tool grouping"
+        );
+    }
 }

@@ -17,6 +17,7 @@ use super::status_bar::{StatusBar, StatusState};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 const DIM: Color = Color::DarkGray;
@@ -28,15 +29,23 @@ impl Widget for &StatusBar {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let (icon, label, color) = match self.status {
             StatusState::Idle => ("●", "Ready", DIM),
+            StatusState::Connecting => ("◌", "Connecting", ACCENT),
+            StatusState::Retrying => ("↻", "Retrying", WARN),
             StatusState::Thinking => ("●", "Thinking", ACCENT),
             StatusState::Outputting => ("▸", "Outputting", OUTPUT),
             StatusState::CreatingToolCall => ("⚒", "Creating tool call", WARN),
             StatusState::ToolRunning => ("⚡", "Running tools", WARN),
+            StatusState::Classifying => ("◍", "Evaluating", ACCENT),
+            StatusState::Checking => ("◇", "Checking diagnostics", ACCENT),
+            StatusState::Compacting => ("⧉", "Compacting context", ACCENT),
+            StatusState::Cancelling => ("✖", "Cancelling", WARN),
+            StatusState::WaitingAnswer => ("?", "Waiting for answer", ACCENT),
+            StatusState::WaitingApproval => ("🛡", "Waiting for approval", WARN),
         };
 
-        // Build the status text: icon + label + optional elapsed time.
+        let busy = self.status.is_busy();
         let mut text = format!(" {} {} ", icon, label);
-        if let Some(dur) = self.elapsed() {
+        if busy && let Some(dur) = self.elapsed() {
             let secs = dur.as_secs_f64();
             if secs < 60.0 {
                 text.push_str(&format!("({:.1}s)", secs));
@@ -47,8 +56,16 @@ impl Widget for &StatusBar {
             }
         }
 
-        ratatui::widgets::Paragraph::new(text)
-            .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
-            .render(area, buf);
+        let mut spans = vec![Span::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )];
+        if let Some(detail) = &self.detail {
+            spans.push(Span::styled(
+                format!("· {detail} "),
+                Style::default().fg(DIM),
+            ));
+        }
+        ratatui::widgets::Paragraph::new(Line::from(spans)).render(area, buf);
     }
 }

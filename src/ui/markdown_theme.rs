@@ -14,7 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use ratatui::prelude::Color;
-use ratatui_markdown::theme::{Generation, RichTextTheme};
+use ratatui_markdown::theme::{CodeColors, Generation, RichTextTheme};
 
 /// Central color palette for the whole UI (Tokyo Night-ish). Every color used
 /// anywhere in the app is defined here so the theme lives in one place.
@@ -50,6 +50,26 @@ pub mod palette {
     /// Code-block background (a touch darker than `SURFACE`).
     pub const CODE_BG: Color = Color::Rgb(0x1f, 0x23, 0x35);
 }
+
+/// Syntax-highlight colors derived from the application palette.
+pub const CODE_COLORS: CodeColors = CodeColors {
+    comment: palette::MUTED,
+    keyword: palette::PURPLE,
+    string: palette::GREEN,
+    string_escape: palette::CYAN,
+    number: Color::Cyan,
+    constant: palette::PURPLE,
+    function: palette::BLUE,
+    r#type: palette::CYAN,
+    variable: palette::TEXT,
+    property: palette::BLUE,
+    operator: palette::PURPLE,
+    punctuation: palette::MUTED,
+    attribute: Color::Cyan,
+    tag: palette::BLUE,
+    label: palette::RED_MUTED,
+    error: palette::RED,
+};
 
 pub struct AppTheme;
 
@@ -93,7 +113,7 @@ impl RichTextTheme for AppTheme {
     }
 
     fn get_json_number_color(&self) -> Color {
-        palette::YELLOW
+        Color::Cyan
     }
     fn get_json_bool_color(&self) -> Color {
         palette::PURPLE
@@ -102,7 +122,10 @@ impl RichTextTheme for AppTheme {
         palette::FAINT
     }
     fn get_accent_yellow(&self) -> Color {
-        palette::YELLOW
+        Color::Cyan
+    }
+    fn get_code_colors(&self) -> CodeColors {
+        CODE_COLORS
     }
     fn get_popup_selected_text_color(&self) -> Color {
         palette::TEXT
@@ -110,5 +133,23 @@ impl RichTextTheme for AppTheme {
 
     fn get_background_color(&self) -> Color {
         Color::Reset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_theme_uses_the_application_palette_for_code() {
+        let colors = AppTheme.get_code_colors();
+
+        assert_eq!(colors.comment, palette::MUTED);
+        assert_eq!(colors.keyword, palette::PURPLE);
+        assert_eq!(colors.string, palette::GREEN);
+        assert_eq!(colors.function, palette::BLUE);
+        assert_eq!(colors.r#type, palette::CYAN);
+        assert_eq!(colors.variable, palette::TEXT);
+        assert_eq!(colors.error, palette::RED);
     }
 }

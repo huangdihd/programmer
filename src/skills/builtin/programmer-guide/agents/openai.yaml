@@ -1,0 +1,4 @@
+interface:
+  display_name: "Programmer Guide"
+  short_description: "Explain Programmer features, controls, and internals"
+  default_prompt: "Use $programmer-guide to explain how Programmer works and how to use it."

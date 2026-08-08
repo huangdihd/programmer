@@ -1,0 +1,84 @@
+- ~~multimodal support(use /vision on/off to switch support)~~
+  - ~~paste images directly from the system clipboard with Ctrl+V~~
+- ~~jump to bottom button~~
+- ~~http mcp~~
+- ~~redesign the `--mcp-http` mode UI~~
+- ~~edit_file tool diff-style message~~
+- ~~lint~~
+- ~~improve command and task system~~
+  - ~~stream command output in the TUI while it is running~~
+  - ~~view interactive and non-interactive tasks with `/terminal`~~
+- ~~convert a command into a task~~
+- ~~configurable restricted access control rule system~~
+- ~~multi-agent system~~
+  - ~~in-process sub-agent runner and registry~~
+  - ~~agent spawn/list/result/wait/cancel tool~~
+  - ~~forward permission requests to the parent surface~~
+  - ~~independent child conversations and result delivery~~
+  - ~~Agents sidebar and conversation viewer~~
+  - ~~concurrency, cancellation, and stale-edit protection~~
+- ~~sandbox~~
+  - ~~macOS Seatbelt and Linux Landlock/seccomp process sandbox~~
+- ~~optimize headless mode~~
+  - ~~refactor args parsing to clap~~
+  - ~~replace flat headless flags with run/init/diagnostics/mcp subcommands~~
+  - ~~support model, classifier model, thinking, work mode, cwd, timeout, and step limits~~
+  - ~~run automatic post-edit diagnostics and optional final checks~~
+  - ~~support text, JSON, and JSONL output~~
+- ~~store too long outputs as files~~
+- ~~display full output when commands are running~~
+- ~~fold consecutive tool calls with context-aware group titles~~
+- ~~default classifier model~~
+- ~~monitor local file changes and prevent modifications after changes before read~~
+- ~~after switch sessions using /new, task can't be cleaned and todos can't update as expectations~~
+- ~~fix intermittent failure where Esc does not interrupt the active operation~~
+- ~~require Ctrl+C twice to exit~~
+- ~~thinking level adjustment~~
+- ~~/usage~~
+- ~~clear finished tasks~~
+- ~~fix sidebar scrolling lag~~
+- ~~method to refetch models from providers~~
+- ~~title on terminal~~
+- ~~/compact [model]~~
+- ~~/compact~~
+- ~~fix /init~~
+- ~~interactive background task terminal~~
+- ~~installation script~~
+- ~~git cooperator signature~~
+- ~~expose local tools as a MCP server~~
+- ~~`@` to reference local files by path without injecting their contents~~
+- ~~improve `@` references~~
+  - ~~support referencing errors, warnings, and lint diagnostics~~
+- ~~! to run a command interactively in the app~~
+- ~~multi-provider support~~
+- ~~session persistence~~
+- ~~network retry logic~~
+- ~~per-turn token usage~~
+- ~~clipboard support~~
+- ~~tab completion~~
+- ~~provider management panel~~
+- ~~model browser~~
+- ~~ask_user tool~~
+- ~~manual mode classifier (approval UI)~~
+- ~~auto mode (LLM-based classifier)~~
+- ~~work mode cycling (Ctrl+T)~~
+- ~~diagnostics system~~
+- ~~LSP diagnostics~~
+- ~~MCP client (stdio)~~
+- ~~agent skills system~~
+- ~~todo list subsystem~~
+- ~~plan mode~~
+- ~~right-hand sidebar~~
+- ~~background task system~~
+- ~~fetch tool~~
+- ~~lazy-render conversation items~~
+- ~~MCP progress in UI~~
+- ~~atomic file writes~~
+- ~~incremental search in panels~~
+- ~~interactive task tool improvements (for TUI smoke testing):~~
+  - ~~`expect_screen(pattern, timeout)`: block until screen contains a pattern~~
+  - ~~`screen_diff`: return only changed regions since last screen snapshot~~
+  - ~~reliable mouse scroll support in PTY~~
+  - ~~stderr/stdout split or separate capture~~ (PTY limitation, use transcript instead)
+  - ~~larger output tail or configurable output buffer size~~
+  - ~~keys should auto-wait for program to consume input before returning~~

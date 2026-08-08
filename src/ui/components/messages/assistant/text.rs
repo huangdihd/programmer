@@ -22,7 +22,7 @@ use crate::ui::markdown_theme::AppTheme;
 
 /// Matches the horizontal padding of the parent `AssistantMessage` block, so the
 /// wrapped markdown lines up with the block's content area.
-const HORIZONTAL_PAD: u16 = 4;
+const HORIZONTAL_PAD: u16 = 2;
 
 /// Renders a regular assistant text message as themed, syntax-highlighted
 /// markdown.
@@ -36,7 +36,9 @@ impl<'a> TextMessage<'a> {
         Self { message, width }
     }
 
-    pub fn into_text(self) -> Text<'static> {
+    /// Renders the message, also returning the raw content of every code block
+    /// (in render order) so copy buttons can be wired up.
+    pub fn into_parts(self) -> (Text<'static>, Vec<String>) {
         let md = self
             .message
             .content
@@ -48,10 +50,14 @@ impl<'a> TextMessage<'a> {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let render_width = self.width.saturating_sub(HORIZONTAL_PAD).min(100);
-        let renderer = MarkdownRenderer::new(render_width as usize)
-            .with_render_hooks(Box::new(CodeBlockHooks::new(render_width as usize)));
+        let render_width = self.width.saturating_sub(HORIZONTAL_PAD);
+        let hooks = CodeBlockHooks::new(render_width as usize);
+        let codes = hooks.codes();
+        let renderer =
+            MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
         let blocks = renderer.parse(&md);
-        Text::from(renderer.render(&blocks, &AppTheme))
+        let text = Text::from(renderer.render(&blocks, &AppTheme));
+        let codes = codes.lock().map(|c| c.clone()).unwrap_or_default();
+        (text, codes)
     }
 }

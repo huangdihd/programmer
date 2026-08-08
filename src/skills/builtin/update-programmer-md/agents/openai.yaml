@@ -1,0 +1,4 @@
+interface:
+  display_name: "Update PROGRAMMER.md"
+  short_description: "Refresh the repository guide from verified project facts"
+  default_prompt: "Use $update-programmer-md to update PROGRAMMER.md for this repository."

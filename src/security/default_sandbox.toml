@@ -1,0 +1,12 @@
+network = true
+allow_system_read = true
+allow_temp_write = true
+fail_closed = true
+
+readable_paths = []
+
+writable_paths = []
+
+denied_read_paths = []
+
+denied_environment = []

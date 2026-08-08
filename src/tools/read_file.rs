@@ -53,18 +53,38 @@ struct Args {
     limit: Option<usize>,
 }
 
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
+    let security = crate::security::SecurityManager::standalone()?;
+    run_with_security(arguments, &security).await
+}
+
+pub(crate) async fn run_with_security(
+    arguments: &str,
+    security: &crate::security::SecurityManager,
+) -> Result<String, String> {
+    run_with_security_scope(arguments, security, 0).await
+}
+
+pub(crate) async fn run_with_security_scope(
+    arguments: &str,
+    security: &crate::security::SecurityManager,
+    scope: u64,
+) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(error) => return format!("error: invalid arguments: {error}"),
+        Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
-    let contents = match tokio::fs::read_to_string(&args.path).await {
-        Ok(contents) => contents,
-        Err(error) => return format!("error: could not read {}: {error}", args.path),
-    };
+    let path = security.authorize_path(crate::security::policy::AccessKind::Read, &args.path)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|error| format!("error: could not read {}: {error}", path.display()))?;
+    let contents = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("error: could not read {}: {error}", path.display()))?
+        .to_owned();
+    security.record_read_scoped(scope, &path, &bytes);
 
-    slice_lines(contents, args.offset, args.limit)
+    Ok(slice_lines(contents, args.offset, args.limit))
 }
 
 fn slice_lines(contents: String, offset: Option<usize>, limit: Option<usize>) -> String {

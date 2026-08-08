@@ -20,64 +20,150 @@ use std::time::Instant;
 pub enum StatusState {
     /// Waiting for the user to type and send a message.
     Idle,
+    /// The request has been sent but no output has streamed back yet.
+    Connecting,
+    /// Connecting failed transiently; backing off before another attempt.
+    Retrying,
     /// The model is generating reasoning tokens (thinking phase).
     Thinking,
-    /// The model is outputting a normal text message (not reasoning, not a tool call).
+    /// The model is outputting a normal text message.
     Outputting,
     /// The model is generating tool call arguments in the current stream.
     CreatingToolCall,
     /// Tool calls returned by the model are executing in the background.
     ToolRunning,
+    /// The Auto-mode LLM classifier is deciding whether to approve tool calls.
+    Classifying,
+    /// Diagnostics checkers are running after an edit.
+    Checking,
+    /// `/compact` is summarizing the conversation.
+    Compacting,
+    /// The user pressed Esc and the runner is stopping.
+    Cancelling,
+    /// The model called `ask_user` and is waiting for the user's response.
+    WaitingAnswer,
+    /// Tool calls are queued for approval in Manual mode.
+    WaitingApproval,
+}
+
+impl StatusState {
+    /// Whether this is an active-work phase that runs a live elapsed timer.
+    pub fn is_busy(self) -> bool {
+        matches!(
+            self,
+            StatusState::Connecting
+                | StatusState::Retrying
+                | StatusState::Thinking
+                | StatusState::Outputting
+                | StatusState::CreatingToolCall
+                | StatusState::ToolRunning
+                | StatusState::Classifying
+                | StatusState::Compacting
+                | StatusState::Cancelling
+        )
+    }
+
+    /// Emoji + short label suitable for terminal title bars.
+    pub(crate) fn emoji_label(self) -> &'static str {
+        match self {
+            StatusState::Idle => "\u{25cf} Ready",
+            StatusState::Connecting => "\u{25cc} Connecting",
+            StatusState::Retrying => "\u{21bb} Retrying",
+            StatusState::Thinking => "\u{25cf} Thinking",
+            StatusState::Outputting => "\u{25b8} Outputting",
+            StatusState::CreatingToolCall => "\u{2692} Creating tool call",
+            StatusState::ToolRunning => "\u{26a1} Running tools",
+            StatusState::Classifying => "\u{25cd} Evaluating",
+            StatusState::Checking => "\u{25c7} Checking diagnostics",
+            StatusState::Compacting => "\u{29c9} Compacting",
+            StatusState::Cancelling => "\u{2716} Cancelling",
+            StatusState::WaitingAnswer => "? Waiting for answer",
+            StatusState::WaitingApproval => "\u{1f6e1} Waiting for approval",
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct StatusBar {
     pub status: StatusState,
-    /// When the current busy phase (Thinking or ToolRunning) began.
-    pub busy_start: Option<Instant>,
+    /// Extra context appended after the label, e.g. live MCP progress
+    /// ("codegraph: 67% step 2"). Cleared by the owner when stale.
+    pub detail: Option<String>,
+    /// When the current busy phase began.
+    busy_start: Option<Instant>,
 }
 
 impl StatusBar {
     pub fn new() -> Self {
         Self {
             status: StatusState::Idle,
+            detail: None,
             busy_start: None,
         }
     }
 
-    /// Call every frame so the status bar can track state transitions and
-    /// measure elapsed time in the current phase.
-    pub fn update(
-        &mut self,
-        is_receiving: bool,
-        is_outputting_message: bool,
-        is_creating_tool_call: bool,
-        is_tool_running: bool,
-    ) {
-        let new_state = if is_tool_running {
-            StatusState::ToolRunning
-        } else if is_creating_tool_call {
-            StatusState::CreatingToolCall
-        } else if is_outputting_message {
-            StatusState::Outputting
-        } else if is_receiving {
-            StatusState::Thinking
-        } else {
-            StatusState::Idle
-        };
-
+    /// Set the current status, starting the elapsed timer when entering a busy
+    /// phase and clearing it otherwise. The caller ([`App::resolve_status`])
+    /// owns the precedence logic; this just tracks timing.
+    pub fn set(&mut self, new_state: StatusState) {
         if new_state != self.status {
             self.status = new_state;
-            self.busy_start = if new_state != StatusState::Idle {
-                Some(Instant::now())
-            } else {
-                None
-            };
+            self.busy_start = new_state.is_busy().then(Instant::now);
         }
     }
 
-    /// Elapsed time since the current busy phase started, if any.
     pub fn elapsed(&self) -> Option<std::time::Duration> {
         self.busy_start.map(|start| start.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every status variant has a human-readable emoji label.
+    #[test]
+    fn emoji_label_all_variants_non_empty() {
+        let variants = [
+            StatusState::Idle,
+            StatusState::Connecting,
+            StatusState::Retrying,
+            StatusState::Thinking,
+            StatusState::Outputting,
+            StatusState::CreatingToolCall,
+            StatusState::ToolRunning,
+            StatusState::Classifying,
+            StatusState::Checking,
+            StatusState::Compacting,
+            StatusState::WaitingAnswer,
+            StatusState::WaitingApproval,
+        ];
+        for v in variants {
+            let label = v.emoji_label();
+            assert!(!label.is_empty(), "{v:?} returned empty label");
+        }
+    }
+
+    /// Each variant has a visually distinct label so the user can tell
+    /// states apart at a glance.
+    #[test]
+    fn emoji_label_all_distinct() {
+        use std::collections::HashSet;
+        let variants = [
+            StatusState::Idle,
+            StatusState::Connecting,
+            StatusState::Retrying,
+            StatusState::Thinking,
+            StatusState::Outputting,
+            StatusState::CreatingToolCall,
+            StatusState::ToolRunning,
+            StatusState::Classifying,
+            StatusState::Checking,
+            StatusState::Compacting,
+            StatusState::WaitingAnswer,
+            StatusState::WaitingApproval,
+        ];
+        let labels: HashSet<&str> = variants.iter().map(|v| v.emoji_label()).collect();
+        assert_eq!(labels.len(), variants.len(), "duplicate labels detected");
     }
 }

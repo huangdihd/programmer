@@ -14,24 +14,27 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use async_openai::types::responses::Tool;
-use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::function_tool;
+use super::grep::simple_glob_match;
+use super::search_budget::SearchBudget;
 
 pub const NAME: &str = "blob";
 
 pub fn tool() -> Tool {
     function_tool(
         NAME,
-        "Find files by name using a regex pattern. Walks the directory tree and \
-         returns every file whose name matches the pattern. Useful for locating \
-         files when you know (part of) the filename but not the path.",
+        "Find files by name using a glob pattern (e.g. '*.rs', 'auth_*.{rs,toml}'). \
+         Walks the directory tree and returns matching files until the search \
+         result or traversal budget is reached. \
+         Useful for locating files when you know (part of) the filename but \
+         not the path.",
         json!({
             "pattern": {
                 "type": "string",
-                "description": "The regex pattern to match against filenames (Rust regex syntax)."
+                "description": "Glob pattern matched against file names (not paths): `*` matches any run of characters, `{a,b}` matches alternatives. A leading `**/` is accepted and ignored."
             },
             "path": {
                 "type": "string",
@@ -49,18 +52,24 @@ struct Args {
     path: Option<String>,
 }
 
-const MAX_MATCHES: usize = 200;
-
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(error) => return format!("error: invalid arguments: {error}"),
+        Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
-    let re = match Regex::new(&args.pattern) {
-        Ok(re) => re,
-        Err(error) => return format!("error: invalid regex: {error}"),
-    };
+    tokio::task::spawn_blocking(move || run_blocking(args))
+        .await
+        .map_err(|error| format!("error: file search task failed: {error}"))?
+}
+
+fn run_blocking(args: Args) -> Result<String, String> {
+    // Matching is against file names only, so a `**/` path prefix (a common
+    // way to write "at any depth") is redundant — accept and drop it.
+    let pattern = args.pattern.strip_prefix("**/").unwrap_or(&args.pattern);
+    if pattern.is_empty() {
+        return Err("error: empty pattern".to_string());
+    }
 
     let root = args.path.clone().unwrap_or_else(|| {
         std::env::current_dir()
@@ -69,36 +78,32 @@ pub async fn run(arguments: &str) -> String {
     });
 
     let mut results = Vec::new();
-    let mut count: usize = 0;
+    let mut budget = SearchBudget::default();
 
-    if let Err(error) = walk(&root, &re, &mut results, &mut count) {
-        return format!("error: {error}");
+    if let Err(error) = walk(&root, pattern, &mut results, &mut budget) {
+        return Err(format!("error: {error}"));
     }
 
     if results.is_empty() {
-        return format!("no files matching '{}'", args.pattern);
+        results.push(format!("no files matching '{}'", args.pattern));
+    }
+    if let Some(notice) = budget.notice() {
+        results.push(notice);
     }
 
-    if count >= MAX_MATCHES {
-        results.push(format!(
-            "[truncated: {} matches, showing first {MAX_MATCHES}]",
-            count
-        ));
-    }
-
-    results.join("\n")
+    Ok(results.join("\n"))
 }
 
 fn walk(
     root: &str,
-    re: &Regex,
+    pattern: &str,
     results: &mut Vec<String>,
-    count: &mut usize,
+    budget: &mut SearchBudget,
 ) -> Result<(), String> {
     let metadata = std::fs::metadata(root).map_err(|e| format!("cannot access {root}: {e}"))?;
 
     if metadata.is_file() {
-        check_file(root, re, results, count);
+        check_file(root, pattern, results, budget);
         return Ok(());
     }
 
@@ -106,7 +111,7 @@ fn walk(
         std::fs::read_dir(root).map_err(|e| format!("cannot read directory {root}: {e}"))?;
 
     for entry in entries {
-        if *count >= MAX_MATCHES {
+        if budget.is_exhausted() || !budget.try_visit_entry() {
             break;
         }
         let entry = match entry {
@@ -115,31 +120,34 @@ fn walk(
         };
         let path = entry.path();
         let path_str = path.to_string_lossy();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
 
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') || name == "target" || name == "node_modules" {
-                    continue;
-                }
-            }
-            if walk(&path_str, re, results, count).is_err() {
+        if file_type.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.starts_with('.') || name == "target" || name == "node_modules")
+            {
                 continue;
             }
-        } else if path.is_file() {
-            check_file(&path_str, re, results, count);
+            if walk(&path_str, pattern, results, budget).is_err() {
+                continue;
+            }
+        } else if file_type.is_file() {
+            check_file(&path_str, pattern, results, budget);
         }
     }
     Ok(())
 }
 
-fn check_file(path: &str, re: &Regex, results: &mut Vec<String>, count: &mut usize) {
+fn check_file(path: &str, pattern: &str, results: &mut Vec<String>, budget: &mut SearchBudget) {
     let file_name = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    if re.is_match(file_name) {
+    if simple_glob_match(pattern, file_name) && budget.try_record_match() {
         results.push(path.to_string());
-        *count += 1;
     }
 }
 
@@ -160,13 +168,29 @@ mod tests {
         let json_path = dir.to_string_lossy().replace('\\', "\\\\");
 
         let out = run(&format!(
-            r#"{{"pattern":"auth_.*\\.rs","path":"{json_path}"}}"#
+            r#"{{"pattern":"auth_*.rs","path":"{json_path}"}}"#
         ))
-        .await;
+        .await
+        .expect("blob should succeed");
         assert!(out.contains("auth_service.rs"), "got: {out}");
         assert!(out.contains("auth_test.rs"), "got: {out}");
         assert!(!out.contains("main.rs"), "got: {out}");
         assert!(!out.contains("config.toml"), "got: {out}");
+
+        // The most common first attempt: a plain `*.ext` glob must work.
+        let star = run(&format!(r#"{{"pattern":"*.rs","path":"{json_path}"}}"#))
+            .await
+            .expect("glob should succeed");
+        assert!(star.contains("main.rs"), "got: {star}");
+        assert!(!star.contains("config.toml"), "got: {star}");
+
+        // A `**/` prefix is tolerated and matches at any depth.
+        let deep = run(&format!(
+            r#"{{"pattern":"**/*.toml","path":"{json_path}"}}"#
+        ))
+        .await
+        .expect("**/ prefix should succeed");
+        assert!(deep.contains("config.toml"), "got: {deep}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -181,15 +205,58 @@ mod tests {
         let out = run(&format!(
             r#"{{"pattern":"zzz_nonexistent","path":"{json_path}"}}"#
         ))
-        .await;
+        .await
+        .expect("blob should succeed with no matches");
         assert!(out.starts_with("no files matching"), "got: {out}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn blob_rejects_invalid_regex() {
-        let out = run(r#"{"pattern":"[invalid"}"#).await;
-        assert!(out.starts_with("error: invalid regex"), "got: {out}");
+    async fn blob_rejects_empty_pattern() {
+        let out = run(r#"{"pattern":""}"#)
+            .await
+            .expect_err("empty pattern should fail");
+        assert!(out.starts_with("error: empty pattern"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn blob_stops_after_the_result_budget() {
+        let dir =
+            std::env::temp_dir().join(format!("programmer_blob_limit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        for index in 0..250 {
+            std::fs::write(dir.join(format!("match_{index}.rs")), "").unwrap();
+        }
+        let json_path = dir.to_string_lossy().replace('\\', "\\\\");
+
+        let out = run(&format!(r#"{{"pattern":"*.rs","path":"{json_path}"}}"#))
+            .await
+            .expect("blob should stop cleanly");
+
+        assert_eq!(out.lines().count(), 201, "got: {out}");
+        assert!(out.contains("[truncated: showing the first 200 matches"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blob_does_not_follow_directory_symlinks() {
+        let dir =
+            std::env::temp_dir().join(format!("programmer_blob_symlink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("source")).unwrap();
+        std::fs::write(dir.join("source").join("only.rs"), "").unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("source").join("loop")).unwrap();
+        let json_path = dir.to_string_lossy().replace('\\', "\\\\");
+
+        let out = run(&format!(r#"{{"pattern":"*.rs","path":"{json_path}"}}"#))
+            .await
+            .expect("blob should ignore the symlink loop");
+
+        assert_eq!(out.lines().count(), 1, "got: {out}");
+        assert!(out.contains("only.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -17,8 +17,10 @@ use async_openai::types::responses::Tool;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
+use std::io::{BufRead, BufReader};
 
 use super::function_tool;
+use super::search_budget::SearchBudget;
 
 pub const NAME: &str = "grep";
 
@@ -26,8 +28,8 @@ pub fn tool() -> Tool {
     function_tool(
         NAME,
         "Search for a regex pattern across files in a directory tree. Returns matching \
-         file paths, line numbers, and line contents. Useful for finding definitions, \
-         usages, or patterns in the codebase.",
+         file paths, line numbers, and line contents until the search result or traversal \
+         budget is reached. Useful for finding definitions, usages, or patterns in the codebase.",
         json!({
             "pattern": {
                 "type": "string",
@@ -55,20 +57,23 @@ struct Args {
     include: Option<String>,
 }
 
-/// Maximum total matches to return so a broad search can't blow up the context.
-const MAX_MATCHES: usize = 200;
-
-pub async fn run(arguments: &str) -> String {
+pub async fn run(arguments: &str) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(error) => return format!("error: invalid arguments: {error}"),
+        Err(error) => return Err(format!("error: invalid arguments: {error}")),
     };
 
     let re = match Regex::new(&args.pattern) {
         Ok(re) => re,
-        Err(error) => return format!("error: invalid regex: {error}"),
+        Err(error) => return Err(format!("error: invalid regex: {error}")),
     };
 
+    tokio::task::spawn_blocking(move || run_blocking(args, re))
+        .await
+        .map_err(|error| format!("error: file search task failed: {error}"))?
+}
+
+fn run_blocking(args: Args, re: Regex) -> Result<String, String> {
     let root = args.path.clone().unwrap_or_else(|| {
         std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -76,23 +81,20 @@ pub async fn run(arguments: &str) -> String {
     });
 
     let mut results = Vec::new();
-    let mut count: usize = 0;
+    let mut budget = SearchBudget::default();
 
-    if let Err(error) = search(&root, &re, &args.include, &mut results, &mut count) {
-        return format!("error: {error}");
+    if let Err(error) = search(&root, &re, &args.include, &mut results, &mut budget) {
+        return Err(format!("error: {error}"));
     }
 
     if results.is_empty() {
-        return format!("no matches found for pattern '{}'", args.pattern);
+        results.push(format!("no matches found for pattern '{}'", args.pattern));
+    }
+    if let Some(notice) = budget.notice() {
+        results.push(notice);
     }
 
-    if count >= MAX_MATCHES {
-        results.push(format!(
-            "[truncated: {count} matches, showing first {MAX_MATCHES}]"
-        ));
-    }
-
-    results.join("\n")
+    Ok(results.join("\n"))
 }
 
 fn search(
@@ -100,12 +102,12 @@ fn search(
     re: &Regex,
     include: &Option<String>,
     results: &mut Vec<String>,
-    count: &mut usize,
+    budget: &mut SearchBudget,
 ) -> Result<(), String> {
     let metadata = std::fs::metadata(root).map_err(|e| format!("cannot access {root}: {e}"))?;
 
     if metadata.is_file() {
-        search_file(root, re, results, count);
+        search_file(root, re, results, budget);
         return Ok(());
     }
 
@@ -113,7 +115,7 @@ fn search(
         std::fs::read_dir(root).map_err(|e| format!("cannot read directory {root}: {e}"))?;
 
     for entry in entries {
-        if *count >= MAX_MATCHES {
+        if budget.is_exhausted() || !budget.try_visit_entry() {
             break;
         }
         let entry = match entry {
@@ -122,24 +124,28 @@ fn search(
         };
         let path = entry.path();
         let path_str = path.to_string_lossy();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
 
         // Skip hidden directories and common non-source dirs.
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') || name == "target" || name == "node_modules" {
-                    continue;
-                }
-            }
-            // Recursively search subdirectories
-            if let Err(_) = search(&path_str, re, include, results, count) {
+        if file_type.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.starts_with('.') || name == "target" || name == "node_modules")
+            {
                 continue;
             }
-        } else if path.is_file() {
+            // Recursively search subdirectories
+            if search(&path_str, re, include, results, budget).is_err() {
+                continue;
+            }
+        } else if file_type.is_file() {
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if should_skip_file(file_name, include) {
                 continue;
             }
-            search_file(&path_str, re, results, count);
+            search_file(&path_str, re, results, budget);
         }
     }
     Ok(())
@@ -191,22 +197,23 @@ fn should_skip_file(file_name: &str, include: &Option<String>) -> bool {
 }
 
 /// Simple glob matching that supports `*` wildcards and `{a,b}` alternation.
-fn simple_glob_match(pattern: &str, name: &str) -> bool {
+/// Shared with the `blob` tool, which matches file names by glob.
+pub(crate) fn simple_glob_match(pattern: &str, name: &str) -> bool {
     // Handle {a,b} alternation by trying each alternative.
-    if let Some(start) = pattern.find('{') {
-        if let Some(end) = pattern[start..].find('}') {
-            let end = start + end;
-            let prefix = &pattern[..start];
-            let alts = &pattern[start + 1..end];
-            let suffix = &pattern[end + 1..];
-            for alt in alts.split(',') {
-                let candidate = format!("{prefix}{alt}{suffix}");
-                if simple_glob_match(&candidate, name) {
-                    return true;
-                }
+    if let Some(start) = pattern.find('{')
+        && let Some(end) = pattern[start..].find('}')
+    {
+        let end = start + end;
+        let prefix = &pattern[..start];
+        let alts = &pattern[start + 1..end];
+        let suffix = &pattern[end + 1..];
+        for alt in alts.split(',') {
+            let candidate = format!("{prefix}{alt}{suffix}");
+            if simple_glob_match(&candidate, name) {
+                return true;
             }
-            return false;
         }
+        return false;
     }
     // Simple wildcard matching: * matches anything.
     if pattern == "*" {
@@ -247,25 +254,22 @@ fn simple_glob_match(pattern: &str, name: &str) -> bool {
     true
 }
 
-fn search_file(path: &str, re: &Regex, results: &mut Vec<String>, count: &mut usize) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return, // skip binary / unreadable files silently
+fn search_file(path: &str, re: &Regex, results: &mut Vec<String>, budget: &mut SearchBudget) {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return,
     };
 
-    // Quick pre-check: does the file contain the pattern anywhere?
-    if !re.is_match(&content) {
-        return;
-    }
-
-    for (line_num, line) in content.lines().enumerate() {
-        if *count >= MAX_MATCHES {
+    for (line_num, line) in BufReader::new(file).lines().enumerate() {
+        if budget.is_exhausted() {
             return;
         }
-        if re.is_match(line) {
+        let Ok(line) = line else {
+            return;
+        };
+        if re.is_match(&line) && budget.try_record_match() {
             let trimmed = line.trim();
             results.push(format!("{}:{}: {}", path, line_num + 1, trimmed));
-            *count += 1;
         }
     }
 }
@@ -297,14 +301,17 @@ mod tests {
 
         let json_path = dir.to_string_lossy().replace('\\', "\\\\");
 
-        let out = run(&format!(r#"{{"pattern":"hello","path":"{json_path}"}}"#)).await;
+        let out = run(&format!(r#"{{"pattern":"hello","path":"{json_path}"}}"#))
+            .await
+            .expect("grep should succeed");
         assert!(out.contains("a.rs:1:"), "got: {out}");
         assert!(out.contains("b.txt:1:"), "got: {out}");
 
         let out_filtered = run(&format!(
             r#"{{"pattern":"hello","path":"{json_path}","include":"*.rs"}}"#
         ))
-        .await;
+        .await
+        .expect("grep should succeed");
         assert!(out_filtered.contains("a.rs"), "got: {out_filtered}");
         assert!(!out_filtered.contains("b.txt"), "got: {out_filtered}");
 
@@ -321,7 +328,8 @@ mod tests {
         let out = run(&format!(
             r#"{{"pattern":"zzz_nonexistent_xyz","path":"{json_path}"}}"#
         ))
-        .await;
+        .await
+        .expect("grep should succeed with no matches");
         assert!(out.starts_with("no matches found"), "got: {out}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -329,7 +337,31 @@ mod tests {
 
     #[tokio::test]
     async fn grep_rejects_invalid_regex() {
-        let out = run(r#"{"pattern":"[invalid"}"#).await;
+        let out = run(r#"{"pattern":"[invalid"}"#)
+            .await
+            .expect_err("invalid regex should fail");
         assert!(out.starts_with("error: invalid regex"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn grep_stops_after_the_result_budget() {
+        let dir =
+            std::env::temp_dir().join(format!("programmer_grep_limit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let matches = (0..250)
+            .map(|index| format!("match {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("many.txt"), matches).unwrap();
+        let json_path = dir.to_string_lossy().replace('\\', "\\\\");
+
+        let out = run(&format!(r#"{{"pattern":"match","path":"{json_path}"}}"#))
+            .await
+            .expect("grep should stop cleanly");
+
+        assert_eq!(out.lines().count(), 201, "got: {out}");
+        assert!(out.contains("[truncated: showing the first 200 matches"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

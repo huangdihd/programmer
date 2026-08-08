@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::cancel::CancellationToken;
 use crate::response::response_finish_reason::ResponseFinishReason;
 use async_openai::types::responses::ResponseStreamEvent::{
     ResponseCodeInterpreterCallCodeDelta, ResponseCodeInterpreterCallCodeDone, ResponseCompleted,
@@ -30,8 +31,6 @@ use async_openai::types::responses::{
     Annotation, OutputContent, OutputItem, OutputMessageContent, ReasoningItemContent,
     ReasoningTextContent, Response, ResponseStreamEvent, SummaryPart, SummaryTextContent,
 };
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FinalizeError {
@@ -47,6 +46,16 @@ pub enum FinalizeError {
     StreamError(#[from] async_openai::error::OpenAIError),
 }
 
+/// Coarse kind of the output item currently streaming, for the status bar:
+/// reasoning reads as "Thinking", a message as "Outputting", and any tool-call
+/// variant (function/MCP/custom/code-interpreter) as "Creating tool call".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingKind {
+    Reasoning,
+    Message,
+    ToolCall,
+}
+
 #[derive(Debug)]
 pub struct PartialResponse {
     pub items: Vec<Option<OutputItem>>,
@@ -56,17 +65,20 @@ pub struct PartialResponse {
     /// own `status` field is only populated for finalized items.
     finished_items: Vec<bool>,
     finish_reason: Option<ResponseFinishReason>,
-    /// Set to `true` when the user presses Escape to cancel the current request.
-    pub cancelled: Arc<AtomicBool>,
+    /// Cancelled when the user presses Escape to stop the current request.
+    pub cancelled: CancellationToken,
+    /// Token usage from the completed response: (input_tokens, output_tokens).
+    pub usage: Option<(u32, u32)>,
 }
 
 impl PartialResponse {
-    pub fn new(cancelled: Arc<AtomicBool>) -> Self {
+    pub fn new(cancelled: CancellationToken) -> Self {
         PartialResponse {
             items: vec![],
             finished_items: vec![],
             finish_reason: None,
             cancelled,
+            usage: None,
         }
     }
 
@@ -110,16 +122,15 @@ impl PartialResponse {
                 let output_index = item_done_event.output_index as usize;
                 let mut incoming = item_done_event.item;
 
-                if let OutputItem::Reasoning(incoming_reasoning) = &mut incoming {
-                    if let Some(Some(OutputItem::Reasoning(existing))) =
+                if let OutputItem::Reasoning(incoming_reasoning) = &mut incoming
+                    && let Some(Some(OutputItem::Reasoning(existing))) =
                         self.items.get(output_index)
-                    {
-                        if incoming_reasoning.content.is_none() && existing.content.is_some() {
-                            incoming_reasoning.content = existing.content.clone();
-                        }
-                        if incoming_reasoning.summary.is_empty() && !existing.summary.is_empty() {
-                            incoming_reasoning.summary = existing.summary.clone();
-                        }
+                {
+                    if incoming_reasoning.content.is_none() && existing.content.is_some() {
+                        incoming_reasoning.content = existing.content.clone();
+                    }
+                    if incoming_reasoning.summary.is_empty() && !existing.summary.is_empty() {
+                        incoming_reasoning.summary = existing.summary.clone();
                     }
                 }
 
@@ -148,13 +159,11 @@ impl PartialResponse {
                         }
                         OutputItem::Reasoning(reasoning_item) => {
                             let contents = reasoning_item.content.get_or_insert_with(Vec::new);
-                            if contents.len() <= content_index {
-                                if let OutputContent::ReasoningText(reasoning_text) =
+                            if contents.len() <= content_index
+                                && let OutputContent::ReasoningText(reasoning_text) =
                                     part_added_event.part
-                                {
-                                    contents
-                                        .push(ReasoningItemContent::ReasoningText(reasoning_text));
-                                }
+                            {
+                                contents.push(ReasoningItemContent::ReasoningText(reasoning_text));
                             }
                         }
                         _ => {}
@@ -228,12 +237,10 @@ impl PartialResponse {
                     return;
                 };
                 if output_text.annotations.len() <= annotation_added_event.annotation_index as usize
-                {
-                    if let Ok(annotation) =
+                    && let Ok(annotation) =
                         serde_json::from_value::<Annotation>(annotation_added_event.annotation)
-                    {
-                        output_text.annotations.push(annotation);
-                    }
+                {
+                    output_text.annotations.push(annotation);
                 }
             }
 
@@ -458,15 +465,24 @@ impl PartialResponse {
             }
 
             ResponseCompleted(response_completed_event) => {
+                if let Some(ref u) = response_completed_event.response.usage {
+                    self.usage = Some((u.input_tokens, u.output_tokens));
+                }
                 self.finish_reason = Some(ResponseFinishReason::Completed(
                     response_completed_event.response,
                 ));
             }
             ResponseFailed(response_failed_event) => {
+                if let Some(ref u) = response_failed_event.response.usage {
+                    self.usage = Some((u.input_tokens, u.output_tokens));
+                }
                 self.finish_reason =
                     Some(ResponseFinishReason::Failed(response_failed_event.response));
             }
             ResponseIncomplete(response_incomplete_event) => {
+                if let Some(ref u) = response_incomplete_event.response.usage {
+                    self.usage = Some((u.input_tokens, u.output_tokens));
+                }
                 self.finish_reason = Some(ResponseFinishReason::Incomplete(
                     response_incomplete_event.response,
                 ));
@@ -500,15 +516,37 @@ impl PartialResponse {
             .enumerate()
             .filter_map(|(i, item)| {
                 let finished = self.finished_items.get(i).copied().unwrap_or(false);
-                item.filter(|item| {
-                    !matches!(item, OutputItem::FunctionCall(_)) || finished
-                })
+                item.filter(|item| !matches!(item, OutputItem::FunctionCall(_)) || finished)
             })
             .collect()
     }
 
     pub fn finished(&self) -> bool {
         self.finish_reason.is_some()
+    }
+
+    /// Whether any output has arrived yet. False in the window between the
+    /// request being sent and the first output item streaming back, which the
+    /// UI shows as "Connecting" rather than "Thinking".
+    pub fn started(&self) -> bool {
+        self.items.iter().any(Option::is_some) || self.usage.is_some()
+    }
+
+    /// What the stream is producing right now, from the last in-progress item:
+    /// `None` between items (or before the first), otherwise its coarse kind.
+    /// Drives the status indicator during streaming.
+    pub fn streaming_kind(&self) -> Option<StreamingKind> {
+        self.items.iter().enumerate().rev().find_map(|(i, slot)| {
+            let item = slot.as_ref()?;
+            if self.finished_items.get(i).copied().unwrap_or(false) {
+                return None;
+            }
+            Some(match item {
+                OutputItem::Message(_) => StreamingKind::Message,
+                OutputItem::Reasoning(_) => StreamingKind::Reasoning,
+                _ => StreamingKind::ToolCall,
+            })
+        })
     }
 
     /// Returns true if any output item in this partial response is a function
@@ -568,5 +606,90 @@ impl PartialResponse {
         }
 
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh() -> PartialResponse {
+        PartialResponse::new(CancellationToken::new())
+    }
+
+    fn msg_item() -> OutputItem {
+        serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "id": "m1",
+            "role": "assistant",
+            "content": [],
+            "status": "in_progress"
+        }))
+        .unwrap()
+    }
+
+    fn fc_item() -> OutputItem {
+        serde_json::from_value(serde_json::json!({
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "read_file",
+            "arguments": "{}"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_response_has_no_items() {
+        let p = fresh();
+        assert!(p.get_message_items().is_empty());
+        assert!(!p.has_function_calls());
+        assert!(!p.has_message_items());
+        assert_eq!(p.streaming_kind(), None);
+    }
+
+    #[test]
+    fn detects_function_call() {
+        let mut p = fresh();
+        p.set_item(fc_item(), 0);
+        assert!(p.has_function_calls());
+        assert!(!p.has_message_items());
+        assert_eq!(p.streaming_kind(), Some(StreamingKind::ToolCall));
+    }
+
+    #[test]
+    fn detects_message_item() {
+        let mut p = fresh();
+        p.set_item(msg_item(), 0);
+        assert!(p.has_message_items());
+        assert!(!p.has_function_calls());
+    }
+
+    #[test]
+    fn finalize_without_finish_reason_is_error() {
+        let p = fresh();
+        assert!(matches!(
+            p.finalize().unwrap_err(),
+            FinalizeError::NotFinished
+        ));
+    }
+
+    #[test]
+    fn get_message_items_marks_in_progress() {
+        let mut p = fresh();
+        p.set_item(msg_item(), 0);
+        let items = p.get_message_items();
+        assert_eq!(items.len(), 1);
+        // Not yet finished — second element is `true` (in progress).
+        assert!(items[0].1);
+    }
+
+    #[test]
+    fn get_message_items_marks_finished_after_done_event() {
+        let mut p = fresh();
+        p.set_item(msg_item(), 0);
+        p.mark_finished(0);
+        let items = p.get_message_items();
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].1, "item should be finished");
     }
 }

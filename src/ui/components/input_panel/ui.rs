@@ -20,14 +20,31 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 const ACCENT: Color = Color::LightBlue;
+const PASTE_ACCENT: Color = Color::LightMagenta;
+/// Accent while the input is a `!command` (shell mode) — the green of the
+/// terminal panel's grabbed state.
+const BANG_ACCENT: Color = Color::LightGreen;
 
 impl Widget for &InputPanel<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // A leading `!` flips the panel into shell mode: green accent, `$`
+        // prompt, and a title saying where the command will run.
+        let bang = self.get_content().starts_with('!');
+        let (title, accent, prompt) = if bang {
+            (
+                " ! Shell — runs in the interactive terminal ",
+                BANG_ACCENT,
+                "$ ",
+            )
+        } else {
+            (" Input ", ACCENT, "❯ ")
+        };
+
         let block = Block::default()
-            .title(" Input ")
-            .title_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+            .title(title)
+            .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
             .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().fg(ACCENT));
+            .border_style(Style::default().fg(accent));
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -37,10 +54,88 @@ impl Widget for &InputPanel<'_> {
             .constraints([Constraint::Length(2), Constraint::Min(1)])
             .split(inner);
 
-        Paragraph::new("❯ ")
-            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        Paragraph::new(prompt)
+            .style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
             .render(chunks[0], buf);
 
         self.text_area.render(chunks[1], buf);
+        style_placeholders(self, chunks[1], buf);
+    }
+}
+
+fn style_placeholders(panel: &InputPanel<'_>, area: Rect, buf: &mut Buffer) {
+    let placeholders = panel
+        .placeholders()
+        .map(|placeholder| placeholder.chars().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let style = Style::default()
+        .fg(PASTE_ACCENT)
+        .add_modifier(Modifier::BOLD);
+
+    for y in area.y..area.bottom() {
+        let symbols = (area.x..area.right())
+            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect::<Vec<_>>();
+        for placeholder in &placeholders {
+            for start in 0..=symbols.len().saturating_sub(placeholder.len()) {
+                if symbols[start..].starts_with(placeholder) {
+                    for offset in 0..placeholder.len() {
+                        buf[(area.x + (start + offset) as u16, y)].set_style(style);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_to_text(panel: &InputPanel<'_>) -> String {
+        let area = Rect::new(0, 0, 60, 5);
+        let mut buf = Buffer::empty(area);
+        panel.render(area, &mut buf);
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn bang_input_switches_to_shell_mode() {
+        let mut panel = InputPanel::new();
+        let normal = render_to_text(&panel);
+        assert!(normal.contains(" Input "), "normal title: {normal}");
+        assert!(normal.contains("❯"), "normal prompt: {normal}");
+
+        panel.set_content("!cargo test");
+        let bang = render_to_text(&panel);
+        assert!(bang.contains(" ! Shell "), "bang title: {bang}");
+        assert!(bang.contains("$ !cargo test"), "bang prompt + text: {bang}");
+
+        // Deleting the `!` flips straight back.
+        panel.set_content("cargo test");
+        let back = render_to_text(&panel);
+        assert!(back.contains(" Input "), "back to normal: {back}");
+    }
+
+    #[test]
+    fn pasted_placeholder_has_distinct_color() {
+        let mut panel = InputPanel::new();
+        panel.add_paste("many\nlines".to_string());
+        let area = Rect::new(0, 0, 60, 5);
+        let mut buf = Buffer::empty(area);
+
+        panel.render(area, &mut buf);
+
+        let opening_bracket = (0..area.width)
+            .find(|&x| buf[(x, 1)].symbol() == "[")
+            .expect("rendered paste placeholder");
+        assert_eq!(buf[(opening_bracket, 1)].fg, PASTE_ACCENT);
     }
 }

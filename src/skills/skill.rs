@@ -1,0 +1,244 @@
+// Copyright (C) 2026 huangdihd
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+//! A single skill — loaded from a `SKILL.md` file with YAML frontmatter.
+//!
+//! Format:
+//! ```markdown
+//! ---
+//! name: my-skill
+//! description: What this skill does.
+//! metadata:
+//!   author: someone
+//!   version: "1.0.0"
+//! ---
+//!
+//! # Body
+//! Markdown body…
+//! ```
+
+use std::path::Path;
+
+/// Where a skill file was loaded from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkillSource {
+    /// Shipped inside the `programmer` binary.
+    BuiltIn,
+    /// Cross-agent shared: `~/.agents/skills/<name>/SKILL.md`.
+    Shared,
+    /// User-global: the platform config directory's
+    /// `programmer/skills/<name>/SKILL.md`.
+    Global,
+    /// Project-scoped: `.programmer/skills/<name>/SKILL.md`.
+    Project,
+}
+
+/// A skill loaded from a `SKILL.md` file.
+#[derive(Debug, Clone)]
+pub(crate) struct Skill {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    /// The markdown body (everything after the closing `---` divider).
+    pub(crate) body: String,
+    /// Where this skill was loaded from.
+    pub(crate) source: SkillSource,
+}
+
+impl Skill {
+    /// Parse a `SKILL.md` file from `path`, which may be a directory
+    /// containing a `SKILL.md` or a direct `.md` file.
+    pub(crate) fn from_path(path: &Path) -> Option<Self> {
+        let file = if path.is_dir() {
+            path.join("SKILL.md")
+        } else {
+            path.to_path_buf()
+        };
+
+        let raw = std::fs::read_to_string(&file).ok()?;
+        Self::from_raw(&raw, SkillSource::Project)
+    }
+
+    /// Parse a skill embedded in the binary at compile time.
+    pub(crate) fn from_builtin(raw: &str) -> Option<Self> {
+        Self::from_raw(raw, SkillSource::BuiltIn)
+    }
+
+    fn from_raw(raw: &str, source: SkillSource) -> Option<Self> {
+        let (front, body) = split_frontmatter(raw)?;
+        let (name, description) = parse_frontmatter(front)?;
+
+        Some(Skill {
+            name,
+            description,
+            body: body.to_string(),
+            source,
+        })
+    }
+
+    /// Re-tag a disk-loaded skill with the directory it came from.
+    pub(crate) fn with_source(mut self, source: SkillSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// The complete instructions returned when the model loads this skill.
+    pub(crate) fn to_prompt(&self) -> String {
+        let mut prompt = format!(
+            "## Skill: {}\n\n*{}. If this skill is active, follow its instructions.*\n\n{}",
+            self.name, self.description, self.body
+        );
+        // 80 KiB safety cap — skills shouldn't be enormous, but avoid token bombs.
+        if prompt.len() > 81920 {
+            let truncate_at = 81920 - 128;
+            prompt.truncate(truncate_at);
+            prompt.push_str("\n\n[... skill truncated — too large ...]");
+        }
+        prompt
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frontmatter parsing
+// ---------------------------------------------------------------------------
+
+/// Split raw file content into (frontmatter, body). Returns `None` if the
+/// file doesn't start with `---`.
+fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
+    let rest = raw
+        .strip_prefix("---\r\n")
+        .or_else(|| raw.strip_prefix("---\n"))?;
+    let (front, body) = rest
+        .split_once("\r\n---")
+        .or_else(|| rest.split_once("\n---"))?;
+    // Body may start with a line ending; trim exactly one.
+    let body = body
+        .strip_prefix("\r\n")
+        .or_else(|| body.strip_prefix('\n'))
+        .unwrap_or(body);
+    Some((front, body))
+}
+
+/// Parse YAML frontmatter into (name, description). The name is required.
+/// Other keys — including nested `metadata:` blocks — are skipped; only the
+/// fields the app actually uses are kept.
+fn parse_frontmatter(front: &str) -> Option<(String, String)> {
+    let mut name: Option<String> = None;
+    let mut description = String::new();
+    let mut in_metadata = false;
+    let mut metadata_indent = 0usize;
+
+    for line in front.lines() {
+        // Skip over nested metadata block lines.
+        if in_metadata {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if trimmed.is_empty() || indent <= metadata_indent {
+                // Exited the metadata block — fall through to parse this line
+                // as a regular top-level key.
+                in_metadata = false;
+            } else {
+                continue;
+            }
+        }
+
+        // Top-level keys.
+        let trimmed = line.trim();
+        if let Some((k, v)) = trimmed.split_once(':') {
+            let key = k.trim();
+            let val = v.trim().trim_matches('"');
+            match key {
+                "name" => name = Some(val.to_string()),
+                "description" => {
+                    if !description.is_empty() {
+                        description.push(' ');
+                    }
+                    description.push_str(val);
+                }
+                "metadata" => {
+                    in_metadata = true;
+                    metadata_indent = line.len() - line.trim_start().len();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let name = name?;
+    Some((name, description))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_minimal_skill() {
+        let raw =
+            "---\nname: test-skill\ndescription: A test skill\n---\n\n# Body\nSome body text.";
+        let (front, body) = split_frontmatter(raw).unwrap();
+        assert!(front.contains("name: test-skill"));
+        assert_eq!(body, "\n# Body\nSome body text.");
+
+        let (name, desc) = parse_frontmatter(front).unwrap();
+        assert_eq!(name, "test-skill");
+        assert_eq!(desc, "A test skill");
+    }
+
+    #[test]
+    fn parse_skill_with_windows_line_endings() {
+        let raw = "---\r\nname: windows-skill\r\ndescription: Works on Windows\r\n---\r\n\r\n# Body\r\nInstructions.";
+        let skill = Skill::from_builtin(raw).expect("CRLF skill should parse");
+
+        assert_eq!(skill.name, "windows-skill");
+        assert_eq!(skill.description, "Works on Windows");
+        assert!(skill.body.contains("# Body"));
+    }
+
+    #[test]
+    fn parse_skips_metadata_block_without_derailing() {
+        // A nested metadata block (and unknown keys after it) must not break
+        // parsing of the fields we care about.
+        let raw = "---\nname: advanced\ndescription: An advanced skill\nmetadata:\n  author: vercel\n  version: \"1.0.0\"\nlicense: MIT\n---\n\n# Advanced\nBody here.";
+        let (front, _body) = split_frontmatter(raw).unwrap();
+        let (name, desc) = parse_frontmatter(front).unwrap();
+        assert_eq!(name, "advanced");
+        assert_eq!(desc, "An advanced skill");
+    }
+
+    #[test]
+    fn no_frontmatter() {
+        assert!(split_frontmatter("just plain text").is_none());
+    }
+
+    #[test]
+    fn missing_name() {
+        let raw = "---\ndescription: no name\n---\n\nBody.";
+        let (front, _) = split_frontmatter(raw).unwrap();
+        assert!(parse_frontmatter(front).is_none());
+    }
+
+    #[test]
+    fn to_prompt_includes_name_and_body() {
+        let skill = Skill {
+            name: "test".into(),
+            description: "a test".into(),
+            body: "Do the thing.".into(),
+            source: SkillSource::Project,
+        };
+        let prompt = skill.to_prompt();
+        assert!(prompt.contains("## Skill: test"));
+        assert!(prompt.contains("Do the thing."));
+    }
+}

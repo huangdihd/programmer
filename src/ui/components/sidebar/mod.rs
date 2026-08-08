@@ -1,0 +1,229 @@
+// Copyright (C) 2026 huangdihd
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+//! Right-hand sidebar panel showing provider, skill, MCP, diagnostics, and task state.
+//!
+//! The sidebar is toggled with `Ctrl+B`. Each section can be
+//! collapsed/expanded by clicking its title. Todo items can be toggled by
+//! clicking them. Scroll is handled with the mouse wheel.
+
+pub mod ui;
+
+use crossterm::event::{KeyCode, KeyEvent};
+use std::collections::HashSet;
+
+/// Identifies one collapsible section within the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarSection {
+    Agents,
+    Diagnostics,
+    Mcp,
+    Providers,
+    Skills,
+    Todos,
+    Tasks,
+}
+
+/// Per-section UI state.
+#[derive(Debug)]
+pub(crate) struct SectionState {
+    key: SidebarSection,
+    collapsed: bool,
+}
+
+/// What occupies a given line in the rendered sidebar.
+#[derive(Debug, Clone)]
+pub enum ClickTarget {
+    /// Nothing actionable.
+    None,
+    /// Section title; click toggles collapse.
+    Section(SidebarSection),
+    /// A todo item; the usize is the index into the sorted todo slice.
+    TodoItem(usize),
+    /// A diagnostic entry; the usize is the index into the sorted diagnostics
+    /// slice.
+    Diagnostic(usize),
+    /// A background task header; click toggles its output view.
+    Task(u64),
+    /// A sub-agent header; click opens its live conversation.
+    Agent(u64),
+}
+
+/// The sidebar panel itself.
+#[derive(Debug)]
+pub struct Sidebar {
+    /// Ordered list of sections (top → bottom).
+    sections: Vec<SectionState>,
+    /// Vertical scroll offset in lines (for the entire sidebar content).
+    scroll_offset: u16,
+    /// Whether keyboard input is routed to the sidebar.
+    pub has_focus: bool,
+    /// Click map built by the last render: for each rendered line (after
+    /// scrolling), what is clickable there.
+    pub click_map: Vec<ClickTarget>,
+    /// Ids of background tasks whose output is expanded.
+    expanded_tasks: std::collections::HashSet<u64>,
+}
+
+impl Sidebar {
+    pub fn new() -> Self {
+        let sections = vec![
+            SectionState {
+                key: SidebarSection::Agents,
+                collapsed: false,
+            },
+            SectionState {
+                key: SidebarSection::Providers,
+                collapsed: false,
+            },
+            SectionState {
+                key: SidebarSection::Skills,
+                collapsed: false,
+            },
+            SectionState {
+                key: SidebarSection::Mcp,
+                collapsed: false,
+            },
+            SectionState {
+                key: SidebarSection::Todos,
+                collapsed: false,
+            },
+            SectionState {
+                key: SidebarSection::Tasks,
+                collapsed: false,
+            },
+            SectionState {
+                key: SidebarSection::Diagnostics,
+                collapsed: false,
+            },
+        ];
+        Sidebar {
+            sections,
+            scroll_offset: 0,
+            has_focus: false,
+            click_map: Vec::new(),
+            expanded_tasks: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Fixed width of the sidebar in columns.
+    pub fn needed_width() -> u16 {
+        32
+    }
+
+    /// Current vertical scroll offset.
+    pub fn scroll_offset(&self) -> u16 {
+        self.scroll_offset
+    }
+
+    /// Toggle the collapse state of a section.
+    pub fn toggle_section(&mut self, section: SidebarSection) {
+        if let Some(s) = self.sections.iter_mut().find(|s| s.key == section) {
+            s.collapsed = !s.collapsed;
+        }
+    }
+
+    /// Toggle a background task's output view.
+    pub fn toggle_task(&mut self, id: u64) {
+        if !self.expanded_tasks.remove(&id) {
+            self.expanded_tasks.insert(id);
+        }
+    }
+
+    /// Whether a task's output view is expanded.
+    pub(crate) fn task_expanded(&self, id: u64) -> bool {
+        self.expanded_tasks.contains(&id)
+    }
+
+    pub(crate) fn expanded_task_ids(&self) -> &HashSet<u64> {
+        &self.expanded_tasks
+    }
+
+    pub(crate) fn retain_existing_tasks(&mut self) {
+        let existing = crate::tasks::task_ids();
+        self.expanded_tasks.retain(|id| existing.contains(id));
+    }
+
+    // -- scrolling --
+
+    pub fn scroll_down(&mut self) {
+        self.scroll_by(1);
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    pub fn scroll_by(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_add(lines);
+    }
+
+    pub fn scroll_up_by(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    /// Clamp scroll_offset so it doesn't exceed available content.
+    pub fn clamp_scroll(&mut self, total_lines: usize, visible_lines: usize) {
+        let max_scroll = total_lines
+            .saturating_sub(visible_lines)
+            .min(usize::from(u16::MAX)) as u16;
+        if self.scroll_offset > max_scroll {
+            self.scroll_offset = max_scroll;
+        }
+    }
+
+    // -- keyboard (minimal) --
+
+    pub fn handle_key(&mut self, key: KeyEvent, visible_lines: u16) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.scroll_up();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.scroll_down();
+            }
+            KeyCode::PageUp => self.scroll_up_by(visible_lines),
+            KeyCode::PageDown => self.scroll_by(visible_lines),
+            KeyCode::Home => self.scroll_offset = 0,
+            KeyCode::End => self.scroll_offset = u16::MAX,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    #[test]
+    fn keyboard_scroll_supports_lines_pages_and_boundaries() {
+        let mut sidebar = Sidebar::new();
+        sidebar.handle_key(key(KeyCode::Down), 10);
+        sidebar.handle_key(key(KeyCode::PageDown), 10);
+        assert_eq!(sidebar.scroll_offset(), 11);
+
+        sidebar.handle_key(key(KeyCode::PageUp), 10);
+        assert_eq!(sidebar.scroll_offset(), 1);
+        sidebar.handle_key(key(KeyCode::Home), 10);
+        assert_eq!(sidebar.scroll_offset(), 0);
+        sidebar.handle_key(key(KeyCode::End), 10);
+        sidebar.clamp_scroll(30, 10);
+        assert_eq!(sidebar.scroll_offset(), 20);
+    }
+}

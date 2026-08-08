@@ -15,8 +15,13 @@
 
 pub mod assistant;
 pub mod assistant_message;
+pub mod compacting_message;
 pub mod error_message;
+pub mod info_message;
+mod notice_message;
 pub mod pending_message;
 pub mod tool_result;
+pub mod usage_message;
 pub mod user_message;
+pub mod warning_message;
 pub mod welcome_message;

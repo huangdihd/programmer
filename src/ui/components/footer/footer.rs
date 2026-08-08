@@ -13,23 +13,90 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::classifier::WorkMode;
+use crate::security::SandboxMode;
+use crate::thinking::ThinkingLevel;
 use crate::ui::components::status_bar::status_bar::StatusBar;
 
-/// Bottom bar: status indicator on the left, copyright on the right.
+/// Bottom bar: work/sandbox modes and status on the left, model and thinking
+/// level in the middle, copyright on the right.
 #[derive(Debug)]
 pub struct Footer {
     pub status: StatusBar,
+    pub current_model: String,
+    pub(crate) thinking_level: ThinkingLevel,
+    pub work_mode: WorkMode,
+    pub(crate) sandbox_mode: SandboxMode,
+    pub(crate) sandbox_profile: String,
+    /// Whether the project has an LSP checker configured, so the LSP block shows
+    /// even before a server has started.
+    pub lsp_configured: bool,
 }
 
 impl Footer {
     pub fn new() -> Self {
         Self {
             status: StatusBar::new(),
+            current_model: String::new(),
+            thinking_level: ThinkingLevel::default(),
+            work_mode: WorkMode::default(),
+            sandbox_mode: SandboxMode::default(),
+            sandbox_profile: String::new(),
+            lsp_configured: false,
         }
     }
 
-    pub fn update(&mut self, is_receiving: bool, is_outputting_message: bool, is_creating_tool_call: bool, is_tool_running: bool) {
-        self.status
-            .update(is_receiving, is_outputting_message, is_creating_tool_call, is_tool_running);
+    pub(crate) fn model_and_thinking_text(&self) -> String {
+        if self.current_model.is_empty() {
+            String::new()
+        } else if self.thinking_level == ThinkingLevel::None {
+            format!(" {} ", self.current_model)
+        } else {
+            format!(" {} · {} ", self.current_model, self.thinking_level.label())
+        }
+    }
+
+    pub(crate) fn sandbox_text(&self) -> String {
+        if self.sandbox_profile.is_empty() {
+            format!(" \u{1f512} {} ", self.sandbox_mode.label())
+        } else {
+            format!(
+                " \u{1f512} {}/{} ",
+                self.sandbox_profile,
+                self.sandbox_mode.label()
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_and_thinking_text_omits_none() {
+        let mut footer = Footer::new();
+        footer.current_model = "openai/gpt-5".to_string();
+        footer.thinking_level = ThinkingLevel::None;
+
+        assert_eq!(footer.model_and_thinking_text(), " openai/gpt-5 ");
+    }
+
+    #[test]
+    fn model_and_thinking_text_includes_active_level() {
+        let mut footer = Footer::new();
+        footer.current_model = "openai/gpt-5".to_string();
+        footer.thinking_level = ThinkingLevel::High;
+
+        assert_eq!(footer.model_and_thinking_text(), " openai/gpt-5 · high ");
+    }
+
+    #[test]
+    fn sandbox_text_shows_the_effective_mode() {
+        let mut footer = Footer::new();
+        footer.sandbox_mode = SandboxMode::Off;
+        footer.sandbox_profile = "local".to_string();
+
+        assert_eq!(footer.sandbox_text(), " 🔒 local/off ");
     }
 }
