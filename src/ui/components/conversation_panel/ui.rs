@@ -15,13 +15,14 @@
 
 use crate::response::message_item::MessageItem;
 use crate::ui::components::conversation_panel::conversation_panel::{
-    CachedParagraph, CachedToolGroup, ConversationPanel, ToolGroupLayout,
+    ActivePhase, CachedParagraph, CachedToolGroup, ConversationPanel, ToolGroupLayout,
 };
 use crate::ui::components::conversation_panel::tool_group::{
     MemberHeader, ToolGroupMember, build_tool_group_paragraph, discover_tool_group_bridge,
     discover_tool_groups, function_call, is_hidden_runtime_tool,
 };
 use crate::ui::components::messages::assistant_message::AssistantMessage;
+use crate::ui::components::messages::compacting_message::CompactingMessage;
 use crate::ui::components::messages::error_message::ErrorMessage;
 use crate::ui::components::messages::info_message::InfoMessage;
 use crate::ui::components::messages::pending_message::PendingMessage;
@@ -753,6 +754,15 @@ impl Widget for &mut ConversationPanel {
             content_height = content_height.saturating_add(*height);
         }
 
+        let compacting = (self.phase == ActivePhase::Compacting).then(|| {
+            let paragraph = CompactingMessage::into_paragraph();
+            let height = paragraph.line_count(content_width) as u16;
+            (paragraph, height)
+        });
+        if let Some((_, height)) = &compacting {
+            content_height = content_height.saturating_add(*height);
+        }
+
         let pending = self.pending_message.as_ref().map(|text| {
             let paragraph = PendingMessage::new(text).into_paragraph();
             let height = paragraph.line_count(content_width) as u16;
@@ -866,6 +876,12 @@ impl Widget for &mut ConversationPanel {
             }
             y = y.saturating_add(*height);
         }
+        if let Some((paragraph, height)) = &compacting {
+            if visible(y, *height) {
+                scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
+            }
+            y = y.saturating_add(*height);
+        }
         self.pending_layout = pending.as_ref().map(|(_, height)| (y, *height));
         if let Some((paragraph, height)) = &pending
             && visible(y, *height)
@@ -973,7 +989,9 @@ mod tests {
     use ratatui::widgets::Widget;
 
     use crate::tools::ToolOutput;
-    use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
+    use crate::ui::components::conversation_panel::conversation_panel::{
+        ActivePhase, ConversationPanel,
+    };
 
     #[test]
     fn developer_runtime_inputs_are_hidden_from_chat_rendering() {
@@ -986,6 +1004,19 @@ mod tests {
         }))
         .into();
         assert!(is_hidden_developer_input(&input));
+    }
+
+    #[test]
+    fn compacting_phase_renders_a_transient_conversation_message() {
+        let mut panel = ConversationPanel::new();
+        panel.phase = ActivePhase::Compacting;
+
+        let active = render_text(&mut panel, Rect::new(0, 0, 80, 8));
+        assert!(active.contains("⧉  Compacting context…"), "{active}");
+
+        panel.phase = ActivePhase::None;
+        let finished = render_text(&mut panel, Rect::new(0, 0, 80, 8));
+        assert!(!finished.contains("Compacting context"), "{finished}");
     }
 
     #[test]

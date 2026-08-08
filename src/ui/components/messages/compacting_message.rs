@@ -13,15 +13,22 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-pub mod assistant;
-pub mod assistant_message;
-pub mod compacting_message;
-pub mod error_message;
-pub mod info_message;
-mod notice_message;
-pub mod pending_message;
-pub mod tool_result;
-pub mod usage_message;
-pub mod user_message;
-pub mod warning_message;
-pub mod welcome_message;
+use ratatui_widgets::paragraph::Paragraph;
+
+use super::notice_message::notice;
+use crate::ui::markdown_theme::palette;
+
+/// Transient conversation entry shown while `/compact` is summarizing the
+/// current context. It disappears when the operation finishes or is cancelled.
+pub struct CompactingMessage;
+
+impl CompactingMessage {
+    pub fn into_paragraph() -> Paragraph<'static> {
+        notice(
+            "⧉",
+            palette::CYAN,
+            palette::MUTED,
+            "Compacting context…".to_string(),
+        )
+    }
+}

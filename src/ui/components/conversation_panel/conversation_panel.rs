@@ -751,9 +751,7 @@ impl ConversationPanel {
 
     /// Flush the accumulated usage as a message and reset the counter.
     pub fn flush_usage(&mut self) {
-        if self.conversation.lock().unwrap().flush_usage() {
-            self.stick_to_bottom = true;
-        }
+        self.conversation.lock().unwrap().flush_usage();
     }
 
     /// Reset the accumulated usage counter (on /clear, new session, etc.).
@@ -1042,6 +1040,27 @@ mod tests {
             "offset should decrease: {bottom} -> {after}"
         );
         assert!(!panel.stick_to_bottom, "scrolling up disables auto-follow");
+    }
+
+    #[test]
+    fn flushing_usage_preserves_manual_scroll_position() {
+        let mut panel = ConversationPanel::new();
+        for i in 0..40 {
+            panel.add_input_message(user_message(&format!("message number {i}")));
+        }
+        let area = Rect::new(0, 0, 40, 10);
+
+        (&mut panel).render(area, &mut Buffer::empty(area));
+        panel.scroll_up_by(5);
+        (&mut panel).render(area, &mut Buffer::empty(area));
+        let before = panel.scroll_view_state.offset().y;
+
+        panel.add_usage(13, 7);
+        panel.flush_usage();
+        (&mut panel).render(area, &mut Buffer::empty(area));
+
+        assert!(!panel.stick_to_bottom);
+        assert_eq!(panel.scroll_view_state.offset().y, before);
     }
 
     #[test]
