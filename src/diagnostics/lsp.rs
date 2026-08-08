@@ -214,6 +214,7 @@ pub fn diagnostic_from_lsp(value: &Value, file: &str) -> Diagnostic {
 #[derive(Default)]
 struct ServerState {
     by_uri: HashMap<String, Vec<Diagnostic>>,
+    generation: u64,
 }
 
 /// One warm language-server process.
@@ -353,6 +354,7 @@ impl LspServer {
     async fn snapshot(&self, checker: &Checker) -> Result<Vec<Diagnostic>, String> {
         let _guard = self.op_lock.lock().await;
         let _checking = CheckGuard::new();
+        let starting_generation = self.state.lock().await.generation;
 
         // Send didOpen for newly-seen files and didChange for changed ones.
         let mut sent_change = false;
@@ -389,13 +391,20 @@ impl LspServer {
         } else {
             Duration::from_millis(300)
         };
+        let mut saw_update = !sent_change;
         loop {
             if start.elapsed() > SNAPSHOT_TIMEOUT {
                 break;
             }
+
+            if !saw_update {
+                saw_update = self.state.lock().await.generation > starting_generation;
+            }
+
             match tokio::time::timeout(quiet, self.updated.notified()).await {
-                Ok(_) => {}      // an update arrived; keep waiting for it to settle
-                Err(_) => break, // quiet ⇒ settled
+                Ok(_) => saw_update = true,    // keep waiting for updates to settle
+                Err(_) if saw_update => break, // quiet after an update ⇒ settled
+                Err(_) => {}                   // no update yet; keep waiting
             }
         }
 
@@ -469,7 +478,10 @@ fn spawn_reader(
                         .and_then(Value::as_array)
                         .map(|arr| arr.iter().map(|d| diagnostic_from_lsp(d, &file)).collect())
                         .unwrap_or_default();
-                    state.lock().await.by_uri.insert(uri.to_string(), diags);
+                    let mut state = state.lock().await;
+                    state.by_uri.insert(uri.to_string(), diags);
+                    state.generation = state.generation.wrapping_add(1);
+                    drop(state);
                     updated.notify_waiters();
                 }
             } else {
