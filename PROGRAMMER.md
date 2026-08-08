@@ -22,7 +22,7 @@ Key features beyond the chat loop:
   parent-forwarded approvals, completion delivery, and live sidebar inspection.
 - **Todo list**: per-session task tracking with a `todo` tool and a sidebar panel.
 - **Diagnostics pipeline**: IDE-style error/warning feedback after edits (command + LSP backends).
-- **Slash-commands**: `/init`, `/model`, `/mode`, `/skills`, `/mcp`, `/todo`, etc. with tab-completion.
+- **Slash-commands**: `/init`, `/model`, `/mode`, `/skill`, `/mcp`, `/todo`, etc. with tab-completion.
 
 ## Tech stack
 

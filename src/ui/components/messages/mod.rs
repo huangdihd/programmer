@@ -17,6 +17,7 @@ pub mod assistant;
 pub mod assistant_message;
 pub mod error_message;
 pub mod info_message;
+mod notice_message;
 pub mod pending_message;
 pub mod tool_result;
 pub mod usage_message;

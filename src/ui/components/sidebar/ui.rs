@@ -26,6 +26,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use unicode_width::UnicodeWidthStr;
 
 /// Max visible content lines per expanded MCP section before truncation.
 const VISIBLE_PER_SECTION: usize = 6;
@@ -40,6 +41,7 @@ struct SidebarData<'a> {
     mcp_servers: &'a [McpServerStatus],
     provider_models: &'a [ProviderModelStatus],
     active_provider: &'a str,
+    active_skills: &'a [String],
     todo_list: &'a TodoList,
     tasks: &'a [SidebarTaskSnapshot],
     agents: &'a [AgentSnapshot],
@@ -58,6 +60,7 @@ impl Sidebar {
         mcp_servers: &[McpServerStatus],
         provider_models: &[ProviderModelStatus],
         active_provider: &str,
+        active_skills: &[String],
         todo_list: &TodoList,
         tasks: &[SidebarTaskSnapshot],
         agents: &[AgentSnapshot],
@@ -80,6 +83,7 @@ impl Sidebar {
             mcp_servers,
             provider_models,
             active_provider,
+            active_skills,
             todo_list,
             tasks,
             agents,
@@ -179,7 +183,7 @@ impl Sidebar {
             rendered_any = true;
 
             // Title line.
-            let title = self.section_title(section, data);
+            let title = self.section_title(section, data, width);
             let title_line = self.make_title_line(&title, section.key, section.collapsed);
             lines.push(title_line);
             targets.push(ClickTarget::Section(section.key));
@@ -205,6 +209,9 @@ impl Sidebar {
                             data.provider_models,
                             data.active_provider,
                         );
+                    }
+                    SidebarSection::Skills => {
+                        self.render_skills(&mut lines, &mut targets, data.active_skills);
                     }
                     SidebarSection::Todos => {
                         self.render_todos(&mut lines, &mut targets, width, data.todo_list);
@@ -240,6 +247,7 @@ impl Sidebar {
             SidebarSection::Diagnostics => data.lsp_configured || !data.diagnostics.is_empty(),
             SidebarSection::Mcp => !data.mcp_servers.is_empty(),
             SidebarSection::Providers => !data.provider_models.is_empty(),
+            SidebarSection::Skills => !data.active_skills.is_empty(),
             SidebarSection::Todos => !data.todo_list.todos.is_empty(),
             SidebarSection::Tasks => !data.tasks.is_empty(),
             SidebarSection::Agents => !data.agents.is_empty(),
@@ -248,7 +256,12 @@ impl Sidebar {
 
     // -- section title helpers --
 
-    fn section_title(&self, section: &super::SectionState, data: SidebarData<'_>) -> String {
+    fn section_title(
+        &self,
+        section: &super::SectionState,
+        data: SidebarData<'_>,
+        width: u16,
+    ) -> String {
         match section.key {
             SidebarSection::Agents => {
                 let running = data
@@ -348,7 +361,21 @@ impl Sidebar {
                         parts.push(format!("{amount} {label}"));
                     }
                 }
-                format!("Providers ({})", parts.join(", "))
+                let title = format!("Providers ({})", parts.join(", "));
+                if UnicodeWidthStr::width(title.as_str()) + 3 <= usize::from(width) {
+                    title
+                } else {
+                    let mut compact_parts = Vec::new();
+                    for (amount, label) in [(ready, "R"), (refreshing, "↻"), (failed, "F")] {
+                        if amount > 0 {
+                            compact_parts.push(format!("{amount}{label}"));
+                        }
+                    }
+                    format!("Providers ({})", compact_parts.join(" "))
+                }
+            }
+            SidebarSection::Skills => {
+                format!("Skills ({} active)", data.active_skills.len())
             }
             SidebarSection::Todos => {
                 let pending = data
@@ -385,6 +412,7 @@ impl Sidebar {
             SidebarSection::Diagnostics => Color::Red,
             SidebarSection::Mcp => Color::Magenta,
             SidebarSection::Providers => Color::Green,
+            SidebarSection::Skills => Color::LightMagenta,
             SidebarSection::Todos => Color::Yellow,
             SidebarSection::Tasks => Color::Cyan,
             SidebarSection::Agents => Color::Blue,
@@ -430,6 +458,23 @@ impl Sidebar {
                 Span::styled(provider.name.clone(), Style::default().fg(Color::White)),
                 Span::styled(active_marker, Style::default().fg(Color::Yellow)),
                 Span::styled(format!(" ({label})"), Style::default().fg(label_color)),
+            ]));
+            targets.push(ClickTarget::None);
+        }
+    }
+
+    fn render_skills(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        targets: &mut Vec<ClickTarget>,
+        active_skills: &[String],
+    ) {
+        for name in active_skills {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("●", Style::default().fg(Color::LightMagenta)),
+                Span::raw(" "),
+                Span::styled(name.clone(), Style::default().fg(Color::White)),
             ]));
             targets.push(ClickTarget::None);
         }
@@ -854,6 +899,7 @@ mod tests {
             statuses,
             &[],
             "",
+            &[],
             &crate::todos::TodoList::default(),
             &[],
             &[],
@@ -873,6 +919,7 @@ mod tests {
             &[],
             statuses,
             active,
+            &[],
             &crate::todos::TodoList::default(),
             &[],
             &[],
@@ -968,6 +1015,71 @@ mod tests {
     }
 
     #[test]
+    fn provider_title_keeps_closing_parenthesis_in_narrow_sidebar() {
+        let mut sidebar = Sidebar::new();
+        let area = Rect::new(0, 0, Sidebar::needed_width(), 10);
+        let mut buf = Buffer::empty(area);
+        let statuses = [
+            ProviderModelStatus {
+                name: "ready".to_string(),
+                state: ProviderModelState::Ready { model_count: 1 },
+            },
+            ProviderModelStatus {
+                name: "refreshing".to_string(),
+                state: ProviderModelState::Refreshing,
+            },
+            ProviderModelStatus {
+                name: "failed".to_string(),
+                state: ProviderModelState::Failed,
+            },
+        ];
+
+        sidebar.render(
+            area,
+            &mut buf,
+            &[],
+            false,
+            &[],
+            &statuses,
+            "ready",
+            &[],
+            &crate::todos::TodoList::default(),
+            &[],
+            &[],
+        );
+
+        let text = buffer_text(&buf);
+        assert!(text.contains("Providers (1R 1↻ 1F)"), "got:\n{text}");
+    }
+
+    #[test]
+    fn active_skills_render_in_the_sidebar() {
+        let mut sidebar = Sidebar::new();
+        let area = Rect::new(0, 0, Sidebar::needed_width(), 10);
+        let mut buf = Buffer::empty(area);
+        let skills = vec!["programmer-guide".to_string(), "release".to_string()];
+
+        sidebar.render(
+            area,
+            &mut buf,
+            &[],
+            false,
+            &[],
+            &[],
+            "",
+            &skills,
+            &crate::todos::TodoList::default(),
+            &[],
+            &[],
+        );
+
+        let text = buffer_text(&buf);
+        assert!(text.contains("Skills (2 active)"), "got:\n{text}");
+        assert!(text.contains("programmer-guide"), "got:\n{text}");
+        assert!(text.contains("release"), "got:\n{text}");
+    }
+
+    #[test]
     fn tasks_section_renders_above_diagnostics() {
         let mut sidebar = Sidebar::new();
         let area = Rect::new(0, 0, 32, 40);
@@ -991,6 +1103,7 @@ mod tests {
             &[],
             &[],
             "",
+            &[],
             &crate::todos::TodoList::default(),
             &tasks,
             &[],
@@ -1031,6 +1144,7 @@ mod tests {
             &[],
             &[],
             "",
+            &[],
             &crate::todos::TodoList::default(),
             &tasks,
             &[],
@@ -1054,6 +1168,7 @@ mod tests {
             &[],
             &[],
             "",
+            &[],
             &crate::todos::TodoList::default(),
             &tasks,
             &[],
@@ -1083,6 +1198,7 @@ mod tests {
             &[],
             &[],
             "",
+            &[],
             &crate::todos::TodoList::default(),
             &[],
             &agents,

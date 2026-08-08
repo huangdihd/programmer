@@ -13,16 +13,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders};
-use ratatui_widgets::block::Padding;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use crate::ui::markdown_theme::palette;
-
-const PAD_LEFT: u16 = 1;
-const PAD_RIGHT: u16 = 1;
 
 /// Renders a token-usage summary after each response.
 pub struct UsageMessage {
@@ -39,22 +34,50 @@ impl UsageMessage {
     }
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
-        let muted = palette::MUTED;
         let total = self.input_tokens + self.output_tokens;
 
-        Paragraph::new(Text::from(vec![Line::from(Span::styled(
-            format!(
-                "↑ {} input  ↓ {} output  Σ {} tokens",
-                self.input_tokens, self.output_tokens, total
+        Paragraph::new(Line::from(vec![
+            Span::styled("↳  ", Style::new().fg(palette::FAINT)),
+            Span::styled(
+                self.input_tokens.to_string(),
+                Style::new().fg(palette::CYAN),
             ),
-            Style::new().fg(muted).add_modifier(Modifier::ITALIC),
-        ))]))
+            Span::styled(" input", Style::new().fg(palette::MUTED)),
+            Span::styled("  ·  ", Style::new().fg(palette::FAINT)),
+            Span::styled(
+                self.output_tokens.to_string(),
+                Style::new().fg(palette::PURPLE),
+            ),
+            Span::styled(" output", Style::new().fg(palette::MUTED)),
+            Span::styled("  ·  ", Style::new().fg(palette::FAINT)),
+            Span::styled(total.to_string(), Style::new().fg(palette::TEXT)),
+            Span::styled(" total tokens", Style::new().fg(palette::MUTED)),
+        ]))
         .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::LEFT)
-                .border_style(Style::new().fg(muted))
-                .padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 0)),
-        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UsageMessage;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    #[test]
+    fn usage_is_a_compact_borderless_summary() {
+        let area = Rect::new(0, 0, 60, 1);
+        let mut buffer = Buffer::empty(area);
+        UsageMessage::new(13, 7)
+            .into_paragraph()
+            .render(area, &mut buffer);
+
+        let rendered = (0..area.width)
+            .filter_map(|x| buffer.cell((x, 0)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.starts_with("↳  13 input  ·  7 output  ·  20 total tokens"));
+        assert!(!rendered.contains('│'));
     }
 }

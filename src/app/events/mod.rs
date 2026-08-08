@@ -552,7 +552,7 @@ fn handle_start_init(app: &mut App<'_>) {
     };
     let surface = super::surface::TuiSurface {
         tx: app.events.sender.clone(),
-        skill_prompt: app.skill_registry.combined_prompt(),
+        skill_prompt: app.skill_registry.catalog_prompt(),
         plan_prompt: None,
         approval_label: format!(
             "{} approved by {} mode",

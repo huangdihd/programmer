@@ -186,12 +186,12 @@ impl McpClient {
     }
 
     /// Send a JSON-RPC response (for server→client requests).
-    async fn send_response(&self, id: u64, result: serde_json::Value) -> Result<(), String> {
-        let resp = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        });
+    async fn send_response(
+        &self,
+        id: serde_json::Value,
+        result: serde_json::Value,
+    ) -> Result<(), String> {
+        let resp = response_message(id, result);
         let line = serde_json::to_string(&resp).map_err(|e| format!("MCP serialise: {e}"))?;
         let mut stdin = self.stdin.lock().await;
         stdin
@@ -236,14 +236,10 @@ impl McpClient {
                 serde_json::from_str(line.trim()).map_err(|e| format!("MCP parse JSON: {e}"))?;
 
             // --- server→client request? (has `method` + `id`, no `result`/`error`) ---
-            if raw.get("method").and_then(|v| v.as_str()).is_some()
-                && raw.get("id").and_then(|v| v.as_u64()).is_some()
-                && raw.get("result").is_none()
-                && raw.get("error").is_none()
-            {
-                let req_id = raw["id"].as_u64().unwrap();
-                let method = raw["method"].as_str().unwrap();
-                let params = raw.get("params").cloned();
+            // JSON-RPC ids may be strings or numbers. CodeGraph uses ids such
+            // as `cg-srv-1` for roots/list when the current folder is not
+            // indexed, so preserve the raw id and echo it in our response.
+            if let Some((req_id, method, params)) = server_request(&raw) {
                 self.handle_server_request(req_id, method, params).await;
                 continue;
             }
@@ -273,7 +269,7 @@ impl McpClient {
     /// Handle a server→client request (e.g. `roots/list`).
     async fn handle_server_request(
         &self,
-        req_id: u64,
+        req_id: serde_json::Value,
         method: &str,
         _params: Option<serde_json::Value>,
     ) {
@@ -393,5 +389,108 @@ impl McpClient {
         tokio::time::timeout(Duration::from_secs(timeout_secs), self.call(method, params))
             .await
             .map_err(|_| format!("MCP call to '{method}' timed out after {timeout_secs}s"))?
+    }
+}
+
+/// Extract a server-initiated JSON-RPC request while preserving its id type.
+fn server_request(
+    raw: &serde_json::Value,
+) -> Option<(serde_json::Value, &str, Option<serde_json::Value>)> {
+    if raw.get("result").is_some() || raw.get("error").is_some() {
+        return None;
+    }
+    let method = raw.get("method")?.as_str()?;
+    let id = raw.get("id")?;
+    if id.is_null() {
+        return None;
+    }
+    Some((id.clone(), method, raw.get("params").cloned()))
+}
+
+fn response_message(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{response_message, server_request};
+
+    #[test]
+    fn recognizes_codegraph_string_id_server_request() {
+        let raw = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cg-srv-1",
+            "method": "roots/list"
+        });
+
+        let (id, method, params) = server_request(&raw).expect("server request");
+        assert_eq!(id, "cg-srv-1");
+        assert_eq!(method, "roots/list");
+        assert!(params.is_none());
+
+        let response = response_message(id, serde_json::json!({"roots": []}));
+        assert_eq!(response["id"], "cg-srv-1");
+    }
+
+    #[test]
+    fn does_not_misclassify_json_rpc_responses_as_requests() {
+        let raw = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": []}
+        });
+
+        assert!(server_request(&raw).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_round_trip_handles_string_id_roots_request() {
+        let script = r#"
+            IFS= read -r initialize
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}'
+            IFS= read -r initialized
+            IFS= read -r tools
+            printf '%s\n' '{"jsonrpc":"2.0","id":"cg-srv-1","method":"roots/list"}'
+            IFS= read -r roots
+            case "$roots" in
+                *'"id":"cg-srv-1"'*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+                    ;;
+                *)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"string id was not echoed"}}'
+                    ;;
+            esac
+        "#;
+        let client = super::McpClient::spawn(
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &std::collections::HashMap::new(),
+            "/tmp/project",
+        )
+        .unwrap();
+
+        client
+            .call(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"roots": {"listChanged": true}},
+                    "clientInfo": {"name": "test", "version": "1"}
+                })),
+            )
+            .await
+            .unwrap();
+        client
+            .send_notification("notifications/initialized", None)
+            .await
+            .unwrap();
+
+        let tools = client.call("tools/list", None).await.unwrap();
+        assert_eq!(tools["tools"], serde_json::json!([]));
     }
 }

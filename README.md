@@ -266,7 +266,7 @@ programmer
 | `/session` `/s` | Show current session UUID and info |
 | `/providers show` | List all configured providers and models |
 | `/providers manage` | Open the provider management panel |
-| `/providers refresh` | Refetch auto-discovered model lists |
+| `/providers refresh [provider]` | Refetch auto-discovered model lists (optionally for one provider) |
 | `/clear` `/c` | Clear the conversation history |
 | `/quit` `/q` | Exit the application |
 | `/help` `/?` | Show all commands |
@@ -306,13 +306,16 @@ Open with `/providers manage` or the `--providers` flag.
 
 ### Skills
 
-Activate reusable instruction modules with `/skill <name>` or manage them in
-the `/skill manage` panel. Programmer ships with a built-in
-`programmer-guide` skill that explains Programmer's own features, controls,
-paths, security model, and architecture; activate it with:
+Reusable instruction modules are enabled by default and can be toggled with
+`/skill <name>` or managed in the `/skill manage` panel. Programmer ships with
+two built-in skills: `programmer-guide`, which explains Programmer's own
+features and architecture, and `update-programmer-md`, which refreshes the
+repository guide from verified project facts. Their full instructions are
+loaded only when a request needs them.
 
 ```text
 /skill programmer-guide
+/skill update-programmer-md
 ```
 
 Additional skills are loaded from the cross-agent `~/.agents/skills/<name>/`

@@ -76,6 +76,7 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     session.classifier_model = app.config.classifier_model.clone();
     session.todos = app.todo_list.todos.clone();
     session.activated_skills = app.skill_registry.activated_names().to_vec();
+    session.skill_selection_saved = true;
     session.tasks = crate::tasks::persist_all();
     match mgr.save(&mut session) {
         Ok(()) => app.session.did_save = true,

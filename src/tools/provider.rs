@@ -25,7 +25,8 @@
 
 use super::{
     agent, ask_user, blob, command, configure_diagnostics, diagnostics, edit_file, fetch, grep,
-    mcp_bridge, read_file, read_image, request_permission, run_local_tool, task, todo, write_file,
+    load_skill, mcp_bridge, read_file, read_image, request_permission, run_local_tool, task, todo,
+    write_file,
 };
 use crate::mcp::McpManager;
 use crate::ui::event::Event;
@@ -137,6 +138,40 @@ pub(crate) trait ToolProvider: Send + Sync {
         call: &FunctionToolCall,
         ctx: &ToolCtx<'_>,
     ) -> Result<FunctionCallOutput, String>;
+}
+
+/// Read-only provider that loads the body of an enabled skill on demand.
+pub(crate) struct SkillToolProvider {
+    registry: crate::skills::SkillRegistry,
+}
+
+impl SkillToolProvider {
+    pub(crate) fn new(registry: crate::skills::SkillRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolProvider for SkillToolProvider {
+    fn tools(&self) -> Vec<Tool> {
+        vec![load_skill::tool()]
+    }
+
+    fn is_read_only(&self, name: &str) -> bool {
+        name == load_skill::NAME
+    }
+
+    fn approval(&self, _name: &str, _arguments: &str) -> ToolApproval {
+        ToolApproval::AutoApprove
+    }
+
+    async fn call(
+        &self,
+        call: &FunctionToolCall,
+        _ctx: &ToolCtx<'_>,
+    ) -> Result<FunctionCallOutput, String> {
+        load_skill::run(&call.arguments, &self.registry).map(FunctionCallOutput::Text)
+    }
 }
 
 /// The built-in local tools, exposed as one provider — the local analogue of an
@@ -527,6 +562,21 @@ mod tests {
         // An unknown tool has no route: not read-only, not interactive.
         assert!(!reg.is_read_only("nope"));
         assert!(!reg.requires_interaction("nope"));
+    }
+
+    #[test]
+    fn skill_provider_advertises_a_read_only_loader() {
+        let provider = SkillToolProvider::new(crate::skills::SkillRegistry::load());
+
+        assert!(provider.tools().iter().any(|tool| matches!(
+            tool,
+            Tool::Function(function) if function.name == load_skill::NAME
+        )));
+        assert!(provider.is_read_only(load_skill::NAME));
+        assert_eq!(
+            provider.approval(load_skill::NAME, r#"{"name":"programmer-guide"}"#),
+            ToolApproval::AutoApprove
+        );
     }
 
     #[test]

@@ -89,8 +89,10 @@ completion for the exact controls in the installed version.
 
 Built-in skills are compiled into Programmer. Shared `~/.agents/skills` can
 override built-ins, Programmer-global skills can override shared skills, and
-project skills can override all other sources. Skills are activated explicitly
-and the active set is saved with the session.
+project skills can override all other sources. All discovered skills are
+enabled by default, and changes to the active set are saved with the session.
+Only the enabled skill catalog is included in each request; matching skill
+instructions are loaded on demand instead of injecting every skill body.
 
 ## Other interfaces
 

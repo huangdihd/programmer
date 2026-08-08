@@ -34,14 +34,6 @@ impl Widget for &Footer {
         let model_text = self.model_and_thinking_text();
         let model_len = model_text.width() as u16;
 
-        // Active skills indicator — only shown when skills are active.
-        let skill_text = if self.active_skills.is_empty() {
-            String::new()
-        } else {
-            format!(" \u{1f3af} {} ", self.active_skills)
-        };
-        let skill_len = skill_text.chars().count() as u16;
-
         // LSP indicator: shown whenever the project has an LSP checker
         // configured (from startup) or a server is live. Command-backend
         // projects see no extra clutter.
@@ -77,7 +69,6 @@ impl Widget for &Footer {
             .constraints([
                 Constraint::Length(mode_len),    // work mode (leftmost)
                 Constraint::Length(sandbox_len), // sandbox mode
-                Constraint::Length(skill_len),   // active skills
                 Constraint::Min(1),              // status
                 Constraint::Length(model_len),   // model and thinking level
                 Constraint::Length(lsp_len),     // LSP status
@@ -105,33 +96,26 @@ impl Widget for &Footer {
             .style(sandbox_style)
             .render(chunks[1], buf);
 
-        // Active skills (if any)
-        if !skill_text.is_empty() {
-            ratatui::widgets::Paragraph::new(skill_text)
-                .style(Style::default().fg(Color::LightMagenta))
-                .render(chunks[2], buf);
-        }
-
         // Status indicator
-        (&self.status).render(chunks[3], buf);
+        (&self.status).render(chunks[2], buf);
 
         // Model name and thinking level
         if !model_text.is_empty() {
             ratatui::widgets::Paragraph::new(model_text)
                 .style(Style::default().fg(ACCENT))
-                .render(chunks[4], buf);
+                .render(chunks[3], buf);
         }
 
         // LSP status (empty string renders nothing)
         if !lsp_text.is_empty() {
             ratatui::widgets::Paragraph::new(lsp_text)
                 .style(lsp_style)
-                .render(chunks[5], buf);
+                .render(chunks[4], buf);
         }
 
         // Right: copyright
         ratatui::widgets::Paragraph::new("GPL-3.0-or-later \u{b7} \u{a9} 2026")
             .style(Style::default().fg(DIM))
-            .render(chunks[6], buf);
+            .render(chunks[5], buf);
     }
 }

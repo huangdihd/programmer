@@ -93,8 +93,7 @@ impl Skill {
         self
     }
 
-    /// The full prompt text injected into the system prompt when this skill
-    /// is activated: title + description + body.
+    /// The complete instructions returned when the model loads this skill.
     pub(crate) fn to_prompt(&self) -> String {
         let mut prompt = format!(
             "## Skill: {}\n\n*{}. If this skill is active, follow its instructions.*\n\n{}",

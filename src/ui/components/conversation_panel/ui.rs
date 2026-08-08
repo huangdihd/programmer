@@ -19,7 +19,7 @@ use crate::ui::components::conversation_panel::conversation_panel::{
 };
 use crate::ui::components::conversation_panel::tool_group::{
     MemberHeader, ToolGroupMember, build_tool_group_paragraph, discover_tool_group_bridge,
-    discover_tool_groups, function_call,
+    discover_tool_groups, function_call, is_hidden_runtime_tool,
 };
 use crate::ui::components::messages::assistant_message::AssistantMessage;
 use crate::ui::components::messages::error_message::ErrorMessage;
@@ -57,6 +57,7 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
         MessageItem::Output(output) => match output {
             OutputItem::Reasoning(_) => 3, // rough
             OutputItem::Message(_) => 4,
+            OutputItem::FunctionCall(call) if is_hidden_runtime_tool(call) => 0,
             OutputItem::FunctionCall(_) => 2,
             _ => 1,
         },
@@ -298,8 +299,7 @@ impl Widget for &mut ConversationPanel {
                 let group = &tool_groups[group_index];
                 if group.member_indices[0] != index {
                     0
-                } else if self.expanded_tool_groups.contains(&group.key)
-                {
+                } else if self.expanded_tool_groups.contains(&group.key) {
                     1 + group
                         .member_indices
                         .iter()
@@ -376,9 +376,10 @@ impl Widget for &mut ConversationPanel {
                 MessageItem::ToolOutput { output, .. } => {
                     (call_ids.contains(output.call_id.as_str()), None)
                 }
-                MessageItem::Output(OutputItem::FunctionCall(call)) => {
-                    (false, outputs_by_call.get(call.call_id.as_str()).copied())
-                }
+                MessageItem::Output(OutputItem::FunctionCall(call)) => (
+                    is_hidden_runtime_tool(call),
+                    outputs_by_call.get(call.call_id.as_str()).copied(),
+                ),
                 MessageItem::Input(input) => (is_hidden_developer_input(input), None),
                 _ => (false, None),
             };
@@ -419,9 +420,10 @@ impl Widget for &mut ConversationPanel {
                         output.map_or('p', |(_, failed, _)| if *failed { 'f' } else { 's' })
                     )
                 });
-                let absorbed_states = group.absorbed.iter().map(|&index| {
-                    usize::from(self.expanded_items.contains(&index)).to_string()
-                });
+                let absorbed_states = group
+                    .absorbed
+                    .iter()
+                    .map(|&index| usize::from(self.expanded_items.contains(&index)).to_string());
                 format!(
                     "{}:{}:{}",
                     usize::from(group_expanded),
@@ -732,6 +734,11 @@ impl Widget for &mut ConversationPanel {
                 live_paragraphs.push((paragraph, height, Vec::new()));
             } else {
                 live_group_headers.push(None);
+                if matches!(output_item, OutputItem::FunctionCall(call) if is_hidden_runtime_tool(call))
+                {
+                    live_paragraphs.push((Paragraph::new(""), 0, Vec::new()));
+                    continue;
+                }
                 let (paragraph, copy_buttons) = AssistantMessage::new(output_item, content_width)
                     .in_progress(*in_progress)
                     .expanded(expanded)
@@ -982,6 +989,59 @@ mod tests {
     }
 
     #[test]
+    fn load_skill_call_and_instructions_are_hidden_from_chat_rendering() {
+        let mut panel = ConversationPanel::new();
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_output(OutputItem::FunctionCall(tool_call(
+                0,
+                crate::tools::load_skill::NAME,
+            )));
+        panel.add_tool_output(ToolOutput {
+            param: FunctionCallOutputItemParam {
+                call_id: "call-0".into(),
+                output: FunctionCallOutput::Text("very large private skill instructions".into()),
+                id: None,
+                status: None,
+            },
+            failed: false,
+            approval_label: None,
+        });
+
+        let rendered = render_text(&mut panel, Rect::new(0, 0, 80, 24));
+        assert!(!rendered.contains("load_skill"), "{rendered}");
+        assert!(
+            !rendered.contains("private skill instructions"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Used tools"), "{rendered}");
+    }
+
+    #[test]
+    fn streaming_load_skill_call_is_hidden_immediately() {
+        use crate::cancel::CancellationToken;
+        use async_openai::types::responses::{ResponseOutputItemAddedEvent, ResponseStreamEvent};
+
+        let mut panel = ConversationPanel::new();
+        panel.receiving_response = Some(crate::response::partial_response::PartialResponse::new(
+            CancellationToken::new(),
+        ));
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
+            ResponseOutputItemAddedEvent {
+                sequence_number: 0,
+                output_index: 0,
+                item: OutputItem::FunctionCall(tool_call(0, crate::tools::load_skill::NAME)),
+            },
+        ));
+
+        let rendered = render_text(&mut panel, Rect::new(0, 0, 80, 24));
+        assert!(!rendered.contains("load_skill"), "{rendered}");
+        assert!(!rendered.contains("Used tools"), "{rendered}");
+    }
+
+    #[test]
     fn long_tool_run_collapses_and_refreshes_as_results_arrive() {
         let mut panel = ConversationPanel::new();
         for (index, name) in ["grep", "blob", "read_file"].into_iter().enumerate() {
@@ -1069,10 +1129,9 @@ mod tests {
             ResponseStreamEvent,
         };
         let mut panel = ConversationPanel::new();
-        panel.receiving_response =
-            Some(crate::response::partial_response::PartialResponse::new(
-                CancellationToken::new(),
-            ));
+        panel.receiving_response = Some(crate::response::partial_response::PartialResponse::new(
+            CancellationToken::new(),
+        ));
         let reasoning = ReasoningItem {
             id: None,
             summary: Vec::new(),
@@ -1115,7 +1174,10 @@ mod tests {
         // The thought was absorbed into the group: it appears on the muted
         // summary line right under the header, still streaming, and its
         // status string is the last piece of that line.
-        let header_row = rendered.lines().position(|l| l.contains("Exploring")).unwrap();
+        let header_row = rendered
+            .lines()
+            .position(|l| l.contains("Exploring"))
+            .unwrap();
         let summary_row = rendered.lines().position(|l| l.contains("✻")).unwrap();
         assert_eq!(summary_row, header_row + 1, "{rendered}");
         let summary = rendered.lines().nth(summary_row).unwrap();
@@ -1184,10 +1246,9 @@ mod tests {
         let committed = render_text(&mut panel, area);
         assert!(committed.contains("Explored"), "{committed}");
 
-        panel.receiving_response =
-            Some(crate::response::partial_response::PartialResponse::new(
-                CancellationToken::new(),
-            ));
+        panel.receiving_response = Some(crate::response::partial_response::PartialResponse::new(
+            CancellationToken::new(),
+        ));
         panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
             ResponseOutputItemAddedEvent {
                 sequence_number: 0,
@@ -1233,11 +1294,7 @@ mod tests {
             .unwrap()
             .get_message_items();
         for (item, _) in newly_committed {
-            panel
-                .conversation
-                .lock()
-                .unwrap()
-                .add_output(item);
+            panel.conversation.lock().unwrap().add_output(item);
         }
         panel.commit_live();
         let committed_again = render_text(&mut panel, area);
@@ -1258,9 +1315,7 @@ mod tests {
     #[test]
     fn cancelling_a_bridged_stream_restores_ungrouped_committed_calls() {
         use crate::cancel::CancellationToken;
-        use async_openai::types::responses::{
-            ResponseOutputItemAddedEvent, ResponseStreamEvent,
-        };
+        use async_openai::types::responses::{ResponseOutputItemAddedEvent, ResponseStreamEvent};
 
         let mut panel = ConversationPanel::new();
         for (index, name) in ["grep", "blob"].into_iter().enumerate() {
@@ -1276,10 +1331,9 @@ mod tests {
         assert!(before.contains("blob  {}"), "{before}");
 
         let cancel = CancellationToken::new();
-        panel.receiving_response =
-            Some(crate::response::partial_response::PartialResponse::new(
-                cancel.clone(),
-            ));
+        panel.receiving_response = Some(crate::response::partial_response::PartialResponse::new(
+            cancel.clone(),
+        ));
         panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
             ResponseOutputItemAddedEvent {
                 sequence_number: 0,

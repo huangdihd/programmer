@@ -349,7 +349,6 @@ impl Widget for &mut App<'_> {
         self.footer.current_model = self.current_model.clone();
         self.footer.thinking_level = self.thinking_level;
         self.footer.lsp_configured = self.diag.lsp_configured;
-        self.footer.active_skills = self.skill_registry.activated_names().join(",");
 
         // When the model is asking a question or waiting for approval,
         // the bottom area grows; the conversation panel shrinks.
@@ -424,7 +423,9 @@ impl Widget for &mut App<'_> {
             let active_provider = self
                 .current_model
                 .split_once('/')
-                .map_or(self.config.default_provider.as_str(), |(provider, _)| provider);
+                .map_or(self.config.default_provider.as_str(), |(provider, _)| {
+                    provider
+                });
             self.sidebar.as_mut().unwrap().render(
                 horiz[1],
                 buf,
@@ -438,6 +439,7 @@ impl Widget for &mut App<'_> {
                 &self.mcp_server_statuses,
                 &self.provider_model_statuses,
                 active_provider,
+                self.skill_registry.activated_names(),
                 &self.todo_list,
                 &sidebar_tasks,
                 &sidebar_agents,

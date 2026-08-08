@@ -39,6 +39,10 @@ const APPROVE_MARGIN: f64 = 0.7;
 /// before it emits the answer token whose logprobs we read.
 const CLASSIFIER_MAX_TOKENS: u32 = 2048;
 
+/// Number of retries after the initial classifier request for transient
+/// transport, rate-limit, and server failures.
+const CLASSIFIER_MAX_RETRIES: u32 = 3;
+
 /// The outcome of one LLM classification, plus whether the provider turned out
 /// not to support logprobs (so the caller can cache that and skip the fast
 /// path next time).
@@ -162,6 +166,29 @@ fn first_text(
     })
 }
 
+/// Send a non-streaming classifier request with the same transient-error
+/// policy as normal model streams. Classifier calls are short and have no
+/// partial output to reconcile, so replaying the whole request is safe.
+async fn create_with_retries(
+    client: &Client<OpenAIConfig>,
+    request: &CreateResponse,
+) -> Result<async_openai::types::responses::Response, OpenAIError> {
+    let mut attempt = 0;
+    loop {
+        match client.responses().create(request.clone()).await {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if crate::runner::stream::is_retryable(&error)
+                    && attempt < CLASSIFIER_MAX_RETRIES =>
+            {
+                attempt += 1;
+                tokio::time::sleep(crate::runner::stream::backoff_delay(attempt)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Fast path: make the model answer yes/no, then compare `P(yes)` vs `P(no)` in
 /// the logprobs of the *first message-content token*.
 ///
@@ -188,7 +215,7 @@ async fn classify_fast(
     req.top_logprobs = Some(20);
     req.include = Some(vec![IncludeEnum::MessageOutputTextLogprobs]);
 
-    let response = match client.responses().create(req).await {
+    let response = match create_with_retries(client, &req).await {
         Ok(r) => r,
         // Some providers return logprobs in a non-spec shape (e.g. omitting
         // the `bytes` field on empty tokens), which fails response
@@ -268,7 +295,7 @@ async fn classify_reasoned(
     let mut req = base_request(model, prompt);
     req.max_output_tokens = Some(CLASSIFIER_MAX_TOKENS);
 
-    let response = match client.responses().create(req).await {
+    let response = match create_with_retries(client, &req).await {
         Ok(r) => r,
         Err(e) => {
             return Verdict::Deny {

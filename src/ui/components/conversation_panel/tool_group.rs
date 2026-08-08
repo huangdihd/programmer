@@ -31,9 +31,7 @@
 //! [`MIN_TOOL_GROUP_SIZE`] threshold so short, finished sequences stay easy to
 //! scan as ordinary calls.
 
-use async_openai::types::responses::{
-    FunctionCallOutputItemParam, FunctionToolCall, OutputItem,
-};
+use async_openai::types::responses::{FunctionCallOutputItemParam, FunctionToolCall, OutputItem};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Wrap;
@@ -145,7 +143,10 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     let mut run = Vec::new();
     let mut absorbed = Vec::new();
 
-    let flush = |run: &mut Vec<usize>, absorbed: &mut Vec<usize>, open: bool, groups: &mut Vec<ToolGroup>| {
+    let flush = |run: &mut Vec<usize>,
+                 absorbed: &mut Vec<usize>,
+                 open: bool,
+                 groups: &mut Vec<ToolGroup>| {
         let min = if !absorbed.is_empty() {
             1
         } else {
@@ -171,6 +172,7 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
 
     for (index, item) in items.iter().enumerate() {
         match function_call(item) {
+            Some(call) if is_hidden_runtime_tool(call) => {}
             Some(call) if !is_interactive(call) => run.push(index),
             None if matches!(item, MessageItem::Output(OutputItem::Reasoning(_))) => {
                 absorbed.push(index)
@@ -237,12 +239,19 @@ pub(crate) fn discover_tool_group_bridge(
 
 fn continues_tool_run(item: &MessageItem) -> bool {
     match function_call(item) {
+        Some(call) if is_hidden_runtime_tool(call) => true,
         Some(call) => !is_interactive(call),
         None => matches!(
             item,
             MessageItem::Output(OutputItem::Reasoning(_)) | MessageItem::ToolOutput { .. }
         ),
     }
+}
+
+/// Runtime plumbing that must remain in the protocol transcript but should not
+/// appear as user-visible work or influence tool-run grouping.
+pub(crate) fn is_hidden_runtime_tool(call: &FunctionToolCall) -> bool {
+    call.name == crate::tools::load_skill::NAME
 }
 
 pub(crate) fn function_call(item: &MessageItem) -> Option<&FunctionToolCall> {
@@ -342,7 +351,8 @@ impl ToolGroup {
         }
     }
 
-    pub(crate) fn title(&self, completed: usize, failed: usize) -> String {        let total = self.member_indices.len();
+    pub(crate) fn title(&self, completed: usize, failed: usize) -> String {
+        let total = self.member_indices.len();
         let mut title = if completed < total {
             format!("{}… · {completed}/{total}", self.kind.active_title())
         } else {
@@ -702,6 +712,22 @@ mod tests {
     }
 
     #[test]
+    fn load_skill_is_not_a_used_tools_group_member() {
+        let items = vec![
+            call(0, "grep"),
+            call(1, crate::tools::load_skill::NAME),
+            call(2, "blob"),
+            call(3, "read_file"),
+        ];
+
+        let groups = discover_tool_groups(&items);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_indices, [0, 2, 3]);
+        assert_eq!(groups[0].title(3, 0), "Explored");
+    }
+
+    #[test]
     fn reasoning_does_not_break_a_tool_group() {
         let reasoning = || {
             MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
@@ -733,17 +759,15 @@ mod tests {
         // Real interleaved turn: each call streams back, is approved, runs, and
         // its result is committed before the next call arrives. The outputs are
         // machine-generated echoes of the same run, so they must not split it.
-        let output = |index: usize| {
-            MessageItem::ToolOutput {
-                output: FunctionCallOutputItemParam {
-                    call_id: format!("call-{index}"),
-                    output: FunctionCallOutput::Text("ok".into()),
-                    id: None,
-                    status: None,
-                },
-                failed: false,
-                approval_label: Some("approved by Auto mode".into()),
-            }
+        let output = |index: usize| MessageItem::ToolOutput {
+            output: FunctionCallOutputItemParam {
+                call_id: format!("call-{index}"),
+                output: FunctionCallOutput::Text("ok".into()),
+                id: None,
+                status: None,
+            },
+            failed: false,
+            approval_label: Some("approved by Auto mode".into()),
         };
         let items = vec![
             call(0, "grep"),
@@ -817,7 +841,8 @@ mod tests {
             })
             .collect();
 
-        let (paragraph, _) = build_tool_group_paragraph(&group, &members, &absorbed, 80, true, false);
+        let (paragraph, _) =
+            build_tool_group_paragraph(&group, &members, &absorbed, 80, true, false);
         let rendered = render_paragraph(&paragraph, 80, 40);
         let grep_row = rendered.lines().position(|l| l.contains("grep")).unwrap();
         let thought_rows = rendered
@@ -834,11 +859,15 @@ mod tests {
 
         // Folded: the calls and thoughts disappear into the header, which now
         // carries a muted summary line: tool names, then the thought state.
-        let (paragraph, _) = build_tool_group_paragraph(&group, &members, &absorbed, 80, false, false);
+        let (paragraph, _) =
+            build_tool_group_paragraph(&group, &members, &absorbed, 80, false, false);
         let rendered = render_paragraph(&paragraph, 80, 40);
         assert!(!rendered.contains("grep  {}"), "{rendered}");
         assert!(rendered.contains("Exploring… · 0/3"), "{rendered}");
-        let summary = rendered.lines().find(|line| line.contains("✻ Thought")).unwrap();
+        let summary = rendered
+            .lines()
+            .find(|line| line.contains("✻ Thought"))
+            .unwrap();
         assert!(summary.contains("grep, blob, read_file"), "{summary}");
         // The thought state is the last piece of the summary.
         let grep_pos = summary.find("read_file").unwrap();

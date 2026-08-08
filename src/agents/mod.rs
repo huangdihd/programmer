@@ -369,6 +369,7 @@ pub(crate) struct AgentRuntime {
     pub(crate) coauthor: Option<String>,
     pub(crate) vision_enabled: bool,
     pub(crate) thinking_level: crate::thinking::ThinkingLevel,
+    pub(crate) skill_registry: crate::skills::SkillRegistry,
     pub(crate) skill_prompt: Option<String>,
     pub(crate) approval_label: String,
 }
@@ -403,12 +404,17 @@ impl AgentRuntime {
 
     fn build_runner(&self, file_scope: u64) -> TurnRunner {
         use crate::tools::provider::{
-            LocalToolProvider, McpToolProvider, ToolProvider, ToolRegistry,
+            LocalToolProvider, McpToolProvider, SkillToolProvider, ToolProvider, ToolRegistry,
         };
 
-        let mut providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(
-            LocalToolProvider::new_scoped(self.todos.clone(), self.security.clone(), file_scope),
-        )];
+        let mut providers: Vec<Arc<dyn ToolProvider>> = vec![
+            Arc::new(LocalToolProvider::new_scoped(
+                self.todos.clone(),
+                self.security.clone(),
+                file_scope,
+            )),
+            Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
+        ];
         if let Some(mcp) = &self.mcp_manager {
             providers.push(Arc::new(McpToolProvider::new(mcp.clone())));
         }

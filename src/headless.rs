@@ -32,7 +32,9 @@ use crate::runner::{
     AgentSurface, DiagnosticsState, LlmPolicy, ReviewDecision, RunnerEvent, RunnerPhase,
     RunnerPolicy, TurnResult, TurnRunner,
 };
-use crate::tools::provider::{AgentToolProvider, LocalToolProvider, ToolProvider, ToolRegistry};
+use crate::tools::provider::{
+    AgentToolProvider, LocalToolProvider, SkillToolProvider, ToolProvider, ToolRegistry,
+};
 
 const OUTPUT_SCHEMA_VERSION: u32 = 1;
 
@@ -140,6 +142,7 @@ struct HeadlessAgent {
     cancel: CancellationToken,
     model: String,
     mode: WorkMode,
+    skill_prompt: Option<String>,
     agents: crate::agents::AgentManager,
 }
 
@@ -166,9 +169,12 @@ impl HeadlessAgent {
 
         let todo_store = Arc::new(Mutex::new(Default::default()));
         let security = Arc::new(crate::security::SecurityHandle::new(security));
-        let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(
-            LocalToolProvider::new(todo_store.clone(), security.clone()),
-        )];
+        let skill_registry = crate::skills::SkillRegistry::load();
+        let skill_prompt = skill_registry.catalog_prompt();
+        let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
+            Arc::new(LocalToolProvider::new(todo_store.clone(), security.clone())),
+            Arc::new(SkillToolProvider::new(skill_registry.clone())),
+        ];
 
         let (policy, child_policy) = match args.work_mode {
             WorkMode::Yolo => (RunnerPolicy::Yolo, crate::agents::AgentPolicyFactory::Yolo),
@@ -224,7 +230,8 @@ impl HeadlessAgent {
             coauthor: config.git_coauthor.clone(),
             vision_enabled: false,
             thinking_level: args.thinking,
-            skill_prompt: None,
+            skill_registry,
+            skill_prompt: skill_prompt.clone(),
             approval_label: format!(
                 "{} approved by {} mode (headless sub-agent)",
                 args.work_mode.icon(),
@@ -265,6 +272,7 @@ impl HeadlessAgent {
             cancel,
             model,
             mode: args.work_mode,
+            skill_prompt,
             agents,
         })
     }
@@ -282,6 +290,7 @@ impl HeadlessAgent {
         let surface = CliSurface {
             jsonl: format == AgentOutputFormat::Jsonl,
             plan: self.mode == WorkMode::Plan,
+            skill_prompt: self.skill_prompt.clone(),
             approval_label: format!(
                 "{} approved by {} mode (headless)",
                 self.mode.icon(),
@@ -313,6 +322,7 @@ impl HeadlessAgent {
 struct CliSurface {
     jsonl: bool,
     plan: bool,
+    skill_prompt: Option<String>,
     approval_label: String,
 }
 
@@ -360,6 +370,10 @@ impl AgentSurface for CliSurface {
 
     fn plan_prompt(&self) -> Option<&str> {
         self.plan.then_some(crate::prompts::PLAN_PLANNING_PROMPT)
+    }
+
+    fn skill_prompt(&self) -> Option<String> {
+        self.skill_prompt.clone()
     }
 
     fn approval_label(&self) -> String {
@@ -664,6 +678,21 @@ mod tests {
         let report = DiagnosticsReport::from_snapshot(DiagnosticThreshold::Error, None);
         assert!(!report.configured);
         assert!(!report.passed);
+    }
+
+    #[test]
+    fn cli_surface_exposes_the_loaded_skill_prompt() {
+        let surface = CliSurface {
+            jsonl: false,
+            plan: false,
+            skill_prompt: Some("skill instructions".to_string()),
+            approval_label: "test".to_string(),
+        };
+
+        assert_eq!(
+            surface.skill_prompt().as_deref(),
+            Some("skill instructions")
+        );
     }
 
     #[test]

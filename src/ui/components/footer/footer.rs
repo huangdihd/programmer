@@ -31,8 +31,6 @@ pub struct Footer {
     /// Whether the project has an LSP checker configured, so the LSP block shows
     /// even before a server has started.
     pub lsp_configured: bool,
-    /// Comma-separated names of active skills for display.
-    pub active_skills: String,
 }
 
 impl Footer {
@@ -45,7 +43,6 @@ impl Footer {
             sandbox_mode: SandboxMode::default(),
             sandbox_profile: String::new(),
             lsp_configured: false,
-            active_skills: String::new(),
         }
     }
 

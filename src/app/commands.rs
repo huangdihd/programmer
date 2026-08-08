@@ -217,7 +217,7 @@ async fn start_ready_request(
     };
     let surface = TuiSurface {
         tx: app.events.sender.clone(),
-        skill_prompt: app.skill_registry.combined_prompt(),
+        skill_prompt: app.skill_registry.catalog_prompt(),
         plan_prompt: plan_system_prompt(app),
         approval_label: format!(
             "{} approved by {} mode",

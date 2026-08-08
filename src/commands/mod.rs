@@ -97,10 +97,13 @@ enum CompletionKind {
     None,
     Model,
     Fixed(&'static [&'static str]),
+    Providers,
     Skill,
     Terminal,
     Permission,
 }
+
+pub(crate) const PROVIDERS_SUBCOMMANDS: &[&str] = &["show", "manage", "refresh"];
 
 pub(crate) const PERMISSION_BOOLEAN_SETTINGS: &[&str] = &[
     "filesystem",
@@ -193,8 +196,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         kind: CommandKind::Providers,
         name: "providers",
-        aliases: &["provider"],
-        completion: CompletionKind::Fixed(&["show", "manage", "refresh"]),
+        aliases: &[],
+        completion: CompletionKind::Providers,
         help: &[
             HelpEntry {
                 order: 20,
@@ -208,7 +211,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
             },
             HelpEntry {
                 order: 22,
-                usage: "/providers refresh",
+                usage: "/providers refresh [provider]",
                 description: "Refetch auto-discovered provider models",
             },
         ],
@@ -271,7 +274,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         kind: CommandKind::Todo,
         name: "todo",
-        aliases: &["todos", "t"],
+        aliases: &["t"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
             order: 18,
@@ -282,7 +285,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         kind: CommandKind::Skill,
         name: "skill",
-        aliases: &["skills"],
+        aliases: &[],
         completion: CompletionKind::Skill,
         help: &[
             HelpEntry {
@@ -598,6 +601,7 @@ impl CompletionEngine {
             CompletionKind::None => None,
             CompletionKind::Model => Self::complete_model(text, cmd, pm),
             CompletionKind::Fixed(values) => Self::complete_subcommand(text, cmd, values),
+            CompletionKind::Providers => Self::complete_providers(text, cmd, pm),
             CompletionKind::Skill => Self::complete_skill(text, cmd, skill_registry),
             CompletionKind::Terminal => Self::complete_terminal(text, cmd),
             CompletionKind::Permission => Self::complete_permission(text, cmd),
@@ -773,6 +777,47 @@ impl CompletionEngine {
             .map(|s| s.to_string())
             .collect();
         CompletionState::new(prefix, candidates)
+    }
+
+    /// Complete `/providers <subcommand> [provider]`: the subcommand comes
+    /// from a fixed set, and after `refresh` the provider name is completed
+    /// from the configured providers.
+    fn complete_providers(text: &str, cmd: &str, pm: &ProviderManager) -> Option<CompletionState> {
+        let after_cmd = text[cmd.len()..].trim_start();
+        let trailing_space = after_cmd.ends_with(char::is_whitespace);
+        let parts = after_cmd.split_whitespace().collect::<Vec<_>>();
+
+        // Completing the subcommand token.
+        if parts.is_empty() || (parts.len() == 1 && !trailing_space) {
+            let typed = parts.first().copied().unwrap_or("");
+            let candidates: Vec<String> = PROVIDERS_SUBCOMMANDS
+                .iter()
+                .filter(|s| s.starts_with(typed))
+                .map(|s| (*s).to_string())
+                .collect();
+            return CompletionState::new(format!("/{cmd} "), candidates);
+        }
+
+        // After `refresh`, complete the provider name.
+        if parts[0] == "refresh" {
+            let typed = parts
+                .get(1)
+                .copied()
+                .filter(|_| !trailing_space)
+                .unwrap_or("");
+            if parts.len() > 2 || (parts.len() == 2 && trailing_space) {
+                return None;
+            }
+            let candidates: Vec<String> = pm
+                .provider_names()
+                .iter()
+                .filter(|p| p.starts_with(typed))
+                .map(|p| p.to_string())
+                .collect();
+            return CompletionState::new(format!("/{cmd} refresh "), candidates);
+        }
+
+        None
     }
 
     fn complete_model(text: &str, cmd: &str, pm: &ProviderManager) -> Option<CompletionState> {
@@ -1486,6 +1531,13 @@ mod tests {
     }
 
     #[test]
+    fn plural_command_aliases_are_not_accepted() {
+        assert_eq!(Command::parse("/todos"), None);
+        assert_eq!(Command::parse("/skills"), None);
+        assert!(!Command::completion_names().any(|name| name == "todos" || name == "skills"));
+    }
+
+    #[test]
     fn command_catalog_preserves_help_order_and_text() {
         let expected = vec![
             ("/model <provider/model>", "Switch to a different model"),
@@ -1547,7 +1599,7 @@ mod tests {
             ),
             ("/providers manage", "Open the provider management panel"),
             (
-                "/providers refresh",
+                "/providers refresh [provider]",
                 "Refetch auto-discovered provider models",
             ),
             ("/session | /s", "Show current session info"),
@@ -1599,15 +1651,23 @@ mod tests {
             .iter()
             .find(|spec| spec.name == "providers")
             .expect("providers spec");
-        assert!(providers.matches("provider"));
-        let CompletionKind::Fixed(values) = providers.completion else {
-            panic!("providers should use fixed completions");
-        };
-        assert_eq!(values, &["show", "manage", "refresh"]);
-        let state = CompletionEngine::complete_subcommand("provider m", "provider", values)
-            .expect("provider alias completion");
-        assert_eq!(state.prefix, "/provider ");
+        assert!(providers.matches("providers"));
+        assert!(!providers.matches("provider"));
+        assert!(matches!(providers.completion, CompletionKind::Providers));
+        let provider_manager = ProviderManager::from_config(&crate::ProgrammerConfig::default());
+        let state =
+            CompletionEngine::complete_providers("providers m", "providers", &provider_manager)
+                .expect("providers completion");
+        assert_eq!(state.prefix, "/providers ");
         assert_eq!(state.candidates[0].value, "manage");
+        let state = CompletionEngine::complete_providers(
+            "providers refresh o",
+            "providers",
+            &provider_manager,
+        )
+        .expect("providers refresh completion");
+        assert_eq!(state.prefix, "/providers refresh ");
+        assert_eq!(state.candidates[0].value, "openai");
 
         let mode = COMMAND_SPECS
             .iter()

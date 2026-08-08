@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Right-hand sidebar panel showing provider, MCP, diagnostics, and task state.
+//! Right-hand sidebar panel showing provider, skill, MCP, diagnostics, and task state.
 //!
 //! The sidebar is toggled with `Ctrl+B`. Each section can be
 //! collapsed/expanded by clicking its title. Todo items can be toggled by
@@ -31,6 +31,7 @@ pub enum SidebarSection {
     Diagnostics,
     Mcp,
     Providers,
+    Skills,
     Todos,
     Tasks,
 }
@@ -85,6 +86,10 @@ impl Sidebar {
             },
             SectionState {
                 key: SidebarSection::Providers,
+                collapsed: false,
+            },
+            SectionState {
+                key: SidebarSection::Skills,
                 collapsed: false,
             },
             SectionState {

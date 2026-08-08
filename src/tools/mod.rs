@@ -22,6 +22,7 @@ pub mod diagnostics;
 pub mod edit_file;
 pub mod fetch;
 pub mod grep;
+pub mod load_skill;
 pub(crate) mod mcp_bridge;
 pub(crate) mod provider;
 pub mod read_file;
@@ -320,6 +321,12 @@ pub(crate) fn is_read_only_builtin(name: &str) -> bool {
 
 /// Archive long output before returning a bounded head/tail excerpt.
 fn archive_and_truncate(tool_name: &str, call_id: &str, output: String) -> String {
+    // Skill parsing already applies its own 80 KiB safety cap. Preserve the
+    // complete selected instructions here; the general 8K tool-output limit
+    // would otherwise make larger skills unusable after loading them.
+    if tool_name == load_skill::NAME {
+        return output;
+    }
     let len = output.chars().count();
     if len <= MAX_OUTPUT_LENGTH {
         return output;
@@ -488,6 +495,14 @@ mod tests {
         assert!(text.ends_with('ω'));
         assert!(text.contains(".programmer/outputs/command-call.txt"));
         assert!(text.contains("8020 chars total"));
+    }
+
+    #[test]
+    fn loaded_skill_instructions_keep_their_complete_body() {
+        let original = "skill instruction\n".repeat(MAX_OUTPUT_LENGTH);
+        let output = archive_and_truncate(load_skill::NAME, "skill-call", original.clone());
+
+        assert_eq!(output, original);
     }
 
     /// `run_tool_call` must set `failed` from the tool's own `Result`, not by

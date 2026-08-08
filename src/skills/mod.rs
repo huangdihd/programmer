@@ -32,7 +32,10 @@ pub mod skill;
 use skill::{Skill, SkillSource};
 use std::path::PathBuf;
 
-const BUILTIN_SKILLS: &[&str] = &[include_str!("builtin/programmer-guide/SKILL.md")];
+const BUILTIN_SKILLS: &[&str] = &[
+    include_str!("builtin/programmer-guide/SKILL.md"),
+    include_str!("builtin/update-programmer-md/SKILL.md"),
+];
 
 /// Manages installed and activated skills for the session.
 #[derive(Debug, Clone, Default)]
@@ -62,6 +65,10 @@ impl SkillRegistry {
         // Project skills override every other source.
         let project_dir = project_skills_dir();
         registry.scan_dir(&project_dir, SkillSource::Project);
+
+        // Skills are available by default. Users can still disable individual
+        // skills or clear the active set for the current session.
+        registry.activate_all();
 
         registry
     }
@@ -104,6 +111,11 @@ impl SkillRegistry {
         self.activated.retain(|n| n != name);
         self.activated.push(name.to_string());
         true
+    }
+
+    /// Activate every installed skill in deterministic name order.
+    fn activate_all(&mut self) {
+        self.activated = self.names().into_iter().cloned().collect();
     }
 
     /// Deactivate a single skill by name. Returns `true` if it was active.
@@ -174,23 +186,35 @@ impl SkillRegistry {
 
     // -- prompt generation --
 
-    /// Build the combined prompt text for all active skills. Returns `None`
-    /// when no skills are active.
-    pub(crate) fn combined_prompt(&self) -> Option<String> {
+    /// Build the compact catalog shown to the model. Skill bodies are loaded
+    /// on demand through `load_skill`, rather than being repeated in every
+    /// request.
+    pub(crate) fn catalog_prompt(&self) -> Option<String> {
         if self.activated.is_empty() {
             return None;
         }
 
-        let mut parts = Vec::new();
+        let mut lines = vec![
+            "# Available skills".to_string(),
+            "The following skills are enabled. When the user's request clearly matches a skill's description, call `load_skill` with its exact name before acting, then follow the returned instructions. Do not load unrelated skills.".to_string(),
+        ];
         for name in &self.activated {
             if let Some(skill) = self.skills.get(name) {
-                parts.push(skill.to_prompt());
+                lines.push(format!("- `{}`: {}", skill.name, skill.description));
             }
         }
-        if parts.is_empty() {
+        if lines.len() == 2 {
             return None;
         }
-        Some(parts.join("\n\n"))
+        Some(lines.join("\n"))
+    }
+
+    /// Return the complete instructions for an enabled skill.
+    pub(crate) fn instructions(&self, name: &str) -> Option<String> {
+        if !self.is_active(name) {
+            return None;
+        }
+        self.skills.get(name).map(Skill::to_prompt)
     }
 }
 
@@ -224,7 +248,7 @@ mod tests {
         let reg = SkillRegistry::default();
         assert!(!reg.has_active());
         assert!(reg.names().is_empty());
-        assert!(reg.combined_prompt().is_none());
+        assert!(reg.catalog_prompt().is_none());
     }
 
     #[test]
@@ -234,9 +258,9 @@ mod tests {
     }
 
     #[test]
-    fn combined_prompt_empty_when_no_active_skills() {
+    fn catalog_prompt_empty_when_no_active_skills() {
         let reg = SkillRegistry::default();
-        assert!(reg.combined_prompt().is_none());
+        assert!(reg.catalog_prompt().is_none());
     }
 
     #[test]
@@ -250,11 +274,41 @@ mod tests {
         assert_eq!(skill.source, SkillSource::BuiltIn);
         assert!(skill.body.contains("Programmer's identity"));
         assert!(reg.activate("programmer-guide"));
+        let catalog = reg.catalog_prompt().unwrap();
+        assert!(catalog.contains("`programmer-guide`"));
+        assert!(!catalog.contains("Programmer's identity"));
         assert!(
-            reg.combined_prompt()
+            reg.instructions("programmer-guide")
                 .unwrap()
-                .contains("## Skill: programmer-guide")
+                .contains("Programmer's identity")
         );
+    }
+
+    #[test]
+    fn built_in_programmer_md_updater_is_available() {
+        let mut reg = SkillRegistry::default();
+        reg.load_builtins();
+
+        let skill = reg
+            .get("update-programmer-md")
+            .expect("PROGRAMMER.md updater should load");
+        assert_eq!(skill.source, SkillSource::BuiltIn);
+        assert!(skill.description.contains("PROGRAMMER.md"));
+
+        assert!(reg.activate("update-programmer-md"));
+        let instructions = reg
+            .instructions("update-programmer-md")
+            .expect("active built-in should return instructions");
+        assert!(instructions.contains("Keep `PROGRAMMER.md` an accurate, concise map"));
+    }
+
+    #[test]
+    fn load_activates_every_discovered_skill_by_default() {
+        let reg = SkillRegistry::load();
+
+        assert!(!reg.names().is_empty());
+        assert_eq!(reg.activated_names().len(), reg.names().len());
+        assert!(reg.names().iter().all(|name| reg.is_active(name)));
     }
 
     #[test]
@@ -307,8 +361,10 @@ mod tests {
         // Activate
         assert!(reg.activate("hello"));
         assert!(reg.has_active());
-        let prompt = reg.combined_prompt().unwrap();
-        assert!(prompt.contains("## Skill: hello"));
+        let prompt = reg.catalog_prompt().unwrap();
+        assert!(prompt.contains("`hello`: greets the world"));
+        assert!(!prompt.contains("Hello, world!"));
+        assert!(reg.instructions("hello").unwrap().contains("Hello, world!"));
 
         // Activate another — should stack
         assert!(reg.activate("react-best-practices"));
@@ -317,6 +373,7 @@ mod tests {
         // Deactivate
         reg.clear();
         assert!(!reg.has_active());
+        assert!(reg.instructions("hello").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

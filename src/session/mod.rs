@@ -191,6 +191,11 @@ pub(crate) struct Session {
     /// Names of activated skills, restored on resume.
     #[serde(default)]
     pub(crate) activated_skills: Vec<String>,
+    /// Whether `activated_skills` was saved after skills became enabled by
+    /// default. This distinguishes a deliberate empty selection from legacy
+    /// sessions whose implicit default was empty.
+    #[serde(default)]
+    pub(crate) skill_selection_saved: bool,
     /// Background tasks carried with the session. Tasks recorded as running
     /// are restored as killed — their processes died with the old instance.
     #[serde(default)]
@@ -258,6 +263,7 @@ impl SessionManager {
             classifier_model: None,
             todos: Vec::new(),
             activated_skills: Vec::new(),
+            skill_selection_saved: false,
             tasks: Vec::new(),
         }
     }
@@ -647,6 +653,22 @@ mod tests {
 
         let loaded: Session = serde_json::from_value(value).unwrap();
         assert_eq!(loaded.thinking_level, crate::thinking::ThinkingLevel::Auto);
+    }
+
+    #[test]
+    fn legacy_sessions_have_no_explicit_skill_selection() {
+        let sessions_dir =
+            std::env::temp_dir().join(format!("programmer-session-test-{}", uuid_v4()));
+        let mgr = SessionManager { sessions_dir };
+        let mut value = serde_json::to_value(mgr.create()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("skill_selection_saved")
+            .unwrap();
+
+        let loaded: Session = serde_json::from_value(value).unwrap();
+        assert!(!loaded.skill_selection_saved);
     }
 
     #[test]

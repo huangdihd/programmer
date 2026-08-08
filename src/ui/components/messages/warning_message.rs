@@ -13,18 +13,12 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders};
-use ratatui_widgets::block::Padding;
-use ratatui_widgets::paragraph::{Paragraph, Wrap};
+use ratatui_widgets::paragraph::Paragraph;
 
+use super::notice_message::notice;
 use crate::ui::markdown_theme::palette;
 
-const PAD_LEFT: u16 = 1;
-const PAD_RIGHT: u16 = 1;
-
-/// Renders a warning message as a yellow-accented block.
+/// Renders a warning as a lightweight yellow notice.
 pub struct WarningMessage {
     message: String,
 }
@@ -35,25 +29,6 @@ impl WarningMessage {
     }
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
-        let yellow = palette::YELLOW;
-        let body = palette::MUTED;
-
-        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
-            "⚠ Warning",
-            Style::new().fg(yellow).add_modifier(Modifier::BOLD),
-        ))];
-
-        for line in self.message.lines() {
-            lines.push(Line::styled(line.to_string(), Style::new().fg(body)));
-        }
-
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::LEFT)
-                    .border_style(Style::new().fg(yellow))
-                    .padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 0)),
-            )
+        notice("⚠", palette::YELLOW, palette::MUTED, self.message)
     }
 }

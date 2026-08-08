@@ -342,7 +342,7 @@ impl App<'_> {
         let mut vision_enabled = false;
         let mut thinking_level = crate::thinking::ThinkingLevel::default();
 
-        let mut saved_activated_skills: Vec<String> = Vec::new();
+        let mut saved_activated_skills: Option<Vec<String>> = None;
         if let Some(mgr) = &session_mgr
             && let Some(saved) = mgr.load(&session_uuid)
         {
@@ -359,7 +359,9 @@ impl App<'_> {
             if saved.classifier_model.is_some() {
                 config.classifier_model = saved.classifier_model;
             }
-            saved_activated_skills = saved.activated_skills;
+            if saved.skill_selection_saved || !saved.activated_skills.is_empty() {
+                saved_activated_skills = Some(saved.activated_skills);
+            }
         }
         let mut conversation_panel = ConversationPanel::new();
         conversation_panel.restore_items(saved_items);
@@ -453,7 +455,7 @@ impl App<'_> {
             project_name,
         };
 
-        if !saved_activated_skills.is_empty() {
+        if let Some(saved_activated_skills) = saved_activated_skills {
             app.skill_registry.set_activated(&saved_activated_skills);
         }
 
@@ -512,16 +514,20 @@ impl App<'_> {
         use std::sync::Arc;
 
         use crate::tools::provider::{
-            LocalToolProvider, McpToolProvider, ToolProvider, ToolRegistry,
+            LocalToolProvider, McpToolProvider, SkillToolProvider, ToolProvider, ToolRegistry,
         };
 
         let (client, model_name) = self.provider_manager.resolve(&self.current_model)?;
         let model_str = self.current_model.clone();
         // Unify every tool source behind the registry: the local built-ins are
         // one provider, all connected MCP servers another.
-        let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(
-            LocalToolProvider::new(self.todo_store.clone(), self.security.clone()),
-        )];
+        let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
+            Arc::new(LocalToolProvider::new(
+                self.todo_store.clone(),
+                self.security.clone(),
+            )),
+            Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
+        ];
         if let Some(mcp) = &self.mcp_manager {
             base_providers.push(Arc::new(McpToolProvider::new(mcp.clone())));
         }
@@ -565,7 +571,8 @@ impl App<'_> {
             coauthor: self.config.git_coauthor.clone(),
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,
-            skill_prompt: self.skill_registry.combined_prompt(),
+            skill_registry: self.skill_registry.clone(),
+            skill_prompt: self.skill_registry.catalog_prompt(),
             approval_label: format!(
                 "{} approved by {} mode (sub-agent)",
                 self.work_mode.icon(),

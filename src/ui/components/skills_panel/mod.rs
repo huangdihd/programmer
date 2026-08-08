@@ -15,7 +15,7 @@
 
 //! Full-screen skills management panel.
 //!
-//! Opened with `/skills manage` inside the app. Lists every discovered skill
+//! Opened with `/skill manage` inside the app. Lists every discovered skill
 //! and lets the user activate/deactivate them. Skills themselves are read-only
 //! (either built into the binary or loaded from `SKILL.md` files on disk), so
 //! this panel only toggles the active set. Every change is reported via
