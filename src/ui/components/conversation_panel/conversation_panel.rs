@@ -808,7 +808,8 @@ impl ConversationPanel {
             self.live_expanded_items.clear();
             // Live groups carry the same keys (first call's protocol id) as
             // the committed ones, so keep any user expansion across the swap.
-            self.expanded_tool_groups.extend(self.live_expanded_groups.drain());
+            self.expanded_tool_groups
+                .extend(self.live_expanded_groups.drain());
         }
     }
 
@@ -825,7 +826,8 @@ impl ConversationPanel {
             for &live_idx in &self.live_expanded_items {
                 self.expanded_items.insert(base_index + live_idx);
             }
-            self.expanded_tool_groups.extend(self.live_expanded_groups.drain());
+            self.expanded_tool_groups
+                .extend(self.live_expanded_groups.drain());
             let cancelled = partial.cancelled.is_cancelled();
             let items: Vec<OutputItem> = if cancelled {
                 // When the user cancelled, drop all function calls so they

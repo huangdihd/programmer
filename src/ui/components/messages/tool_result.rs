@@ -37,10 +37,7 @@ pub struct ToolResultMessage<'a> {
 }
 
 impl<'a> ToolResultMessage<'a> {
-    pub fn new(
-        output: &'a FunctionCallOutputItemParam,
-        width: u16,
-    ) -> Self {
+    pub fn new(output: &'a FunctionCallOutputItemParam, width: u16) -> Self {
         Self {
             output,
             width,
@@ -60,8 +57,7 @@ impl<'a> ToolResultMessage<'a> {
     }
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
-        let text =
-            crate::ui::image_preview::output_text(&self.output.output);
+        let text = crate::ui::image_preview::output_text(&self.output.output);
 
         let result_style = if self.failed {
             Style::new().fg(palette::RED_MUTED)
@@ -72,12 +68,7 @@ impl<'a> ToolResultMessage<'a> {
         let all: Vec<&str> = text.lines().collect();
         let multiline = all.len() > 1;
 
-        let block = Block::default().padding(Padding::new(
-            PAD_LEFT,
-            PAD_RIGHT,
-            0,
-            1,
-        ));
+        let block = Block::default().padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 1));
 
         if !self.expanded {
             let first = all.first().copied().unwrap_or("[no output]");
@@ -97,21 +88,14 @@ impl<'a> ToolResultMessage<'a> {
             .enumerate()
             .map(|(index, line)| {
                 if index == 0 {
-                    let caret = if multiline {
-                        "\u{25BE} "
-                    } else {
-                        ""
-                    };
+                    let caret = if multiline { "\u{25BE} " } else { "" };
 
                     Line::from(Span::styled(
                         format!("{caret}\u{23BF} {line}"),
                         result_style,
                     ))
                 } else {
-                    Line::from(Span::styled(
-                        format!("  {line}"),
-                        result_style,
-                    ))
+                    Line::from(Span::styled(format!("  {line}"), result_style))
                 }
             })
             .collect();
@@ -125,9 +109,7 @@ impl<'a> ToolResultMessage<'a> {
 
         // The Paragraph receives the full outer width, but the image is
         // rendered inside the block padding.
-        let preview_width = self
-            .width
-            .saturating_sub(PAD_LEFT + PAD_RIGHT);
+        let preview_width = self.width.saturating_sub(PAD_LEFT + PAD_RIGHT);
 
         lines.extend(crate::ui::image_preview::preview_lines(
             &self.output.output,

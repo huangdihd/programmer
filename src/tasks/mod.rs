@@ -1794,7 +1794,6 @@ fn tail_chars(text: &str, max_chars: usize) -> String {
     text.chars().skip(count - max_chars).collect()
 }
 
-
 #[cfg(test)]
 #[path = "task_tests.rs"]
 mod tests;

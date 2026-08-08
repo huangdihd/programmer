@@ -58,14 +58,7 @@ impl<'a> UserMessage<'a> {
 
         Paragraph::new(Text::from(lines))
             .style(Style::new().fg(text_fg).bg(bar_bg))
-            .block(
-                Block::default().padding(Padding::new(
-                    PAD_LEFT,
-                    PAD_RIGHT,
-                    PAD_TOP,
-                    PAD_BOTTOM,
-                )),
-            )
+            .block(Block::default().padding(Padding::new(PAD_LEFT, PAD_RIGHT, PAD_TOP, PAD_BOTTOM)))
             .wrap(Wrap { trim: false })
     }
 }
@@ -97,11 +90,7 @@ fn display_lines(
                 ));
             }
             InputContent::InputFile(_) => {
-                lines.extend(text_lines(
-                    "📎 File attachment",
-                    accent,
-                    !prompt_rendered,
-                ));
+                lines.extend(text_lines("📎 File attachment", accent, !prompt_rendered));
                 prompt_rendered = true;
             }
         }
@@ -109,11 +98,7 @@ fn display_lines(
     lines
 }
 
-fn text_lines(
-    text: &str,
-    accent: ratatui::style::Color,
-    show_prompt: bool,
-) -> Vec<Line<'static>> {
+fn text_lines(text: &str, accent: ratatui::style::Color, show_prompt: bool) -> Vec<Line<'static>> {
     text.lines()
         .enumerate()
         .map(|(i, line)| {
@@ -133,14 +118,10 @@ fn display_text(input_item: &InputItem) -> String {
             .content
             .iter()
             .filter_map(|input_content| match input_content {
-                InputContent::InputText(c) => {
-                    Some(strip_pasted_image_placeholders(&c.text))
-                }
+                InputContent::InputText(c) => Some(strip_pasted_image_placeholders(&c.text)),
                 // The image itself is rendered as a preview below.
                 InputContent::InputImage(_) => None,
-                InputContent::InputFile(_) => {
-                    Some("📎 File attachment".to_string())
-                }
+                InputContent::InputFile(_) => Some("📎 File attachment".to_string()),
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -155,9 +136,9 @@ fn display_text(input_item: &InputItem) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
 
-        InputItem::Item(_)
-        | InputItem::ItemReference(_)
-        | InputItem::EasyMessage(_) => "[Unsupported message]\n".to_string(),
+        InputItem::Item(_) | InputItem::ItemReference(_) | InputItem::EasyMessage(_) => {
+            "[Unsupported message]\n".to_string()
+        }
     }
 }
 
@@ -172,8 +153,8 @@ fn strip_pasted_image_placeholders(text: &str) -> String {
 mod tests {
     use super::*;
     use async_openai::types::responses::{
-        ImageDetail, InputImageContent, InputMessage, InputTextContent, Item,
-        MessageItem, OutputStatus,
+        ImageDetail, InputImageContent, InputMessage, InputTextContent, Item, MessageItem,
+        OutputStatus,
     };
     use base64::Engine;
     use image::{ImageBuffer, ImageFormat, Rgb};
@@ -186,14 +167,11 @@ mod tests {
         let image = ImageBuffer::from_pixel(2, 2, Rgb([255u8, 0, 0]));
         let mut bytes = Cursor::new(Vec::new());
 
-        image
-            .write_to(&mut bytes, ImageFormat::Png)
-            .unwrap();
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
 
         format!(
             "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD
-                .encode(bytes.into_inner())
+            base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
         )
     }
 
@@ -216,8 +194,7 @@ mod tests {
 
     #[test]
     fn sent_image_placeholder_is_replaced_by_the_preview() {
-        let input =
-            pasted_image_message("data:image/png;base64,AAAA".to_string());
+        let input = pasted_image_message("data:image/png;base64,AAAA".to_string());
 
         assert_eq!(display_text(&input), "Can you see this?");
     }
@@ -232,15 +209,10 @@ mod tests {
             .into_paragraph()
             .render(area, &mut buffer);
 
-        crate::ui::image_preview::render_protocol_images(
-            area,
-            &mut buffer,
-        );
+        crate::ui::image_preview::render_protocol_images(area, &mut buffer);
 
         let rendered = (0..area.height)
-            .flat_map(|y| {
-                (0..area.width).map(move |x| (x, y))
-            })
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
             .filter_map(|position| buffer.cell(position))
             .map(|cell| cell.symbol())
             .collect::<String>();
@@ -269,19 +241,13 @@ mod tests {
                     buffer[(x, y)]
                         .symbol()
                         .chars()
-                        .any(|c| {
-                            ('\u{e000}'..='\u{f8ff}')
-                                .contains(&c)
-                        })
+                        .any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c))
                 })
             })
             .expect("image preview row");
 
         let text_row = (0..area.height)
-            .find(|&y| {
-                (0..area.width)
-                    .any(|x| buffer[(x, y)].symbol() == "C")
-            })
+            .find(|&y| (0..area.width).any(|x| buffer[(x, y)].symbol() == "C"))
             .expect("text row");
 
         assert!(image_row < text_row);

@@ -105,9 +105,7 @@ mod tests {
     #[test]
     fn first_user_text_returns_none_for_empty() {
         assert!(first_user_text(&[]).is_none());
-        assert!(
-            first_user_text(&[MessageItem::Info("no user input".to_string())]).is_none()
-        );
+        assert!(first_user_text(&[MessageItem::Info("no user input".to_string())]).is_none());
     }
 
     #[test]

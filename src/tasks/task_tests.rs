@@ -160,8 +160,7 @@ async fn command_live_output_is_keyed_by_call_id() {
     let id = spawn_command(command, None, Some("command-live-id")).expect("spawn command");
     let mut seen = false;
     for _ in 0..60 {
-        if command_live_output("command-live-id")
-            .is_some_and(|text| text.contains("command-live"))
+        if command_live_output("command-live-id").is_some_and(|text| text.contains("command-live"))
         {
             seen = true;
             break;
@@ -232,7 +231,11 @@ async fn pipe_stderr_is_kept_separate_from_stdout() {
     };
     let id = spawn(command, None, None).expect("spawn");
     let snap = wait_until_finished(id).await.expect("wait");
-    assert!(snap.output.contains("stdout-text"), "stdout: {}", snap.output);
+    assert!(
+        snap.output.contains("stdout-text"),
+        "stdout: {}",
+        snap.output
+    );
     assert!(
         snap.stderr.contains("stderr-text"),
         "stderr: {}",
@@ -288,7 +291,9 @@ async fn screen_text_returns_visible_grid() {
     let id = spawn_interactive("echo visible-text", None, None, 24, 80).expect("spawn");
     let _ = wait(id, Duration::from_secs(10)).await.expect("wait");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let text = screen_snapshot(id).expect("interactive task has a screen").text;
+    let text = screen_snapshot(id)
+        .expect("interactive task has a screen")
+        .text;
     assert!(
         text.contains("visible-text"),
         "screen should contain visible-text, got: {text}"
@@ -357,9 +362,11 @@ async fn cancelled_agent_wait_restores_notification() {
     };
     let id = spawn(long, None, None).expect("spawn");
     let wait = wait_for_agent(id, Duration::from_secs(30));
-    assert!(tokio::time::timeout(Duration::from_millis(10), wait)
-        .await
-        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), wait)
+            .await
+            .is_err()
+    );
     assert!(notification_enabled(id));
     kill(id).expect("clean up cancelled wait");
 }

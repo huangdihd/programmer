@@ -5,23 +5,20 @@
 - ~~redesign the `--mcp-http` mode UI~~
 - ~~edit_file tool diff-style message~~
 - ~~lint~~
-- remote control(?)
 - ~~improve command and task system~~
   - ~~stream command output in the TUI while it is running~~
   - ~~view interactive and non-interactive tasks with `/terminal`~~
 - ~~convert a command into a task~~
 - ~~configurable restricted access control rule system~~
-- multi-agent system
+- ~~multi-agent system~~
   - ~~in-process sub-agent runner and registry~~
   - ~~agent spawn/list/result/wait/cancel tool~~
   - ~~forward permission requests to the parent surface~~
   - ~~independent child conversations and result delivery~~
   - ~~Agents sidebar and conversation viewer~~
   - ~~concurrency, cancellation, and stale-edit protection~~
-  - optional nested agents and worktree isolation
-- sandbox
+- ~~sandbox~~
   - ~~macOS Seatbelt and Linux Landlock/seccomp process sandbox~~
-  - Windows AppContainer process launcher
 - ~~optimize headless mode~~
   - ~~refactor args parsing to clap~~
   - ~~replace flat headless flags with run/init/diagnostics/mcp subcommands~~

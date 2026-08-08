@@ -20,9 +20,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
+use ratatui_image::Resize;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
-use ratatui_image::Resize;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock};
 
@@ -59,18 +59,13 @@ struct StoredImage {
 /// intentionally called by terminal setup before crossterm starts consuming
 /// input; tests and non-interactive users retain the deterministic fallback.
 pub(crate) fn detect_terminal_protocol() {
-    let mut picker =
-        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
-    let running_in_iterm = std::env::var("TERM_PROGRAM")
-        .is_ok_and(|value| value.contains("iTerm"))
-        || std::env::var("LC_TERMINAL")
-        .is_ok_and(|value| value.contains("iTerm"))
-        || std::env::var("ITERM_SESSION_ID")
-        .is_ok_and(|value| !value.is_empty());
+    let running_in_iterm = std::env::var("TERM_PROGRAM").is_ok_and(|value| value.contains("iTerm"))
+        || std::env::var("LC_TERMINAL").is_ok_and(|value| value.contains("iTerm"))
+        || std::env::var("ITERM_SESSION_ID").is_ok_and(|value| !value.is_empty());
 
-    let forced_protocol =
-        std::env::var("PROGRAMMER_IMAGE_PROTOCOL").ok();
+    let forced_protocol = std::env::var("PROGRAMMER_IMAGE_PROTOCOL").ok();
 
     match forced_protocol.as_deref() {
         Some("sixel") => {
@@ -159,14 +154,8 @@ pub(crate) fn content_preview_lines(
     lines
 }
 
-fn cached_data_url_lines(
-    url: &str,
-    available_width: u16,
-) -> Vec<Line<'static>> {
-    let key = (
-        blake3::hash(url.as_bytes()),
-        available_width,
-    );
+fn cached_data_url_lines(url: &str, available_width: u16) -> Vec<Line<'static>> {
+    let key = (blake3::hash(url.as_bytes()), available_width);
 
     {
         let cache = PREVIEW_LINE_CACHE.lock().unwrap();
@@ -233,12 +222,9 @@ fn render_image_lines(image: DynamicImage, available_width: u16) -> Vec<Line<'st
         if MARKER_START + registry.next_marker + u32::from(size.height) > MARKER_END + 1 {
             return Vec::new();
         }
-        let Ok(protocol) = SlicedProtocol::new_with_resize(
-            picker(),
-            image,
-            size,
-            Resize::Fit(None),
-        ) else {
+        let Ok(protocol) =
+            SlicedProtocol::new_with_resize(picker(), image, size, Resize::Fit(None))
+        else {
             return Vec::new();
         };
         let image_id = registry.images.len();

@@ -667,7 +667,10 @@ mod tests {
     #[test]
     fn finalize_without_finish_reason_is_error() {
         let p = fresh();
-        assert!(matches!(p.finalize().unwrap_err(), FinalizeError::NotFinished));
+        assert!(matches!(
+            p.finalize().unwrap_err(),
+            FinalizeError::NotFinished
+        ));
     }
 
     #[test]
