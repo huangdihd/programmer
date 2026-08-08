@@ -150,6 +150,10 @@ fn is_foldable(item: &MessageItem) -> bool {
 pub(crate) struct CachedParagraph {
     pub paragraph: Paragraph<'static>,
     pub height: u16,
+    /// Whether this slot was intentionally hidden when cached. Bridged live
+    /// groups temporarily hide their committed members, then reveal them again
+    /// if the stream is cancelled before commit.
+    pub hidden: bool,
     /// The expand/collapse state this entry was built with, so it can be rebuilt
     /// when the user toggles the item.
     pub expanded: bool,
@@ -182,6 +186,10 @@ pub(crate) struct ToolGroupLayout {
     pub top: u16,
     pub bottom: u16,
     pub member_headers: Vec<MemberHeader>,
+    /// Live groups use transcript-wide indices so a bridged group can contain
+    /// both committed and streaming members. Indices at or above this base map
+    /// back to `live_expanded_items`; lower indices are committed items.
+    pub live_index_base: Option<usize>,
 }
 
 /// A mouse text selection over the conversation, in scroll-buffer coordinates
@@ -407,7 +415,9 @@ impl ConversationPanel {
         {
             if buffer_y == group.top {
                 let key = group.key.clone();
-                if !self.live_expanded_groups.remove(&key) {
+                if !self.live_expanded_groups.remove(&key)
+                    && !self.expanded_tool_groups.remove(&key)
+                {
                     self.live_expanded_groups.insert(key);
                 }
             } else if let Some(header) = group
@@ -416,8 +426,15 @@ impl ConversationPanel {
                 .find(|header| buffer_y >= header.top && buffer_y < header.bottom)
             {
                 let index = header.index;
-                if !self.live_expanded_items.remove(&index) {
-                    self.live_expanded_items.insert(index);
+                if let Some(base) = group.live_index_base
+                    && index >= base
+                {
+                    let live_index = index - base;
+                    if !self.live_expanded_items.remove(&live_index) {
+                        self.live_expanded_items.insert(live_index);
+                    }
+                } else if !self.expanded_items.remove(&index) {
+                    self.expanded_items.insert(index);
                 }
             }
             return;

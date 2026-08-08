@@ -145,7 +145,10 @@ pub(crate) async fn handle_key_events(
                 app.events.send(AppEvent::ProvidersChanged);
             }
             PanelAction::RefreshModels => {
-                app.events.send(AppEvent::RefreshProviderModels);
+                app.events.send(AppEvent::RefreshProviderModels {
+                    name: None,
+                    notify: true,
+                });
             }
             PanelAction::None => {}
         }

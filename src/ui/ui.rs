@@ -361,6 +361,12 @@ impl Widget for &mut App<'_> {
                     trimmed.push('…');
                 }
                 trimmed
+            })
+            .or_else(|| {
+                let count = self.provider_manager.startup_errors.len();
+                (count > 0).then(|| {
+                    format!("⚠ Model list refresh incomplete ({count}) · /providers manage")
+                })
             });
         self.footer.work_mode = self.work_mode;
         self.footer.sandbox_mode = self.security.sandbox_mode();

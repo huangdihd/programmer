@@ -518,14 +518,23 @@ impl ProviderPanel {
         // -- Title --
         let total = config.providers.len();
         let names = self.filtered_names(config);
-        Paragraph::new(Line::from(vec![
+        let mut title = vec![Line::from(vec![
             Span::styled("🔌  Providers", Style::default().fg(Color::Cyan).bold()),
             Span::styled(
                 format!("  ({total} configured)"),
                 Style::default().fg(Color::Gray).italic(),
             ),
-        ]))
-        .render(chunks[0], buf);
+        ])];
+        if !pm.startup_errors.is_empty() {
+            title.push(Line::from(Span::styled(
+                format!(
+                    "⚠ Model list refresh incomplete ({}) · providers remain usable · press r to retry",
+                    pm.startup_errors.len()
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        Paragraph::new(title).render(chunks[0], buf);
 
         let mut list_block = Block::default()
             .borders(Borders::ALL)
@@ -999,6 +1008,34 @@ mod tests {
         );
         assert_eq!(config.default_provider, "alpha");
         assert_eq!(config.providers.len(), 1);
+    }
+
+    #[test]
+    fn model_refresh_failures_render_as_a_compact_panel_notice() {
+        let config = config_with(&["alpha"]);
+        let mut pm = pm_stub();
+        pm.startup_errors
+            .push("raw transport error that should not be shown here".into());
+        let panel = ProviderPanel::new();
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buf = Buffer::empty(area);
+
+        panel.render(&config, &pm, area, &mut buf);
+
+        let rendered = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("Model list refresh incomplete (1)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("providers remain usable"), "{rendered}");
+        assert!(!rendered.contains("raw transport error"), "{rendered}");
     }
 
     #[test]

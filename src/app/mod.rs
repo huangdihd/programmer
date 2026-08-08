@@ -365,9 +365,6 @@ impl App<'_> {
         for msg in startup_messages {
             conversation_panel.add_info_string(msg);
         }
-        for msg in &provider_manager.startup_errors {
-            conversation_panel.add_error_string(msg.clone());
-        }
         if config.providers.is_empty() {
             conversation_panel.add_warning_string(
                 "no providers configured — press / then type 'providers manage' to add one, \
@@ -462,10 +459,11 @@ impl App<'_> {
             .values()
             .any(|provider| provider.models.is_none())
         {
-            app.conversation_panel
-                .add_info_string("Refreshing provider model lists...");
             app.events
-                .send(crate::ui::event::AppEvent::RefreshProviderModels);
+                .send(crate::ui::event::AppEvent::RefreshProviderModels {
+                    name: None,
+                    notify: false,
+                });
         }
         if !app.config.mcp_servers.is_empty() {
             app.events.send(crate::ui::event::AppEvent::McpChanged);

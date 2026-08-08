@@ -52,12 +52,30 @@ fn providers(app: &mut App<'_>, arg: &str) {
         "refresh" => {
             app.conversation_panel
                 .add_info_string("Refreshing provider model lists...");
-            app.events.send(AppEvent::RefreshProviderModels);
+            app.events.send(AppEvent::RefreshProviderModels {
+                name: None,
+                notify: true,
+            });
+        }
+        arg if arg.starts_with("refresh ") => {
+            let provider_name = arg["refresh ".len()..].trim().to_string();
+            if provider_name.is_empty() {
+                app.conversation_panel
+                    .add_info_string("usage: /providers refresh [provider]");
+                return;
+            }
+            app.conversation_panel.add_info_string(format!(
+                "Refreshing model list for provider '{provider_name}'..."
+            ));
+            app.events.send(AppEvent::RefreshProviderModels {
+                name: Some(provider_name),
+                notify: true,
+            });
         }
         _ => app.conversation_panel.add_info_string(
             "usage: /providers show — list configured providers\n\
              \u{20}      /providers manage — open the management panel\n\
-             \u{20}      /providers refresh — refetch auto-discovered model lists",
+             \u{20}      /providers refresh [provider] — refetch auto-discovered model lists",
         ),
     }
 }

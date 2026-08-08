@@ -21,6 +21,8 @@ mod mouse;
 
 pub(crate) use keys::handle_key_events;
 
+use std::collections::HashMap;
+
 use super::App;
 use super::PendingReview;
 use super::{commands, diagnostics, helpers, session};
@@ -262,11 +264,14 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         }
         AppEvent::Quit => handle_quit_request(app),
         AppEvent::ProvidersChanged => reload_provider_manager(app),
-        AppEvent::RefreshProviderModels => handle_provider_models_refresh(app),
+        AppEvent::RefreshProviderModels { name, notify } => {
+            handle_provider_models_refresh(app, name, notify)
+        }
         AppEvent::ProviderModelsRefreshed {
             models,
             startup_errors,
-        } => handle_provider_models_refreshed(app, models, startup_errors),
+            notify,
+        } => handle_provider_models_refreshed(app, models, startup_errors, notify),
         AppEvent::McpChanged => handle_mcp_changed(app),
         AppEvent::McpServerConnectionUpdated {
             generation,
@@ -603,14 +608,32 @@ fn reload_provider_manager(app: &mut App<'_>) {
         .values()
         .any(|provider| provider.models.is_none())
     {
-        handle_provider_models_refresh(app);
+        handle_provider_models_refresh(app, None, false);
     }
 }
 
 /// `/providers refresh`: kick off background model discovery so the event
 /// loop stays responsive while the network fetches run.
-fn handle_provider_models_refresh(app: &mut App<'_>) {
-    let providers = app.config.providers.clone();
+fn handle_provider_models_refresh(app: &mut App<'_>, name: Option<String>, notify: bool) {
+    // If a specific provider was requested, validate it exists.
+    if let Some(ref provider_name) = name
+        && !app.config.providers.contains_key(provider_name)
+    {
+        app.conversation_panel
+            .add_error_string(format!("unknown provider: {provider_name}"));
+        return;
+    }
+
+    let providers = if let Some(ref provider_name) = name {
+        let mut filtered = HashMap::new();
+        if let Some(config) = app.config.providers.get(provider_name) {
+            filtered.insert(provider_name.clone(), config.clone());
+        }
+        filtered
+    } else {
+        app.config.providers.clone()
+    };
+
     let clients = app.provider_manager.clients().clone();
     let tx = app.events.sender.clone();
     tokio::spawn(async move {
@@ -619,6 +642,7 @@ fn handle_provider_models_refresh(app: &mut App<'_>) {
         let _ = tx.send(Event::App(AppEvent::ProviderModelsRefreshed {
             models,
             startup_errors,
+            notify,
         }));
     });
 }
@@ -628,17 +652,28 @@ fn handle_provider_models_refreshed(
     app: &mut App<'_>,
     models: std::collections::HashMap<String, Vec<String>>,
     startup_errors: Vec<String>,
+    notify: bool,
 ) {
     let model_count = models.values().map(|v| v.len()).sum::<usize>();
     let provider_count = models.len();
+    let error_count = startup_errors.len();
     app.provider_manager
         .apply_model_refresh(models, startup_errors);
-    for msg in &app.provider_manager.startup_errors {
-        app.conversation_panel.add_error_string(msg.clone());
+    if !notify {
+        return;
     }
-    app.conversation_panel.add_info_string(format!(
-        "Provider models refreshed: {model_count} model(s) across {provider_count} provider(s)."
-    ));
+    if error_count == 0 {
+        app.conversation_panel.add_info_string(format!(
+            "Provider models refreshed: {model_count} model(s) across {provider_count} provider(s)."
+        ));
+    } else {
+        let error_label = if error_count == 1 { "error" } else { "errors" };
+        app.conversation_panel.add_warning_string(format!(
+            "Provider model refresh incomplete: loaded {model_count} model(s) from \
+             {provider_count} provider(s); {error_count} {error_label}. \
+             Providers remain usable — retry with /providers refresh [provider]."
+        ));
+    }
 }
 
 /// MCP config changed: start a background reload (or clear the manager).

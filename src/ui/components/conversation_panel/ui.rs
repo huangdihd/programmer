@@ -18,7 +18,8 @@ use crate::ui::components::conversation_panel::conversation_panel::{
     CachedParagraph, CachedToolGroup, ConversationPanel, ToolGroupLayout,
 };
 use crate::ui::components::conversation_panel::tool_group::{
-    MemberHeader, ToolGroupMember, build_tool_group_paragraph, discover_tool_groups, function_call,
+    MemberHeader, ToolGroupMember, build_tool_group_paragraph, discover_tool_group_bridge,
+    discover_tool_groups, function_call,
 };
 use crate::ui::components::messages::assistant_message::AssistantMessage;
 use crate::ui::components::messages::error_message::ErrorMessage;
@@ -216,6 +217,23 @@ impl Widget for &mut ConversationPanel {
         let conv_arc = self.conversation.clone();
         let conv = conv_arc.lock().unwrap();
 
+        let receiving_items = self
+            .receiving_response
+            .as_ref()
+            .map(|receiving_response| receiving_response.get_message_items())
+            .unwrap_or_default();
+        let live_message_items: Vec<MessageItem> = receiving_items
+            .iter()
+            .map(|(output_item, _)| MessageItem::Output(output_item.clone()))
+            .collect();
+        let bridge_group = discover_tool_group_bridge(&conv.items, &live_message_items);
+        let bridged_committed_items: HashSet<usize> = bridge_group
+            .iter()
+            .flat_map(|group| group.member_indices.iter().chain(group.absorbed.iter()))
+            .copied()
+            .filter(|&index| index < conv.items.len())
+            .collect();
+
         // Tool calls render together with their result as one message: map each
         // call_id to its result, and collect the call ids so the standalone
         // result items can be hidden (they draw inside their call's entry).
@@ -274,7 +292,9 @@ impl Widget for &mut ConversationPanel {
         // fully rendering them, so we can figure out which ones are visible.
         let mut est_heights: Vec<u16> = Vec::with_capacity(conv.items.len());
         for (index, &group_index) in group_by_item.iter().enumerate() {
-            let mut h = if let Some(group_index) = group_index {
+            let mut h = if bridged_committed_items.contains(&index) {
+                0
+            } else if let Some(group_index) = group_index {
                 let group = &tool_groups[group_index];
                 if group.member_indices[0] != index {
                     0
@@ -351,6 +371,7 @@ impl Widget for &mut ConversationPanel {
             let group = group_index.map(|group_index| &tool_groups[group_index]);
             let is_group_start = group.is_some_and(|group| group.member_indices[0] == index);
             let hidden_group_member = group.is_some() && !is_group_start;
+            let bridged_group_member = bridged_committed_items.contains(&index);
             let (hidden, tool_output) = match &conv.items[index] {
                 MessageItem::ToolOutput { output, .. } => {
                     (call_ids.contains(output.call_id.as_str()), None)
@@ -361,7 +382,7 @@ impl Widget for &mut ConversationPanel {
                 MessageItem::Input(input) => (is_hidden_developer_input(input), None),
                 _ => (false, None),
             };
-            let hidden = hidden || hidden_group_member;
+            let hidden = hidden || hidden_group_member || bridged_group_member;
             let has_output = tool_output.is_some();
             let effective_has_output = group
                 .filter(|_| is_group_start)
@@ -427,7 +448,7 @@ impl Widget for &mut ConversationPanel {
                     entry.expanded != expanded
                         || entry.has_output != effective_has_output
                         || cached_group_key != group_render_key.as_deref()
-                        || (hidden && entry.height != 0)
+                        || entry.hidden != hidden
                         || (entry.lazy && in_viewport)
                 });
             if needs_build {
@@ -435,6 +456,7 @@ impl Widget for &mut ConversationPanel {
                     CachedParagraph {
                         paragraph: Paragraph::new(""),
                         height: 0,
+                        hidden: true,
                         expanded,
                         has_output: effective_has_output,
                         copy_buttons: Vec::new(),
@@ -445,6 +467,7 @@ impl Widget for &mut ConversationPanel {
                     CachedParagraph {
                         paragraph: Paragraph::new(""),
                         height: est_heights[index],
+                        hidden: false,
                         expanded,
                         has_output: effective_has_output,
                         copy_buttons: Vec::new(),
@@ -508,6 +531,7 @@ impl Widget for &mut ConversationPanel {
                     CachedParagraph {
                         paragraph,
                         height,
+                        hidden: false,
                         expanded,
                         has_output: effective_has_output,
                         copy_buttons: Vec::new(),
@@ -530,6 +554,7 @@ impl Widget for &mut ConversationPanel {
                     CachedParagraph {
                         paragraph,
                         height,
+                        hidden: false,
                         expanded,
                         has_output: effective_has_output,
                         copy_buttons,
@@ -554,20 +579,43 @@ impl Widget for &mut ConversationPanel {
         // open), so a thought is absorbed into its group as soon as the first
         // call of the run appears instead of standing alone until the response
         // is committed.
-        let receiving_items = self
-            .receiving_response
-            .as_ref()
-            .map(|receiving_response| receiving_response.get_message_items())
-            .unwrap_or_default();
-        let live_message_items: Vec<MessageItem> = receiving_items
-            .iter()
-            .map(|(output_item, _)| MessageItem::Output(output_item.clone()))
-            .collect();
-        let live_groups = discover_tool_groups(&live_message_items);
+        let live_index_base = conv.items.len();
+        let mut live_groups = discover_tool_groups(&live_message_items);
+        for group in &mut live_groups {
+            group.offset_indices(live_index_base);
+        }
+        if let Some(bridge_group) = bridge_group {
+            live_groups.retain(|group| {
+                !group
+                    .member_indices
+                    .iter()
+                    .chain(group.absorbed.iter())
+                    .any(|&index| {
+                        bridge_group
+                            .member_indices
+                            .iter()
+                            .chain(bridge_group.absorbed.iter())
+                            .any(|&bridge_index| bridge_index == index)
+                    })
+            });
+            live_groups.push(bridge_group);
+            live_groups.sort_by_key(|group| {
+                group
+                    .member_indices
+                    .iter()
+                    .chain(group.absorbed.iter())
+                    .filter(|&&index| index >= live_index_base)
+                    .copied()
+                    .min()
+                    .unwrap_or(usize::MAX)
+            });
+        }
         let mut live_group_by_item = vec![None; receiving_items.len()];
         for (group_index, group) in live_groups.iter().enumerate() {
             for &item_index in group.member_indices.iter().chain(group.absorbed.iter()) {
-                live_group_by_item[item_index] = Some(group_index);
+                if item_index >= live_index_base {
+                    live_group_by_item[item_index - live_index_base] = Some(group_index);
+                }
             }
         }
         // Parallel to `live_paragraphs`: the group's key and clickable member
@@ -580,7 +628,16 @@ impl Widget for &mut ConversationPanel {
             let expanded = self.live_expanded_items.contains(&i);
             if let Some(group_index) = live_group_by_item[i] {
                 let group = &live_groups[group_index];
-                if group.member_indices[0] != i {
+                let first_live_index = group
+                    .member_indices
+                    .iter()
+                    .chain(group.absorbed.iter())
+                    .filter(|&&index| index >= live_index_base)
+                    .copied()
+                    .min()
+                    .expect("live group has a streaming item")
+                    - live_index_base;
+                if first_live_index != i {
                     // Hidden inside the group's own paragraph. Keep a
                     // zero-height slot so `live_group_headers` and
                     // `live_paragraphs` stay index-aligned with
@@ -589,11 +646,37 @@ impl Widget for &mut ConversationPanel {
                     live_paragraphs.push((Paragraph::new(""), 0, Vec::new()));
                     continue;
                 }
-                let members: Vec<ToolGroupMember<'_>> = group
+                let live_outputs: Vec<Option<String>> = group
                     .member_indices
                     .iter()
                     .map(|&member_index| {
-                        let call = match &receiving_items[member_index].0 {
+                        if member_index >= live_index_base {
+                            return None;
+                        }
+                        let call = function_call(&conv.items[member_index]).unwrap();
+                        (!outputs_by_call.contains_key(call.call_id.as_str())
+                            && call.name == crate::tools::command::NAME)
+                            .then(|| crate::tools::command::live_output(&call.call_id))
+                            .flatten()
+                    })
+                    .collect();
+                let members: Vec<ToolGroupMember<'_>> = group
+                    .member_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &member_index)| {
+                        if member_index < live_index_base {
+                            let call = function_call(&conv.items[member_index]).unwrap();
+                            return ToolGroupMember {
+                                index: member_index,
+                                call,
+                                output: outputs_by_call.get(call.call_id.as_str()).copied(),
+                                live_output: live_outputs[position].as_deref(),
+                                expanded: self.expanded_items.contains(&member_index),
+                            };
+                        }
+                        let live_index = member_index - live_index_base;
+                        let call = match &receiving_items[live_index].0 {
                             OutputItem::FunctionCall(call) => call,
                             _ => unreachable!("group members are calls"),
                         };
@@ -602,7 +685,7 @@ impl Widget for &mut ConversationPanel {
                             call,
                             output: None,
                             live_output: None,
-                            expanded: self.live_expanded_items.contains(&member_index),
+                            expanded: self.live_expanded_items.contains(&live_index),
                         }
                     })
                     .collect();
@@ -610,21 +693,32 @@ impl Widget for &mut ConversationPanel {
                     .absorbed
                     .iter()
                     .map(|&index| {
-                        let item = match &receiving_items[index].0 {
+                        if index < live_index_base {
+                            let item = match &conv.items[index] {
+                                MessageItem::Output(OutputItem::Reasoning(item)) => item,
+                                _ => unreachable!("absorbed items are reasoning"),
+                            };
+                            return (index, item, self.expanded_items.contains(&index));
+                        }
+                        let live_index = index - live_index_base;
+                        let item = match &receiving_items[live_index].0 {
                             OutputItem::Reasoning(item) => item,
                             _ => unreachable!("absorbed items are reasoning"),
                         };
-                        (index, item, self.live_expanded_items.contains(&index))
+                        (index, item, self.live_expanded_items.contains(&live_index))
                     })
                     .collect();
                 // Live groups stay collapsed by default, same as committed
                 // ones; the streaming thought state rides on the muted summary
                 // line under the header.
-                let group_expanded = self.live_expanded_groups.contains(&group.key);
+                let group_expanded = self.live_expanded_groups.contains(&group.key)
+                    || self.expanded_tool_groups.contains(&group.key);
                 let thought_in_progress = group
                     .absorbed
                     .iter()
-                    .any(|&index| receiving_items[index].1);
+                    .chain(group.member_indices.iter())
+                    .filter(|&&index| index >= live_index_base)
+                    .any(|&index| receiving_items[index - live_index_base].1);
                 let (paragraph, member_headers) = build_tool_group_paragraph(
                     group,
                     &members,
@@ -717,6 +811,7 @@ impl Widget for &mut ConversationPanel {
                     key: group.key.clone(),
                     top: y,
                     bottom: y.saturating_add(entry.height),
+                    live_index_base: None,
                     member_headers: group
                         .member_headers
                         .iter()
@@ -748,6 +843,7 @@ impl Widget for &mut ConversationPanel {
                     key: key.clone(),
                     top: y,
                     bottom: y.saturating_add(*height),
+                    live_index_base: Some(live_index_base),
                     member_headers: headers
                         .iter()
                         .map(|header| MemberHeader {
@@ -969,31 +1065,44 @@ mod tests {
         // collapsed by default.
         use crate::cancel::CancellationToken;
         use async_openai::types::responses::{
-            ReasoningItem, ResponseOutputItemAddedEvent, ResponseStreamEvent,
+            ReasoningItem, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent,
+            ResponseStreamEvent,
         };
         let mut panel = ConversationPanel::new();
         panel.receiving_response =
             Some(crate::response::partial_response::PartialResponse::new(
                 CancellationToken::new(),
             ));
+        let reasoning = ReasoningItem {
+            id: None,
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: None,
+            status: None,
+        };
         panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
             ResponseOutputItemAddedEvent {
                 sequence_number: 0,
                 output_index: 0,
-                item: OutputItem::Reasoning(ReasoningItem {
-                    id: None,
-                    summary: Vec::new(),
-                    content: None,
-                    encrypted_content: None,
-                    status: None,
-                }),
+                item: OutputItem::Reasoning(reasoning.clone()),
             },
         ));
+        // Real Responses streams finish the reasoning item before starting the
+        // function call. The old test omitted this event, so it never exercised
+        // the state transition that made Thinking jump out of the group.
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemDone(
+            ResponseOutputItemDoneEvent {
+                sequence_number: 1,
+                output_index: 0,
+                item: OutputItem::Reasoning(reasoning),
+            },
+        ));
+        let call = tool_call(0, "grep");
         panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
             ResponseOutputItemAddedEvent {
-                sequence_number: 1,
+                sequence_number: 2,
                 output_index: 1,
-                item: OutputItem::FunctionCall(tool_call(0, "grep")),
+                item: OutputItem::FunctionCall(call.clone()),
             },
         ));
 
@@ -1016,9 +1125,177 @@ mod tests {
         assert!(thought_pos > grep_pos, "{summary}");
         assert!(summary.contains("✻ Thinking"), "{summary}");
 
+        // Once the call itself is done, the absorbed state settles to Thought.
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemDone(
+            ResponseOutputItemDoneEvent {
+                sequence_number: 3,
+                output_index: 1,
+                item: OutputItem::FunctionCall(call),
+            },
+        ));
+        let completed = render_text(&mut panel, area);
+        assert!(completed.contains("✻ Thought"), "{completed}");
+        assert!(!completed.contains("✻ Thinking"), "{completed}");
+
         // Clicking the header expands the live group, showing the call.
         panel.handle_click(2, header_row as u16);
         let expanded = render_text(&mut panel, area);
         assert!(expanded.contains("grep  {}"), "{expanded}");
+    }
+
+    #[test]
+    fn streaming_tools_extend_the_existing_committed_group_without_splitting() {
+        use crate::cancel::CancellationToken;
+        use async_openai::types::responses::{
+            ReasoningItem, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent,
+            ResponseStreamEvent,
+        };
+
+        let reasoning = || ReasoningItem {
+            id: None,
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: None,
+            status: None,
+        };
+        let mut panel = ConversationPanel::new();
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_output(OutputItem::Reasoning(reasoning()));
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_output(OutputItem::FunctionCall(tool_call(0, "grep")));
+        panel.add_tool_output(ToolOutput {
+            param: FunctionCallOutputItemParam {
+                call_id: "call-0".into(),
+                output: FunctionCallOutput::Text("done".into()),
+                id: None,
+                status: None,
+            },
+            failed: false,
+            approval_label: None,
+        });
+
+        let area = Rect::new(0, 0, 80, 24);
+        let committed = render_text(&mut panel, area);
+        assert!(committed.contains("Explored"), "{committed}");
+
+        panel.receiving_response =
+            Some(crate::response::partial_response::PartialResponse::new(
+                CancellationToken::new(),
+            ));
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
+            ResponseOutputItemAddedEvent {
+                sequence_number: 0,
+                output_index: 0,
+                item: OutputItem::Reasoning(reasoning()),
+            },
+        ));
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemDone(
+            ResponseOutputItemDoneEvent {
+                sequence_number: 1,
+                output_index: 0,
+                item: OutputItem::Reasoning(reasoning()),
+            },
+        ));
+        for (output_index, name) in [(1usize, "blob"), (2usize, "read_file")] {
+            panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
+                ResponseOutputItemAddedEvent {
+                    sequence_number: output_index as u64 + 1,
+                    output_index: output_index as u32,
+                    item: OutputItem::FunctionCall(tool_call(output_index, name)),
+                },
+            ));
+        }
+
+        let streaming = render_text(&mut panel, area);
+        assert_eq!(
+            streaming
+                .lines()
+                .filter(|line| line.contains("Explor"))
+                .count(),
+            1,
+            "the committed and live portions must render as one block:\n{streaming}"
+        );
+        assert!(streaming.contains("Exploring… · 1/3"), "{streaming}");
+        assert!(streaming.contains("grep, blob, read_file"), "{streaming}");
+        assert!(!streaming.contains("Explored · 1/1"), "{streaming}");
+
+        // The block keeps the same shape when the runner commits the streamed
+        // response; it must not briefly split or move during that hand-off.
+        let newly_committed = panel
+            .receiving_response
+            .as_ref()
+            .unwrap()
+            .get_message_items();
+        for (item, _) in newly_committed {
+            panel
+                .conversation
+                .lock()
+                .unwrap()
+                .add_output(item);
+        }
+        panel.commit_live();
+        let committed_again = render_text(&mut panel, area);
+        assert_eq!(
+            committed_again
+                .lines()
+                .filter(|line| line.contains("Explor"))
+                .count(),
+            1,
+            "the commit hand-off must keep one block:\n{committed_again}"
+        );
+        assert!(
+            committed_again.contains("Exploring… · 1/3"),
+            "{committed_again}"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_bridged_stream_restores_ungrouped_committed_calls() {
+        use crate::cancel::CancellationToken;
+        use async_openai::types::responses::{
+            ResponseOutputItemAddedEvent, ResponseStreamEvent,
+        };
+
+        let mut panel = ConversationPanel::new();
+        for (index, name) in ["grep", "blob"].into_iter().enumerate() {
+            panel
+                .conversation
+                .lock()
+                .unwrap()
+                .add_output(OutputItem::FunctionCall(tool_call(index, name)));
+        }
+        let area = Rect::new(0, 0, 80, 24);
+        let before = render_text(&mut panel, area);
+        assert!(before.contains("grep  {}"), "{before}");
+        assert!(before.contains("blob  {}"), "{before}");
+
+        let cancel = CancellationToken::new();
+        panel.receiving_response =
+            Some(crate::response::partial_response::PartialResponse::new(
+                cancel.clone(),
+            ));
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
+            ResponseOutputItemAddedEvent {
+                sequence_number: 0,
+                output_index: 0,
+                item: OutputItem::FunctionCall(tool_call(2, "read_file")),
+            },
+        ));
+        let bridged = render_text(&mut panel, area);
+        assert!(bridged.contains("Exploring… · 0/3"), "{bridged}");
+        assert!(!bridged.contains("grep  {}"), "{bridged}");
+
+        cancel.cancel();
+        panel.abort_receiving();
+        let restored = render_text(&mut panel, area);
+        assert!(!restored.contains("Exploring"), "{restored}");
+        assert!(restored.contains("grep  {}"), "{restored}");
+        assert!(restored.contains("blob  {}"), "{restored}");
     }
 }

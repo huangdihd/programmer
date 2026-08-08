@@ -105,13 +105,20 @@ pub enum AppEvent {
     /// Provider config changed (via the management panel): rebuild the
     /// provider manager from the current config.
     ProvidersChanged,
-    /// Re-fetch auto-discovered model lists for all configured providers.
-    RefreshProviderModels,
+    /// Re-fetch auto-discovered model lists for all configured providers,
+    /// or for a single named provider when `Some(name)`. Automatic startup
+    /// discovery stays out of the conversation; explicit user refreshes report
+    /// one compact result.
+    RefreshProviderModels {
+        name: Option<String>,
+        notify: bool,
+    },
     /// Background model discovery finished: apply the fresh model lists and
     /// errors to the provider manager without blocking the event loop.
     ProviderModelsRefreshed {
         models: std::collections::HashMap<String, Vec<String>>,
         startup_errors: Vec<String>,
+        notify: bool,
     },
     /// MCP server config changed (via the management panel): re-spawn the
     /// MCP manager from the current config.
@@ -210,7 +217,11 @@ impl std::fmt::Debug for AppEvent {
             Self::Start => write!(f, "Start"),
             Self::StartInit => write!(f, "StartInit"),
             Self::ProvidersChanged => write!(f, "ProvidersChanged"),
-            Self::RefreshProviderModels => write!(f, "RefreshProviderModels"),
+            Self::RefreshProviderModels { name, notify } => f
+                .debug_struct("RefreshProviderModels")
+                .field("name", name)
+                .field("notify", notify)
+                .finish(),
             Self::ProviderModelsRefreshed { .. } => write!(f, "ProviderModelsRefreshed"),
             Self::McpChanged => write!(f, "McpChanged"),
             Self::McpServerConnectionUpdated {

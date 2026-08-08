@@ -72,6 +72,15 @@ pub(crate) struct ToolGroup {
     kind: ToolGroupKind,
 }
 
+impl ToolGroup {
+    pub(crate) fn offset_indices(&mut self, offset: usize) {
+        self.member_indices
+            .iter_mut()
+            .chain(self.absorbed.iter_mut())
+            .for_each(|index| *index += offset);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolGroupKind {
     Explore,
@@ -137,7 +146,7 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     let mut absorbed = Vec::new();
 
     let flush = |run: &mut Vec<usize>, absorbed: &mut Vec<usize>, open: bool, groups: &mut Vec<ToolGroup>| {
-        let min = if open && !absorbed.is_empty() {
+        let min = if !absorbed.is_empty() {
             1
         } else {
             MIN_TOOL_GROUP_SIZE
@@ -172,6 +181,68 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     }
     flush(&mut run, &mut absorbed, true, &mut groups);
     groups
+}
+
+/// Find the open tool run that crosses from committed conversation history
+/// into the currently streaming response. The renderer stores those two parts
+/// separately, but they are one logical run and must therefore render as one
+/// stable block while the response is still arriving.
+pub(crate) fn discover_tool_group_bridge(
+    committed: &[MessageItem],
+    live: &[MessageItem],
+) -> Option<ToolGroup> {
+    if live.is_empty() {
+        return None;
+    }
+
+    // Only the trailing run can continue into a new streamed response. Clone
+    // that small suffix instead of the whole transcript on every frame.
+    let tail_start = committed
+        .iter()
+        .rposition(|item| !continues_tool_run(item))
+        .map_or(0, |index| index + 1);
+    let committed_tail_len = committed.len().saturating_sub(tail_start);
+    if committed_tail_len == 0 {
+        return None;
+    }
+
+    let mut joined = committed[tail_start..].to_vec();
+    joined.extend_from_slice(live);
+    let mut group = discover_tool_groups(&joined).into_iter().find(|group| {
+        let has_committed_call = group
+            .member_indices
+            .iter()
+            .any(|&index| index < committed_tail_len);
+        let has_live_item = group
+            .member_indices
+            .iter()
+            .chain(group.absorbed.iter())
+            .any(|&index| index >= committed_tail_len);
+        has_committed_call && has_live_item
+    })?;
+
+    for index in group
+        .member_indices
+        .iter_mut()
+        .chain(group.absorbed.iter_mut())
+    {
+        *index = if *index < committed_tail_len {
+            tail_start + *index
+        } else {
+            committed.len() + (*index - committed_tail_len)
+        };
+    }
+    Some(group)
+}
+
+fn continues_tool_run(item: &MessageItem) -> bool {
+    match function_call(item) {
+        Some(call) => !is_interactive(call),
+        None => matches!(
+            item,
+            MessageItem::Output(OutputItem::Reasoning(_)) | MessageItem::ToolOutput { .. }
+        ),
+    }
 }
 
 pub(crate) fn function_call(item: &MessageItem) -> Option<&FunctionToolCall> {
@@ -558,10 +629,10 @@ mod tests {
     }
 
     #[test]
-    fn closed_run_with_reasoning_still_needs_three_calls() {
-        // Once a boundary closes a short run, it reverts to individual items:
-        // a thought above its single call reads naturally, and small sequences
-        // stay easy to scan as ordinary calls.
+    fn closed_run_with_reasoning_stays_absorbed_from_the_first_call() {
+        // Once a thought has been associated with a tool run, closing the run
+        // must not dissolve the group and make the thought jump back out as a
+        // standalone item.
         let reasoning = || {
             MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
                 id: None,
@@ -579,14 +650,14 @@ mod tests {
 
         let groups = discover_tool_groups(&items);
 
-        assert!(groups.is_empty());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_indices, [1]);
+        assert_eq!(groups[0].absorbed, [0]);
+        assert!(!groups[0].open);
     }
 
     #[test]
-    fn open_run_with_reasoning_dissolves_once_a_boundary_closes_it_short() {
-        // A short open run groups so its thought is absorbed promptly; once a
-        // boundary closes it below the size threshold, it dissolves back into
-        // ordinary items.
+    fn open_run_with_reasoning_remains_grouped_after_a_boundary() {
         let reasoning = || {
             MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
                 id: None,
@@ -603,11 +674,14 @@ mod tests {
         assert_eq!(groups[0].absorbed, [0]);
         assert!(groups[0].open);
 
-        // Same run once a boundary closes it: below the size threshold, so it
-        // reverts to a standalone thought above its ordinary calls.
+        // The same run stays grouped after a boundary closes it.
         let mut closed = items;
         closed.push(MessageItem::Info("boundary".into()));
-        assert!(discover_tool_groups(&closed).is_empty());
+        let groups = discover_tool_groups(&closed);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_indices, [1, 2]);
+        assert_eq!(groups[0].absorbed, [0]);
+        assert!(!groups[0].open);
     }
 
     #[test]
