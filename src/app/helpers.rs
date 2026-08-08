@@ -35,46 +35,6 @@ pub(crate) fn lsp_checker_configured() -> bool {
     )
 }
 
-/// The hidden developer prompt that drives the `/init` flow.
-pub(crate) fn init_prompt() -> String {
-    "Initialize this project for our future work together. Do the following, in order:\n\
-     \n\
-     1. Explore the repository to understand it: read the README and any build \
-     manifests (Cargo.toml, package.json, pyproject.toml, go.mod, etc.), and skim \
-     the main source directories to learn the architecture, entry points, and \
-     conventions. Ground everything in what you actually read — do not invent.\n\
-     \n\
-     2. Write a concise `PROGRAMMER.md` at the repository root capturing your \
-     understanding: a one-paragraph overview, the tech stack, how to build / test / \
-     run, the layout of key directories, and any notable conventions or gotchas. \
-     Keep it tight and factual — it is a map for future sessions, not marketing.\n\
-     \n\
-     3. Set up diagnostics so edits get IDE-style error feedback. Determine how \
-     this project surfaces compile/lint errors and call `configure_diagnostics` \
-     with a profile of one-shot checker commands. Common cases: Rust → \
-     `cargo check --message-format=json` with parser `rustc-json`; TypeScript → \
-     `tsc --noEmit` with parser `tsc`; C/C++/others that print \
-     `file:line:col: severity: message` → parser `gnu`; anything else → parser \
-     `regex` with a `pattern` you write. Prefer commands that terminate (NOT \
-     watch/dev-servers). A language server may be used instead via \
-     `kind = \"lsp\"` with `command` set to its launch line (e.g. `clangd`), but \
-     it re-initializes each run and is slower, so favour a command checker unless \
-     there's a clear reason. The tool test-runs each checker and refuses to save \
-     a profile that doesn't work, so iterate until it saves. If you genuinely \
-     can't find a suitable checker, note that in PROGRAMMER.md and skip this \
-     step.\n\
-     \n\
-     4. If the project has a linter distinct from its compiler (Rust → \
-     `cargo clippy --message-format=json`; JS/TS → eslint; Python → ruff; Go → \
-     golangci-lint; etc.), add it as an additional checker with `lint = true`. \
-     Its findings then show as a lower \"lint\" tier alongside — but below — real \
-     errors and warnings, IDE-style. Pick whatever the project actually uses; \
-     skip if there's no separate linter.\n\
-     \n\
-     When done, briefly summarize what you set up."
-        .to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Response parsing helpers
 // ---------------------------------------------------------------------------

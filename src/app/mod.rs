@@ -495,6 +495,18 @@ impl App<'_> {
             }
         });
 
+        if app.config.auto_update_check {
+            let app_event_tx = app.events.sender.clone();
+            tokio::spawn(async move {
+                // Quietly ask GitHub for the latest tag; the check never blocks
+                // the UI and failures (offline, rate limit) are simply ignored.
+                if let Some(tag) = crate::upgrade::check_for_update().await {
+                    let _ = app_event_tx
+                        .send(Event::App(crate::ui::event::AppEvent::UpdateAvailable(tag)));
+                }
+            });
+        }
+
         app
     }
 

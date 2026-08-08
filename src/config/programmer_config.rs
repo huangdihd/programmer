@@ -68,6 +68,10 @@ pub struct ProgrammerConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub git_coauthor: Option<String>,
+    /// Check GitHub for a newer release at startup and show a one-line notice
+    /// when one exists. Set to false to disable the network call.
+    #[serde(default = "default_true")]
+    pub auto_update_check: bool,
     /// Configured MCP (Model Context Protocol) servers. Each entry is spawned
     /// as a child process at startup; its tools are bridged into the tool list
     /// as `mcp__<server>__<tool>`. Empty by default (no servers, no overhead).
@@ -110,6 +114,10 @@ fn default_security_profile_name() -> String {
     DEFAULT_SECURITY_PROFILE.to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for ProgrammerConfig {
     fn default() -> Self {
         let mut providers = HashMap::new();
@@ -135,6 +143,7 @@ impl Default for ProgrammerConfig {
             security_profiles: BTreeMap::new(),
             active_security_profile: default_security_profile_name(),
             git_coauthor: default_git_coauthor(),
+            auto_update_check: true,
             mcp_servers: Vec::new(),
             model: None,
             base_url: None,

@@ -62,7 +62,7 @@ pub(crate) async fn run(args: RunArgs) -> color_eyre::Result<bool> {
         if run_init {
             agent
                 .run_turn(
-                    crate::app::helpers::init_prompt(),
+                    agent.initialization_prompt.clone(),
                     InputRole::Developer,
                     AgentOutputFormat::Text,
                 )
@@ -104,7 +104,7 @@ pub(crate) async fn init(args: InitArgs) -> color_eyre::Result<bool> {
         }
         let result = agent
             .run_turn(
-                crate::app::helpers::init_prompt(),
+                agent.initialization_prompt.clone(),
                 InputRole::Developer,
                 format,
             )
@@ -143,6 +143,7 @@ struct HeadlessAgent {
     model: String,
     mode: WorkMode,
     skill_prompt: Option<String>,
+    initialization_prompt: String,
     agents: crate::agents::AgentManager,
 }
 
@@ -171,6 +172,11 @@ impl HeadlessAgent {
         let security = Arc::new(crate::security::SecurityHandle::new(security));
         let skill_registry = crate::skills::SkillRegistry::load();
         let skill_prompt = skill_registry.catalog_prompt();
+        let initialization_prompt = skill_registry
+            .prompt(crate::skills::INITIALIZE_PROJECT_SKILL)
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("built-in initialize-project skill is unavailable")
+            })?;
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
             Arc::new(LocalToolProvider::new(todo_store.clone(), security.clone())),
             Arc::new(SkillToolProvider::new(skill_registry.clone())),
@@ -273,6 +279,7 @@ impl HeadlessAgent {
             model,
             mode: args.work_mode,
             skill_prompt,
+            initialization_prompt,
             agents,
         })
     }

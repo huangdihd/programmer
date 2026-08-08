@@ -308,13 +308,15 @@ Open with `/providers manage` or the `--providers` flag.
 
 Reusable instruction modules are enabled by default and can be toggled with
 `/skill <name>` or managed in the `/skill manage` panel. Programmer ships with
-two built-in skills: `programmer-guide`, which explains Programmer's own
-features and architecture, and `update-programmer-md`, which refreshes the
+three built-in skills: `programmer-guide`, which explains Programmer's own
+features and architecture; `initialize-project`, which drives `/init` and the
+headless initialization flow; and `update-programmer-md`, which refreshes the
 repository guide from verified project facts. Their full instructions are
 loaded only when a request needs them.
 
 ```text
 /skill programmer-guide
+/skill initialize-project
 /skill update-programmer-md
 ```
 
@@ -336,9 +338,9 @@ programmer run --init --format json "implement the first todo item"
 printf 'explain this repository' | programmer run -
 ```
 
-`run --init` first executes the same hidden Developer initialization turn as
-`/init`, then sends the user prompt in the same conversation. Automatic
-post-edit diagnostics are enabled whenever
+`run --init` first executes the same `initialize-project` skill as `/init` in a
+hidden Developer turn, then sends the user prompt in the same conversation.
+Automatic post-edit diagnostics are enabled whenever
 `.programmer/diagnostics.toml` exists; use `--no-diagnostics` to disable the
 hook or `--check` for an additional final snapshot. Other controls include
 `--classifier-model`, `--work-mode auto|plan|yolo`, `--cwd`,

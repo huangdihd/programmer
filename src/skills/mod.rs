@@ -32,7 +32,10 @@ pub mod skill;
 use skill::{Skill, SkillSource};
 use std::path::PathBuf;
 
+pub(crate) const INITIALIZE_PROJECT_SKILL: &str = "initialize-project";
+
 const BUILTIN_SKILLS: &[&str] = &[
+    include_str!("builtin/initialize-project/SKILL.md"),
     include_str!("builtin/programmer-guide/SKILL.md"),
     include_str!("builtin/update-programmer-md/SKILL.md"),
 ];
@@ -179,6 +182,12 @@ impl SkillRegistry {
         self.skills.get(name)
     }
 
+    /// Return a skill's complete prompt for an explicit workflow invocation.
+    /// Unlike `instructions`, this does not require the skill to be enabled.
+    pub(crate) fn prompt(&self, name: &str) -> Option<String> {
+        self.skills.get(name).map(Skill::to_prompt)
+    }
+
     /// Whether any skills are currently active.
     pub(crate) fn has_active(&self) -> bool {
         !self.activated.is_empty()
@@ -300,6 +309,25 @@ mod tests {
             .instructions("update-programmer-md")
             .expect("active built-in should return instructions");
         assert!(instructions.contains("Keep `PROGRAMMER.md` an accurate, concise map"));
+    }
+
+    #[test]
+    fn built_in_project_initializer_is_available_for_explicit_init() {
+        let mut reg = SkillRegistry::default();
+        reg.load_builtins();
+
+        let skill = reg
+            .get(INITIALIZE_PROJECT_SKILL)
+            .expect("project initializer should load");
+        assert_eq!(skill.source, SkillSource::BuiltIn);
+        assert!(skill.description.contains("PROGRAMMER.md"));
+
+        reg.clear();
+        let prompt = reg
+            .prompt(INITIALIZE_PROJECT_SKILL)
+            .expect("explicit init should load a disabled skill");
+        assert!(prompt.contains("## Skill: initialize-project"));
+        assert!(prompt.contains("Configure diagnostics"));
     }
 
     #[test]

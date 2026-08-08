@@ -46,7 +46,7 @@
 - ~~/compact~~
 - ~~fix /init~~
 - ~~interactive background task terminal~~
-- installation script(publish to cargo?)
+- ~~installation script~~
 - ~~git cooperator signature~~
 - ~~expose local tools as a MCP server~~
 - ~~`@` to reference local files by path without injecting their contents~~

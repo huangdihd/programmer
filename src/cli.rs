@@ -50,6 +50,10 @@ pub(crate) enum Command {
     Diagnostics(DiagnosticsArgs),
     /// Expose programmer's local tools over MCP.
     Mcp(McpArgs),
+    /// Update programmer to the latest release.
+    Upgrade(UpgradeArgs),
+    /// Remove programmer from this machine.
+    Uninstall(UninstallArgs),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -161,6 +165,26 @@ pub(crate) struct DiagnosticsArgs {
 pub(crate) struct McpArgs {
     #[command(subcommand)]
     pub command: McpCommand,
+}
+
+/// Check for and install a newer release of programmer.
+#[derive(Debug, Default, ClapArgs)]
+pub(crate) struct UpgradeArgs {
+    /// Check for a newer version without installing it.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Install this specific release tag instead of the latest one.
+    #[arg(long, value_name = "TAG")]
+    pub tag: Option<String>,
+}
+
+/// Remove programmer from this machine.
+#[derive(Debug, Default, ClapArgs)]
+pub(crate) struct UninstallArgs {
+    /// Also delete the configuration directory (~/.config/programmer).
+    #[arg(long)]
+    pub purge: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -374,5 +398,43 @@ mod tests {
     #[test]
     fn tui_flags_conflict_with_subcommands() {
         assert!(parse(&["programmer", "--providers", "diagnostics"]).is_err());
+    }
+
+    #[test]
+    fn upgrade_parses_check_and_tag() {
+        let args = parse(&["programmer", "upgrade"]).unwrap();
+        let Some(Command::Upgrade(up)) = args.command else {
+            panic!("expected upgrade command");
+        };
+        assert!(!up.check);
+        assert!(up.tag.is_none());
+
+        let args = parse(&["programmer", "upgrade", "--check"]).unwrap();
+        let Some(Command::Upgrade(up)) = args.command else {
+            panic!("expected upgrade command");
+        };
+        assert!(up.check);
+        assert!(up.tag.is_none());
+
+        let args = parse(&["programmer", "upgrade", "--tag", "v0.3.0"]).unwrap();
+        let Some(Command::Upgrade(up)) = args.command else {
+            panic!("expected upgrade command");
+        };
+        assert_eq!(up.tag.as_deref(), Some("v0.3.0"));
+    }
+
+    #[test]
+    fn uninstall_parses_purge() {
+        let args = parse(&["programmer", "uninstall"]).unwrap();
+        let Some(Command::Uninstall(un)) = args.command else {
+            panic!("expected uninstall command");
+        };
+        assert!(!un.purge);
+
+        let args = parse(&["programmer", "uninstall", "--purge"]).unwrap();
+        let Some(Command::Uninstall(un)) = args.command else {
+            panic!("expected uninstall command");
+        };
+        assert!(un.purge);
     }
 }

@@ -909,6 +909,7 @@ mod tests {
             active_security_profile: crate::config::programmer_config::DEFAULT_SECURITY_PROFILE
                 .to_string(),
             git_coauthor: None,
+            auto_update_check: true,
             mcp_servers: Vec::new(),
             model: None,
             base_url: None,

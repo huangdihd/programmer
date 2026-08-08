@@ -6,7 +6,7 @@
 // (at your option) any later version.
 
 use super::CommandOutcome;
-use crate::app::{App, commands, helpers, session};
+use crate::app::{App, commands, session};
 use crate::classifier::{PlanPhase, WorkMode};
 use crate::commands::Command;
 use crate::ui::event::AppEvent;
@@ -23,11 +23,20 @@ pub(in crate::app) async fn execute(app: &mut App<'_>, command: Command) -> Comm
 }
 
 fn init(app: &mut App<'_>) -> CommandOutcome {
+    let Some(prompt) = app
+        .skill_registry
+        .prompt(crate::skills::INITIALIZE_PROJECT_SKILL)
+    else {
+        app.conversation_panel
+            .add_error_string("built-in initialize-project skill is unavailable");
+        return CommandOutcome::handled(false);
+    };
+
     if app.cancel.active_id.is_some() {
         commands::queue_pending_request(
             &mut app.conversation_panel,
             &mut app.pending_images,
-            helpers::init_prompt(),
+            prompt,
             Vec::new(),
         );
         return CommandOutcome::without_history(false);
@@ -36,7 +45,7 @@ fn init(app: &mut App<'_>) -> CommandOutcome {
     app.conversation_panel
         .add_info_string("Scanning project and setting up diagnostics…");
     // Send synchronously so another request cannot claim the operation id first.
-    app.events.send(AppEvent::StartInit);
+    app.events.send(AppEvent::StartInit(prompt));
     CommandOutcome::handled(false)
 }
 

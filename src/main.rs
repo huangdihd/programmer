@@ -45,6 +45,7 @@ mod thinking;
 mod todos;
 mod tools;
 mod ui;
+mod upgrade;
 
 /// Build the `(client, model)` the MCP server's `auto` mode uses to classify
 /// tool calls: the configured classifier model, else the default model. Returns
@@ -200,6 +201,10 @@ async fn async_main(mut args: cli::Args) -> color_eyre::Result<()> {
             cli::Command::Mcp(mcp) => {
                 run_mcp(mcp).await?;
                 true
+            }
+            cli::Command::Upgrade(upgrade_args) => crate::upgrade::upgrade(upgrade_args).await?,
+            cli::Command::Uninstall(uninstall_args) => {
+                crate::upgrade::uninstall(uninstall_args).await?
             }
         };
         if !passed {

@@ -99,9 +99,9 @@ pub enum AppEvent {
     /// Quit the application.
     Quit,
     Start,
-    /// `/init` was invoked: kick off the project-initialization turn (explore,
-    /// write PROGRAMMER.md, configure diagnostics) with a synthetic prompt.
-    StartInit,
+    /// `/init` was invoked: kick off the project-initialization turn with the
+    /// resolved `initialize-project` skill prompt.
+    StartInit(String),
     /// Provider config changed (via the management panel): rebuild the
     /// provider manager from the current config.
     ProvidersChanged,
@@ -145,6 +145,9 @@ pub enum AppEvent {
         answer_tx: AnswerTx,
         operation_id: u64,
     },
+    /// A newer programmer release exists. Carries the new tag; the UI shows a
+    /// one-line notice suggesting `programmer upgrade`.
+    UpdateAvailable(String),
 }
 
 /// Wraps a `oneshot::Sender<String>` for the `ask_user` tool answer channel.
@@ -216,7 +219,7 @@ impl std::fmt::Debug for AppEvent {
             Self::Cancel => write!(f, "Cancel"),
             Self::Quit => write!(f, "Quit"),
             Self::Start => write!(f, "Start"),
-            Self::StartInit => write!(f, "StartInit"),
+            Self::StartInit(_) => write!(f, "StartInit"),
             Self::ProvidersChanged => write!(f, "ProvidersChanged"),
             Self::RefreshProviderModels { name, notify } => f
                 .debug_struct("RefreshProviderModels")
@@ -247,6 +250,7 @@ impl std::fmt::Debug for AppEvent {
                 .field("question", &question.text)
                 .field("operation_id", operation_id)
                 .finish(),
+            Self::UpdateAvailable(tag) => f.debug_tuple("UpdateAvailable").field(tag).finish(),
         }
     }
 }

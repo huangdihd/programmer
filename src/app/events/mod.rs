@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use super::App;
 use super::PendingReview;
-use super::{commands, diagnostics, helpers, session};
+use super::{commands, diagnostics, session};
 use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
 use crate::commands::CompletionEngine;
@@ -243,7 +243,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             diagnostics::maybe_seed_diagnostics_baseline(app);
             commands::send_message(app).await;
         }
-        AppEvent::StartInit => handle_start_init(app),
+        AppEvent::StartInit(prompt) => handle_start_init(app, prompt),
         AppEvent::TaskStateChanged(event) => handle_task_state_changed(app, event),
         AppEvent::AgentStateChanged { generation, id } => {
             handle_agent_state_changed(app, generation, id)
@@ -300,6 +300,11 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 return;
             }
             app.question_panel = Some(QuestionPanel::new(question, answer_tx));
+        }
+        AppEvent::UpdateAvailable(tag) => {
+            app.conversation_panel.add_info_string(format!(
+                "A newer version of programmer is available: {tag} — run `programmer upgrade` to update."
+            ));
         }
     }
 }
@@ -523,7 +528,7 @@ async fn handle_cancel(app: &mut App<'_>) {
 }
 
 /// `/init`: seed the init prompt and start the first runner turn.
-fn handle_start_init(app: &mut App<'_>) {
+fn handle_start_init(app: &mut App<'_>, prompt: String) {
     // StartInit is normally queued synchronously by `/init`. Keep this guard so
     // duplicate or externally injected events can never replace a live turn's
     // cancellation token and operation id.
@@ -532,10 +537,8 @@ fn handle_start_init(app: &mut App<'_>) {
             .add_warning_string("cannot initialize while a turn is in flight");
         return;
     }
-    app.conversation_panel.add_meta(
-        "\u{25B8} Initializing project\u{2026}",
-        helpers::init_prompt(),
-    );
+    app.conversation_panel
+        .add_meta("\u{25B8} Initializing project\u{2026}", prompt);
     app.conversation_panel.reset_accumulated_usage();
     diagnostics::maybe_seed_diagnostics_baseline(app);
     session::mark_dirty(app);
