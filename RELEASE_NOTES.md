@@ -1,3 +1,22 @@
+# programmer v0.2.1
+
+v0.2.1 makes the Auto-mode classifier compatible with providers that impose a
+smaller `top_logprobs` limit than OpenAI.
+
+## Fixes
+
+- Added the persisted `classifier_top_logprobs` setting with validation for the
+  Responses API range of 0–20.
+- Added `/classifier logprobs <0-20>` to inspect and change the setting without
+  editing `config.toml` manually.
+- Passed the configured value through TUI, headless, child-agent, and MCP
+  classifier paths.
+- Documented that Qwen endpoints accept at most 5 top logprobs.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.1.1...v0.2.1
+
+---
+
 # programmer v0.2.0
 
 v0.2.0 is the largest Programmer release so far. It turns the original coding
