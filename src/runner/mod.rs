@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct LlmPolicy {
     pub client: Client<OpenAIConfig>,
     pub model_name: String,
+    pub top_logprobs: u8,
     pub no_logprobs: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -475,6 +476,7 @@ impl TurnRunner {
                 classify::classify_llm(
                     &p.client,
                     &p.model_name,
+                    p.top_logprobs,
                     &p.no_logprobs,
                     &light,
                     &full,

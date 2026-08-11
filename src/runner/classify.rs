@@ -117,6 +117,7 @@ pub(crate) fn classify_sync(
 pub(crate) async fn classify_llm(
     client: &Client<OpenAIConfig>,
     model_name: &str,
+    top_logprobs: u8,
     no_logprobs: &Arc<Mutex<HashSet<String>>>,
     light_context: &str,
     full_context: &str,
@@ -142,6 +143,7 @@ pub(crate) async fn classify_llm(
                 light_context,
                 full_context,
                 try_logprobs,
+                top_logprobs,
             )
             .await;
             if outcome.logprobs_missing {
