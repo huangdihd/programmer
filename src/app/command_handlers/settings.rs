@@ -484,8 +484,9 @@ fn mode(app: &mut App<'_>, arg: &str) -> CommandOutcome {
 }
 
 fn classifier(app: &mut App<'_>, arg: &str) -> CommandOutcome {
-    match arg.trim() {
-        "" => {
+    let parts = arg.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [] => {
             let current = app
                 .config
                 .classifier_model
@@ -493,19 +494,36 @@ fn classifier(app: &mut App<'_>, arg: &str) -> CommandOutcome {
                 .unwrap_or_else(|| format!("{} (chat model)", app.current_model));
             app.conversation_panel.add_info_string(format!(
                 "classifier model: {current}\n\
-                 usage: /classifier <provider/model> to set, \
-                 /classifier clear to reset to the chat model"
+                 classifier top logprobs: {}\n\
+                 usage: /classifier <provider/model> to set the model, \
+                 /classifier logprobs <0-20> to set the fast-probe alternatives, \
+                 /classifier clear to reset to the chat model",
+                app.config.classifier_top_logprobs
             ));
         }
-        "clear" | "default" | "reset" => {
+        ["clear" | "default" | "reset"] => {
             app.config.classifier_model = None;
             app.conversation_panel
                 .add_info_string("classifier model reset — Auto mode now uses the chat model");
             session::persist_config(app);
         }
-        model => match app.provider_manager.resolve(model) {
+        ["logprobs" | "top-logprobs" | "top_logprobs", value] => {
+            match parse_classifier_top_logprobs(value) {
+                Ok(top_logprobs) => {
+                    app.config.classifier_top_logprobs = top_logprobs;
+                    app.conversation_panel
+                        .add_info_string(format!("classifier top logprobs set to: {top_logprobs}"));
+                    session::persist_config(app);
+                }
+                Err(error) => app.conversation_panel.add_error_string(error),
+            }
+        }
+        ["logprobs" | "top-logprobs" | "top_logprobs"] => app
+            .conversation_panel
+            .add_error_string("usage: /classifier logprobs <0-20>".to_string()),
+        [model] => match app.provider_manager.resolve(model) {
             Some(_) => {
-                app.config.classifier_model = Some(model.to_string());
+                app.config.classifier_model = Some((*model).to_string());
                 app.conversation_panel
                     .add_info_string(format!("classifier model set to: {model}"));
                 session::persist_config(app);
@@ -516,8 +534,24 @@ fn classifier(app: &mut App<'_>, arg: &str) -> CommandOutcome {
                 ));
             }
         },
+        _ => app.conversation_panel.add_error_string(
+            "usage: /classifier [provider/model | clear | logprobs <0-20>]".to_string(),
+        ),
     }
     CommandOutcome::handled(true)
+}
+
+fn parse_classifier_top_logprobs(value: &str) -> Result<u8, String> {
+    let value = value
+        .parse::<u8>()
+        .map_err(|_| format!("invalid top logprobs '{value}': expected an integer from 0 to 20"))?;
+    if value > crate::consts::MAX_CLASSIFIER_TOP_LOGPROBS {
+        return Err(format!(
+            "invalid top logprobs '{value}': expected an integer from 0 to {}",
+            crate::consts::MAX_CLASSIFIER_TOP_LOGPROBS
+        ));
+    }
+    Ok(value)
 }
 
 fn thinking(app: &mut App<'_>, arg: &str) -> CommandOutcome {
@@ -551,6 +585,15 @@ fn thinking(app: &mut App<'_>, arg: &str) -> CommandOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifier_top_logprobs_parser_enforces_api_range() {
+        assert_eq!(parse_classifier_top_logprobs("0"), Ok(0));
+        assert_eq!(parse_classifier_top_logprobs("5"), Ok(5));
+        assert_eq!(parse_classifier_top_logprobs("20"), Ok(20));
+        assert!(parse_classifier_top_logprobs("21").is_err());
+        assert!(parse_classifier_top_logprobs("five").is_err());
+    }
 
     #[test]
     fn selection_mode_toggles_and_accepts_explicit_states() {

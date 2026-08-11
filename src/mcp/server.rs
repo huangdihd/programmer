@@ -46,7 +46,7 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 /// and a counter for server-initiated request ids.
 pub struct McpServer {
     mode: WorkMode,
-    classifier: Option<(Client<OpenAIConfig>, String)>,
+    classifier: Option<(Client<OpenAIConfig>, String, u8)>,
     client_elicitation: bool,
     next_request_id: u64,
     security: std::sync::Arc<crate::security::SecurityManager>,
@@ -66,7 +66,7 @@ enum Gate {
 
 impl McpServer {
     #[cfg(test)]
-    pub fn new(mode: WorkMode, classifier: Option<(Client<OpenAIConfig>, String)>) -> Self {
+    pub fn new(mode: WorkMode, classifier: Option<(Client<OpenAIConfig>, String, u8)>) -> Self {
         let security = crate::security::SecurityManager::for_current_dir(Default::default())
             .expect("the current directory should support the default security policy");
         Self::with_security(mode, classifier, std::sync::Arc::new(security))
@@ -74,7 +74,7 @@ impl McpServer {
 
     pub(crate) fn with_security(
         mode: WorkMode,
-        classifier: Option<(Client<OpenAIConfig>, String)>,
+        classifier: Option<(Client<OpenAIConfig>, String, u8)>,
         security: std::sync::Arc<crate::security::SecurityManager>,
     ) -> Self {
         McpServer {
@@ -238,15 +238,24 @@ impl McpServer {
     /// Auto mode: let the LLM classifier decide. Empty context — the server has
     /// no conversation, so the call is judged on its own merits.
     async fn llm_approve(&self, name: &str, args: &str) -> Result<(), String> {
-        let Some((client, model)) = &self.classifier else {
+        let Some((client, model, top_logprobs)) = &self.classifier else {
             return Err(
                 "auto mode has no classifier model configured (set classifier_model or a \
                  default model); refusing"
                     .to_string(),
             );
         };
-        let outcome =
-            crate::classifier::classify_tool_call(client, model, name, args, "", "", true).await;
+        let outcome = crate::classifier::classify_tool_call(
+            client,
+            model,
+            name,
+            args,
+            "",
+            "",
+            true,
+            *top_logprobs,
+        )
+        .await;
         match outcome.verdict {
             Verdict::Allow => Ok(()),
             Verdict::Deny { reason } | Verdict::Ask { reason } => {

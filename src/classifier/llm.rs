@@ -82,9 +82,19 @@ pub async fn classify_tool_call(
     light_context: &str,
     full_context: &str,
     try_logprobs: bool,
+    top_logprobs: u8,
 ) -> ClassifyOutcome {
     if try_logprobs {
-        match classify_fast(client, model, tool_name, arguments, light_context).await {
+        match classify_fast(
+            client,
+            model,
+            tool_name,
+            arguments,
+            light_context,
+            top_logprobs,
+        )
+        .await
+        {
             Ok(FastResult::Approved) => {
                 return ClassifyOutcome {
                     verdict: Verdict::Allow,
@@ -156,6 +166,14 @@ fn base_request(model: &str, prompt: String) -> CreateResponse {
     }
 }
 
+fn fast_request(model: &str, prompt: String, top_logprobs: u8) -> CreateResponse {
+    let mut request = base_request(model, prompt);
+    request.max_output_tokens = Some(CLASSIFIER_MAX_TOKENS);
+    request.top_logprobs = Some(top_logprobs);
+    request.include = Some(vec![IncludeEnum::MessageOutputTextLogprobs]);
+    request
+}
+
 /// Pull the first assistant text out of a response, with its logprobs.
 fn first_text(
     response: &async_openai::types::responses::Response,
@@ -203,6 +221,7 @@ async fn classify_fast(
     tool_name: &str,
     arguments: &str,
     context: &str,
+    top_logprobs: u8,
 ) -> Result<FastResult, String> {
     let prompt = format!(
         "{}\n\nShould this tool call be auto-approved? \
@@ -210,10 +229,7 @@ async fn classify_fast(
          direction. Answer with exactly one word: yes or no.",
         call_block(context, tool_name, arguments)
     );
-    let mut req = base_request(model, prompt);
-    req.max_output_tokens = Some(CLASSIFIER_MAX_TOKENS);
-    req.top_logprobs = Some(20);
-    req.include = Some(vec![IncludeEnum::MessageOutputTextLogprobs]);
+    let req = fast_request(model, prompt, top_logprobs);
 
     let response = match create_with_retries(client, &req).await {
         Ok(r) => r,
@@ -345,6 +361,14 @@ mod tests {
         let value = serde_json::to_value(request).expect("classifier request should serialize");
 
         assert_eq!(value["reasoning"]["effort"], "none");
+    }
+
+    #[test]
+    fn fast_request_uses_configured_top_logprobs() {
+        let request = fast_request("test-model", "test prompt".to_string(), 5);
+        let value = serde_json::to_value(request).expect("fast request should serialize");
+
+        assert_eq!(value["top_logprobs"], 5);
     }
 
     #[test]

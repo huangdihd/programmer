@@ -347,6 +347,7 @@ mod tests {
             default_provider: "offline".to_string(),
             providers,
             classifier_model: None,
+            classifier_top_logprobs: crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS,
             allow_yolo: false,
             security: Default::default(),
             security_profiles: Default::default(),

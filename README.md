@@ -127,6 +127,10 @@ default_provider = "openai"
 # Falls back to the chat model when absent. Must be a non-reasoning model.
 classifier_model = "openai/gpt-4o-mini"
 
+# Alternative-token count for the classifier's fast logprob probe. OpenAI
+# accepts up to 20; some compatible providers have a lower limit (Qwen: 5).
+classifier_top_logprobs = 20
+
 # Gate YOLO mode behind this flag so it can't be entered by accident.
 allow_yolo = true
 
@@ -178,6 +182,7 @@ api_key = "sk-your-key-here"
 |---|---|---|
 | `default_provider` | `"openai"` | Active provider at startup. |
 | `classifier_model` | (chat model) | `provider/model` for the Auto-mode classifier. Must be a **non-reasoning** model (see [Auto mode](#work-modes)). |
+| `classifier_top_logprobs` | `20` | Alternative-token count for the fast classifier probe (`0`–`20`). Lower this for providers with a smaller limit; Qwen accepts at most `5`. |
 | `allow_yolo` | `false` | Whether `/mode yolo` and `Ctrl+T` can reach YOLO mode. |
 | `auto_update_check` | `true` | Check GitHub Releases at startup and show a non-blocking update notice. |
 | `git_coauthor` | `programmer <noreply@programmer.local>` | `Co-Authored-By:` trailer added to the agent's git commits. Use a GitHub-linked email for an avatar; `""` disables. |
@@ -268,6 +273,19 @@ or in config:
 classifier_model = "openai/gpt-4o-mini"
 ```
 
+Some OpenAI-compatible providers limit how many alternatives may be requested.
+For example, Qwen accepts at most 5. Adjust it at runtime:
+
+```
+/classifier logprobs 5
+```
+
+or in config:
+
+```toml
+classifier_top_logprobs = 5
+```
+
 If the classifier model turns out to be a thinking model, all Auto-mode
 calls will be denied with a clear error message. Switch it to a
 non-reasoning model to fix.
@@ -297,7 +315,8 @@ programmer
 | `/mode <manual\|auto\|plan>` | Set work mode (or cycle with `Ctrl+T`) |
 | `/mode yolo` | Enter YOLO mode (requires `allow_yolo = true`) |
 | `/plan <approve\|cancel>` | Approve or cancel the current Plan-mode proposal |
-| `/classifier [provider/model]` | Set/show the Auto-mode classifier model |
+| `/classifier [provider/model]` | Set/show the Auto-mode classifier settings |
+| `/classifier logprobs <0-20>` | Set the fast-probe alternative-token count |
 | `/classifier clear` | Reset classifier to the chat model |
 | `/init` | Create or refresh `PROGRAMMER.md` and project diagnostics |
 | `/thinking [level]` | Set/show reasoning effort for chat and compaction |

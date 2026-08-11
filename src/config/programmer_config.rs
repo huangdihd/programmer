@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 pub(crate) const DEFAULT_SECURITY_PROFILE: &str = "default";
@@ -42,6 +43,14 @@ pub struct ProgrammerConfig {
     /// `provider/model` string. When absent, the current chat model is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifier_model: Option<String>,
+    /// Number of alternative tokens requested by the Auto-mode classifier's
+    /// fast logprob probe. Some compatible providers accept fewer than the
+    /// OpenAI maximum of 20.
+    #[serde(
+        default = "default_classifier_top_logprobs",
+        deserialize_with = "deserialize_classifier_top_logprobs"
+    )]
+    pub classifier_top_logprobs: u8,
     /// YOLO mode (run every tool call unchecked) is gated behind this flag so
     /// it can't be reached by the normal Ctrl+T cycle or a bare `/mode yolo`.
     #[serde(default)]
@@ -118,6 +127,25 @@ fn default_true() -> bool {
     true
 }
 
+fn default_classifier_top_logprobs() -> u8 {
+    crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS
+}
+
+fn deserialize_classifier_top_logprobs<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)?;
+    if value <= crate::consts::MAX_CLASSIFIER_TOP_LOGPROBS {
+        Ok(value)
+    } else {
+        Err(D::Error::custom(format!(
+            "classifier_top_logprobs must be between 0 and {}",
+            crate::consts::MAX_CLASSIFIER_TOP_LOGPROBS
+        )))
+    }
+}
+
 impl Default for ProgrammerConfig {
     fn default() -> Self {
         let mut providers = HashMap::new();
@@ -136,6 +164,7 @@ impl Default for ProgrammerConfig {
             default_provider: "openai".to_string(),
             providers,
             classifier_model: None,
+            classifier_top_logprobs: default_classifier_top_logprobs(),
             allow_yolo: false,
             security,
             // Kept empty until normalization so deserialization can distinguish
@@ -287,6 +316,23 @@ mod tests {
         let config = ProgrammerConfig::default();
         let serialized = toml::to_string(&config).expect("serialize");
         assert!(!serialized.contains("mcp_servers"));
+    }
+
+    #[test]
+    fn classifier_top_logprobs_defaults_and_validates() {
+        let defaulted: ProgrammerConfig = toml::from_str("").expect("deserialize defaults");
+        assert_eq!(
+            defaulted.classifier_top_logprobs,
+            crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS
+        );
+
+        let configured: ProgrammerConfig =
+            toml::from_str("classifier_top_logprobs = 5").expect("deserialize configured value");
+        assert_eq!(configured.classifier_top_logprobs, 5);
+
+        let error = toml::from_str::<ProgrammerConfig>("classifier_top_logprobs = 21")
+            .expect_err("reject value above the Responses API maximum");
+        assert!(error.to_string().contains("must be between 0 and 20"));
     }
 
     #[test]

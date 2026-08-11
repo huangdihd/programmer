@@ -47,12 +47,14 @@ mod tools;
 mod ui;
 mod upgrade;
 
-/// Build the `(client, model)` the MCP server's `auto` mode uses to classify
-/// tool calls: the configured classifier model, else the default model. Returns
-/// `None` when no provider resolves (auto mode then refuses dangerous tools).
+/// Build the `(client, model, top_logprobs)` the MCP server's `auto` mode uses
+/// to classify tool calls: the configured classifier model, else the default
+/// model. Returns `None` when no provider resolves (auto mode then refuses
+/// dangerous tools).
 async fn build_mcp_classifier() -> Option<(
     async_openai::Client<async_openai::config::OpenAIConfig>,
     String,
+    u8,
 )> {
     let (config, _) = load_config().ok()?;
     let pm = crate::providers::ProviderManager::new(&config).await;
@@ -61,7 +63,7 @@ async fn build_mcp_classifier() -> Option<(
         .clone()
         .unwrap_or_else(|| pm.default_classifier_model());
     pm.resolve(&model)
-        .map(|(client, name)| (client.clone(), name))
+        .map(|(client, name)| (client.clone(), name, config.classifier_top_logprobs))
 }
 
 /// Resolved session data ready for the application.

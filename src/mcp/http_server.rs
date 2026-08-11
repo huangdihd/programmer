@@ -77,7 +77,7 @@ pub(crate) struct ServerState {
     /// Current work mode; the console mutates it on Ctrl+T.
     pub(crate) mode: Arc<Mutex<WorkMode>>,
     /// Classifier client for `auto` mode (None → auto refuses dangerous tools).
-    classifier: Option<(Client<OpenAIConfig>, String)>,
+    classifier: Option<(Client<OpenAIConfig>, String, u8)>,
     event_tx: mpsc::UnboundedSender<ConsoleEvent>,
     next_call_id: AtomicU64,
     security: Arc<crate::security::SecurityManager>,
@@ -87,7 +87,7 @@ pub(crate) struct ServerState {
 /// the operator quits the console.
 pub async fn serve(
     mode: WorkMode,
-    classifier: Option<(Client<OpenAIConfig>, String)>,
+    classifier: Option<(Client<OpenAIConfig>, String, u8)>,
     addr: SocketAddr,
     allow_yolo: bool,
     security: Arc<crate::security::SecurityManager>,
@@ -218,11 +218,20 @@ impl ServerState {
     }
 
     async fn llm_approve(&self, name: &str, args: &str) -> Result<(), String> {
-        let Some((client, model)) = &self.classifier else {
+        let Some((client, model, top_logprobs)) = &self.classifier else {
             return Err("auto mode has no classifier model configured; refusing".to_string());
         };
-        let outcome =
-            crate::classifier::classify_tool_call(client, model, name, args, "", "", true).await;
+        let outcome = crate::classifier::classify_tool_call(
+            client,
+            model,
+            name,
+            args,
+            "",
+            "",
+            true,
+            *top_logprobs,
+        )
+        .await;
         match outcome.verdict {
             Verdict::Allow => Ok(()),
             Verdict::Deny { reason } | Verdict::Ask { reason } => {

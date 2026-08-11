@@ -34,9 +34,9 @@ pub enum Command {
     Providers(String),
     /// `/mode <manual|auto|plan|yolo>` — cycle/set work mode.
     Mode(String),
-    /// `/classifier [provider/model]` — set or show the Auto-mode classifier
-    /// model. Empty argument shows the current setting; "clear"/"default"
-    /// resets it to the chat model.
+    /// `/classifier [provider/model | logprobs <0-20>]` — set or show the
+    /// Auto-mode classifier settings. Empty argument shows the current
+    /// settings; "clear"/"default" resets the model to the chat model.
     Classifier(String),
     /// `/init` — have the agent explore the project, write `PROGRAMMER.md`, and
     /// configure the diagnostics profile.
@@ -99,6 +99,7 @@ enum CommandKind {
 enum CompletionKind {
     None,
     Model,
+    Classifier,
     Fixed(&'static [&'static str]),
     Providers,
     Skill,
@@ -257,11 +258,11 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         kind: CommandKind::Classifier,
         name: "classifier",
         aliases: &[],
-        completion: CompletionKind::Model,
+        completion: CompletionKind::Classifier,
         help: &[HelpEntry {
             order: 2,
-            usage: "/classifier [provider/model]",
-            description: "Set/show the Auto-mode classifier model",
+            usage: "/classifier [provider/model | logprobs <0-20>]",
+            description: "Set/show the Auto-mode classifier settings",
         }],
     },
     CommandSpec {
@@ -615,6 +616,7 @@ impl CompletionEngine {
         match spec.completion {
             CompletionKind::None => None,
             CompletionKind::Model => Self::complete_model(text, cmd, pm),
+            CompletionKind::Classifier => Self::complete_classifier(text, cmd, pm),
             CompletionKind::Fixed(values) => Self::complete_subcommand(text, cmd, values),
             CompletionKind::Providers => Self::complete_providers(text, cmd, pm),
             CompletionKind::Skill => Self::complete_skill(text, cmd, skill_registry),
@@ -871,6 +873,28 @@ impl CompletionEngine {
             .map(|p| format!("{}/", p))
             .collect();
         CompletionState::new(prefix, providers)
+    }
+
+    fn complete_classifier(text: &str, cmd: &str, pm: &ProviderManager) -> Option<CompletionState> {
+        let after_cmd = text[cmd.len()..].trim_start();
+        if after_cmd.split_whitespace().count() > 1 || after_cmd.ends_with(char::is_whitespace) {
+            return None;
+        }
+
+        let mut candidates = ["clear", "logprobs"]
+            .into_iter()
+            .filter(|candidate| candidate.starts_with(after_cmd))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if let Some(state) = Self::complete_model(text, cmd, pm) {
+            candidates.extend(
+                state
+                    .candidates
+                    .into_iter()
+                    .map(|candidate| candidate.value),
+            );
+        }
+        CompletionState::new(format!("/{cmd} "), candidates)
     }
 
     fn complete_skill(
@@ -1581,8 +1605,8 @@ mod tests {
                 "Set work mode (or cycle with Ctrl+T)",
             ),
             (
-                "/classifier [provider/model]",
-                "Set/show the Auto-mode classifier model",
+                "/classifier [provider/model | logprobs <0-20>]",
+                "Set/show the Auto-mode classifier settings",
             ),
             (
                 "/init",
@@ -1719,6 +1743,19 @@ mod tests {
         let state = CompletionEngine::complete_subcommand("mode p", "mode", values)
             .expect("mode plan completion");
         assert_eq!(state.candidates[0].value, "plan");
+
+        let classifier = COMMAND_SPECS
+            .iter()
+            .find(|spec| spec.name == "classifier")
+            .expect("classifier spec");
+        assert!(matches!(classifier.completion, CompletionKind::Classifier));
+        let state = CompletionEngine::complete_classifier(
+            "classifier log",
+            "classifier",
+            &provider_manager,
+        )
+        .expect("classifier logprobs completion");
+        assert_eq!(state.candidates[0].value, "logprobs");
 
         let plan = COMMAND_SPECS
             .iter()

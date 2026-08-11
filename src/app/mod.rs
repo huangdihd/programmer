@@ -564,11 +564,13 @@ impl App<'_> {
                     RunnerPolicy::Llm(Box::new(LlmPolicy {
                         client: c_client.clone(),
                         model_name: c_model_name.clone(),
+                        top_logprobs: self.config.classifier_top_logprobs,
                         no_logprobs: self.classifier_no_logprobs.clone(),
                     })),
                     crate::agents::AgentPolicyFactory::Llm(Box::new(LlmPolicy {
                         client: c_client.clone(),
                         model_name: c_model_name,
+                        top_logprobs: self.config.classifier_top_logprobs,
                         no_logprobs: self.classifier_no_logprobs.clone(),
                     })),
                 )

@@ -23,6 +23,14 @@ pub(crate) const MAX_OUTPUT_LENGTH: usize = 8000;
 /// Maximum number of Auto-mode classifier LLM requests in flight at once.
 pub(crate) const MAX_CONCURRENT_CLASSIFICATIONS: usize = 4;
 
+/// Default number of alternative tokens requested for the classifier's
+/// fast-path logprob probe.
+pub(crate) const DEFAULT_CLASSIFIER_TOP_LOGPROBS: u8 = 20;
+
+/// Maximum accepted by the OpenAI Responses API. Compatible providers may
+/// impose a lower limit, which can be selected in the user configuration.
+pub(crate) const MAX_CLASSIFIER_TOP_LOGPROBS: u8 = 20;
+
 /// Maximum number of read-only tool calls executed concurrently within a batch.
 /// Writes are never run concurrently; see `spawn_run`.
 pub(crate) const MAX_CONCURRENT_READ_TOOLS: usize = 8;

@@ -207,11 +207,13 @@ impl HeadlessAgent {
                     RunnerPolicy::Llm(Box::new(LlmPolicy {
                         client: classifier_client.clone(),
                         model_name: classifier_name.clone(),
+                        top_logprobs: config.classifier_top_logprobs,
                         no_logprobs: no_logprobs.clone(),
                     })),
                     crate::agents::AgentPolicyFactory::Llm(Box::new(LlmPolicy {
                         client: classifier_client,
                         model_name: classifier_name,
+                        top_logprobs: config.classifier_top_logprobs,
                         no_logprobs,
                     })),
                 )
