@@ -358,6 +358,37 @@ impl CheckpointStore {
         self.persist()
     }
 
+    /// Seed a fork with the conversation checkpoints preceding `target_id`.
+    /// File snapshots belong to the source branch's code timeline, so they are
+    /// deliberately omitted from the fork.
+    pub(crate) fn copy_conversation_history_before(
+        &mut self,
+        source: &Self,
+        target_id: u64,
+    ) -> Result<(), String> {
+        self.manifest.checkpoints = source
+            .manifest
+            .checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.id < target_id && !checkpoint.recovery)
+            .cloned()
+            .map(|mut checkpoint| {
+                checkpoint.files.clear();
+                checkpoint
+            })
+            .collect();
+        self.next_id = self
+            .manifest
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.id)
+            .max()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        self.next_sequence = 1;
+        self.persist()
+    }
+
     pub(crate) fn delete_all(&mut self) -> Result<(), String> {
         if self.root.exists() {
             std::fs::remove_dir_all(&self.root)
@@ -558,5 +589,37 @@ mod tests {
         assert_eq!(store.checkpoint(at).unwrap().conversation_cutoff, 6);
         assert_eq!(store.checkpoint(after).unwrap().conversation_cutoff, 9);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fork_copies_only_earlier_conversation_checkpoints() {
+        let (source_root, mut source) = temp_store();
+        let (fork_root, mut fork) = temp_store();
+        std::fs::create_dir_all(&source_root).unwrap();
+        let file = source_root.join("file.txt");
+        std::fs::write(&file, b"before").unwrap();
+
+        let first = source.begin("first".into(), 0, Vec::new()).unwrap();
+        source.record_before(first, &file).unwrap();
+        std::fs::write(&file, b"after").unwrap();
+        source.record_after(first, &file).unwrap();
+        let selected = source.begin("selected".into(), 2, Vec::new()).unwrap();
+        let later = source.begin("later".into(), 4, Vec::new()).unwrap();
+
+        fork.copy_conversation_history_before(&source, selected)
+            .unwrap();
+
+        assert_eq!(fork.checkpoints().len(), 1);
+        assert_eq!(fork.checkpoints()[0].id, first);
+        assert!(fork.checkpoints()[0].files.is_empty());
+        assert!(fork.checkpoint(selected).is_none());
+        assert!(fork.checkpoint(later).is_none());
+        assert_eq!(
+            fork.begin("branch".into(), 2, Vec::new()).unwrap(),
+            selected
+        );
+
+        std::fs::remove_dir_all(source_root).unwrap();
+        std::fs::remove_dir_all(fork_root).unwrap();
     }
 }

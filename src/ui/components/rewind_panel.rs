@@ -23,6 +23,9 @@ pub(crate) enum RestoreMode {
 pub(crate) enum PanelAction {
     None,
     Close,
+    Fork {
+        checkpoint_id: u64,
+    },
     Restore {
         checkpoint_id: u64,
         mode: RestoreMode,
@@ -110,7 +113,7 @@ impl RewindPanel {
                     let last = if self.entries[self.selected].recovery {
                         1
                     } else {
-                        3
+                        4
                     };
                     self.action_selected = (self.action_selected + 1).min(last);
                     PanelAction::None
@@ -118,9 +121,14 @@ impl RewindPanel {
                 KeyCode::Enter => {
                     let recovery = self.entries[self.selected].recovery;
                     if (recovery && self.action_selected == 1)
-                        || (!recovery && self.action_selected == 3)
+                        || (!recovery && self.action_selected == 4)
                     {
                         return PanelAction::Close;
+                    }
+                    if !recovery && self.action_selected == 3 {
+                        return PanelAction::Fork {
+                            checkpoint_id: self.entries[self.selected].id,
+                        };
                     }
                     let mode = if recovery {
                         RestoreMode::CodeOnly
@@ -202,6 +210,7 @@ impl RewindPanel {
                         "Restore code and conversation",
                         "Restore conversation only",
                         "Restore code only",
+                        "Fork conversation from here",
                         "Cancel",
                     ]
                 };
@@ -220,5 +229,49 @@ impl RewindPanel {
                 Paragraph::new("↑↓ navigate  Enter confirm  Esc back").render(chunks[2], buf);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn checkpoint(recovery: bool) -> crate::checkpoint::Checkpoint {
+        crate::checkpoint::Checkpoint {
+            id: 7,
+            prompt: "try another approach".to_string(),
+            label: recovery.then(|| "recovery".to_string()),
+            conversation_cutoff: 3,
+            todos: Vec::new(),
+            files: Vec::new(),
+            recovery,
+        }
+    }
+
+    #[test]
+    fn fork_is_available_for_prompt_checkpoints() {
+        let mut panel = RewindPanel::new(&[checkpoint(false)]);
+        assert_eq!(panel.handle_key(key(KeyCode::Enter)), PanelAction::None);
+        for _ in 0..3 {
+            assert_eq!(panel.handle_key(key(KeyCode::Down)), PanelAction::None);
+        }
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter)),
+            PanelAction::Fork { checkpoint_id: 7 }
+        );
+    }
+
+    #[test]
+    fn recovery_checkpoints_do_not_offer_fork() {
+        let mut panel = RewindPanel::new(&[checkpoint(true)]);
+        assert_eq!(panel.handle_key(key(KeyCode::Enter)), PanelAction::None);
+        assert_eq!(panel.handle_key(key(KeyCode::Down)), PanelAction::None);
+        assert_eq!(panel.handle_key(key(KeyCode::Down)), PanelAction::None);
+        assert_eq!(panel.handle_key(key(KeyCode::Enter)), PanelAction::Close);
     }
 }

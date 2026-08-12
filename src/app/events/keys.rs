@@ -65,6 +65,10 @@ pub(crate) async fn handle_key_events(
         let action = panel.handle_key(key_event);
         match action {
             RewindAction::Close => app.rewind_panel = None,
+            RewindAction::Fork { checkpoint_id } => {
+                app.rewind_panel = None;
+                apply_rewind_fork(app, checkpoint_id);
+            }
             RewindAction::Restore {
                 checkpoint_id,
                 mode,
@@ -570,6 +574,73 @@ fn apply_rewind(
             ""
         }
     ));
+}
+
+fn apply_rewind_fork(app: &mut App<'_>, checkpoint_id: u64) {
+    let Some(source_store) = app.checkpoint_store.as_ref().cloned() else {
+        app.conversation_panel
+            .add_error_string("rewind checkpoints are unavailable");
+        return;
+    };
+    let checkpoint = {
+        let store = source_store.lock().unwrap();
+        store.checkpoint(checkpoint_id).cloned()
+    };
+    let Some(checkpoint) = checkpoint.filter(|checkpoint| !checkpoint.recovery) else {
+        app.conversation_panel
+            .add_error_string("the selected rewind checkpoint cannot be forked");
+        return;
+    };
+    if app.session.mgr.is_none() {
+        app.conversation_panel
+            .add_error_string("cannot fork without session persistence");
+        return;
+    }
+    if let Err(error) = session::save_session_checked(app) {
+        app.conversation_panel.add_error_string(format!(
+            "could not save the source session before forking: {error}"
+        ));
+        return;
+    }
+    let manager = app
+        .session
+        .mgr
+        .as_ref()
+        .expect("session manager checked above");
+    let source_uuid = app.session.uuid.clone();
+    let fork_uuid = manager.create().uuid;
+    let Some(mut fork_store) = crate::checkpoint::CheckpointStore::for_session(&fork_uuid) else {
+        app.conversation_panel
+            .add_error_string("could not create rewind history for the fork");
+        return;
+    };
+    if let Err(error) =
+        fork_store.copy_conversation_history_before(&source_store.lock().unwrap(), checkpoint_id)
+    {
+        app.conversation_panel.add_error_string(format!(
+            "could not create rewind history for the fork: {error}"
+        ));
+        return;
+    }
+
+    commands::invalidate_auto_compaction(app);
+    app.session.uuid = fork_uuid.clone();
+    app.session.did_save = false;
+    app.conversation_panel
+        .truncate(checkpoint.conversation_cutoff);
+    app.input_panel.set_content(&checkpoint.prompt);
+    app.todo_list = crate::todos::TodoList {
+        todos: checkpoint.todos,
+    };
+    app.sync_todos_to_store();
+    app.pending_images.clear();
+    app.checkpoint_store = Some(std::sync::Arc::new(std::sync::Mutex::new(fork_store)));
+    app.current_checkpoint_id = None;
+    session::mark_dirty(app);
+    app.conversation_panel.add_info_string(format!(
+        "Forked prompt #{checkpoint_id} into session {fork_uuid}. Source session {source_uuid} was preserved; prompt returned to the input."
+    ));
+    session::save_session(app);
 }
 
 fn is_promote_shortcut(key: KeyEvent) -> bool {
