@@ -239,25 +239,6 @@ impl ProviderManager {
         format!("{}/{}", self.default_provider, model)
     }
 
-    /// The model string to use for Auto-mode tool-call classification when no
-    /// global `classifier_model` is configured.
-    ///
-    /// Resolution: provider's `classifier_model` → `default_model` → first in
-    /// list → `"default"`.
-    pub fn default_classifier_model(&self) -> String {
-        let config = self.configs.get(&self.default_provider);
-        let model = config
-            .and_then(|c| c.classifier_model.as_deref())
-            .or_else(|| config.and_then(|c| c.default_model.as_deref()))
-            .or_else(|| {
-                self.models
-                    .get(&self.default_provider)
-                    .and_then(|m| m.first().map(|s| s.as_str()))
-            })
-            .unwrap_or("default");
-        format!("{}/{}", self.default_provider, model)
-    }
-
     pub fn provider_names(&self) -> Vec<&str> {
         self.configs.keys().map(|s| s.as_str()).collect()
     }
@@ -340,7 +321,6 @@ mod tests {
                 api_key: "unused".to_string(),
                 models: None,
                 default_model: None,
-                classifier_model: None,
             },
         );
         let config = ProgrammerConfig {
@@ -348,6 +328,9 @@ mod tests {
             providers,
             classifier_model: None,
             classifier_top_logprobs: crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS,
+            compact_model: None,
+            auto_compact_tokens: 100_000,
+            compact_keep_recent_turns: 2,
             allow_yolo: false,
             security: Default::default(),
             security_profiles: Default::default(),

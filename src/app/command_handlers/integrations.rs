@@ -8,6 +8,7 @@
 use super::CommandOutcome;
 use crate::app::App;
 use crate::commands::Command;
+use crate::ui::components::diagnostics_panel::DiagnosticsPanel;
 use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::provider_panel::ProviderPanel;
 use crate::ui::components::skills_panel::SkillsPanel;
@@ -19,9 +20,26 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::Providers(arg) => providers(app, &arg),
         Command::Skill(arg) => skill(app, &arg),
         Command::Mcp(arg) => mcp(app, &arg),
+        Command::Diagnostics(arg) => diagnostics(app, &arg),
         _ => unreachable!("integrations handler received a command from another domain"),
     }
     CommandOutcome::handled(true)
+}
+
+fn diagnostics(app: &mut App<'_>, arg: &str) {
+    match arg.trim() {
+        "manage" => match DiagnosticsPanel::load() {
+            Ok(panel) => app.diagnostics_panel = Some(panel),
+            Err(error) => app
+                .conversation_panel
+                .add_error_string(format!("could not open diagnostics profile: {error}")),
+        },
+        "update" | "refresh" => crate::app::diagnostics::start_update(app, true),
+        _ => app.conversation_panel.add_info_string(
+            "usage: /diagnostics manage — edit .programmer/diagnostics.toml\n\
+             \u{20}      /diagnostics update — re-run checkers and refresh current findings",
+        ),
+    }
 }
 
 fn providers(app: &mut App<'_>, arg: &str) {

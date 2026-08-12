@@ -56,6 +56,8 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
     if typed.is_empty() {
         return;
     }
+    let draft = app.input_panel.draft_snapshot();
+    let history_text = typed.clone();
     let pasted_images = app.input_panel.take_images();
     // History keeps the compact `@path` form; the model receives a path-only
     // reference for regular files or a stored image for image paths. The
@@ -80,7 +82,14 @@ pub(crate) async fn send_message(app: &mut App<'_>) {
             "omitted {omitted} image(s): attachment count or total size exceeds the per-message limit"
         ));
     }
-    start_request_with_images(app, expanded.text, images).await;
+    start_request_as_with_images(
+        app,
+        expanded.text,
+        InputRole::User,
+        images,
+        Some((draft, history_text)),
+    )
+    .await;
 }
 
 pub(crate) async fn start_request_with_images(
@@ -88,13 +97,13 @@ pub(crate) async fn start_request_with_images(
     text: String,
     images: Vec<async_openai::types::responses::InputImageContent>,
 ) {
-    start_request_as_with_images(app, text, InputRole::User, images).await;
+    start_request_as_with_images(app, text, InputRole::User, images, None).await;
 }
 
 /// Start a turn from a message with the given role. `User` is a normal user
 /// message; `Developer` carries a hidden instruction (like `/init`).
 pub(crate) async fn start_request_as(app: &mut App<'_>, text: String, role: InputRole) {
-    start_request_as_with_images(app, text, role, Vec::new()).await;
+    start_request_as_with_images(app, text, role, Vec::new(), None).await;
 }
 
 async fn start_request_as_with_images(
@@ -102,6 +111,10 @@ async fn start_request_as_with_images(
     text: String,
     role: InputRole,
     images: Vec<async_openai::types::responses::InputImageContent>,
+    original_draft: Option<(
+        crate::ui::components::input_panel::input_panel::InputDraft,
+        String,
+    )>,
 ) {
     // active_id is the lifecycle authority. UI phases are presentation state
     // and can briefly lag the runner; they must never decide whether two turns
@@ -116,7 +129,7 @@ async fn start_request_as_with_images(
         return;
     }
 
-    start_ready_request(app, vec![(text, role, images)]).await;
+    start_ready_request(app, vec![(text, role, images)], original_draft).await;
 }
 
 /// Start one turn containing any completed task/sub-agent updates and an
@@ -149,7 +162,7 @@ pub(crate) async fn start_runtime_update_request(
     if let Some((text, images)) = pending_user {
         inputs.push((text, InputRole::User, images));
     }
-    start_ready_request(app, inputs).await;
+    start_ready_request(app, inputs, None).await;
 }
 
 fn format_agent_updates(agents: &[crate::agents::AgentSnapshot]) -> String {
@@ -187,8 +200,31 @@ fn format_agent_updates(agents: &[crate::agents::AgentSnapshot]) -> String {
 async fn start_ready_request(
     app: &mut App<'_>,
     inputs: Vec<(String, InputRole, Vec<InputImageContent>)>,
+    original_draft: Option<(
+        crate::ui::components::input_panel::input_panel::InputDraft,
+        String,
+    )>,
 ) {
     debug_assert!(app.cancel.active_id.is_none());
+    let conversation_cutoff = app.conversation_panel.items_snapshot().len();
+    let user_prompt = inputs
+        .iter()
+        .find(|(_, role, _)| matches!(role, InputRole::User))
+        .map(|(text, _, _)| text.clone());
+    app.current_checkpoint_id = None;
+    if let (Some(prompt), Some(store)) = (user_prompt, app.checkpoint_store.as_ref()) {
+        let cutoff = app.conversation_panel.items_snapshot().len();
+        match store
+            .lock()
+            .unwrap()
+            .begin(prompt, cutoff, app.todo_list.todos.clone())
+        {
+            Ok(id) => app.current_checkpoint_id = Some(id),
+            Err(error) => app
+                .conversation_panel
+                .add_warning_string(format!("could not create rewind checkpoint: {error}")),
+        }
+    }
     for (text, role, images) in inputs {
         let content = ordered_message_content(text, images);
         app.conversation_panel
@@ -208,9 +244,19 @@ async fn start_ready_request(
     app.cancel.next_id = app.cancel.next_id.wrapping_add(1);
     let operation_id = app.cancel.next_id;
     app.cancel.active_id = Some(operation_id);
+    app.cancel.turn_conversation_cutoff = Some(conversation_cutoff);
+    app.cancel.response_started = false;
+    app.cancel.active_user_request =
+        original_draft.map(|(draft, history_text)| super::ActiveUserRequest {
+            draft,
+            conversation_cutoff,
+            history_text,
+        });
 
     let Some(runner) = app.build_runner() else {
         app.cancel.active_id = None;
+        app.cancel.turn_conversation_cutoff = None;
+        app.cancel.active_user_request = None;
         app.conversation_panel
             .add_error_string(format!("unknown provider/model: {}", app.current_model));
         return;
@@ -409,12 +455,7 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
     }
 }
 
-/// `/compact [provider/model]`: ask the model for a continuation summary of the
-/// conversation so far, then (in [`super::events`]'s `CompactFinished` handler)
-/// install it as a context boundary — the model afterwards sees the summary
-/// instead of the summarized history, while the UI keeps everything visible.
-/// An argument picks a different model for the summarization request only; the
-/// chat model is unchanged.
+/// Build the no-tools request shared by foreground and background compaction.
 fn build_compact_request(
     input_items: Vec<async_openai::types::responses::InputItem>,
     model_name: String,
@@ -428,50 +469,11 @@ fn build_compact_request(
     }
 }
 
-pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
-    use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
-    use crate::ui::event::Event;
-    use async_openai::types::responses::{
-        InputItem, InputParam, Item, OutputItem, OutputMessageContent,
-    };
-
-    if app.cancel.active_id.is_some() {
-        app.conversation_panel
-            .add_warning_string("cannot compact while a turn is in flight");
-        return;
-    }
-    if !app.conversation_panel.has_compactable_history() {
-        app.conversation_panel
-            .add_info_string("nothing to compact yet".to_string());
-        return;
-    }
-    let target_model = if model_arg.is_empty() {
-        app.current_model.clone()
-    } else {
-        model_arg.to_string()
-    };
-    let (client, model_name) = match app.provider_manager.resolve(&target_model) {
-        Some((c, m)) => (c.clone(), m),
-        None => {
-            app.conversation_panel
-                .add_error_string(format!("unknown provider/model: {target_model}"));
-            return;
-        }
-    };
-    if !model_arg.is_empty() {
-        app.conversation_panel
-            .add_info_string(format!("compacting with {target_model}"));
-    }
-
-    // The full current context plus the summarization instruction. No tools:
-    // the model must answer with the summary text, not act.
-    let mut input_items = match app.conversation_panel.get_input_param(
-        &target_model,
-        None,
-        None,
-        None,
-        app.vision_enabled,
-    ) {
+fn compact_input_items(
+    input: async_openai::types::responses::InputParam,
+) -> Vec<async_openai::types::responses::InputItem> {
+    use async_openai::types::responses::{InputItem, InputParam, Item};
+    let mut items = match input {
         InputParam::Items(items) => items,
         InputParam::Text(text) => vec![InputItem::from(Item::Message(ApiMessageItem::Input(
             InputMessage {
@@ -481,7 +483,7 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
             },
         )))],
     };
-    input_items.push(InputItem::from(Item::Message(ApiMessageItem::Input(
+    items.push(InputItem::from(Item::Message(ApiMessageItem::Input(
         InputMessage {
             content: vec![InputContent::InputText(InputTextContent {
                 text: crate::prompts::COMPACT_PROMPT.to_string(),
@@ -490,6 +492,72 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
             status: Some(OutputStatus::Completed),
         },
     ))));
+    items
+}
+
+fn compact_response_text(
+    response: async_openai::types::responses::Response,
+) -> Result<String, String> {
+    use async_openai::types::responses::{OutputItem, OutputMessageContent};
+    let text = response
+        .output
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::Message(message) => {
+                Some(message.content.iter().filter_map(|content| match content {
+                    OutputMessageContent::OutputText(text) => Some(text.text.as_str()),
+                    _ => None,
+                }))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        Err("the model returned an empty summary".to_string())
+    } else {
+        Ok(text)
+    }
+}
+
+pub(crate) fn start_compact(app: &mut App<'_>) {
+    use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
+    use crate::ui::event::Event;
+
+    if app.cancel.active_id.is_some() {
+        app.conversation_panel
+            .add_warning_string("cannot compact while a turn is in flight");
+        return;
+    }
+    invalidate_auto_compaction(app);
+    let Some(cutoff) = app
+        .conversation_panel
+        .compaction_cutoff(app.effective_compact_keep_recent_turns())
+    else {
+        app.conversation_panel
+            .add_info_string("nothing old enough to compact yet".to_string());
+        return;
+    };
+    let target_model = app.effective_compact_model();
+    let (client, model_name) = match app.provider_manager.resolve(&target_model) {
+        Some((c, m)) => (c.clone(), m),
+        None => {
+            app.conversation_panel
+                .add_error_string(format!("unknown provider/model: {target_model}"));
+            return;
+        }
+    };
+    app.conversation_panel
+        .add_info_string(format!("compacting with {target_model}"));
+
+    // The full current context plus the summarization instruction. No tools:
+    // the model must answer with the summary text, not act.
+    let input_items = compact_input_items(app.conversation_panel.input_param_for_prefix(
+        cutoff,
+        &target_model,
+        app.vision_enabled,
+    ));
 
     app.conversation_panel.phase = ActivePhase::Compacting;
     app.cancel.active = crate::cancel::CancellationToken::new();
@@ -507,28 +575,7 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
             .wait_or(client.responses().create(request))
             .await
         {
-            Some(Ok(response)) => {
-                let text = response
-                    .output
-                    .iter()
-                    .filter_map(|item| match item {
-                        OutputItem::Message(msg) => {
-                            Some(msg.content.iter().filter_map(|c| match c {
-                                OutputMessageContent::OutputText(t) => Some(t.text.as_str()),
-                                _ => None,
-                            }))
-                        }
-                        _ => None,
-                    })
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if text.trim().is_empty() {
-                    Err("the model returned an empty summary".to_string())
-                } else {
-                    Ok(text)
-                }
-            }
+            Some(Ok(response)) => compact_response_text(response),
             Some(Err(e)) => Err(e.to_string()),
             None => Err("cancelled".to_string()),
         };
@@ -536,10 +583,79 @@ pub(crate) fn start_compact(app: &mut App<'_>, model_arg: &str) {
         // handle_compact_finished can clear active_id and reset the phase.
         let _ = sender.send(Event::App(crate::ui::event::AppEvent::CompactFinished(
             operation_id,
+            cutoff,
             result,
             cancel_token,
         )));
     });
+}
+
+/// Observe a provider-reported input-token count and, when the session's
+/// threshold is crossed, snapshot a complete historical prefix for seamless
+/// background compaction. The foreground turn and input remain interactive.
+pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) {
+    app.auto_compact.last_input_tokens = Some(input_tokens);
+    let Some(threshold) = app.effective_auto_compact_tokens() else {
+        return;
+    };
+    if input_tokens < threshold || app.auto_compact.active_id.is_some() {
+        return;
+    }
+    let stable_end = app
+        .cancel
+        .turn_conversation_cutoff
+        .unwrap_or_else(|| app.conversation_panel.items_snapshot().len());
+    let Some(cutoff) = app
+        .conversation_panel
+        .compaction_cutoff_before(app.effective_compact_keep_recent_turns(), stable_end)
+    else {
+        return;
+    };
+    if app.auto_compact.last_cutoff == Some(cutoff) {
+        return;
+    }
+    let target_model = app.effective_compact_model();
+    let Some((client, model_name)) = app.provider_manager.resolve(&target_model) else {
+        app.conversation_panel.add_warning_string(format!(
+            "automatic context compaction skipped: unknown provider/model {target_model}"
+        ));
+        app.auto_compact.last_cutoff = Some(cutoff);
+        return;
+    };
+    let client = client.clone();
+    let input_items = compact_input_items(app.conversation_panel.input_param_for_prefix(
+        cutoff,
+        &target_model,
+        app.vision_enabled,
+    ));
+    app.auto_compact.next_id = app.auto_compact.next_id.wrapping_add(1);
+    let job_id = app.auto_compact.next_id;
+    let history_epoch = app.auto_compact.history_epoch;
+    app.auto_compact.active_id = Some(job_id);
+    app.auto_compact.last_cutoff = Some(cutoff);
+    let thinking_level = app.thinking_level;
+    let sender = app.events.sender.clone();
+    tokio::spawn(async move {
+        let request = build_compact_request(input_items, model_name, thinking_level);
+        let result = client
+            .responses()
+            .create(request)
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(compact_response_text);
+        let _ = sender.send(Event::App(AppEvent::AutoCompactFinished {
+            job_id,
+            history_epoch,
+            cutoff,
+            result,
+        }));
+    });
+}
+
+pub(crate) fn invalidate_auto_compaction(app: &mut App<'_>) {
+    app.auto_compact.history_epoch = app.auto_compact.history_epoch.wrapping_add(1);
+    app.auto_compact.active_id = None;
+    app.auto_compact.last_cutoff = None;
 }
 
 /// Open the full-screen task panel. Interactive tasks can grab input; pipe
@@ -618,6 +734,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         | Command::New
         | Command::Session
         | Command::Usage
+        | Command::Rewind
         | Command::Todo
         | Command::Terminal(_)
         | Command::Help) => command_handlers::session::execute(app, command),
@@ -628,9 +745,10 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         | Command::Classifier(_)
         | Command::Thinking(_)
         | Command::Permission(_)) => command_handlers::settings::execute(app, command),
-        command @ (Command::Providers(_) | Command::Skill(_) | Command::Mcp(_)) => {
-            command_handlers::integrations::execute(app, command)
-        }
+        command @ (Command::Providers(_)
+        | Command::Skill(_)
+        | Command::Mcp(_)
+        | Command::Diagnostics(_)) => command_handlers::integrations::execute(app, command),
         command @ (Command::Init | Command::Compact(_) | Command::Plan(_)) => {
             command_handlers::workflow::execute(app, command).await
         }
@@ -663,6 +781,7 @@ mod tests {
         ProviderPanel,
         SkillsPanel,
         McpPanel,
+        DiagnosticsPanel,
         SecurityPanel,
         TodoPanel,
         Quit,
@@ -701,6 +820,7 @@ mod tests {
                 ExpectedCommandEffect::AppendedMessage,
             ),
             ("usage", "/usage", ExpectedCommandEffect::AppendedMessage),
+            ("rewind", "/rewind", ExpectedCommandEffect::AppendedMessage),
             ("mode", "/mode auto", ExpectedCommandEffect::AppendedMessage),
             (
                 "classifier",
@@ -711,6 +831,11 @@ mod tests {
             ("todo", "/todo", ExpectedCommandEffect::TodoPanel),
             ("skill", "/skill manage", ExpectedCommandEffect::SkillsPanel),
             ("mcp", "/mcp manage", ExpectedCommandEffect::McpPanel),
+            (
+                "diagnostics",
+                "/diagnostics manage",
+                ExpectedCommandEffect::DiagnosticsPanel,
+            ),
             ("plan", "/plan", ExpectedCommandEffect::AppendedMessage),
             (
                 "terminal",
@@ -771,6 +896,9 @@ mod tests {
                 ExpectedCommandEffect::ProviderPanel => assert!(app.provider_panel.is_some()),
                 ExpectedCommandEffect::SkillsPanel => assert!(app.skills_panel.is_some()),
                 ExpectedCommandEffect::McpPanel => assert!(app.mcp_panel.is_some()),
+                ExpectedCommandEffect::DiagnosticsPanel => {
+                    assert!(app.diagnostics_panel.is_some())
+                }
                 ExpectedCommandEffect::SecurityPanel => assert!(app.security_panel.is_some()),
                 ExpectedCommandEffect::TodoPanel => assert!(app.todo_panel.is_some()),
                 ExpectedCommandEffect::Quit => assert!(!app.running),

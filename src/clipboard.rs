@@ -89,7 +89,7 @@ pub fn copy(text: &str) -> bool {
         if set_clipboard_windows(text) {
             return true;
         }
-        return osc52(text).is_ok();
+        osc52(text).is_ok()
     }
     #[cfg(not(windows))]
     {

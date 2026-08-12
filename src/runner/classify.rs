@@ -20,10 +20,8 @@
 //! calls them inline.
 
 use crate::cancel::CancellationToken;
-use crate::classifier::{Classifier, Verdict};
+use crate::classifier::{Classifier, ClassifyContext, Verdict};
 use crate::response::message_item::MessageItem;
-use async_openai::Client;
-use async_openai::config::OpenAIConfig;
 use async_openai::types::responses::{FunctionCallOutput, FunctionToolCall, OutputItem};
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -115,12 +113,8 @@ pub(crate) fn classify_sync(
 /// caller has already run the provider front gate, so every call here genuinely
 /// needs review; each is sent straight to the LLM. Returns `None` if cancelled.
 pub(crate) async fn classify_llm(
-    client: &Client<OpenAIConfig>,
-    model_name: &str,
-    top_logprobs: u8,
+    ctx: &ClassifyContext<'_>,
     no_logprobs: &Arc<Mutex<HashSet<String>>>,
-    light_context: &str,
-    full_context: &str,
     calls: Vec<FunctionToolCall>,
     cancel: &CancellationToken,
 ) -> Option<ClassificationOutcome> {
@@ -134,20 +128,16 @@ pub(crate) async fn classify_llm(
             if cancel.is_cancelled() {
                 return None;
             }
-            let try_logprobs = !no_logprobs.lock().unwrap().contains(model_name);
+            let try_logprobs = !no_logprobs.lock().unwrap().contains(ctx.model);
             let outcome = crate::classifier::classify_tool_call(
-                client,
-                model_name,
+                ctx,
                 &call.name,
                 &call.arguments,
-                light_context,
-                full_context,
                 try_logprobs,
-                top_logprobs,
             )
             .await;
             if outcome.logprobs_missing {
-                no_logprobs.lock().unwrap().insert(model_name.to_string());
+                no_logprobs.lock().unwrap().insert(ctx.model.to_string());
             }
 
             Some(match outcome.verdict {

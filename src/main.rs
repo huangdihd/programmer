@@ -22,6 +22,7 @@ use std::path::Path;
 mod agents;
 mod app;
 mod cancel;
+mod checkpoint;
 mod classifier;
 mod cli;
 mod clipboard;
@@ -61,7 +62,7 @@ async fn build_mcp_classifier() -> Option<(
     let model = config
         .classifier_model
         .clone()
-        .unwrap_or_else(|| pm.default_classifier_model());
+        .unwrap_or_else(|| pm.default_model());
     pm.resolve(&model)
         .map(|(client, name)| (client.clone(), name, config.classifier_top_logprobs))
 }

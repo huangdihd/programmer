@@ -57,6 +57,8 @@ pub enum AppEvent {
     /// The runner's turn moved to a new phase (classifying, running tools, …).
     /// Tagged with the operation id.
     RunnerPhase(u64, crate::runner::RunnerPhase),
+    /// Real input usage reported by a response at a call/output-safe point.
+    UsageSafePoint(u64, u32),
     /// The runner asks the user to review a tool call the classifier flagged
     /// (`Ask` verdict). Carries the call, the classifier's reason, the call's
     /// 1-based position and batch total, and the oneshot the decision goes
@@ -82,7 +84,15 @@ pub enum AppEvent {
     /// context boundary, `Err` the error to surface. The token identifies the
     /// run so a summary from a cancelled compaction is dropped. Tagged with
     /// the operation id.
-    CompactFinished(u64, Result<String, String>, CancellationToken),
+    CompactFinished(u64, usize, Result<String, String>, CancellationToken),
+    /// A seamless background compaction finished. The job id and history
+    /// epoch make stale summaries harmless after clear/rewind/session changes.
+    AutoCompactFinished {
+        job_id: u64,
+        history_epoch: u64,
+        cutoff: usize,
+        result: Result<String, String>,
+    },
     /// A background process entered a terminal state.
     TaskStateChanged(crate::tasks::TaskLifecycleEvent),
     /// An in-process sub-agent entered a terminal state.
@@ -136,6 +146,12 @@ pub enum AppEvent {
         generation: u64,
         manager: Box<crate::mcp::McpManager>,
     },
+    /// `/diagnostics update` finished collecting the project profile. A
+    /// missing snapshot means no diagnostics profile is configured.
+    DiagnosticsUpdated {
+        generation: u64,
+        snapshot: Option<crate::diagnostics::Snapshot>,
+    },
     /// The `ask_user` tool is prompting the user. Carries the question and a
     /// oneshot sender that the UI uses to send the answer back. Tagged with
     /// the operation id so questions from stale turns are dropped.
@@ -181,6 +197,11 @@ impl std::fmt::Debug for AppEvent {
                 .finish(),
             Self::ResponseCommitted(id) => f.debug_tuple("ResponseCommitted").field(id).finish(),
             Self::RunnerPhase(id, _) => f.debug_tuple("RunnerPhase").field(id).finish(),
+            Self::UsageSafePoint(id, tokens) => f
+                .debug_tuple("UsageSafePoint")
+                .field(id)
+                .field(tokens)
+                .finish(),
             Self::ReviewRequest {
                 call, operation_id, ..
             } => f
@@ -193,10 +214,16 @@ impl std::fmt::Debug for AppEvent {
                 .field(id)
                 .field(&r.as_ref().map(|_| "..").map_err(|e| e.to_string()))
                 .finish(),
-            Self::CompactFinished(id, r, _) => f
+            Self::CompactFinished(id, cutoff, r, _) => f
                 .debug_tuple("CompactFinished")
                 .field(id)
+                .field(cutoff)
                 .field(&r.as_ref().map(|_| ".."))
+                .finish(),
+            Self::AutoCompactFinished { job_id, result, .. } => f
+                .debug_struct("AutoCompactFinished")
+                .field("job_id", job_id)
+                .field("result", &result.as_ref().map(|_| ".."))
                 .finish(),
             Self::TaskStateChanged(event) => f
                 .debug_tuple("TaskStateChanged")
@@ -240,6 +267,14 @@ impl std::fmt::Debug for AppEvent {
             Self::McpReloaded { generation, .. } => f
                 .debug_struct("McpReloaded")
                 .field("generation", generation)
+                .finish(),
+            Self::DiagnosticsUpdated {
+                generation,
+                snapshot,
+            } => f
+                .debug_struct("DiagnosticsUpdated")
+                .field("generation", generation)
+                .field("configured", &snapshot.is_some())
                 .finish(),
             Self::QuestionPrompt {
                 question,

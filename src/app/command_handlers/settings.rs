@@ -486,56 +486,73 @@ fn mode(app: &mut App<'_>, arg: &str) -> CommandOutcome {
 fn classifier(app: &mut App<'_>, arg: &str) -> CommandOutcome {
     let parts = arg.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
-        [] => {
-            let current = app
-                .config
-                .classifier_model
-                .clone()
-                .unwrap_or_else(|| format!("{} (chat model)", app.current_model));
+        [] | ["show"] => {
+            let source = match &app.session.classifier_model_override {
+                crate::session::ModelOverride::Inherit => "global",
+                crate::session::ModelOverride::Current => "session: current chat model",
+                crate::session::ModelOverride::Model(_) => "session",
+            };
+            let logprobs_source = if app.session.classifier_top_logprobs_override.is_some() {
+                "session"
+            } else {
+                "global"
+            };
             app.conversation_panel.add_info_string(format!(
-                "classifier model: {current}\n\
-                 classifier top logprobs: {}\n\
-                 usage: /classifier <provider/model> to set the model, \
-                 /classifier logprobs <0-20> to set the fast-probe alternatives, \
-                 /classifier clear to reset to the chat model",
-                app.config.classifier_top_logprobs
+                "classifier model: {} ({source})\n\
+                 classifier top logprobs: {} ({logprobs_source})\n\
+                 usage: /classifier <provider/model|current|default>, \
+                 /classifier logprobs <0-20|default>",
+                app.effective_classifier_model(),
+                app.effective_classifier_top_logprobs()
             ));
         }
         ["clear" | "default" | "reset"] => {
-            app.config.classifier_model = None;
+            app.session.classifier_model_override = crate::session::ModelOverride::Inherit;
             app.conversation_panel
-                .add_info_string("classifier model reset — Auto mode now uses the chat model");
-            session::persist_config(app);
+                .add_info_string("classifier model now inherits the global setting");
+            session::mark_dirty(app);
+        }
+        ["current"] => {
+            app.session.classifier_model_override = crate::session::ModelOverride::Current;
+            app.conversation_panel
+                .add_info_string("classifier model set to the current chat model for this session");
+            session::mark_dirty(app);
+        }
+        ["logprobs" | "top-logprobs" | "top_logprobs", "default"] => {
+            app.session.classifier_top_logprobs_override = None;
+            app.conversation_panel
+                .add_info_string("classifier top logprobs now inherits the global setting");
+            session::mark_dirty(app);
         }
         ["logprobs" | "top-logprobs" | "top_logprobs", value] => {
             match parse_classifier_top_logprobs(value) {
                 Ok(top_logprobs) => {
-                    app.config.classifier_top_logprobs = top_logprobs;
-                    app.conversation_panel
-                        .add_info_string(format!("classifier top logprobs set to: {top_logprobs}"));
-                    session::persist_config(app);
+                    app.session.classifier_top_logprobs_override = Some(top_logprobs);
+                    app.conversation_panel.add_info_string(format!(
+                        "classifier top logprobs set to {top_logprobs} for this session"
+                    ));
+                    session::mark_dirty(app);
                 }
                 Err(error) => app.conversation_panel.add_error_string(error),
             }
         }
         ["logprobs" | "top-logprobs" | "top_logprobs"] => app
             .conversation_panel
-            .add_error_string("usage: /classifier logprobs <0-20>".to_string()),
+            .add_error_string("usage: /classifier logprobs <0-20|default>".to_string()),
         [model] => match app.provider_manager.resolve(model) {
             Some(_) => {
-                app.config.classifier_model = Some((*model).to_string());
+                app.session.classifier_model_override =
+                    crate::session::ModelOverride::Model((*model).to_string());
                 app.conversation_panel
-                    .add_info_string(format!("classifier model set to: {model}"));
-                session::persist_config(app);
+                    .add_info_string(format!("classifier model set to {model} for this session"));
+                session::mark_dirty(app);
             }
-            None => {
-                app.conversation_panel.add_error_string(format!(
-                    "unknown provider/model: {model} — use /providers to list available"
-                ));
-            }
+            None => app.conversation_panel.add_error_string(format!(
+                "unknown provider/model: {model} — use /providers to list available"
+            )),
         },
         _ => app.conversation_panel.add_error_string(
-            "usage: /classifier [provider/model | clear | logprobs <0-20>]".to_string(),
+            "usage: /classifier [show | provider/model | current | default | logprobs <0-20|default>]",
         ),
     }
     CommandOutcome::handled(true)

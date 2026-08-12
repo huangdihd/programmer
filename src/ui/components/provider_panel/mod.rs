@@ -24,6 +24,7 @@ use crate::config::programmer_config::{ProgrammerConfig, ProviderConfig};
 use crate::providers::ProviderManager;
 use crate::ui::components::completion_popup::CompletionPopup;
 use crate::ui::components::panel_search::{PanelSearch, SearchKey};
+use crate::ui::markdown_theme::palette;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -70,6 +71,13 @@ struct Form {
 }
 
 #[derive(Debug)]
+struct GlobalForm {
+    fields: [String; 3],
+    focus: usize,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
 enum Mode {
     List,
     ConfirmDelete(String),
@@ -80,6 +88,12 @@ enum Mode {
         filter: String,
         selected: usize,
     },
+    RoleMenu {
+        provider: String,
+        model: String,
+        selected: usize,
+    },
+    GlobalSettings(GlobalForm),
 }
 
 #[derive(Debug)]
@@ -87,6 +101,15 @@ pub struct ProviderPanel {
     mode: Mode,
     selected: usize,
     search: PanelSearch,
+}
+
+fn rename_global_model_provider(value: &mut Option<String>, old: &str, new: &str) {
+    if let Some(model) = value
+        && let Some((provider, name)) = model.split_once('/')
+        && provider == old
+    {
+        *model = format!("{new}/{name}");
+    }
 }
 
 impl ProviderPanel {
@@ -132,6 +155,8 @@ impl ProviderPanel {
             Mode::ConfirmDelete(_) => self.handle_confirm_key(key, config),
             Mode::Form(_) => self.handle_form_key(key, config, pm),
             Mode::Models { .. } => self.handle_models_key(key, config, pm),
+            Mode::RoleMenu { .. } => self.handle_role_key(key, config),
+            Mode::GlobalSettings(_) => self.handle_global_settings_key(key, config),
         }
     }
 
@@ -180,6 +205,17 @@ impl ProviderPanel {
                 }
             }
             KeyCode::Char('r') => return PanelAction::RefreshModels,
+            KeyCode::Char('g') => {
+                self.mode = Mode::GlobalSettings(GlobalForm {
+                    fields: [
+                        config.classifier_top_logprobs.to_string(),
+                        config.auto_compact_tokens.to_string(),
+                        config.compact_keep_recent_turns.to_string(),
+                    ],
+                    focus: 0,
+                    error: None,
+                });
+            }
             KeyCode::Char('e') => {
                 if let Some(name) = names.get(self.selected) {
                     let p = &config.providers[name];
@@ -223,6 +259,20 @@ impl ProviderPanel {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let name = name.clone();
                 config.providers.remove(&name);
+                if config
+                    .classifier_model
+                    .as_deref()
+                    .is_some_and(|model| model.starts_with(&format!("{name}/")))
+                {
+                    config.classifier_model = None;
+                }
+                if config
+                    .compact_model
+                    .as_deref()
+                    .is_some_and(|model| model.starts_with(&format!("{name}/")))
+                {
+                    config.compact_model = None;
+                }
                 // Keep default_provider pointing at something that exists.
                 if config.default_provider == name {
                     config.default_provider = Self::sorted_names(config)
@@ -388,6 +438,8 @@ impl ProviderPanel {
                     if config.default_provider == *original {
                         config.default_provider = name.clone();
                     }
+                    rename_global_model_provider(&mut config.classifier_model, original, &name);
+                    rename_global_model_provider(&mut config.compact_model, original, &name);
                 }
                 config.providers.insert(
                     name.clone(),
@@ -396,7 +448,6 @@ impl ProviderPanel {
                         api_key,
                         models: None,
                         default_model: (!default_model.is_empty()).then_some(default_model),
-                        classifier_model: None,
                     },
                 );
                 // First provider ever: make it the default.
@@ -446,7 +497,7 @@ impl ProviderPanel {
     fn handle_models_key(
         &mut self,
         key: KeyEvent,
-        config: &mut ProgrammerConfig,
+        _config: &mut ProgrammerConfig,
         pm: &ProviderManager,
     ) -> PanelAction {
         let Mode::Models {
@@ -458,15 +509,23 @@ impl ProviderPanel {
             unreachable!("handle_models_key called outside Models mode");
         };
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc => {
                 self.mode = Mode::List;
                 return PanelAction::None;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 *selected = selected.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                *selected = selected.saturating_add(1);
+            KeyCode::Down => {
+                let needle = filter.to_lowercase();
+                let match_count = pm
+                    .models_for(provider)
+                    .iter()
+                    .filter(|model| model.to_lowercase().contains(&needle))
+                    .count();
+                *selected = selected
+                    .saturating_add(1)
+                    .min(match_count.saturating_sub(1));
             }
             KeyCode::Backspace => {
                 filter.pop();
@@ -485,11 +544,107 @@ impl ProviderPanel {
                     .collect();
                 let sel = (*selected).min(filtered.len().saturating_sub(1));
                 if let Some(model) = filtered.get(sel) {
-                    if let Some(pc) = config.providers.get_mut(provider) {
-                        pc.default_model = Some(model.to_string());
+                    self.mode = Mode::RoleMenu {
+                        provider: provider.clone(),
+                        model: model.to_string(),
+                        selected: 0,
+                    };
+                }
+            }
+            _ => {}
+        }
+        PanelAction::None
+    }
+
+    fn handle_role_key(&mut self, key: KeyEvent, config: &mut ProgrammerConfig) -> PanelAction {
+        let Mode::RoleMenu {
+            provider,
+            model,
+            selected,
+        } = &mut self.mode
+        else {
+            unreachable!("handle_role_key called outside RoleMenu mode");
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Models {
+                    provider: provider.clone(),
+                    filter: String::new(),
+                    selected: 0,
+                };
+                PanelAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+                PanelAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1).min(4);
+                PanelAction::None
+            }
+            KeyCode::Enter => {
+                let qualified = format!("{provider}/{model}");
+                match *selected {
+                    0 => {
+                        if let Some(provider_config) = config.providers.get_mut(provider) {
+                            provider_config.default_model = Some(model.clone());
+                        }
                     }
-                    self.mode = Mode::List;
-                    return PanelAction::Saved;
+                    1 => config.classifier_model = Some(qualified),
+                    2 => config.compact_model = Some(qualified),
+                    3 => config.classifier_model = None,
+                    4 => config.compact_model = None,
+                    _ => unreachable!(),
+                }
+                self.mode = Mode::List;
+                PanelAction::Saved
+            }
+            _ => PanelAction::None,
+        }
+    }
+
+    fn handle_global_settings_key(
+        &mut self,
+        key: KeyEvent,
+        config: &mut ProgrammerConfig,
+    ) -> PanelAction {
+        let Mode::GlobalSettings(form) = &mut self.mode else {
+            unreachable!("handle_global_settings_key called outside GlobalSettings mode");
+        };
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::List,
+            KeyCode::Tab | KeyCode::Down => form.focus = (form.focus + 1) % form.fields.len(),
+            KeyCode::BackTab | KeyCode::Up => {
+                form.focus = (form.focus + form.fields.len() - 1) % form.fields.len();
+            }
+            KeyCode::Backspace => {
+                form.fields[form.focus].pop();
+            }
+            KeyCode::Char(character) if character.is_ascii_digit() => {
+                form.fields[form.focus].push(character);
+            }
+            KeyCode::Enter => {
+                let parsed = (
+                    form.fields[0].parse::<u8>(),
+                    form.fields[1].parse::<u32>(),
+                    form.fields[2].parse::<usize>(),
+                );
+                match parsed {
+                    (Ok(top), Ok(tokens), Ok(keep))
+                        if top <= crate::consts::MAX_CLASSIFIER_TOP_LOGPROBS =>
+                    {
+                        config.classifier_top_logprobs = top;
+                        config.auto_compact_tokens = tokens;
+                        config.compact_keep_recent_turns = keep;
+                        self.mode = Mode::List;
+                        return PanelAction::Saved;
+                    }
+                    _ => {
+                        form.error = Some(
+                            "logprobs must be 0-20; tokens and keep must be non-negative integers"
+                                .to_string(),
+                        );
+                    }
                 }
             }
             _ => {}
@@ -623,6 +778,8 @@ impl ProviderPanel {
                     Span::styled(" models  ", Style::default().fg(Color::Gray)),
                     Span::styled("r", Style::default().fg(Color::Cyan).bold()),
                     Span::styled(" refresh  ", Style::default().fg(Color::Gray)),
+                    Span::styled("g", Style::default().fg(Color::Cyan).bold()),
+                    Span::styled(" global settings  ", Style::default().fg(Color::Gray)),
                 ];
                 help.extend(PanelSearch::help_spans());
                 help.extend([
@@ -777,23 +934,23 @@ impl ProviderPanel {
                 let sel = (*selected).min(filtered.len().saturating_sub(1));
                 let items: Vec<ListItem> = filtered
                     .iter()
-                    .enumerate()
-                    .map(|(i, m)| {
-                        let is_sel = i == sel;
-                        let prefix = if is_sel { "❯ " } else { "  " };
-                        let style = if is_sel {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
-                        let line = if f.is_empty() {
-                            Line::from(Span::styled(format!("{prefix}{m}"), style))
+                    .map(|m| {
+                        let style = Style::default().fg(palette::TEXT);
+                        let qualified = format!("{provider}/{m}");
+                        let is_chat = config
+                            .providers
+                            .get(provider)
+                            .and_then(|p| p.default_model.as_deref())
+                            == Some(**m);
+                        let is_classifier =
+                            config.classifier_model.as_deref() == Some(qualified.as_str());
+                        let is_compact =
+                            config.compact_model.as_deref() == Some(qualified.as_str());
+                        let mut spans = if f.is_empty() {
+                            vec![Span::styled((*m).to_string(), style)]
                         } else {
                             let lower = m.to_lowercase();
-                            let mut spans: Vec<Span> = vec![Span::styled(prefix, style)];
+                            let mut spans = Vec::new();
                             let mut pos = 0;
                             while let Some(idx) = lower[pos..].find(&f) {
                                 let start = pos + idx;
@@ -803,37 +960,57 @@ impl ProviderPanel {
                                 }
                                 spans.push(Span::styled(
                                     m[start..end].to_string(),
-                                    style.add_modifier(Modifier::UNDERLINED),
+                                    Style::default()
+                                        .fg(palette::BLUE)
+                                        .add_modifier(Modifier::BOLD),
                                 ));
                                 pos = end;
                             }
                             if pos < m.len() {
                                 spans.push(Span::styled(m[pos..].to_string(), style));
                             }
-                            Line::from(spans)
+                            spans
                         };
-                        ListItem::new(line)
+                        if is_chat {
+                            spans.push(Span::styled("  chat", Style::default().fg(palette::GREEN)));
+                        }
+                        if is_classifier {
+                            spans.push(Span::styled(
+                                "  classifier",
+                                Style::default().fg(palette::PURPLE),
+                            ));
+                        }
+                        if is_compact {
+                            spans.push(Span::styled(
+                                "  compact",
+                                Style::default().fg(palette::CYAN),
+                            ));
+                        }
+                        ListItem::new(Line::from(spans))
                     })
                     .collect();
 
-                let list_area = Rect {
-                    y: chunks[1].y,
-                    height: chunks[1].height + chunks[2].height,
-                    ..chunks[1]
-                };
+                // The provider list is rendered first for list/confirmation
+                // modes. This mode replaces it, so clear both replacement
+                // regions before drawing or the provider highlight background
+                // leaks through model spans that only set a foreground color.
+                let list_area = chunks[1];
+                Clear.render(list_area, buf);
+                Clear.render(chunks[2], buf);
                 let list = List::new(items)
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Cyan))
+                            .border_style(Style::default().fg(palette::BORDER))
+                            .title_style(Style::default().fg(palette::BLUE).bold())
                             .title(title),
                     )
                     .highlight_style(
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
+                            .bg(palette::SURFACE)
                             .add_modifier(Modifier::BOLD),
-                    );
+                    )
+                    .highlight_symbol("› ");
                 let mut list_state = ListState::default();
                 if !filtered.is_empty() {
                     list_state.select(Some(sel));
@@ -842,30 +1019,111 @@ impl ProviderPanel {
 
                 let hint = if f.is_empty() {
                     Line::from(vec![
-                        Span::styled(" type", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" to filter  ", Style::default().fg(Color::Gray)),
-                        Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" navigate  ", Style::default().fg(Color::Gray)),
-                        Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-                        Span::styled(" set as default_model  ", Style::default().fg(Color::Gray)),
-                        Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" back", Style::default().fg(Color::Gray)),
+                        Span::styled("type", Style::default().fg(palette::BLUE).bold()),
+                        Span::styled(" to filter  ", Style::default().fg(palette::MUTED)),
+                        Span::styled("↑↓", Style::default().fg(palette::BLUE).bold()),
+                        Span::styled(" navigate  ", Style::default().fg(palette::MUTED)),
+                        Span::styled("Enter", Style::default().fg(palette::GREEN).bold()),
+                        Span::styled(" choose role  ", Style::default().fg(palette::MUTED)),
+                        Span::styled("Esc", Style::default().fg(palette::BLUE).bold()),
+                        Span::styled(" back", Style::default().fg(palette::MUTED)),
                     ])
                 } else {
                     Line::from(vec![
                         Span::styled(
                             format!(" filter: \"{filter}\"  "),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(palette::BLUE),
                         ),
-                        Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" navigate  ", Style::default().fg(Color::Gray)),
-                        Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-                        Span::styled(" set as default_model  ", Style::default().fg(Color::Gray)),
-                        Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" back", Style::default().fg(Color::Gray)),
+                        Span::styled("↑↓", Style::default().fg(palette::BLUE).bold()),
+                        Span::styled(" navigate  ", Style::default().fg(palette::MUTED)),
+                        Span::styled("Enter", Style::default().fg(palette::GREEN).bold()),
+                        Span::styled(" choose role  ", Style::default().fg(palette::MUTED)),
+                        Span::styled("Esc", Style::default().fg(palette::BLUE).bold()),
+                        Span::styled(" back", Style::default().fg(palette::MUTED)),
                     ])
                 };
                 Paragraph::new(hint).render(chunks[2], buf);
+            }
+            Mode::RoleMenu {
+                provider,
+                model,
+                selected,
+            } => {
+                Clear.render(chunks[1], buf);
+                Clear.render(chunks[2], buf);
+                let choices = [
+                    "Set as provider chat default",
+                    "Set as global classifier model",
+                    "Set as global compact model",
+                    "Clear global classifier model",
+                    "Clear global compact model",
+                ];
+                let items = choices.iter().enumerate().map(|(index, choice)| {
+                    let style = if index == *selected {
+                        Style::default()
+                            .fg(palette::BLUE)
+                            .bg(palette::SURFACE)
+                            .bold()
+                    } else {
+                        Style::default().fg(palette::TEXT)
+                    };
+                    ListItem::new(Line::from(Span::styled(*choice, style)))
+                });
+                let list = List::new(items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(palette::BORDER))
+                        .title_style(Style::default().fg(palette::BLUE).bold())
+                        .title(format!(" Model role: {provider}/{model} ")),
+                );
+                let mut state = ListState::default().with_selected(Some(*selected));
+                ratatui::widgets::StatefulWidget::render(list, chunks[1], buf, &mut state);
+                Paragraph::new("↑↓ navigate  Enter apply globally  Esc back")
+                    .render(chunks[2], buf);
+            }
+            Mode::GlobalSettings(form) => {
+                Clear.render(chunks[1], buf);
+                Clear.render(chunks[2], buf);
+                let labels = [
+                    "classifier_top_logprobs",
+                    "auto_compact_tokens (0=off)",
+                    "compact_keep_recent_turns",
+                ];
+                let mut lines = labels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        let style = if index == form.focus {
+                            Style::default().fg(palette::BLUE).bold()
+                        } else {
+                            Style::default().fg(palette::MUTED)
+                        };
+                        Line::from(vec![
+                            Span::styled(format!("{label:>30}: "), style),
+                            Span::styled(
+                                form.fields[index].clone(),
+                                Style::default().fg(palette::TEXT),
+                            ),
+                        ])
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(error) = &form.error {
+                    lines.push(Line::from(Span::styled(
+                        error.clone(),
+                        Style::default().fg(palette::RED),
+                    )));
+                }
+                Paragraph::new(lines)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(palette::BORDER))
+                            .title_style(Style::default().fg(palette::BLUE).bold())
+                            .title(" Global model-role settings "),
+                    )
+                    .render(chunks[1], buf);
+                Paragraph::new("Tab/arrows field  Enter save globally  Esc cancel")
+                    .render(chunks[2], buf);
             }
         }
     }
@@ -895,7 +1153,6 @@ mod tests {
                     api_key: "k".into(),
                     models: None,
                     default_model: None,
-                    classifier_model: None,
                 },
             );
         }
@@ -904,6 +1161,9 @@ mod tests {
             providers,
             classifier_model: None,
             classifier_top_logprobs: crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS,
+            compact_model: None,
+            auto_compact_tokens: 100_000,
+            compact_keep_recent_turns: 2,
             allow_yolo: false,
             security: Default::default(),
             security_profiles: Default::default(),
@@ -1010,6 +1270,73 @@ mod tests {
         );
         assert_eq!(config.default_provider, "alpha");
         assert_eq!(config.providers.len(), 1);
+    }
+
+    #[test]
+    fn model_filter_accepts_vim_letters_as_text() {
+        let mut config = config_with(&["alpha"]);
+        let mut models = HashMap::new();
+        models.insert(
+            "alpha".to_string(),
+            vec!["deepseek-chat".to_string(), "qwen-coder".to_string()],
+        );
+        let pm = ProviderManager::stub(models);
+        let mut panel = ProviderPanel::new();
+        panel.mode = Mode::Models {
+            provider: "alpha".to_string(),
+            filter: String::new(),
+            selected: 0,
+        };
+
+        for character in "deepseek".chars() {
+            assert_eq!(
+                panel.handle_key(key(KeyCode::Char(character)), &mut config, &pm),
+                PanelAction::None
+            );
+        }
+
+        assert!(matches!(
+            &panel.mode,
+            Mode::Models { filter, .. } if filter == "deepseek"
+        ));
+    }
+
+    #[test]
+    fn model_browser_clears_the_provider_list_before_rendering() {
+        let config = config_with(&["llmhub"]);
+        let mut models = HashMap::new();
+        models.insert(
+            "llmhub".to_string(),
+            vec![
+                "deepseek/deepseek-v4-flash".to_string(),
+                "deepseek/deepseek-v4-pro".to_string(),
+            ],
+        );
+        let pm = ProviderManager::stub(models);
+        let mut panel = ProviderPanel::new();
+        panel.mode = Mode::Models {
+            provider: "llmhub".to_string(),
+            filter: "deepseek".to_string(),
+            selected: 0,
+        };
+        let area = Rect::new(0, 0, 120, 14);
+        let mut buf = Buffer::empty(area);
+
+        panel.render(&config, &pm, area, &mut buf);
+
+        let rendered = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("default_model:"), "{rendered}");
+        assert!(rendered.contains("deepseek-v4-flash"), "{rendered}");
+        assert!(
+            (0..area.height).all(|y| { (0..area.width).all(|x| buf[(x, y)].bg != Color::Cyan) })
+        );
     }
 
     #[test]

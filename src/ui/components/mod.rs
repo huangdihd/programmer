@@ -16,6 +16,7 @@
 pub mod agent_panel;
 pub mod completion_popup;
 pub mod conversation_panel;
+pub mod diagnostics_panel;
 pub mod footer;
 pub mod input_panel;
 pub mod logo;
@@ -24,6 +25,7 @@ pub mod messages;
 pub mod panel_search;
 pub mod provider_panel;
 pub mod question_panel;
+pub mod rewind_panel;
 pub mod security_panel;
 pub mod sidebar;
 pub mod skills_panel;

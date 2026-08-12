@@ -29,9 +29,13 @@ pub(crate) async fn handle_key_events(
     app: &mut App<'_>,
     key_event: KeyEvent,
 ) -> color_eyre::Result<()> {
-    // ---- Esc while a turn is active: cancel before ANY panel grabs it ----
-    // (including the terminal panel and approval/question modals)
-    if key_event.code == KeyCode::Esc && app.cancel.active_id.is_some() {
+    // ---- Esc while a turn is active: cancel unless an independent overlay
+    // owns the key. Approval/question prompts belong to the active turn and
+    // intentionally are not listed here, so Esc still cancels that turn.
+    if key_event.code == KeyCode::Esc
+        && app.cancel.active_id.is_some()
+        && !independent_overlay_owns_escape(app)
+    {
         app.events.send(AppEvent::Cancel);
         return Ok(());
     }
@@ -52,6 +56,23 @@ pub(crate) async fn handle_key_events(
     if let Some(panel) = app.agent_panel.as_mut() {
         if panel.handle_key(key_event) {
             app.agent_panel = None;
+        }
+        return Ok(());
+    }
+
+    if let Some(panel) = app.rewind_panel.as_mut() {
+        use crate::ui::components::rewind_panel::PanelAction as RewindAction;
+        let action = panel.handle_key(key_event);
+        match action {
+            RewindAction::Close => app.rewind_panel = None,
+            RewindAction::Restore {
+                checkpoint_id,
+                mode,
+            } => {
+                app.rewind_panel = None;
+                apply_rewind(app, checkpoint_id, mode);
+            }
+            RewindAction::None => {}
         }
         return Ok(());
     }
@@ -182,6 +203,28 @@ pub(crate) async fn handle_key_events(
                 app.events.send(AppEvent::McpChanged);
             }
             McpAction::None => {}
+        }
+        return Ok(());
+    }
+
+    // ---- diagnostics management panel (modal) ----
+    if let Some(panel) = app.diagnostics_panel.as_mut() {
+        use crate::ui::components::diagnostics_panel::PanelAction as DiagnosticsAction;
+        match panel.handle_key(key_event) {
+            DiagnosticsAction::Close => app.diagnostics_panel = None,
+            DiagnosticsAction::Saved(profile) => {
+                match crate::app::diagnostics::save_profile(&profile) {
+                    Ok(()) => {
+                        crate::app::diagnostics::reset_diagnostics_state(app);
+                        app.diag.lsp_configured = crate::app::helpers::lsp_checker_configured();
+                        crate::app::diagnostics::start_update(app, false);
+                    }
+                    Err(error) => app
+                        .conversation_panel
+                        .add_error_string(format!("could not save diagnostics profile: {error}")),
+                }
+            }
+            DiagnosticsAction::None => {}
         }
         return Ok(());
     }
@@ -368,6 +411,167 @@ pub(crate) async fn handle_key_events(
     Ok(())
 }
 
+/// Independent UI surfaces must get the first chance to close or leave their
+/// local mode before Esc is interpreted as cancelling the active model turn.
+fn independent_overlay_owns_escape(app: &App<'_>) -> bool {
+    app.terminal_pane.is_some()
+        || app.agent_panel.is_some()
+        || app.rewind_panel.is_some()
+        || app.todo_panel.is_some()
+        || app.provider_panel.is_some()
+        || app.skills_panel.is_some()
+        || app.mcp_panel.is_some()
+        || app.diagnostics_panel.is_some()
+        || app.security_panel.is_some()
+        || app
+            .sidebar
+            .as_ref()
+            .is_some_and(|sidebar| sidebar.has_focus)
+        || app
+            .input_panel
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.visible)
+}
+
+fn apply_rewind(
+    app: &mut App<'_>,
+    checkpoint_id: u64,
+    mode: crate::ui::components::rewind_panel::RestoreMode,
+) {
+    use crate::ui::components::rewind_panel::RestoreMode;
+
+    let restore_code = matches!(
+        mode,
+        RestoreMode::CodeAndConversation | RestoreMode::CodeOnly
+    );
+    let restore_conversation = matches!(
+        mode,
+        RestoreMode::CodeAndConversation | RestoreMode::ConversationOnly
+    );
+    if restore_code
+        && (crate::tasks::snapshot_all()
+            .iter()
+            .any(|task| task.status == crate::tasks::TaskStatus::Running)
+            || app
+                .agents
+                .snapshot_all()
+                .iter()
+                .any(|agent| !agent.status.is_terminal()))
+    {
+        app.conversation_panel.add_warning_string(
+            "cannot restore files while a background task or sub-agent is running",
+        );
+        return;
+    }
+
+    let Some(store) = app.checkpoint_store.as_ref().cloned() else {
+        app.conversation_panel
+            .add_error_string("rewind checkpoints are unavailable");
+        return;
+    };
+    let checkpoint = {
+        let store = store.lock().unwrap();
+        store.checkpoint(checkpoint_id).cloned()
+    };
+    let Some(checkpoint) = checkpoint else {
+        app.conversation_panel
+            .add_error_string("the selected rewind checkpoint no longer exists");
+        return;
+    };
+
+    let mut restored_files = 0;
+    let mut recovery_id = None;
+    if restore_code {
+        let has_file_changes = store
+            .lock()
+            .unwrap()
+            .has_file_changes_for_restore(checkpoint_id);
+        if has_file_changes {
+            let conversation_cutoff = app.conversation_panel.items_snapshot().len();
+            let begin_recovery = store.lock().unwrap().begin_recovery(
+                checkpoint_id,
+                conversation_cutoff,
+                app.todo_list.todos.clone(),
+            );
+            match begin_recovery {
+                Ok(id) => recovery_id = Some(id),
+                Err(error) => {
+                    app.conversation_panel.add_error_string(format!(
+                        "could not create rewind recovery point: {error}"
+                    ));
+                    return;
+                }
+            }
+        }
+        let restore_result = store.lock().unwrap().restore_files(checkpoint_id);
+        match restore_result {
+            Ok(report) if report.conflicts.is_empty() => restored_files = report.restored,
+            Ok(report) => {
+                if let Some(recovery_id) = recovery_id {
+                    let _ = store.lock().unwrap().discard_checkpoint(recovery_id);
+                }
+                let paths = report
+                    .conflicts
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                app.conversation_panel.add_warning_string(format!(
+                    "rewind stopped: files changed outside Programmer: {paths}"
+                ));
+                return;
+            }
+            Err(error) => {
+                if let Some(recovery_id) = recovery_id {
+                    let _ = store.lock().unwrap().discard_checkpoint(recovery_id);
+                }
+                app.conversation_panel
+                    .add_error_string(format!("rewind failed: {error}"));
+                return;
+            }
+        }
+        if let Some(recovery_id) = recovery_id
+            && let Err(error) = store.lock().unwrap().finalize_recovery(recovery_id)
+        {
+            app.conversation_panel.add_warning_string(format!(
+                "files were restored, but the recovery point could not be finalized: {error}"
+            ));
+        }
+    }
+
+    if restore_conversation {
+        commands::invalidate_auto_compaction(app);
+        app.conversation_panel
+            .truncate(checkpoint.conversation_cutoff);
+        app.input_panel.set_content(&checkpoint.prompt);
+        app.todo_list = crate::todos::TodoList {
+            todos: checkpoint.todos,
+        };
+        app.sync_todos_to_store();
+        app.pending_images.clear();
+    }
+    if let Err(error) = store
+        .lock()
+        .unwrap()
+        .truncate_after(checkpoint_id, recovery_id)
+    {
+        app.conversation_panel
+            .add_warning_string(format!("could not prune rewind history: {error}"));
+    }
+    app.current_checkpoint_id = None;
+    session::mark_dirty(app);
+    app.conversation_panel.add_info_string(format!(
+        "Rewound to prompt #{checkpoint_id}: {} file(s) restored{}",
+        restored_files,
+        if restore_conversation {
+            "; prompt returned to the input"
+        } else {
+            ""
+        }
+    ));
+}
+
 fn is_promote_shortcut(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('z') && key.modifiers == KeyModifiers::CONTROL
 }
@@ -527,6 +731,9 @@ pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
         return;
     }
     let data = data.replace("\r\n", "\n").replace('\r', "\n");
+    if app.rewind_panel.is_some() {
+        return;
+    }
     if let Some(panel) = app.question_panel.as_mut() {
         panel.handle_paste(&data);
         return;
@@ -536,6 +743,10 @@ pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
         return;
     }
     if let Some(panel) = app.mcp_panel.as_mut() {
+        panel.handle_paste(&data);
+        return;
+    }
+    if let Some(panel) = app.diagnostics_panel.as_mut() {
         panel.handle_paste(&data);
         return;
     }
@@ -734,5 +945,33 @@ mod tests {
             KeyCode::Char('v'),
             KeyModifiers::NONE
         )));
+    }
+
+    #[tokio::test]
+    async fn esc_closes_mcp_panel_without_cancelling_the_active_turn() {
+        let mut config = crate::config::programmer_config::ProgrammerConfig::default();
+        config.providers.clear();
+        let mut app = crate::app::App::new(
+            config,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "mcp-escape-routing-test".to_string(),
+            None,
+            Vec::new(),
+            false,
+            "test".to_string(),
+        )
+        .await;
+        app.cancel.active_id = Some(42);
+        app.mcp_panel = Some(crate::ui::components::mcp_panel::McpPanel::new());
+
+        handle_key_events(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(app.mcp_panel.is_none());
+        assert_eq!(app.cancel.active_id, Some(42));
+        assert!(!app.cancel.active.is_cancelled());
     }
 }
