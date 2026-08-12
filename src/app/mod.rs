@@ -136,7 +136,6 @@ pub(crate) struct SessionState {
     /// end instead of writing after every event.
     pub(crate) dirty: bool,
     pub(crate) classifier_model_override: ModelOverride,
-    pub(crate) classifier_top_logprobs_override: Option<u8>,
     pub(crate) compact_model_override: ModelOverride,
     pub(crate) auto_compact_override: AutoCompactOverride,
     pub(crate) compact_keep_recent_turns_override: Option<usize>,
@@ -387,7 +386,6 @@ impl App<'_> {
         let mut vision_enabled = false;
         let mut thinking_level = crate::thinking::ThinkingLevel::default();
         let mut classifier_model_override = ModelOverride::Inherit;
-        let mut classifier_top_logprobs_override = None;
         let mut compact_model_override = ModelOverride::Inherit;
         let mut auto_compact_override = AutoCompactOverride::Inherit;
         let mut compact_keep_recent_turns_override = None;
@@ -407,7 +405,6 @@ impl App<'_> {
             vision_enabled = saved.vision_enabled;
             thinking_level = saved.thinking_level;
             classifier_model_override = saved.classifier_model_override;
-            classifier_top_logprobs_override = saved.classifier_top_logprobs_override;
             compact_model_override = saved.compact_model_override;
             auto_compact_override = saved.auto_compact_override;
             compact_keep_recent_turns_override = saved.compact_keep_recent_turns_override;
@@ -507,7 +504,6 @@ impl App<'_> {
                 dirty: false,
                 did_save: false,
                 classifier_model_override,
-                classifier_top_logprobs_override,
                 compact_model_override,
                 auto_compact_override,
                 compact_keep_recent_turns_override,
@@ -594,12 +590,6 @@ impl App<'_> {
         )
     }
 
-    pub(crate) fn effective_classifier_top_logprobs(&self) -> u8 {
-        self.session
-            .classifier_top_logprobs_override
-            .unwrap_or(self.config.classifier_top_logprobs)
-    }
-
     pub(crate) fn effective_compact_model(&self) -> String {
         self.effective_model_override(
             &self.session.compact_model_override,
@@ -676,7 +666,7 @@ impl App<'_> {
             WorkMode::Auto => {
                 let model_str = self.effective_classifier_model();
                 let (c_client, c_model_name) = self.provider_manager.resolve(&model_str)?;
-                let top_logprobs = self.effective_classifier_top_logprobs();
+                let top_logprobs = self.config.classifier_top_logprobs;
                 (
                     RunnerPolicy::Llm(Box::new(LlmPolicy {
                         client: c_client.clone(),

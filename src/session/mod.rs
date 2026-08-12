@@ -201,11 +201,9 @@ pub(crate) struct Session {
     #[serde(default)]
     pub(crate) thinking_level: crate::thinking::ThinkingLevel,
     /// Session-only overrides. Slash commands update these values; provider
-    /// management updates the global defaults instead.
+    /// management updates their global defaults instead.
     #[serde(default)]
     pub(crate) classifier_model_override: ModelOverride,
-    #[serde(default)]
-    pub(crate) classifier_top_logprobs_override: Option<u8>,
     #[serde(default)]
     pub(crate) compact_model_override: ModelOverride,
     #[serde(default)]
@@ -288,7 +286,6 @@ impl SessionManager {
             vision_enabled: false,
             thinking_level: crate::thinking::ThinkingLevel::default(),
             classifier_model_override: ModelOverride::Inherit,
-            classifier_top_logprobs_override: None,
             compact_model_override: ModelOverride::Inherit,
             auto_compact_override: AutoCompactOverride::Inherit,
             compact_keep_recent_turns_override: None,

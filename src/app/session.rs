@@ -93,7 +93,6 @@ fn persist_session(app: &mut App<'_>) -> Result<bool, String> {
     session.vision_enabled = app.vision_enabled;
     session.thinking_level = app.thinking_level;
     session.classifier_model_override = app.session.classifier_model_override.clone();
-    session.classifier_top_logprobs_override = app.session.classifier_top_logprobs_override;
     session.compact_model_override = app.session.compact_model_override.clone();
     session.auto_compact_override = app.session.auto_compact_override.clone();
     session.compact_keep_recent_turns_override = app.session.compact_keep_recent_turns_override;

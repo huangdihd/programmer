@@ -492,18 +492,13 @@ fn classifier(app: &mut App<'_>, arg: &str) -> CommandOutcome {
                 crate::session::ModelOverride::Current => "session: current chat model",
                 crate::session::ModelOverride::Model(_) => "session",
             };
-            let logprobs_source = if app.session.classifier_top_logprobs_override.is_some() {
-                "session"
-            } else {
-                "global"
-            };
             app.conversation_panel.add_info_string(format!(
                 "classifier model: {} ({source})\n\
-                 classifier top logprobs: {} ({logprobs_source})\n\
+                 classifier top logprobs: {} (global)\n\
                  usage: /classifier <provider/model|current|default>, \
                  /classifier logprobs <0-20|default>",
                 app.effective_classifier_model(),
-                app.effective_classifier_top_logprobs()
+                app.config.classifier_top_logprobs
             ));
         }
         ["clear" | "default" | "reset"] => {
@@ -519,19 +514,24 @@ fn classifier(app: &mut App<'_>, arg: &str) -> CommandOutcome {
             session::mark_dirty(app);
         }
         ["logprobs" | "top-logprobs" | "top_logprobs", "default"] => {
-            app.session.classifier_top_logprobs_override = None;
-            app.conversation_panel
-                .add_info_string("classifier top logprobs now inherits the global setting");
-            session::mark_dirty(app);
+            app.config.classifier_top_logprobs =
+                crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS;
+            app.classifier_no_logprobs.lock().unwrap().clear();
+            session::persist_config(app);
+            app.conversation_panel.add_info_string(format!(
+                "global classifier top logprobs reset to {}",
+                app.config.classifier_top_logprobs
+            ));
         }
         ["logprobs" | "top-logprobs" | "top_logprobs", value] => {
             match parse_classifier_top_logprobs(value) {
                 Ok(top_logprobs) => {
-                    app.session.classifier_top_logprobs_override = Some(top_logprobs);
+                    app.config.classifier_top_logprobs = top_logprobs;
+                    app.classifier_no_logprobs.lock().unwrap().clear();
+                    session::persist_config(app);
                     app.conversation_panel.add_info_string(format!(
-                        "classifier top logprobs set to {top_logprobs} for this session"
+                        "global classifier top logprobs set to {top_logprobs}"
                     ));
-                    session::mark_dirty(app);
                 }
                 Err(error) => app.conversation_panel.add_error_string(error),
             }

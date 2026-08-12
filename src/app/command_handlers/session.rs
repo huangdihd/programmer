@@ -153,7 +153,6 @@ fn new(app: &mut App<'_>) -> CommandOutcome {
     app.sync_todos_to_store();
     app.vision_enabled = false;
     app.session.classifier_model_override = crate::session::ModelOverride::Inherit;
-    app.session.classifier_top_logprobs_override = None;
     app.session.compact_model_override = crate::session::ModelOverride::Inherit;
     app.session.auto_compact_override = crate::session::AutoCompactOverride::Inherit;
     app.session.compact_keep_recent_turns_override = None;
