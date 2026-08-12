@@ -221,17 +221,14 @@ impl ServerState {
         let Some((client, model, top_logprobs)) = &self.classifier else {
             return Err("auto mode has no classifier model configured; refusing".to_string());
         };
-        let outcome = crate::classifier::classify_tool_call(
+        let ctx = crate::classifier::ClassifyContext {
             client,
             model,
-            name,
-            args,
-            "",
-            "",
-            true,
-            *top_logprobs,
-        )
-        .await;
+            light_context: "",
+            full_context: "",
+            top_logprobs: *top_logprobs,
+        };
+        let outcome = crate::classifier::classify_tool_call(&ctx, name, args, true).await;
         match outcome.verdict {
             Verdict::Allow => Ok(()),
             Verdict::Deny { reason } | Verdict::Ask { reason } => {

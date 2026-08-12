@@ -51,6 +51,17 @@ pub struct ProgrammerConfig {
         deserialize_with = "deserialize_classifier_top_logprobs"
     )]
     pub classifier_top_logprobs: u8,
+    /// Model used for manual and automatic context compaction. When absent,
+    /// the current chat model is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_model: Option<String>,
+    /// Start a background context compaction after an API response reports at
+    /// least this many input tokens. Zero disables automatic compaction.
+    #[serde(default = "default_auto_compact_tokens")]
+    pub auto_compact_tokens: u32,
+    /// Number of complete recent turns kept verbatim after a compaction.
+    #[serde(default = "default_compact_keep_recent_turns")]
+    pub compact_keep_recent_turns: usize,
     /// YOLO mode (run every tool call unchecked) is gated behind this flag so
     /// it can't be reached by the normal Ctrl+T cycle or a bare `/mode yolo`.
     #[serde(default)]
@@ -107,10 +118,6 @@ pub struct ProviderConfig {
     /// list (auto-discovered or manual) is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
-    /// Model used for Auto-mode tool-call classification for this provider.
-    /// When absent, falls back to [`default_model`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub classifier_model: Option<String>,
 }
 
 /// Default co-author trailer. It's a placeholder — replace the email with one
@@ -129,6 +136,14 @@ fn default_true() -> bool {
 
 fn default_classifier_top_logprobs() -> u8 {
     crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS
+}
+
+fn default_auto_compact_tokens() -> u32 {
+    100_000
+}
+
+fn default_compact_keep_recent_turns() -> usize {
+    2
 }
 
 fn deserialize_classifier_top_logprobs<'de, D>(deserializer: D) -> Result<u8, D::Error>
@@ -156,7 +171,6 @@ impl Default for ProgrammerConfig {
                 api_key: "sk-...".to_string(),
                 models: None,
                 default_model: None,
-                classifier_model: None,
             },
         );
         let security = crate::security::SecurityConfig::default();
@@ -165,6 +179,9 @@ impl Default for ProgrammerConfig {
             providers,
             classifier_model: None,
             classifier_top_logprobs: default_classifier_top_logprobs(),
+            compact_model: None,
+            auto_compact_tokens: default_auto_compact_tokens(),
+            compact_keep_recent_turns: default_compact_keep_recent_turns(),
             allow_yolo: false,
             security,
             // Kept empty until normalization so deserialization can distinguish
@@ -221,7 +238,6 @@ impl ProgrammerConfig {
                 api_key,
                 models: Some(vec![model]),
                 default_model: None,
-                classifier_model: None,
             },
         );
         self.default_provider = "openai".to_string();

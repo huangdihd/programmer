@@ -44,9 +44,28 @@ pub(crate) fn flush_if_dirty(app: &mut App<'_>) {
 
 /// Persist the current conversation to the session file.
 pub(crate) fn save_session(app: &mut App<'_>) {
+    if let Err(e) = persist_session(app) {
+        app.conversation_panel
+            .add_error_string(format!("session save: {e}"));
+    }
+}
+
+/// Persist the current session and report failures to callers that must not
+/// proceed without a durable source snapshot (notably conversation forks).
+pub(crate) fn save_session_checked(app: &mut App<'_>) -> Result<(), String> {
+    if persist_session(app)? {
+        Ok(())
+    } else {
+        Err("the current session has no persistable user input".to_string())
+    }
+}
+
+fn persist_session(app: &mut App<'_>) -> Result<bool, String> {
     app.session.dirty = false;
     app.sync_todos_from_store();
-    let Some(mgr) = &app.session.mgr else { return };
+    let Some(mgr) = &app.session.mgr else {
+        return Ok(false);
+    };
     let mut items: Vec<MessageItem> = app.conversation_panel.items_snapshot();
     remove_transient_items(&mut items);
     // Don't persist a session with no user input — there's nothing worth
@@ -54,7 +73,7 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     // (developer-role) input message, which `first_user_text` picks up, so a
     // session that ran `/init` still counts as having input.
     if helpers::first_user_text(&items).is_none() {
-        return;
+        return Ok(false);
     }
     let mut session = mgr.load(&app.session.uuid).unwrap_or_else(|| {
         let mut s = mgr.create();
@@ -73,17 +92,17 @@ pub(crate) fn save_session(app: &mut App<'_>) {
     session.current_model = Some(app.current_model.clone());
     session.vision_enabled = app.vision_enabled;
     session.thinking_level = app.thinking_level;
-    session.classifier_model = app.config.classifier_model.clone();
+    session.classifier_model_override = app.session.classifier_model_override.clone();
+    session.compact_model_override = app.session.compact_model_override.clone();
+    session.auto_compact_override = app.session.auto_compact_override.clone();
+    session.compact_keep_recent_turns_override = app.session.compact_keep_recent_turns_override;
     session.todos = app.todo_list.todos.clone();
     session.activated_skills = app.skill_registry.activated_names().to_vec();
     session.skill_selection_saved = true;
     session.tasks = crate::tasks::persist_all();
-    match mgr.save(&mut session) {
-        Ok(()) => app.session.did_save = true,
-        Err(e) => app
-            .conversation_panel
-            .add_error_string(format!("session save: {e}")),
-    }
+    mgr.save(&mut session)?;
+    app.session.did_save = true;
+    Ok(true)
 }
 
 fn remove_transient_items(items: &mut Vec<MessageItem>) {
@@ -115,11 +134,17 @@ pub(crate) fn persist_config(app: &mut App<'_>) {
 
 /// Delete the session file and start a fresh session with a new UUID.
 pub(crate) fn delete_session(app: &mut App<'_>) {
+    if let Some(store) = &app.checkpoint_store {
+        let _ = store.lock().unwrap().delete_all();
+    }
     if let Some(mgr) = &app.session.mgr {
         let _ = mgr.delete(&app.session.uuid);
         let new_session = mgr.create();
         app.session.uuid = new_session.uuid;
     }
+    app.checkpoint_store = crate::checkpoint::CheckpointStore::for_session(&app.session.uuid)
+        .map(|store| std::sync::Arc::new(std::sync::Mutex::new(store)));
+    app.current_checkpoint_id = None;
 }
 
 #[cfg(test)]

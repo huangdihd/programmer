@@ -1,3 +1,33 @@
+# programmer v0.2.2
+
+v0.2.2 adds recoverable conversation navigation, automatic context management,
+and in-app diagnostics configuration.
+
+## Highlights
+
+- Added `/rewind` checkpoints with independent code/conversation restore modes
+  and conversation forking that preserves the source session.
+- Restored an unsent prompt to the input editor when a request is cancelled
+  before the model begins responding.
+- Added manual and automatic context compaction with configurable global and
+  session-level models, token thresholds, and recent-turn retention.
+- Added `/diagnostics manage` and `/diagnostics update` for editing and
+  refreshing diagnostics without leaving the TUI.
+- Added global classifier and compaction model controls to provider management,
+  plus model search and modal keyboard-routing fixes.
+- Made `classifier_top_logprobs` a single global setting; `/classifier
+  logprobs` now updates and persists that value directly.
+
+## Fixes
+
+- Fixed Escape in management panels cancelling the active conversation.
+- Fixed provider model filtering swallowing characters used by Vim-style
+  navigation and improved model-list colors and refresh feedback.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.1...v0.2.2
+
+---
+
 # programmer v0.2.1
 
 v0.2.1 makes the Auto-mode classifier compatible with providers that impose a

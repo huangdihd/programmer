@@ -221,7 +221,7 @@ pub fn needs_review(tool_name: &str, arguments: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 mod llm;
-pub use llm::classify_tool_call;
+pub use llm::{ClassifyContext, classify_tool_call};
 
 #[cfg(test)]
 mod tests {

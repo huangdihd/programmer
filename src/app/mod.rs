@@ -30,13 +30,15 @@ use crate::config::programmer_config::ProgrammerConfig;
 use crate::mcp::McpServerStatus;
 use crate::providers::{ProviderManager, ProviderModelStatus};
 use crate::response::message_item::MessageItem;
-use crate::session::SessionManager;
+use crate::session::{AutoCompactOverride, ModelOverride, SessionManager};
 use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
+use crate::ui::components::diagnostics_panel::DiagnosticsPanel;
 use crate::ui::components::footer::footer::Footer;
 use crate::ui::components::input_panel::input_panel::InputPanel;
 use crate::ui::components::mcp_panel::McpPanel;
 use crate::ui::components::provider_panel::ProviderPanel;
 use crate::ui::components::question_panel::QuestionPanel;
+use crate::ui::components::rewind_panel::RewindPanel;
 use crate::ui::components::security_panel::SecurityPanel;
 use crate::ui::components::sidebar::Sidebar;
 use crate::ui::components::skills_panel::SkillsPanel;
@@ -100,8 +102,23 @@ pub(crate) struct CancelState {
     /// arrives, so the UI never races between "start" and "what is my id?" and
     /// stale events from an earlier turn are always dropped.
     pub(crate) active_id: Option<u64>,
+    /// Conversation length immediately before the active turn was appended.
+    /// Automatic compaction may only summarize items before this boundary.
+    pub(crate) turn_conversation_cutoff: Option<usize>,
     /// True while the stream task is backing off between connection retries.
     pub(crate) stream_retrying: Arc<AtomicBool>,
+    /// Becomes true after the current request produces any model output. It
+    /// stays true after the live response has been committed.
+    pub(crate) response_started: bool,
+    /// Original editable draft for a user request, retained until completion
+    /// so an early cancellation can put it back in the input.
+    pub(crate) active_user_request: Option<ActiveUserRequest>,
+}
+
+pub(crate) struct ActiveUserRequest {
+    pub(crate) draft: crate::ui::components::input_panel::input_panel::InputDraft,
+    pub(crate) conversation_cutoff: usize,
+    pub(crate) history_text: String,
 }
 
 /// Session identity, persistence handle, and the deferred-save dirty flag.
@@ -118,6 +135,19 @@ pub(crate) struct SessionState {
     /// so a burst of changes within a turn collapses into a single save at turn
     /// end instead of writing after every event.
     pub(crate) dirty: bool,
+    pub(crate) classifier_model_override: ModelOverride,
+    pub(crate) compact_model_override: ModelOverride,
+    pub(crate) auto_compact_override: AutoCompactOverride,
+    pub(crate) compact_keep_recent_turns_override: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AutoCompactState {
+    pub(crate) next_id: u64,
+    pub(crate) active_id: Option<u64>,
+    pub(crate) history_epoch: u64,
+    pub(crate) last_cutoff: Option<usize>,
+    pub(crate) last_input_tokens: Option<u32>,
 }
 
 pub(crate) struct TaskNotificationState {
@@ -238,12 +268,16 @@ pub struct App<'a> {
     pub skills_panel: Option<SkillsPanel>,
     /// Full-screen MCP server management panel, when open.
     pub mcp_panel: Option<McpPanel>,
+    /// Full-screen project diagnostics management panel, when open.
+    pub diagnostics_panel: Option<DiagnosticsPanel>,
     /// Full-screen security profile management panel, when open.
     pub security_panel: Option<SecurityPanel>,
     /// Modal question panel shown when the model calls `ask_user`.
     pub question_panel: Option<QuestionPanel>,
     /// Todo-list panel shown with `/todo`.
     pub todo_panel: Option<TodoPanel>,
+    /// Full-screen checkpoint selector opened by `/rewind`.
+    pub rewind_panel: Option<RewindPanel>,
     /// Full-screen interactive terminal panel, when open (`/terminal`).
     pub terminal_pane: Option<crate::ui::components::terminal_panel::TerminalPane>,
     /// Full-screen read-only child conversation, opened from the Agents sidebar.
@@ -289,12 +323,19 @@ pub struct App<'a> {
     /// feedback (baseline + edit-turn counter). The TUI holds this so it
     /// persists across per-turn engines.
     pub(crate) diagnostics_state: Arc<std::sync::Mutex<crate::runner::DiagnosticsState>>,
+    /// Rejects stale results when diagnostics are manually refreshed twice.
+    pub(crate) diagnostics_update_generation: u64,
     /// Tracks whether the current mouse-drag started in the sidebar area.
     pub(crate) sidebar_click_active: bool,
     /// Cancellation tokens for the current request lifecycle.
     pub(crate) cancel: CancelState,
     /// Session identity, persistence handle, and deferred-save flag.
     pub(crate) session: SessionState,
+    /// Background automatic compaction bookkeeping. This is deliberately
+    /// independent from the foreground turn phase and cancellation token.
+    pub(crate) auto_compact: AutoCompactState,
+    pub(crate) checkpoint_store: Option<Arc<Mutex<crate::checkpoint::CheckpointStore>>>,
+    pub(crate) current_checkpoint_id: Option<u64>,
     /// Project directory name for the terminal title.
     pub(crate) project_name: String,
     /// Plan mode sub-phase. Only meaningful when `work_mode == WorkMode::Plan`.
@@ -344,6 +385,10 @@ impl App<'_> {
         let mut work_mode = WorkMode::default();
         let mut vision_enabled = false;
         let mut thinking_level = crate::thinking::ThinkingLevel::default();
+        let mut classifier_model_override = ModelOverride::Inherit;
+        let mut compact_model_override = ModelOverride::Inherit;
+        let mut auto_compact_override = AutoCompactOverride::Inherit;
+        let mut compact_keep_recent_turns_override = None;
 
         let mut saved_activated_skills: Option<Vec<String>> = None;
         if let Some(mgr) = &session_mgr
@@ -359,9 +404,10 @@ impl App<'_> {
             }
             vision_enabled = saved.vision_enabled;
             thinking_level = saved.thinking_level;
-            if saved.classifier_model.is_some() {
-                config.classifier_model = saved.classifier_model;
-            }
+            classifier_model_override = saved.classifier_model_override;
+            compact_model_override = saved.compact_model_override;
+            auto_compact_override = saved.auto_compact_override;
+            compact_keep_recent_turns_override = saved.compact_keep_recent_turns_override;
             if saved.skill_selection_saved || !saved.activated_skills.is_empty() {
                 saved_activated_skills = Some(saved.activated_skills);
             }
@@ -394,6 +440,8 @@ impl App<'_> {
             .map(|server| McpServerStatus::connecting(server.name.clone()))
             .collect();
         let provider_model_statuses = ProviderModelStatus::from_config(&config);
+        let checkpoint_store = crate::checkpoint::CheckpointStore::for_session(&session_uuid)
+            .map(|store| Arc::new(Mutex::new(store)));
         let mut app = Self {
             running: true,
             quit_requested_at: None,
@@ -412,9 +460,11 @@ impl App<'_> {
             provider_panel: open_provider_panel.then(ProviderPanel::new),
             skills_panel: None,
             mcp_panel: None,
+            diagnostics_panel: None,
             security_panel: None,
             question_panel: None,
             todo_panel: None,
+            rewind_panel: None,
             terminal_pane: None,
             agent_panel: None,
             task_notifications: TaskNotificationState::new(),
@@ -437,19 +487,30 @@ impl App<'_> {
             diagnostics_state: Arc::new(std::sync::Mutex::new(
                 crate::runner::DiagnosticsState::default(),
             )),
+            diagnostics_update_generation: 0,
             sidebar_click_active: false,
             cancel: CancelState {
                 active: CancellationToken::new(),
                 next_id: 0,
                 active_id: None,
+                turn_conversation_cutoff: None,
                 stream_retrying: Arc::new(AtomicBool::new(false)),
+                response_started: false,
+                active_user_request: None,
             },
             session: SessionState {
                 uuid: session_uuid,
                 mgr: session_mgr,
                 dirty: false,
                 did_save: false,
+                classifier_model_override,
+                compact_model_override,
+                auto_compact_override,
+                compact_keep_recent_turns_override,
             },
+            auto_compact: AutoCompactState::default(),
+            checkpoint_store,
+            current_checkpoint_id: None,
             skill_registry: crate::skills::SkillRegistry::load(),
             mcp_manager: None,
             mcp_server_statuses,
@@ -522,6 +583,55 @@ impl App<'_> {
         }
     }
 
+    pub(crate) fn effective_classifier_model(&self) -> String {
+        self.effective_model_override(
+            &self.session.classifier_model_override,
+            self.config.classifier_model.as_deref(),
+        )
+    }
+
+    pub(crate) fn effective_compact_model(&self) -> String {
+        self.effective_model_override(
+            &self.session.compact_model_override,
+            self.config.compact_model.as_deref(),
+        )
+    }
+
+    pub(crate) fn effective_auto_compact_tokens(&self) -> Option<u32> {
+        match self.session.auto_compact_override {
+            AutoCompactOverride::Inherit => {
+                (self.config.auto_compact_tokens > 0).then_some(self.config.auto_compact_tokens)
+            }
+            AutoCompactOverride::Disabled => None,
+            AutoCompactOverride::Tokens(tokens) => Some(tokens),
+        }
+    }
+
+    pub(crate) fn effective_compact_keep_recent_turns(&self) -> usize {
+        self.session
+            .compact_keep_recent_turns_override
+            .unwrap_or(self.config.compact_keep_recent_turns)
+    }
+
+    pub(crate) fn checkpoint_recorder(&self) -> Option<crate::checkpoint::CheckpointRecorder> {
+        Some(crate::checkpoint::CheckpointRecorder {
+            store: self.checkpoint_store.as_ref()?.clone(),
+            checkpoint_id: self.current_checkpoint_id?,
+        })
+    }
+
+    fn effective_model_override(
+        &self,
+        model_override: &ModelOverride,
+        global: Option<&str>,
+    ) -> String {
+        match model_override {
+            ModelOverride::Inherit => global.unwrap_or(&self.current_model).to_string(),
+            ModelOverride::Current => self.current_model.clone(),
+            ModelOverride::Model(model) => model.clone(),
+        }
+    }
+
     /// Build a fresh [`crate::runner::TurnRunner`] for the current app state.
     /// Called at the start of every turn; the runner is immutable during a turn
     /// and is dropped when the spawned task finishes.
@@ -538,10 +648,10 @@ impl App<'_> {
         // Unify every tool source behind the registry: the local built-ins are
         // one provider, all connected MCP servers another.
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
-            Arc::new(LocalToolProvider::new(
-                self.todo_store.clone(),
-                self.security.clone(),
-            )),
+            Arc::new(
+                LocalToolProvider::new(self.todo_store.clone(), self.security.clone())
+                    .with_checkpoint(self.checkpoint_recorder()),
+            ),
             Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
         ];
         if let Some(mcp) = &self.mcp_manager {
@@ -554,23 +664,20 @@ impl App<'_> {
                 crate::agents::AgentPolicyFactory::Sync(self.work_mode),
             ),
             WorkMode::Auto => {
-                let model_str = self
-                    .config
-                    .classifier_model
-                    .clone()
-                    .unwrap_or_else(|| self.provider_manager.default_classifier_model());
+                let model_str = self.effective_classifier_model();
                 let (c_client, c_model_name) = self.provider_manager.resolve(&model_str)?;
+                let top_logprobs = self.config.classifier_top_logprobs;
                 (
                     RunnerPolicy::Llm(Box::new(LlmPolicy {
                         client: c_client.clone(),
                         model_name: c_model_name.clone(),
-                        top_logprobs: self.config.classifier_top_logprobs,
+                        top_logprobs,
                         no_logprobs: self.classifier_no_logprobs.clone(),
                     })),
                     crate::agents::AgentPolicyFactory::Llm(Box::new(LlmPolicy {
                         client: c_client.clone(),
                         model_name: c_model_name,
-                        top_logprobs: self.config.classifier_top_logprobs,
+                        top_logprobs,
                         no_logprobs: self.classifier_no_logprobs.clone(),
                     })),
                 )
@@ -596,6 +703,7 @@ impl App<'_> {
                 self.work_mode.icon(),
                 self.work_mode.label()
             ),
+            checkpoint: self.checkpoint_recorder(),
         };
         base_providers.push(Arc::new(crate::tools::provider::AgentToolProvider::new(
             self.agents.clone(),

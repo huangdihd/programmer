@@ -303,6 +303,10 @@ impl Widget for &mut App<'_> {
             panel.render(&self.config, &self.provider_manager, area, buf);
             return;
         }
+        if let Some(panel) = &self.rewind_panel {
+            panel.render(area, buf);
+            return;
+        }
         // The skills management panel is modal and replaces the whole UI.
         if let Some(panel) = &self.skills_panel {
             panel.render(&self.skill_registry, area, buf);
@@ -311,6 +315,11 @@ impl Widget for &mut App<'_> {
         // The MCP management panel is modal and replaces the whole UI.
         if let Some(panel) = &self.mcp_panel {
             panel.render(&self.config, self.mcp_manager.as_deref(), area, buf);
+            return;
+        }
+        // The diagnostics management panel is modal and replaces the whole UI.
+        if let Some(panel) = &self.diagnostics_panel {
+            panel.render(area, buf);
             return;
         }
         // The security profile panel is modal and replaces the whole UI.

@@ -44,19 +44,21 @@ pub enum Command {
     Help,
     Session,
     Usage,
+    Rewind,
     Todo,
     /// `/skill <name|list|off>` — activate, list, or clear skills.
     Skill(String),
     /// `/mcp <show|manage>` — list or manage MCP servers.
     Mcp(String),
+    /// `/diagnostics <manage|update>` — edit the project diagnostics profile
+    /// or immediately refresh its current findings.
+    Diagnostics(String),
     /// `/plan <approve|cancel>` — plan mode control.
     Plan(String),
     /// `/terminal [id|clear]` — open a task or clear finished tasks.
     Terminal(String),
-    /// `/compact [provider/model]` — summarize the conversation so far and
-    /// shrink the context the model sees to that summary plus everything
-    /// after it. The optional argument picks a different model for the
-    /// summarization request only.
+    /// `/compact` compacts immediately; `show` and `set` inspect or change the
+    /// current session's compaction settings.
     Compact(String),
     /// `/thinking [level]` — set or show the reasoning effort used by the main
     /// conversation and `/compact`.
@@ -83,9 +85,11 @@ enum CommandKind {
     Help,
     Session,
     Usage,
+    Rewind,
     Todo,
     Skill,
     Mcp,
+    Diagnostics,
     Plan,
     Terminal,
     Compact,
@@ -100,6 +104,7 @@ enum CompletionKind {
     None,
     Model,
     Classifier,
+    Compact,
     Fixed(&'static [&'static str]),
     Providers,
     Skill,
@@ -155,9 +160,11 @@ impl CommandKind {
             Self::Help => Command::Help,
             Self::Session => Command::Session,
             Self::Usage => Command::Usage,
+            Self::Rewind => Command::Rewind,
             Self::Todo => Command::Todo,
             Self::Skill => Command::Skill(args),
             Self::Mcp => Command::Mcp(args),
+            Self::Diagnostics => Command::Diagnostics(args),
             Self::Plan => Command::Plan(args),
             Self::Terminal => Command::Terminal(args),
             Self::Compact => Command::Compact(args),
@@ -193,7 +200,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["n"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 20,
+            order: 22,
             usage: "/new | /n",
             description: "Start a new session (saves current)",
         }],
@@ -205,17 +212,17 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Providers,
         help: &[
             HelpEntry {
-                order: 21,
+                order: 23,
                 usage: "/providers show",
                 description: "List all configured providers and models",
             },
             HelpEntry {
-                order: 22,
+                order: 24,
                 usage: "/providers manage",
                 description: "Open the provider management panel",
             },
             HelpEntry {
-                order: 23,
+                order: 25,
                 usage: "/providers refresh [provider]",
                 description: "Refetch auto-discovered provider models",
             },
@@ -227,7 +234,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["s"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 24,
+            order: 26,
             usage: "/session | /s",
             description: "Show current session info",
         }],
@@ -238,9 +245,20 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 25,
+            order: 27,
             usage: "/usage",
             description: "Show token usage for the current session",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Rewind,
+        name: "rewind",
+        aliases: &[],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 28,
+            usage: "/rewind",
+            description: "Restore conversation and built-in file edits to a user prompt",
         }],
     },
     CommandSpec {
@@ -261,7 +279,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Classifier,
         help: &[HelpEntry {
             order: 2,
-            usage: "/classifier [provider/model | logprobs <0-20>]",
+            usage: "/classifier [show | provider/model | current | default | logprobs <0-20|default>]",
             description: "Set/show the Auto-mode classifier settings",
         }],
     },
@@ -282,7 +300,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["t"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 19,
+            order: 21,
             usage: "/todo | /t",
             description: "Open the todo list panel",
         }],
@@ -324,6 +342,24 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
+        kind: CommandKind::Diagnostics,
+        name: "diagnostics",
+        aliases: &["diag"],
+        completion: CompletionKind::Fixed(&["manage", "update"]),
+        help: &[
+            HelpEntry {
+                order: 10,
+                usage: "/diagnostics manage",
+                description: "Open the project diagnostics management panel",
+            },
+            HelpEntry {
+                order: 11,
+                usage: "/diagnostics update",
+                description: "Re-run configured checkers and refresh current diagnostics",
+            },
+        ],
+    },
+    CommandSpec {
         kind: CommandKind::Plan,
         name: "plan",
         aliases: &[],
@@ -348,12 +384,12 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Terminal,
         help: &[
             HelpEntry {
-                order: 10,
+                order: 12,
                 usage: "/terminal [id]",
                 description: "Open the terminal viewer for a task",
             },
             HelpEntry {
-                order: 11,
+                order: 13,
                 usage: "/terminal clear",
                 description: "Clear completed, failed, and killed tasks",
             },
@@ -363,10 +399,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         kind: CommandKind::Compact,
         name: "compact",
         aliases: &[],
-        completion: CompletionKind::Model,
+        completion: CompletionKind::Compact,
         help: &[HelpEntry {
-            order: 12,
-            usage: "/compact [provider/model]",
+            order: 14,
+            usage: "/compact [show | set model|tokens|keep ...]",
             description: "Summarize older history to shrink the model's context",
         }],
     },
@@ -376,7 +412,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::Fixed(crate::thinking::ThinkingLevel::COMPLETIONS),
         help: &[HelpEntry {
-            order: 13,
+            order: 15,
             usage: "/thinking [auto|none|minimal|low|medium|high|xhigh]",
             description: "Set/show reasoning effort for chat and compaction",
         }],
@@ -387,7 +423,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::Fixed(&["on", "off"]),
         help: &[HelpEntry {
-            order: 14,
+            order: 16,
             usage: "/vision <on|off>",
             description: "Enable or disable image attachments for this session",
         }],
@@ -398,7 +434,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::Fixed(&["on", "off"]),
         help: &[HelpEntry {
-            order: 15,
+            order: 17,
             usage: "/select [on|off]",
             description: "Toggle native terminal text selection and copying",
         }],
@@ -410,17 +446,17 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Permission,
         help: &[
             HelpEntry {
-                order: 16,
+                order: 18,
                 usage: "/permission show | manage",
                 description: "Show security status or open the profile management panel",
             },
             HelpEntry {
-                order: 17,
+                order: 19,
                 usage: "/permission profile <list|use|create|rename|delete>",
                 description: "List, switch, or manage named security profiles",
             },
             HelpEntry {
-                order: 18,
+                order: 20,
                 usage: "/permission mode <restricted|network|off> | <setting> <on|off>",
                 description: "Configure the active profile mode, settings, paths, and environment",
             },
@@ -432,7 +468,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["c"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 26,
+            order: 29,
             usage: "/clear | /c",
             description: "Delete this session; reset chat, todos, images, and diagnostics",
         }],
@@ -443,7 +479,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["q", "exit"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 27,
+            order: 30,
             usage: "/quit | /q",
             description: "Exit the application",
         }],
@@ -454,7 +490,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["?"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 28,
+            order: 31,
             usage: "/help | /?",
             description: "Show this help",
         }],
@@ -617,6 +653,7 @@ impl CompletionEngine {
             CompletionKind::None => None,
             CompletionKind::Model => Self::complete_model(text, cmd, pm),
             CompletionKind::Classifier => Self::complete_classifier(text, cmd, pm),
+            CompletionKind::Compact => Self::complete_compact(text, cmd, pm),
             CompletionKind::Fixed(values) => Self::complete_subcommand(text, cmd, values),
             CompletionKind::Providers => Self::complete_providers(text, cmd, pm),
             CompletionKind::Skill => Self::complete_skill(text, cmd, skill_registry),
@@ -881,7 +918,7 @@ impl CompletionEngine {
             return None;
         }
 
-        let mut candidates = ["clear", "logprobs"]
+        let mut candidates = ["show", "current", "default", "logprobs"]
             .into_iter()
             .filter(|candidate| candidate.starts_with(after_cmd))
             .map(str::to_string)
@@ -895,6 +932,61 @@ impl CompletionEngine {
             );
         }
         CompletionState::new(format!("/{cmd} "), candidates)
+    }
+
+    fn complete_compact(text: &str, cmd: &str, pm: &ProviderManager) -> Option<CompletionState> {
+        let after_cmd = text[cmd.len()..].trim_start();
+        let trailing_space = after_cmd.ends_with(char::is_whitespace);
+        let parts = after_cmd.split_whitespace().collect::<Vec<_>>();
+        if parts.is_empty() || (parts.len() == 1 && !trailing_space) {
+            let typed = parts.first().copied().unwrap_or("");
+            return CompletionState::new(
+                format!("/{cmd} "),
+                ["show", "set"]
+                    .into_iter()
+                    .filter(|value| value.starts_with(typed))
+                    .map(str::to_string)
+                    .collect(),
+            );
+        }
+        if parts.first() != Some(&"set") {
+            return None;
+        }
+        if parts.len() == 1 || (parts.len() == 2 && !trailing_space) {
+            let typed = parts.get(1).copied().unwrap_or("");
+            return CompletionState::new(
+                format!("/{cmd} set "),
+                ["model", "tokens", "keep"]
+                    .into_iter()
+                    .filter(|value| value.starts_with(typed))
+                    .map(str::to_string)
+                    .collect(),
+            );
+        }
+        let setting = parts[1];
+        let typed = parts
+            .get(2)
+            .copied()
+            .filter(|_| !trailing_space)
+            .unwrap_or("");
+        if parts.len() > 3 || (parts.len() == 3 && trailing_space) {
+            return None;
+        }
+        let mut candidates = match setting {
+            "model" => vec!["current".to_string(), "default".to_string()],
+            "tokens" => vec!["off".to_string(), "default".to_string()],
+            "keep" => vec!["default".to_string()],
+            _ => return None,
+        };
+        if setting == "model" {
+            for provider in pm.provider_names() {
+                for model in pm.models_for(provider) {
+                    candidates.push(format!("{provider}/{model}"));
+                }
+            }
+        }
+        candidates.retain(|value| value.starts_with(typed));
+        CompletionState::new(format!("/{cmd} set {setting} "), candidates)
     }
 
     fn complete_skill(
@@ -1551,12 +1643,14 @@ mod tests {
             "providers",
             "session",
             "usage",
+            "rewind",
             "mode",
             "classifier",
             "init",
             "todo",
             "skill",
             "mcp",
+            "diagnostics",
             "plan",
             "terminal",
             "compact",
@@ -1605,7 +1699,7 @@ mod tests {
                 "Set work mode (or cycle with Ctrl+T)",
             ),
             (
-                "/classifier [provider/model | logprobs <0-20>]",
+                "/classifier [show | provider/model | current | default | logprobs <0-20|default>]",
                 "Set/show the Auto-mode classifier settings",
             ),
             (
@@ -1621,13 +1715,21 @@ mod tests {
             ("/skill manage", "Open the skills management panel"),
             ("/mcp show", "List configured MCP servers and their status"),
             ("/mcp manage", "Open the MCP server management panel"),
+            (
+                "/diagnostics manage",
+                "Open the project diagnostics management panel",
+            ),
+            (
+                "/diagnostics update",
+                "Re-run configured checkers and refresh current diagnostics",
+            ),
             ("/terminal [id]", "Open the terminal viewer for a task"),
             (
                 "/terminal clear",
                 "Clear completed, failed, and killed tasks",
             ),
             (
-                "/compact [provider/model]",
+                "/compact [show | set model|tokens|keep ...]",
                 "Summarize older history to shrink the model's context",
             ),
             (
@@ -1667,6 +1769,10 @@ mod tests {
             ),
             ("/session | /s", "Show current session info"),
             ("/usage", "Show token usage for the current session"),
+            (
+                "/rewind",
+                "Restore conversation and built-in file edits to a user prompt",
+            ),
             (
                 "/clear | /c",
                 "Delete this session; reset chat, todos, images, and diagnostics",

@@ -193,7 +193,7 @@ impl HeadlessAgent {
                     .classifier_model
                     .clone()
                     .or_else(|| config.classifier_model.clone())
-                    .unwrap_or_else(|| provider_manager.default_classifier_model());
+                    .unwrap_or_else(|| model.clone());
                 let (classifier_client, classifier_name) = provider_manager
                     .resolve(&classifier_model)
                     .map(|(client, name)| (client.clone(), name))
@@ -245,6 +245,7 @@ impl HeadlessAgent {
                 args.work_mode.icon(),
                 args.work_mode.label()
             ),
+            checkpoint: None,
         };
         base_providers.push(Arc::new(AgentToolProvider::new(
             agents.clone(),
@@ -362,6 +363,7 @@ impl AgentSurface for CliSurface {
                 "type": "phase",
                 "phase": phase_label(phase),
             }),
+            RunnerEvent::UsageSafePoint { .. } => return,
         };
         println!("{event}");
     }

@@ -26,6 +26,24 @@ use async_openai::types::responses::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ModelOverride {
+    #[default]
+    Inherit,
+    Current,
+    Model(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AutoCompactOverride {
+    #[default]
+    Inherit,
+    Disabled,
+    Tokens(u32),
+}
+
 // ---------------------------------------------------------------------------
 // Serializable mirror
 // ---------------------------------------------------------------------------
@@ -182,9 +200,16 @@ pub(crate) struct Session {
     /// Reasoning effort for main chat and compaction requests.
     #[serde(default)]
     pub(crate) thinking_level: crate::thinking::ThinkingLevel,
-    /// Auto-mode classifier model when last saved, restored on resume.
+    /// Session-only overrides. Slash commands update these values; provider
+    /// management updates their global defaults instead.
     #[serde(default)]
-    pub(crate) classifier_model: Option<String>,
+    pub(crate) classifier_model_override: ModelOverride,
+    #[serde(default)]
+    pub(crate) compact_model_override: ModelOverride,
+    #[serde(default)]
+    pub(crate) auto_compact_override: AutoCompactOverride,
+    #[serde(default)]
+    pub(crate) compact_keep_recent_turns_override: Option<usize>,
     /// Todo list carried with the session, restored on resume.
     #[serde(default)]
     pub(crate) todos: Vec<crate::todos::Todo>,
@@ -260,7 +285,10 @@ impl SessionManager {
             current_model: None,
             vision_enabled: false,
             thinking_level: crate::thinking::ThinkingLevel::default(),
-            classifier_model: None,
+            classifier_model_override: ModelOverride::Inherit,
+            compact_model_override: ModelOverride::Inherit,
+            auto_compact_override: AutoCompactOverride::Inherit,
+            compact_keep_recent_turns_override: None,
             todos: Vec::new(),
             activated_skills: Vec::new(),
             skill_selection_saved: false,

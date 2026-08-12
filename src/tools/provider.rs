@@ -180,6 +180,7 @@ pub(crate) struct LocalToolProvider {
     todos: Arc<Mutex<crate::todos::TodoList>>,
     security: Arc<crate::security::SecurityHandle>,
     file_scope: u64,
+    checkpoint: Option<crate::checkpoint::CheckpointRecorder>,
 }
 
 impl LocalToolProvider {
@@ -191,6 +192,7 @@ impl LocalToolProvider {
             todos,
             security,
             file_scope: 0,
+            checkpoint: None,
         }
     }
 
@@ -203,7 +205,16 @@ impl LocalToolProvider {
             todos,
             security,
             file_scope,
+            checkpoint: None,
         }
+    }
+
+    pub(crate) fn with_checkpoint(
+        mut self,
+        checkpoint: Option<crate::checkpoint::CheckpointRecorder>,
+    ) -> Self {
+        self.checkpoint = checkpoint;
+        self
     }
 }
 
@@ -308,14 +319,11 @@ impl ToolProvider for LocalToolProvider {
                 .map(FunctionCallOutput::Text)
         } else if call.name == write_file::NAME {
             let security = self.security.snapshot();
-            write_file::run_with_security_scope(&call.arguments, &security, self.file_scope)
-                .await
-                .map(FunctionCallOutput::Text)
+            self.run_checkpointed_file_call(call, &security, true).await
         } else if call.name == edit_file::NAME {
             let security = self.security.snapshot();
-            edit_file::run_with_security_scope(&call.arguments, &security, self.file_scope)
+            self.run_checkpointed_file_call(call, &security, false)
                 .await
-                .map(FunctionCallOutput::Text)
         } else if call.name == task::NAME {
             let security = self.security.snapshot();
             task::run_with_security(&call.arguments, &security)
@@ -328,6 +336,40 @@ impl ToolProvider for LocalToolProvider {
                 .await
                 .map(FunctionCallOutput::Text)
         }
+    }
+}
+
+impl LocalToolProvider {
+    async fn run_checkpointed_file_call(
+        &self,
+        call: &FunctionToolCall,
+        security: &crate::security::SecurityManager,
+        write: bool,
+    ) -> Result<FunctionCallOutput, String> {
+        let path = match (
+            self.checkpoint.as_ref(),
+            crate::checkpoint::path_from_tool_arguments(&call.arguments),
+        ) {
+            (Some(_), Some(path)) => {
+                Some(security.authorize_path(crate::security::policy::AccessKind::Write, path)?)
+            }
+            _ => None,
+        };
+        if let (Some(recorder), Some(path)) = (&self.checkpoint, path.as_deref()) {
+            recorder.before_path(path)?;
+        }
+        let result = if write {
+            write_file::run_with_security_scope(&call.arguments, security, self.file_scope).await
+        } else {
+            edit_file::run_with_security_scope(&call.arguments, security, self.file_scope).await
+        };
+        if let (Some(recorder), Some(path)) = (&self.checkpoint, path.as_deref()) {
+            match &result {
+                Ok(_) => recorder.after_path(path)?,
+                Err(_) => recorder.discard_path(path)?,
+            }
+        }
+        result.map(FunctionCallOutput::Text)
     }
 }
 

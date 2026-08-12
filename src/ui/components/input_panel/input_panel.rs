@@ -35,6 +35,14 @@ pub struct InputPanel<'a> {
     next_image_id: usize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InputDraft {
+    content: String,
+    pastes: Vec<(String, String)>,
+    images: Vec<(String, InputImageContent)>,
+    next_image_id: usize,
+}
+
 impl InputPanel<'_> {
     pub fn new() -> Self {
         let mut text_area = TextArea::default();
@@ -88,6 +96,31 @@ impl InputPanel<'_> {
             text = text.replace(placeholder.as_str(), content.as_str());
         }
         text
+    }
+
+    pub(crate) fn draft_snapshot(&self) -> InputDraft {
+        InputDraft {
+            content: self.get_content(),
+            pastes: self.pastes.clone(),
+            images: self.images.clone(),
+            next_image_id: self.next_image_id,
+        }
+    }
+
+    pub(crate) fn restore_draft(&mut self, draft: InputDraft) {
+        self.clear();
+        self.text_area.insert_str(&draft.content);
+        self.pastes = draft.pastes;
+        self.images = draft.images;
+        self.next_image_id = draft.next_image_id;
+        self.history_index = -1;
+    }
+
+    pub(crate) fn remove_last_history_if(&mut self, value: &str) {
+        if self.history.last().is_some_and(|entry| entry == value) {
+            self.history.pop();
+        }
+        self.history_index = -1;
     }
 
     /// Insert pasted text at the cursor as-is.
@@ -337,6 +370,24 @@ mod tests {
         assert!(panel.add_image(image(), 320, 200));
         panel.set_content("placeholder removed");
         assert!(panel.take_images().is_empty());
+    }
+
+    #[test]
+    fn draft_snapshot_restores_pastes_and_images_after_send_drains_them() {
+        let mut panel = InputPanel::new();
+        panel.add_paste("first\nsecond".to_string());
+        assert!(panel.add_image(image(), 640, 480));
+        let expected_content = panel.get_content();
+        let expected_expanded = panel.expanded_content();
+        let draft = panel.draft_snapshot();
+
+        assert_eq!(panel.take_images().len(), 1);
+        panel.clear();
+        panel.restore_draft(draft);
+
+        assert_eq!(panel.get_content(), expected_content);
+        assert_eq!(panel.expanded_content(), expected_expanded);
+        assert_eq!(panel.take_images().len(), 1);
     }
 
     #[test]

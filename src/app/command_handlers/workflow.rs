@@ -50,9 +50,115 @@ fn init(app: &mut App<'_>) -> CommandOutcome {
 }
 
 fn compact(app: &mut App<'_>, arg: &str) -> CommandOutcome {
-    // Completion may append a display name; only the first token is the model.
-    let model = arg.split_whitespace().next().unwrap_or("");
-    commands::start_compact(app, model);
+    let parts = arg.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [] => commands::start_compact(app),
+        ["show"] => {
+            let model_source = match &app.session.compact_model_override {
+                crate::session::ModelOverride::Inherit => "global",
+                crate::session::ModelOverride::Current => "session: current chat model",
+                crate::session::ModelOverride::Model(_) => "session",
+            };
+            let tokens = app
+                .effective_auto_compact_tokens()
+                .map_or_else(|| "off".to_string(), |value| value.to_string());
+            let tokens_source = match app.session.auto_compact_override {
+                crate::session::AutoCompactOverride::Inherit => "global",
+                _ => "session",
+            };
+            let keep_source = if app.session.compact_keep_recent_turns_override.is_some() {
+                "session"
+            } else {
+                "global"
+            };
+            let reported = app.auto_compact.last_input_tokens.map_or_else(
+                || "unavailable (provider has not reported usage)".to_string(),
+                |tokens| tokens.to_string(),
+            );
+            let status = if app.auto_compact.active_id.is_some() {
+                "running in background"
+            } else {
+                "idle"
+            };
+            app.conversation_panel.add_info_string(format!(
+                "compact model: {} ({model_source})\n\
+                 auto compact input tokens: {tokens} ({tokens_source})\n\
+                 recent turns kept: {} ({keep_source})\n\
+                 last reported input tokens: {reported}\n\
+                 auto compact status: {status}",
+                app.effective_compact_model(),
+                app.effective_compact_keep_recent_turns()
+            ));
+        }
+        ["set", "model", "default"] => {
+            app.session.compact_model_override = crate::session::ModelOverride::Inherit;
+            app.conversation_panel
+                .add_info_string("compact model now inherits the global setting");
+            session::mark_dirty(app);
+        }
+        ["set", "model", "current"] => {
+            app.session.compact_model_override = crate::session::ModelOverride::Current;
+            app.conversation_panel
+                .add_info_string("compact model set to the current chat model for this session");
+            session::mark_dirty(app);
+        }
+        ["set", "model", model] if app.provider_manager.resolve(model).is_some() => {
+            app.session.compact_model_override =
+                crate::session::ModelOverride::Model((*model).to_string());
+            app.conversation_panel
+                .add_info_string(format!("compact model set to {model} for this session"));
+            session::mark_dirty(app);
+        }
+        ["set", "model", model] => app
+            .conversation_panel
+            .add_error_string(format!("unknown provider/model: {model}")),
+        ["set", "tokens", "default"] => {
+            app.session.auto_compact_override = crate::session::AutoCompactOverride::Inherit;
+            app.conversation_panel
+                .add_info_string("auto compact threshold now inherits the global setting");
+            session::mark_dirty(app);
+        }
+        ["set", "tokens", "off"] => {
+            app.session.auto_compact_override = crate::session::AutoCompactOverride::Disabled;
+            app.conversation_panel
+                .add_info_string("automatic context compaction disabled for this session");
+            session::mark_dirty(app);
+        }
+        ["set", "tokens", value] => match value.parse::<u32>() {
+            Ok(tokens) if tokens > 0 => {
+                app.session.auto_compact_override =
+                    crate::session::AutoCompactOverride::Tokens(tokens);
+                app.conversation_panel.add_info_string(format!(
+                    "automatic context compaction threshold set to {tokens} input tokens for this session"
+                ));
+                session::mark_dirty(app);
+            }
+            _ => app
+                .conversation_panel
+                .add_error_string("compact token threshold must be a positive integer"),
+        },
+        ["set", "keep", "default"] => {
+            app.session.compact_keep_recent_turns_override = None;
+            app.conversation_panel
+                .add_info_string("recent-turn retention now inherits the global setting");
+            session::mark_dirty(app);
+        }
+        ["set", "keep", value] => match value.parse::<usize>() {
+            Ok(keep) => {
+                app.session.compact_keep_recent_turns_override = Some(keep);
+                app.conversation_panel.add_info_string(format!(
+                    "compaction will keep {keep} recent complete turn(s) for this session"
+                ));
+                session::mark_dirty(app);
+            }
+            Err(_) => app
+                .conversation_panel
+                .add_error_string("compact keep value must be a non-negative integer"),
+        },
+        _ => app.conversation_panel.add_error_string(
+            "usage: /compact [show | set model <provider/model|current|default> | set tokens <positive integer|off|default> | set keep <non-negative integer|default>]",
+        ),
+    }
     CommandOutcome::handled(false)
 }
 

@@ -201,6 +201,86 @@ impl Conversation {
         self.items.push(MessageItem::Compacted { summary });
     }
 
+    /// Return the insertion point for a compaction boundary that leaves the
+    /// requested number of most-recent turns verbatim.
+    pub fn compaction_cutoff(&self, keep_recent_turns: usize) -> Option<usize> {
+        self.compaction_cutoff_before(keep_recent_turns, self.items.len())
+    }
+
+    /// Like compaction_cutoff, but only considers the stable prefix before
+    /// stable_end. Automatic compaction passes the start of the in-flight turn
+    /// here so that turn is never summarized.
+    pub fn compaction_cutoff_before(
+        &self,
+        keep_recent_turns: usize,
+        stable_end: usize,
+    ) -> Option<usize> {
+        let stable_end = stable_end.min(self.items.len());
+        let live_start = self.items[..stable_end]
+            .iter()
+            .rposition(|item| matches!(item, MessageItem::Compacted { .. }))
+            .map_or(0, |index| index + 1);
+
+        // A request begins with one or more adjacent user/developer messages.
+        // Count that group as a single turn. This deliberately does not depend
+        // on Usage items because some compatible providers omit usage data.
+        let mut turn_starts = Vec::new();
+        let mut in_initial_input_group = false;
+        for (offset, item) in self.items[live_start..stable_end].iter().enumerate() {
+            let is_request_input = matches!(
+                item,
+                MessageItem::Input(InputItem::Item(Item::Message(ApiMessageItem::Input(_))))
+            );
+            if is_request_input {
+                if !in_initial_input_group {
+                    turn_starts.push(live_start + offset);
+                }
+                in_initial_input_group = true;
+            } else {
+                in_initial_input_group = false;
+            }
+        }
+        if turn_starts.len() <= keep_recent_turns {
+            return None;
+        }
+        let cutoff = if keep_recent_turns == 0 {
+            stable_end
+        } else {
+            turn_starts[turn_starts.len() - keep_recent_turns]
+        };
+        self.items[live_start..cutoff]
+            .iter()
+            .any(|item| matches!(item, MessageItem::Input(_) | MessageItem::Output(_)))
+            .then_some(cutoff)
+    }
+
+    /// Build the model input for the stable prefix ending at `cutoff`.
+    pub fn input_param_for_prefix(
+        &self,
+        cutoff: usize,
+        current_model: &str,
+        vision_enabled: bool,
+    ) -> InputParam {
+        let prefix = Conversation {
+            items: self.items[..cutoff.min(self.items.len())].to_vec(),
+            accumulated_usage: (0, 0),
+            mutation_version: 0,
+        };
+        prefix.to_input_param_with_vision(current_model, None, None, None, vision_enabled)
+    }
+
+    /// Install a compaction boundary at a snapshotted historical cutoff. New
+    /// messages appended while the summary was generated remain after it.
+    pub fn apply_compaction_at(&mut self, cutoff: usize, summary: String) -> bool {
+        if cutoff > self.items.len() {
+            return false;
+        }
+        self.items
+            .insert(cutoff, MessageItem::Compacted { summary });
+        self.mutation_version = self.mutation_version.wrapping_add(1);
+        true
+    }
+
     pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
         self.accumulated_usage.0 += input_tokens;
         self.accumulated_usage.1 += output_tokens;
@@ -257,6 +337,12 @@ impl Conversation {
     pub fn restore_items(&mut self, items: Vec<MessageItem>) {
         self.items = items;
         self.mutation_version += 1;
+    }
+
+    pub fn truncate(&mut self, cutoff: usize) {
+        self.items.truncate(cutoff);
+        self.accumulated_usage = (0, 0);
+        self.mutation_version = self.mutation_version.wrapping_add(1);
     }
 
     /// Iterate over the current conversation items (for persistence and the
@@ -598,6 +684,57 @@ mod tests {
         assert!(matches!(&conv.items[1], MessageItem::Warning(text) if text == "keep warning"));
         assert!(!conv.remove_warning_string("missing"));
         assert_eq!(conv.mutation_version, 1);
+    }
+
+    #[test]
+    fn compaction_cutoff_keeps_recent_complete_and_active_turns() {
+        let mut conv = Conversation::new();
+        for turn in 1..=3 {
+            conv.add_input_message(user_message(&format!("turn {turn}")));
+            conv.add_output(assistant_text(&format!("answer {turn}")));
+            conv.add_usage(10, 2);
+            conv.flush_usage();
+        }
+        let stable_end = conv.items.len();
+        conv.add_input_message(user_message("active turn"));
+
+        let cutoff = conv
+            .compaction_cutoff_before(1, stable_end)
+            .expect("old prefix");
+        assert!(matches!(conv.items[cutoff - 1], MessageItem::Usage(_, _)));
+        assert!(
+            conv.items[cutoff..]
+                .iter()
+                .any(|item| { matches!(item, MessageItem::Input(_)) })
+        );
+
+        assert!(conv.apply_compaction_at(cutoff, "summary".to_string()));
+        let InputParam::Items(items) = conv.to_input_param("test/model", None, None, None) else {
+            panic!("expected item input");
+        };
+        let rendered = format!("{items:?}");
+        assert!(rendered.contains("summary"));
+        assert!(rendered.contains("turn 3"));
+        assert!(rendered.contains("active turn"));
+        assert!(!rendered.contains("turn 1"));
+    }
+
+    #[test]
+    fn compaction_cutoff_does_not_require_provider_usage() {
+        let mut conv = Conversation::new();
+        for turn in 1..=3 {
+            conv.add_input_message(user_message(&format!("turn {turn}")));
+            conv.add_output(assistant_text(&format!("answer {turn}")));
+        }
+
+        let cutoff = conv.compaction_cutoff(1).expect("old prefix");
+        let prefix = format!(
+            "{:?}",
+            conv.input_param_for_prefix(cutoff, "test/model", false)
+        );
+        assert!(prefix.contains("turn 1"));
+        assert!(prefix.contains("turn 2"));
+        assert!(!prefix.contains("turn 3"));
     }
 
     #[test]

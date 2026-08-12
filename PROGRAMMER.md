@@ -13,6 +13,8 @@ The binary is a single crate at the repo root.
 Key features beyond the chat loop:
 - **Multi-provider**: add/edit/delete/switch API backends at runtime.
 - **Multi-session**: UUID-keyed JSON persistence in `~/.config/programmer/sessions/`.
+- **Rewind checkpoints**: prompt-level conversation checkpoints plus content-addressed snapshots for built-in file edits.
+- **Context compaction**: manual and provider-usage-triggered background summaries with session overrides.
 - **Auto-mode classifier**: per-mode LLM classifier that approves/denies/defers tool calls.
 - **MCP (Model Context Protocol)**: connect to external MCP servers (stdio + HTTP);
   their tools are advertised to the model as `mcp__<server>__<tool>`.
@@ -92,6 +94,7 @@ src/
 │   ├── stream.rs             #   API stream management + retry
 │   └── tools.rs              #   Tool-call routing (execute + approval queue)
 │
+├── checkpoint.rs             # Per-session rewind manifests, blobs, conflict-safe restore
 ├── classifier/               # Auto-mode tool-call classification
 │   ├── mod.rs                #   WorkMode enum, Verdict, Classifier trait
 │   └── llm.rs                #   Light (logprob probe) + Full (reasoned) classifier calls

@@ -178,6 +178,9 @@ pub(crate) enum RunnerEvent<'a> {
     ToolCall { name: &'a str },
     /// The turn moved to a new phase.
     Phase(RunnerPhase),
+    /// A completed API response reported its real input token count and all
+    /// function calls from that response (if any) now have paired outputs.
+    UsageSafePoint { input_tokens: u32 },
 }
 
 /// When a turn is cancelled after assistant function calls have already been
@@ -333,6 +336,9 @@ impl TurnRunner {
 
             // ---- no tool calls → the turn is done ----
             if calls.is_empty() {
+                if let Some((input_tokens, _)) = usage {
+                    surface.on_event(RunnerEvent::UsageSafePoint { input_tokens });
+                }
                 let usage = conversation.lock().unwrap().accumulated_usage;
                 return Ok(TurnResult {
                     final_text: assistant_text,
@@ -407,6 +413,9 @@ impl TurnRunner {
                         )
                         .await;
                     }
+                    if let Some((input_tokens, _)) = usage {
+                        surface.on_event(RunnerEvent::UsageSafePoint { input_tokens });
+                    }
                 }
                 None => {
                     ensure_tool_output_pairing(conversation);
@@ -473,17 +482,14 @@ impl TurnRunner {
                     let items: Vec<&MessageItem> = conv.items().collect();
                     classify::build_classifier_context(&items)
                 };
-                classify::classify_llm(
-                    &p.client,
-                    &p.model_name,
-                    p.top_logprobs,
-                    &p.no_logprobs,
-                    &light,
-                    &full,
-                    to_classify,
-                    cancel,
-                )
-                .await?
+                let ctx = crate::classifier::ClassifyContext {
+                    client: &p.client,
+                    model: &p.model_name,
+                    light_context: &light,
+                    full_context: &full,
+                    top_logprobs: p.top_logprobs,
+                };
+                classify::classify_llm(&ctx, &p.no_logprobs, to_classify, cancel).await?
             }
         };
         // Front-gate auto-approvals join whatever the classifier cleared.
@@ -983,7 +989,8 @@ mod tests {
                 // Ephemeral progress events aren't asserted on in these tests.
                 RunnerEvent::StreamChunk(_)
                 | RunnerEvent::ResponseCommitted
-                | RunnerEvent::Phase(_) => return,
+                | RunnerEvent::Phase(_)
+                | RunnerEvent::UsageSafePoint { .. } => return,
             };
             self.events.lock().unwrap().push(label);
         }

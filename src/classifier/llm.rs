@@ -61,37 +61,44 @@ enum FastResult {
     NoLogprobs,
 }
 
+/// Shared configuration and context for a batch of LLM classifications.
+///
+/// Bundles the fields that stay constant across every call in a batch (client,
+/// model, the two context strings, and the logprobs ceiling) so the per-call
+/// function takes one value instead of six.
+pub struct ClassifyContext<'a> {
+    pub client: &'a Client<OpenAIConfig>,
+    pub model: &'a str,
+    /// `light_context` (fast path) carries just the working directory and user
+    /// request — enough to anchor the yes/no decision without burning tokens on
+    /// assistant replies and tool outputs that the single-token probe can't use.
+    pub light_context: &'a str,
+    /// `full_context` (reasoned fallback) adds assistant replies, tool outputs,
+    /// and the recent call history — it is only sent when the fast path couldn't
+    /// confidently approve, so the model has the full picture when it re-evaluates
+    /// with reasoning.
+    pub full_context: &'a str,
+    pub top_logprobs: u8,
+}
+
 /// Classify one tool call with the LLM.
-///
-/// `light_context` (fast path) carries just the working directory and user
-/// request — enough to anchor the yes/no decision without burning tokens on
-/// assistant replies and tool outputs that the single-token probe can't use.
-///
-/// `full_context` (reasoned fallback) adds assistant replies, tool outputs,
-/// and the recent call history — it is only sent when the fast path couldn't
-/// confidently approve, so the model has the full picture when it re-evaluates
-/// with reasoning.
 ///
 /// `try_logprobs` should be `false` when the model is already known not to
 /// support logprobs, so we skip straight to the merged reason-generating call.
 pub async fn classify_tool_call(
-    client: &Client<OpenAIConfig>,
-    model: &str,
+    ctx: &ClassifyContext<'_>,
     tool_name: &str,
     arguments: &str,
-    light_context: &str,
-    full_context: &str,
     try_logprobs: bool,
-    top_logprobs: u8,
 ) -> ClassifyOutcome {
     if try_logprobs {
         match classify_fast(
-            client,
-            model,
+            ctx.client,
+            ctx.model,
             tool_name,
             arguments,
-            light_context,
-            top_logprobs,
+            ctx.light_context,
+            ctx.top_logprobs,
         )
         .await
         {
@@ -106,22 +113,40 @@ pub async fn classify_tool_call(
                 // reasoning so the model gets a chance to approve after seeing
                 // the bigger picture, reducing false positives.
                 return ClassifyOutcome {
-                    verdict: classify_reasoned(client, model, tool_name, arguments, full_context)
-                        .await,
+                    verdict: classify_reasoned(
+                        ctx.client,
+                        ctx.model,
+                        tool_name,
+                        arguments,
+                        ctx.full_context,
+                    )
+                    .await,
                     logprobs_missing: false,
                 };
             }
             Ok(FastResult::Ambiguous) => {
                 return ClassifyOutcome {
-                    verdict: classify_reasoned(client, model, tool_name, arguments, full_context)
-                        .await,
+                    verdict: classify_reasoned(
+                        ctx.client,
+                        ctx.model,
+                        tool_name,
+                        arguments,
+                        ctx.full_context,
+                    )
+                    .await,
                     logprobs_missing: false,
                 };
             }
             Ok(FastResult::NoLogprobs) => {
                 return ClassifyOutcome {
-                    verdict: classify_reasoned(client, model, tool_name, arguments, full_context)
-                        .await,
+                    verdict: classify_reasoned(
+                        ctx.client,
+                        ctx.model,
+                        tool_name,
+                        arguments,
+                        ctx.full_context,
+                    )
+                    .await,
                     logprobs_missing: true,
                 };
             }
@@ -138,7 +163,14 @@ pub async fn classify_tool_call(
 
     // Known to lack logprobs: go straight to the merged path.
     ClassifyOutcome {
-        verdict: classify_reasoned(client, model, tool_name, arguments, full_context).await,
+        verdict: classify_reasoned(
+            ctx.client,
+            ctx.model,
+            tool_name,
+            arguments,
+            ctx.full_context,
+        )
+        .await,
         logprobs_missing: true,
     }
 }

@@ -372,6 +372,7 @@ pub(crate) struct AgentRuntime {
     pub(crate) skill_registry: crate::skills::SkillRegistry,
     pub(crate) skill_prompt: Option<String>,
     pub(crate) approval_label: String,
+    pub(crate) checkpoint: Option<crate::checkpoint::CheckpointRecorder>,
 }
 
 impl AgentRuntime {
@@ -408,11 +409,14 @@ impl AgentRuntime {
         };
 
         let mut providers: Vec<Arc<dyn ToolProvider>> = vec![
-            Arc::new(LocalToolProvider::new_scoped(
-                self.todos.clone(),
-                self.security.clone(),
-                file_scope,
-            )),
+            Arc::new(
+                LocalToolProvider::new_scoped(
+                    self.todos.clone(),
+                    self.security.clone(),
+                    file_scope,
+                )
+                .with_checkpoint(self.checkpoint.clone()),
+            ),
             Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
         ];
         if let Some(mcp) = &self.mcp_manager {

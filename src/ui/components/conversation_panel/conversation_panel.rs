@@ -742,6 +742,57 @@ impl ConversationPanel {
         self.stick_to_bottom = true;
     }
 
+    pub fn response_started(&self) -> bool {
+        self.receiving_response
+            .as_ref()
+            .is_some_and(crate::response::partial_response::PartialResponse::started)
+    }
+
+    pub fn compaction_cutoff(&self, keep_recent_turns: usize) -> Option<usize> {
+        self.conversation
+            .lock()
+            .unwrap()
+            .compaction_cutoff(keep_recent_turns)
+    }
+
+    pub fn compaction_cutoff_before(
+        &self,
+        keep_recent_turns: usize,
+        stable_end: usize,
+    ) -> Option<usize> {
+        self.conversation
+            .lock()
+            .unwrap()
+            .compaction_cutoff_before(keep_recent_turns, stable_end)
+    }
+
+    pub fn input_param_for_prefix(
+        &self,
+        cutoff: usize,
+        current_model: &str,
+        vision_enabled: bool,
+    ) -> InputParam {
+        self.conversation.lock().unwrap().input_param_for_prefix(
+            cutoff,
+            current_model,
+            vision_enabled,
+        )
+    }
+
+    pub fn apply_compaction_at(&mut self, cutoff: usize, summary: String) -> bool {
+        let applied = self
+            .conversation
+            .lock()
+            .unwrap()
+            .apply_compaction_at(cutoff, summary);
+        if applied {
+            self.expanded_items.clear();
+            self.expanded_tool_groups.clear();
+            self.stick_to_bottom = true;
+        }
+        applied
+    }
+
     pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
         self.conversation
             .lock()
@@ -776,6 +827,15 @@ impl ConversationPanel {
         self.conversation.lock().unwrap().restore_items(items);
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
+        self.stick_to_bottom = true;
+    }
+
+    pub fn truncate(&mut self, cutoff: usize) {
+        self.conversation.lock().unwrap().truncate(cutoff);
+        self.abort_receiving();
+        self.expanded_items.clear();
+        self.expanded_tool_groups.clear();
+        self.selection = None;
         self.stick_to_bottom = true;
     }
 

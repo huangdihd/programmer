@@ -21,6 +21,7 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::New => new(app),
         Command::Session => show_session(app),
         Command::Usage => usage(app),
+        Command::Rewind => rewind(app),
         Command::Todo => {
             app.sync_todos_from_store();
             app.todo_panel = Some(TodoPanel::new(app.todo_list.clone()));
@@ -33,6 +34,28 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::Help => help(app),
         _ => unreachable!("session handler received a command from another domain"),
     }
+}
+
+fn rewind(app: &mut App<'_>) -> CommandOutcome {
+    if app.cancel.active_id.is_some() {
+        app.conversation_panel
+            .add_warning_string("cannot rewind while a turn is in flight");
+        return CommandOutcome::handled(false);
+    }
+    let Some(store) = &app.checkpoint_store else {
+        app.conversation_panel
+            .add_warning_string("rewind checkpoints are unavailable");
+        return CommandOutcome::handled(false);
+    };
+    let panel =
+        crate::ui::components::rewind_panel::RewindPanel::new(store.lock().unwrap().checkpoints());
+    if panel.is_empty() {
+        app.conversation_panel
+            .add_info_string("no user prompt checkpoints to rewind to");
+    } else {
+        app.rewind_panel = Some(panel);
+    }
+    CommandOutcome::handled(false)
 }
 
 fn show_session(app: &mut App<'_>) -> CommandOutcome {
@@ -98,6 +121,7 @@ fn format_usage(summary: crate::conversation::UsageSummary) -> String {
 }
 
 fn clear(app: &mut App<'_>) -> CommandOutcome {
+    commands::invalidate_auto_compaction(app);
     app.conversation_panel.clear_messages();
     diagnostics::reset_diagnostics_state(app);
     app.pending_images.clear();
@@ -108,6 +132,7 @@ fn clear(app: &mut App<'_>) -> CommandOutcome {
 }
 
 fn new(app: &mut App<'_>) -> CommandOutcome {
+    commands::invalidate_auto_compaction(app);
     session::save_session(app);
     app.conversation_panel.clear_messages();
     diagnostics::reset_diagnostics_state(app);
@@ -121,9 +146,16 @@ fn new(app: &mut App<'_>) -> CommandOutcome {
         let new_session = manager.create();
         app.session.uuid = new_session.uuid;
     }
+    app.checkpoint_store = crate::checkpoint::CheckpointStore::for_session(&app.session.uuid)
+        .map(|store| std::sync::Arc::new(std::sync::Mutex::new(store)));
+    app.current_checkpoint_id = None;
     app.todo_list = crate::todos::TodoList::default();
     app.sync_todos_to_store();
     app.vision_enabled = false;
+    app.session.classifier_model_override = crate::session::ModelOverride::Inherit;
+    app.session.compact_model_override = crate::session::ModelOverride::Inherit;
+    app.session.auto_compact_override = crate::session::AutoCompactOverride::Inherit;
+    app.session.compact_keep_recent_turns_override = None;
 
     let mut message = "Started a new session. Previous session saved.".to_string();
     if killed > 0 {

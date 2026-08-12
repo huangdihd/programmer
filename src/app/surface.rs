@@ -48,6 +48,9 @@ impl AgentSurface for TuiSurface {
             RunnerEvent::StreamChunk(b) => AppEvent::ChunkReceived(self.operation_id, Box::new(*b)),
             RunnerEvent::ResponseCommitted => AppEvent::ResponseCommitted(self.operation_id),
             RunnerEvent::Phase(p) => AppEvent::RunnerPhase(self.operation_id, p),
+            RunnerEvent::UsageSafePoint { input_tokens } => {
+                AppEvent::UsageSafePoint(self.operation_id, input_tokens)
+            }
             // These are read from the shared conversation directly.
             RunnerEvent::Assistant(_) | RunnerEvent::ToolCall { .. } => return,
         };

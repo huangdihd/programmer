@@ -68,7 +68,12 @@ async fn handle_crossterm(
         }
         crossterm::event::Event::Paste(data) => keys::handle_paste(app, data),
         crossterm::event::Event::Mouse(_)
-            if app.provider_panel.is_some() || app.security_panel.is_some() => {}
+            if app.provider_panel.is_some()
+                || app.skills_panel.is_some()
+                || app.mcp_panel.is_some()
+                || app.diagnostics_panel.is_some()
+                || app.security_panel.is_some()
+                || app.rewind_panel.is_some() => {}
         // The task viewer owns the whole screen. Interactive tasks can forward
         // mouse input to their PTY; read-only tasks use the wheel to scroll.
         crossterm::event::Event::Mouse(mouse) if app.terminal_pane.is_some() => {
@@ -124,6 +129,9 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             }
             if app.conversation_panel.receiving_response.is_some() {
                 app.conversation_panel.handle_response_stream_event(*chunk);
+                if app.conversation_panel.response_started() {
+                    app.cancel.response_started = true;
+                }
             }
         }
         AppEvent::ResponseCommitted(op_id) => {
@@ -131,6 +139,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 return;
             }
             app.conversation_panel.commit_live();
+            app.cancel.response_started = true;
             app.sync_todos_from_store();
         }
         AppEvent::RunnerPhase(op_id, p) => {
@@ -148,6 +157,11 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 RunnerPhase::RunningTools => ActivePhase::ToolRunning,
                 RunnerPhase::Checking => ActivePhase::Checking,
             };
+        }
+        AppEvent::UsageSafePoint(op_id, input_tokens) => {
+            if is_live_turn(app, op_id) {
+                commands::maybe_start_auto_compact(app, input_tokens);
+            }
         }
         AppEvent::ReviewRequest {
             call,
@@ -197,6 +211,8 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             // earlier) turn are dropped and Esc won't try to cancel a
             // turn that has already ended.
             app.cancel.active_id = None;
+            app.cancel.turn_conversation_cutoff = None;
+            app.cancel.active_user_request = None;
             // A prompt may have been installed just before cancellation won the
             // race. Turn completion is the final defensive cleanup boundary.
             discard_reviews_for_operation(app, op_id);
@@ -254,15 +270,47 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         AppEvent::FlushAgentNotifications(token) => {
             flush_agent_notifications(app, token).await;
         }
-        AppEvent::CompactFinished(op_id, result, cancel_token) => {
+        AppEvent::CompactFinished(op_id, cutoff, result, cancel_token) => {
             if !is_current_turn(app, op_id) {
                 return;
             }
-            handle_compact_finished(app, result, cancel_token);
+            handle_compact_finished(app, cutoff, result, cancel_token);
             // handle_compact_finished clears active_id and resets the phase
             // back to idle. If the user queued a message while compacting,
             // start it now — just like TurnFinished does for normal turns.
             start_queued_work(app).await;
+        }
+        AppEvent::AutoCompactFinished {
+            job_id,
+            history_epoch,
+            cutoff,
+            result,
+        } => {
+            if app.auto_compact.active_id != Some(job_id) {
+                return;
+            }
+            app.auto_compact.active_id = None;
+            if app.auto_compact.history_epoch != history_epoch {
+                return;
+            }
+            match result {
+                Ok(summary) => {
+                    if app.conversation_panel.apply_compaction_at(cutoff, summary) {
+                        if let Some(store) = &app.checkpoint_store
+                            && let Err(error) =
+                                store.lock().unwrap().record_conversation_insertion(cutoff)
+                        {
+                            app.conversation_panel.add_warning_string(format!(
+                                "could not update rewind checkpoints after compaction: {error}"
+                            ));
+                        }
+                        session::mark_dirty(app);
+                    }
+                }
+                Err(error) => app
+                    .conversation_panel
+                    .add_warning_string(format!("automatic context compaction failed: {error}")),
+            }
         }
         AppEvent::Quit => handle_quit_request(app),
         AppEvent::ProvidersChanged => reload_provider_manager(app),
@@ -291,6 +339,35 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             generation,
             manager,
         } => handle_mcp_reloaded(app, generation, *manager),
+        AppEvent::DiagnosticsUpdated {
+            generation,
+            snapshot,
+        } => {
+            if generation != app.diagnostics_update_generation {
+                return;
+            }
+            app.diag.lsp_configured = crate::app::helpers::lsp_checker_configured();
+            match snapshot {
+                None => {
+                    app.diagnostics_state.lock().unwrap().baseline = None;
+                    app.conversation_panel.add_info_string(
+                        "No diagnostics profile configured. Use /diagnostics manage to add one.",
+                    );
+                }
+                Some(snapshot) => {
+                    let rendered = snapshot.render();
+                    app.diagnostics_state.lock().unwrap().baseline = Some(snapshot.diagnostics);
+                    if snapshot.errors.is_empty() {
+                        app.conversation_panel
+                            .add_info_string(format!("Diagnostics updated.\n{rendered}"));
+                    } else {
+                        app.conversation_panel.add_warning_string(format!(
+                            "Diagnostics updated with checker errors.\n{rendered}"
+                        ));
+                    }
+                }
+            }
+        }
         AppEvent::QuestionPrompt {
             question,
             answer_tx,
@@ -456,8 +533,10 @@ fn has_blocking_surface(app: &App<'_>) -> bool {
         || app.provider_panel.is_some()
         || app.skills_panel.is_some()
         || app.mcp_panel.is_some()
+        || app.diagnostics_panel.is_some()
         || app.security_panel.is_some()
         || app.todo_panel.is_some()
+        || app.rewind_panel.is_some()
         || app.terminal_pane.is_some()
         || app.agent_panel.is_some()
         || (app.work_mode == WorkMode::Plan
@@ -511,7 +590,21 @@ async fn handle_cancel(app: &mut App<'_>) {
     }
     // Cancel the turn's root token; the runner's spawned task checks this token
     // between every iteration and stops.
+    let restore_draft = !app.cancel.response_started;
     app.cancel.active.cancel();
+    if restore_draft && let Some(request) = app.cancel.active_user_request.take() {
+        app.conversation_panel.truncate(request.conversation_cutoff);
+        app.input_panel
+            .remove_last_history_if(&request.history_text);
+        app.input_panel.restore_draft(request.draft);
+        if let (Some(checkpoint_id), Some(store)) =
+            (app.current_checkpoint_id, app.checkpoint_store.as_ref())
+        {
+            let _ = store.lock().unwrap().truncate_after(checkpoint_id, None);
+        }
+        app.current_checkpoint_id = None;
+        session::mark_dirty(app);
+    }
     app.conversation_panel.abort_receiving();
     app.conversation_panel.phase = ActivePhase::Cancelling;
     app.conversation_panel.flush_usage();
@@ -537,6 +630,7 @@ fn handle_start_init(app: &mut App<'_>, prompt: String) {
             .add_warning_string("cannot initialize while a turn is in flight");
         return;
     }
+    let conversation_cutoff = app.conversation_panel.items_snapshot().len();
     app.conversation_panel
         .add_meta("\u{25B8} Initializing project\u{2026}", prompt);
     app.conversation_panel.reset_accumulated_usage();
@@ -547,10 +641,14 @@ fn handle_start_init(app: &mut App<'_>, prompt: String) {
     app.cancel.next_id = app.cancel.next_id.wrapping_add(1);
     let operation_id = app.cancel.next_id;
     app.cancel.active_id = Some(operation_id);
+    app.cancel.turn_conversation_cutoff = Some(conversation_cutoff);
+    app.cancel.response_started = false;
+    app.cancel.active_user_request = None;
 
     // Spawn the init turn through the same runner path.
     let Some(runner) = app.build_runner() else {
         app.cancel.active_id = None;
+        app.cancel.turn_conversation_cutoff = None;
         app.conversation_panel
             .add_error_string(format!("unknown provider/model: {}", app.current_model));
         return;
@@ -581,17 +679,26 @@ fn handle_start_init(app: &mut App<'_>, prompt: String) {
 /// cancelled compaction doesn't leave the UI stuck in Cancelling.
 fn handle_compact_finished(
     app: &mut App<'_>,
+    cutoff: usize,
     result: Result<String, String>,
     cancel_token: CancellationToken,
 ) {
     app.cancel.active_id = None;
+    app.cancel.turn_conversation_cutoff = None;
     app.conversation_panel.phase = ActivePhase::None;
     if cancel_token.is_cancelled() {
         return;
     }
     match result {
         Ok(summary) => {
-            app.conversation_panel.apply_compaction(summary);
+            if app.conversation_panel.apply_compaction_at(cutoff, summary)
+                && let Some(store) = &app.checkpoint_store
+                && let Err(error) = store.lock().unwrap().record_conversation_insertion(cutoff)
+            {
+                app.conversation_panel.add_warning_string(format!(
+                    "could not update rewind checkpoints after compaction: {error}"
+                ));
+            }
             app.conversation_panel.add_info_string(
                 "Context compacted — older history is summarized for the model \
                  (click the divider to read the summary) but stays visible here."
@@ -895,8 +1002,8 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationPanel, QUIT_CONFIRM_TIMEOUT, QUIT_CONFIRM_WARNING, is_current_turn_id,
-        is_live_turn_id, quit_confirmation_expired, quit_is_confirmed,
+        ConversationPanel, QUIT_CONFIRM_TIMEOUT, QUIT_CONFIRM_WARNING, handle_cancel,
+        is_current_turn_id, is_live_turn_id, quit_confirmation_expired, quit_is_confirmed,
         remove_quit_confirmation_warning, take_pending_request,
     };
     use crate::response::message_item::MessageItem;
@@ -1017,5 +1124,68 @@ mod tests {
         assert_eq!(taken_images.len(), 1);
         assert!(images.is_empty());
         assert!(take_pending_request(&mut panel, &mut images).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_model_output_restores_the_original_draft() {
+        use async_openai::types::responses::{
+            ImageDetail, InputContent, InputImageContent, InputMessage, InputRole, OutputStatus,
+        };
+
+        let mut config = crate::config::programmer_config::ProgrammerConfig::default();
+        config.providers.clear();
+        let mut app = crate::app::App::new(
+            config,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "cancel-draft-test".to_string(),
+            None,
+            Vec::new(),
+            false,
+            "test".to_string(),
+        )
+        .await;
+        app.input_panel.add_paste("first\nsecond".to_string());
+        assert!(app.input_panel.add_image(
+            InputImageContent {
+                detail: ImageDetail::Auto,
+                file_id: None,
+                image_url: Some("data:image/png;base64,AAAA".to_string()),
+            },
+            4,
+            4,
+        ));
+        let draft = app.input_panel.draft_snapshot();
+        let history_text = app.input_panel.expanded_content();
+        app.input_panel.push_history(history_text.clone());
+        app.input_panel.clear();
+        let cutoff = app.conversation_panel.items_snapshot().len();
+        app.conversation_panel.add_input_message(
+            async_openai::types::responses::MessageItem::Input(InputMessage {
+                content: vec![InputContent::InputText("sent".into())],
+                role: InputRole::User,
+                status: Some(OutputStatus::Completed),
+            }),
+        );
+        app.cancel.active_id = Some(1);
+        app.cancel.response_started = false;
+        app.cancel.active_user_request = Some(crate::app::ActiveUserRequest {
+            draft,
+            conversation_cutoff: cutoff,
+            history_text,
+        });
+
+        handle_cancel(&mut app).await;
+
+        assert!(app.input_panel.get_content().contains("[Pasted text #1"));
+        assert_eq!(app.input_panel.take_images().len(), 1);
+        assert!(app.input_panel.history.is_empty());
+        assert!(
+            !app.conversation_panel
+                .items_snapshot()
+                .iter()
+                .any(|item| { matches!(item, MessageItem::Input(_)) })
+        );
     }
 }

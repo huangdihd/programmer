@@ -21,14 +21,21 @@ fn diagnostics_json_reports_findings_and_sets_the_exit_status() {
     let project = std::env::temp_dir().join(unique);
     let profile_dir = project.join(".programmer");
     std::fs::create_dir_all(&profile_dir).unwrap();
+    let command = if cfg!(windows) {
+        "echo src/main.rs:7:3: error: broken"
+    } else {
+        "printf 'src/main.rs:7:3: error: broken\\n'"
+    };
     std::fs::write(
         profile_dir.join("diagnostics.toml"),
-        r#"
+        format!(
+            r#"
 [[checkers]]
 name = "fixture"
-command = "printf 'src/main.rs:7:3: error: broken\\n'"
+command = {command:?}
 parser = "gnu"
-"#,
+"#
+        ),
     )
     .unwrap();
 

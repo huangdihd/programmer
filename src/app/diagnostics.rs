@@ -19,6 +19,52 @@
 
 use super::App;
 
+/// Persist the profile edited by `/diagnostics manage`. An empty profile means
+/// diagnostics are disabled and removes the project file entirely.
+pub(crate) fn save_profile(profile: &crate::diagnostics::DiagnosticsProfile) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let path = crate::diagnostics::DiagnosticsProfile::path_in(&cwd);
+    if profile.checkers.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("remove {}: {error}", path.display()))?;
+        }
+        return Ok(());
+    }
+    profile.validate()?;
+    let text = profile.to_toml()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "diagnostics profile has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    std::fs::write(&path, text).map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+/// Re-run the configured checkers without blocking the TUI and update the
+/// shared sidebar snapshot when the matching result arrives.
+pub(crate) fn start_update(app: &mut App<'_>, notify_started: bool) {
+    app.diagnostics_update_generation = app.diagnostics_update_generation.wrapping_add(1);
+    let generation = app.diagnostics_update_generation;
+    if notify_started {
+        app.conversation_panel
+            .add_info_string("Updating diagnostics in the background…");
+    }
+    let sender = app.events.sender.clone();
+    tokio::spawn(async move {
+        let cwd =
+            std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
+        let snapshot =
+            crate::diagnostics::collect(&cwd, &crate::cancel::CancellationToken::new()).await;
+        let _ = sender.send(crate::ui::event::Event::App(
+            crate::ui::event::AppEvent::DiagnosticsUpdated {
+                generation,
+                snapshot,
+            },
+        ));
+    });
+}
+
 /// On the first turn of a session with a diagnostics profile, run the
 /// checkers once in the background to establish a baseline in the shared
 /// [`crate::runner::DiagnosticsState`] (accessible to both the runner and the UI).

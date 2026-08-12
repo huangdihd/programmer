@@ -131,6 +131,17 @@ classifier_model = "openai/gpt-4o-mini"
 # accepts up to 20; some compatible providers have a lower limit (Qwen: 5).
 classifier_top_logprobs = 20
 
+# Model used for manual and automatic context compaction. Falls back to the
+# current chat model when absent.
+compact_model = "openai/gpt-4o-mini"
+
+# Automatically compact after a response reports at least this many input
+# tokens. This uses provider-reported usage (not an estimate); 0 disables it.
+auto_compact_tokens = 100000
+
+# Keep this many recent complete turns verbatim after compaction.
+compact_keep_recent_turns = 2
+
 # Gate YOLO mode behind this flag so it can't be entered by accident.
 allow_yolo = true
 
@@ -183,6 +194,9 @@ api_key = "sk-your-key-here"
 | `default_provider` | `"openai"` | Active provider at startup. |
 | `classifier_model` | (chat model) | `provider/model` for the Auto-mode classifier. Must be a **non-reasoning** model (see [Auto mode](#work-modes)). |
 | `classifier_top_logprobs` | `20` | Alternative-token count for the fast classifier probe (`0`–`20`). Lower this for providers with a smaller limit; Qwen accepts at most `5`. |
+| `compact_model` | (chat model) | `provider/model` used for manual and automatic context compaction. |
+| `auto_compact_tokens` | `100000` | Provider-reported input-token threshold for seamless background compaction. `0` disables it. Providers that do not report usage do not trigger it. |
+| `compact_keep_recent_turns` | `2` | Number of recent complete turns kept verbatim when context is compacted. |
 | `allow_yolo` | `false` | Whether `/mode yolo` and `Ctrl+T` can reach YOLO mode. |
 | `auto_update_check` | `true` | Check GitHub Releases at startup and show a non-blocking update notice. |
 | `git_coauthor` | `programmer <noreply@programmer.local>` | `Co-Authored-By:` trailer added to the agent's git commits. Use a GitHub-linked email for an avatar; `""` disables. |
@@ -301,6 +315,7 @@ programmer
 | Key | Action |
 |---|---|
 | `Enter` | Send message |
+| `Esc` | Cancel the active request; before any model output, restore the original draft to the input |
 | `Ctrl+T` | Cycle work mode (Manual → Auto → Plan → optional YOLO) |
 | `Ctrl+C` / `Ctrl+Q` twice | Quit |
 | `Ctrl+V` | Paste an image from the clipboard |
@@ -315,12 +330,21 @@ programmer
 | `/mode <manual\|auto\|plan>` | Set work mode (or cycle with `Ctrl+T`) |
 | `/mode yolo` | Enter YOLO mode (requires `allow_yolo = true`) |
 | `/plan <approve\|cancel>` | Approve or cancel the current Plan-mode proposal |
-| `/classifier [provider/model]` | Set/show the Auto-mode classifier settings |
-| `/classifier logprobs <0-20>` | Set the fast-probe alternative-token count |
-| `/classifier clear` | Reset classifier to the chat model |
+| `/classifier [show]` | Show the effective Auto-mode classifier settings and their source |
+| `/classifier <provider/model>` | Override the classifier model for this session |
+| `/classifier current` | Force this session to follow the current chat model |
+| `/classifier default` | Clear the session override and inherit the global setting |
+| `/classifier logprobs <0-20\|default>` | Override or inherit the fast-probe alternative-token count for this session |
 | `/init` | Create or refresh `PROGRAMMER.md` and project diagnostics |
+| `/diagnostics manage` | Open the project diagnostics checker management panel |
+| `/diagnostics update` | Re-run configured checkers and refresh the sidebar diagnostics |
 | `/thinking [level]` | Set/show reasoning effort for chat and compaction |
-| `/compact [provider/model]` | Summarize older history to reduce context usage |
+| `/compact` | Manually compact older complete turns with the effective compact model |
+| `/compact show` | Show compact model, threshold, latest reported usage, and background status |
+| `/compact set model <provider/model\|current\|default>` | Set the compact model for this session |
+| `/compact set tokens <number\|off\|default>` | Set, disable, or inherit automatic compaction for this session |
+| `/compact set keep <number\|default>` | Set or inherit recent-turn retention for this session |
+| `/rewind` | Restore conversation and/or built-in `write_file`/`edit_file` changes to a previous user prompt |
 | `/vision <on\|off>` | Enable/disable `@image` attachments for this session |
 | `/select [on\|off]` | Toggle native terminal text selection and copying |
 | `/permission` `/sandbox` | Show sandbox, file protection, and permission status |
@@ -353,7 +377,29 @@ Open with `/providers manage` or the `--providers` flag.
 | `e` | Edit selected provider |
 | `d` | Delete selected provider (confirm with `y`) |
 | `m` | Browse model list of selected provider |
+| `Enter` (model list) | Choose the model's global chat/classifier/compact role |
+| `g` | Edit global classifier logprobs and automatic-compaction settings |
 | `q` / `Esc` | Close panel |
+
+Slash commands change only the current session. Changes made in this panel are
+global and persisted to `config.toml`. Effective model precedence is session
+override → global role → current chat model.
+
+### Rewind and automatic compaction
+
+`/rewind` creates a checkpoint for every user prompt that actually starts. It
+can restore the conversation, built-in file edits, or both. File rewind tracks
+only successful `write_file` and `edit_file` calls (including sub-agents); shell
+commands, MCP tools, IDE edits, and remote side effects are outside its scope.
+If a tracked file no longer has the content Programmer last wrote, restore
+stops before changing any file. Before changing files, Programmer creates a
+recovery checkpoint so its file changes can be undone from the same panel.
+
+Automatic compaction observes the real `input_tokens` returned after every API
+response. For tool-using responses it waits until all call outputs are recorded,
+then summarizes a stable prefix in the background. Input stays usable and new
+messages remain outside that prefix. A stale summary is discarded after
+`/clear`, `/new`, or `/rewind`.
 
 **In model browser (`m`):**
 
