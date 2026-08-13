@@ -64,8 +64,41 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 Both installers select the release asset for the current OS and architecture.
-Use `--version v0.2.0` with `install.sh`, or `-Version v0.2.0` with
+Use `--version v0.2.2` with `install.sh`, or `-Version v0.2.2` with
 `install.ps1`, to install a specific release.
+
+## Quick start
+
+1. Open the provider manager:
+
+   ```sh
+   programmer --providers
+   ```
+
+2. Press `a`, then enter a provider name, an OpenAI-compatible API base URL,
+   an API key, and a default model. Press `Enter` to save it, select the
+   provider, and press `Enter` again to make it the default.
+
+3. Start Programmer from the project you want it to work on:
+
+   ```sh
+   cd your-project
+   programmer
+   ```
+
+4. Send a concrete first task, for example:
+
+   ```text
+   Explain this repository and run its existing tests. Do not change files yet.
+   ```
+
+   Use `/init` if you want Programmer to create project guidance and configure
+   diagnostics before making changes. The default Auto mode asks a classifier
+   model to review mutating tool calls; use a non-reasoning model for that role.
+
+If the provider works but the model list is empty, configure `models` and
+`default_model` explicitly in `config.toml`; see
+[Provider compatibility](#provider-compatibility).
 
 ### Update or uninstall
 
@@ -74,7 +107,7 @@ Once installed, Programmer can update or remove its own executable:
 ```sh
 programmer upgrade --check
 programmer upgrade
-programmer upgrade --tag v0.2.0
+programmer upgrade --tag v0.2.2
 programmer uninstall
 programmer uninstall --purge
 ```
@@ -214,6 +247,52 @@ api_key = "sk-your-key-here"
 
 Each provider is a `[providers.<name>]` section. You can add as many as you want.
 
+## Provider compatibility
+
+Programmer uses the OpenAI **Responses API**, not only the older Chat
+Completions API. An endpoint describing itself as OpenAI-compatible may still
+implement only part of the protocol.
+
+| Capability | Requirement and fallback |
+|---|---|
+| `POST /responses` with streaming and tool calls | Required for normal agent conversations. A Chat Completions-only endpoint is not compatible. |
+| `GET /models` | Optional. If discovery fails or returns a non-standard response, set `models` and `default_model` manually. |
+| Response usage with `input_tokens` | Optional. Without it, `/usage` may be incomplete and token-triggered automatic compaction will not run; manual `/compact` still works. |
+| Image input in the Responses format | Optional. Keep `/vision off` when the selected model or provider does not accept image content. |
+| Output logprobs | Optional for chat, but used by the Auto classifier's fast probe. Missing or inconclusive logprobs fall back to the full classifier pass. Provider-specific limits may require a lower global `classifier_top_logprobs` value. |
+
+### DeepSeek official API
+
+The DeepSeek official API supports Responses API requests, but its `/models`
+entries omit creation-time metadata expected by Programmer's OpenAI client.
+Automatic model discovery therefore fails with a missing `created` or
+`created_at` field. Configure the current model IDs explicitly:
+
+```toml
+default_provider = "deepseek"
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+api_key = "sk-your-key-here"
+models = ["deepseek-v4-flash", "deepseek-v4-pro"]
+default_model = "deepseek-v4-pro"
+```
+
+The provider remains usable when model discovery fails; the manual list powers
+startup model selection, `/model` completion, and the provider model browser.
+
+### Known limitations
+
+- Reasoning models are unsuitable for the Auto-mode classifier because their
+  first emitted token is not a direct yes/no decision. Use a non-reasoning
+  classifier model.
+- Provider support for logprobs and image content varies independently from
+  basic text and tool-call support.
+- Native process sandboxing is available only on supported Unix platforms.
+- `/rewind` can restore only successful changes made through Programmer's
+  built-in `write_file` and `edit_file` tools. Shell commands, MCP tools, IDE
+  edits, and remote side effects are not reversible by Programmer.
+
 ### Environment variables
 
 Environment variables override file values:
@@ -334,7 +413,7 @@ programmer
 | `/classifier <provider/model>` | Override the classifier model for this session |
 | `/classifier current` | Force this session to follow the current chat model |
 | `/classifier default` | Clear the session override and inherit the global setting |
-| `/classifier logprobs <0-20\|default>` | Override or inherit the fast-probe alternative-token count for this session |
+| `/classifier logprobs <0-20\|default>` | Set or reset the persisted global fast-probe alternative-token count |
 | `/init` | Create or refresh `PROGRAMMER.md` and project diagnostics |
 | `/diagnostics manage` | Open the project diagnostics checker management panel |
 | `/diagnostics update` | Re-run configured checkers and refresh the sidebar diagnostics |
@@ -381,9 +460,11 @@ Open with `/providers manage` or the `--providers` flag.
 | `g` | Edit global classifier logprobs and automatic-compaction settings |
 | `q` / `Esc` | Close panel |
 
-Slash commands change only the current session. Changes made in this panel are
-global and persisted to `config.toml`. Effective model precedence is session
-override → global role → current chat model.
+Classifier and compact model slash commands, plus compact thresholds and
+retention, change only the current session. `/classifier logprobs` is the
+exception: it changes the single global value and persists it to `config.toml`.
+Changes made in this panel are also global and persisted. Effective model
+precedence is session override → global role → current chat model.
 
 ### Rewind and automatic compaction
 
@@ -590,6 +671,14 @@ src/
 ├── upgrade.rs        # Release checks, self-update, and uninstall
 └── ui/               # Ratatui components, rendering, and terminal images
 ```
+
+## Contributing and feedback
+
+Found a bug or provider compatibility issue? Use the structured
+[GitHub issue templates](https://github.com/huangdihd/programmer/issues/new/choose).
+Pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+development workflow and required checks. Never include API keys, private
+prompts, or proprietary code in reports.
 
 ## License
 
