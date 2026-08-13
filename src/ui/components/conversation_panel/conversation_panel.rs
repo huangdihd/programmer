@@ -19,11 +19,11 @@ use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{InputParam, OutputItem, ResponseStreamEvent};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
-use std::collections::HashSet;
-use tui_scrollview::ScrollViewState;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
 use super::tool_group::MemberHeader;
@@ -148,7 +148,7 @@ fn is_foldable(item: &MessageItem) -> bool {
 /// Exploring groups have their own revision-keyed cache below.
 #[derive(Debug)]
 pub(crate) struct CachedParagraph {
-    pub paragraph: Paragraph<'static>,
+    pub paragraph: Arc<Paragraph<'static>>,
     pub height: u16,
     /// Whether this slot was intentionally hidden when cached. Bridged live
     /// groups temporarily hide their committed members, then reveal them again
@@ -169,6 +169,44 @@ pub(crate) struct CachedParagraph {
     /// Present when this cache slot represents a derived tool-call group rather
     /// than its original single history item.
     pub tool_group: Option<CachedToolGroup>,
+}
+
+/// Scrolled clones for paragraphs crossing the viewport's top edge. Cloning a
+/// very large expanded group every 60 Hz tick would undo the benefit of virtual
+/// rendering, so retain one clone per source paragraph at the current offset.
+#[derive(Debug, Default)]
+pub(crate) struct ViewportParagraphCache {
+    viewport_top: u16,
+    entries: HashMap<(usize, u16), Arc<Paragraph<'static>>>,
+    used: HashSet<(usize, u16)>,
+}
+
+impl ViewportParagraphCache {
+    pub(crate) fn begin_frame(&mut self, viewport_top: u16) {
+        if self.viewport_top != viewport_top {
+            self.viewport_top = viewport_top;
+            self.entries.clear();
+        }
+        self.used.clear();
+    }
+
+    pub(crate) fn scrolled(
+        &mut self,
+        source: &Arc<Paragraph<'static>>,
+        offset: u16,
+    ) -> Arc<Paragraph<'static>> {
+        let source_id = Arc::as_ptr(source) as *const () as usize;
+        let key = (source_id, offset);
+        self.used.insert(key);
+        self.entries
+            .entry(key)
+            .or_insert_with(|| Arc::new(source.as_ref().clone().scroll((offset, 0))))
+            .clone()
+    }
+
+    pub(crate) fn finish_frame(&mut self) {
+        self.entries.retain(|key, _| self.used.contains(key));
+    }
 }
 
 #[derive(Debug)]
@@ -287,6 +325,69 @@ pub(crate) struct RenderCache {
     pub seen_mutation_version: u64,
 }
 
+/// Vertical scroll state for the conversation's virtual canvas.
+///
+/// Unlike `tui_scrollview::ScrollViewState`, this does not require allocating a
+/// backing buffer as tall as the entire conversation. The renderer records the
+/// virtual content/page height here and paints only the visible rows.
+#[derive(Debug, Default)]
+pub(crate) struct ConversationScrollState {
+    offset: u16,
+    content_height: u16,
+    page_height: u16,
+}
+
+impl ConversationScrollState {
+    pub(crate) fn offset(&self) -> Position {
+        Position::new(0, self.offset)
+    }
+
+    pub(crate) fn update(&mut self, content_height: u16, page_height: u16) {
+        self.content_height = content_height;
+        self.page_height = page_height;
+        self.offset = self.offset.min(self.max_offset());
+    }
+
+    pub(crate) fn scroll_up(&mut self) {
+        self.offset = self.offset.saturating_sub(1);
+    }
+
+    pub(crate) fn scroll_down(&mut self) {
+        self.offset = self.offset.saturating_add(1).min(self.max_offset());
+    }
+
+    pub(crate) fn scroll_page_up(&mut self) {
+        self.offset = self
+            .offset
+            .saturating_add(1)
+            .saturating_sub(self.page_height.max(1));
+    }
+
+    pub(crate) fn scroll_page_down(&mut self) {
+        self.offset = self
+            .offset
+            .saturating_add(self.page_height.max(1))
+            .saturating_sub(1)
+            .min(self.max_offset());
+    }
+
+    pub(crate) fn scroll_to_top(&mut self) {
+        self.offset = 0;
+    }
+
+    pub(crate) fn scroll_to_bottom(&mut self) {
+        self.offset = self.max_offset();
+    }
+
+    pub(crate) fn is_at_bottom(&self) -> bool {
+        self.offset >= self.max_offset()
+    }
+
+    fn max_offset(&self) -> u16 {
+        self.content_height.saturating_sub(self.page_height)
+    }
+}
+
 #[derive(Debug)]
 pub struct ConversationPanel {
     /// The UI-free conversation model: history items and turn-usage counter.
@@ -296,7 +397,7 @@ pub struct ConversationPanel {
     /// every access here locks briefly and never holds the guard across an
     /// await (there are none in the UI thread) or a render sub-call.
     pub(crate) conversation: std::sync::Arc<std::sync::Mutex<crate::conversation::Conversation>>,
-    pub(crate) scroll_view_state: ScrollViewState,
+    pub(crate) scroll_view_state: ConversationScrollState,
     pub pending_message: Option<String>,
     pub receiving_response: Option<PartialResponse>,
     /// The current active work phase of the turn. Replaces the old cluster of
@@ -342,6 +443,7 @@ pub struct ConversationPanel {
     /// alongside `item_layout` so clicks on streaming items can be mapped.
     live_item_layout: Vec<(usize, u16, u16)>,
     pub(crate) render_cache: RenderCache,
+    pub(crate) viewport_paragraph_cache: ViewportParagraphCache,
     /// Monotonic frame counter, incremented every render. Drives the animated
     /// "Thinking..." dots on the live reasoning indicator during streaming.
     pub(crate) frame_count: u64,
@@ -389,7 +491,7 @@ impl ConversationPanel {
     ) -> Self {
         ConversationPanel {
             conversation,
-            scroll_view_state: ScrollViewState::new(),
+            scroll_view_state: ConversationScrollState::default(),
             pending_message: None,
             receiving_response: None,
             phase: ActivePhase::None,
@@ -406,6 +508,7 @@ impl ConversationPanel {
             live_item_layout: Vec::new(),
             live_tool_group_layout: Vec::new(),
             render_cache: RenderCache::default(),
+            viewport_paragraph_cache: ViewportParagraphCache::default(),
             frame_count: 0,
             live_expanded_items: HashSet::new(),
             live_expanded_groups: HashSet::new(),
@@ -676,7 +779,7 @@ impl ConversationPanel {
                     top,
                     bottom.saturating_sub(top),
                     width,
-                    |b| (&entry.paragraph).render(b.area, b),
+                    |b| entry.paragraph.as_ref().render(b.area, b),
                 );
             }
         }
@@ -1179,6 +1282,35 @@ mod tests {
 
         assert!(!panel.stick_to_bottom);
         assert_eq!(panel.scroll_view_state.offset().y, before);
+    }
+
+    #[test]
+    fn virtual_scroll_state_clamps_without_a_content_buffer() {
+        let mut state = ConversationScrollState::default();
+        state.update(10_000, 20);
+        state.scroll_to_bottom();
+        assert_eq!(state.offset().y, 9_980);
+        assert!(state.is_at_bottom());
+
+        state.scroll_page_up();
+        assert_eq!(state.offset().y, 9_961);
+        assert!(!state.is_at_bottom());
+
+        state.update(10, 20);
+        assert_eq!(state.offset().y, 0);
+        assert!(state.is_at_bottom());
+    }
+
+    #[test]
+    fn clipped_paragraph_clone_is_reused_between_ticks() {
+        let source = Arc::new(Paragraph::new("line\n".repeat(10_000)));
+        let mut cache = ViewportParagraphCache::default();
+        cache.begin_frame(9_900);
+
+        let first = cache.scrolled(&source, 9_900);
+        let second = cache.scrolled(&source, 9_900);
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

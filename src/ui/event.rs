@@ -19,6 +19,8 @@ use async_openai::types::responses::{FunctionToolCall, ResponseStreamEvent};
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -297,6 +299,9 @@ pub struct EventHandler {
     pub sender: mpsc::UnboundedSender<Event>,
     /// Event receiver channel.
     receiver: mpsc::UnboundedReceiver<Event>,
+    /// At most one tick may wait in the FIFO, so a slow render cannot bury
+    /// keyboard and mouse events under stale animation work.
+    tick_queued: Arc<AtomicBool>,
     /// The task that reads crossterm events and emits ticks.
     _task: tokio::task::JoinHandle<()>,
 }
@@ -307,6 +312,8 @@ impl EventHandler {
         let tick_rate = tick_interval();
         let (sender, receiver) = mpsc::unbounded_channel();
         let _sender = sender.clone();
+        let tick_queued = Arc::new(AtomicBool::new(false));
+        let producer_tick_queued = tick_queued.clone();
         let _task = tokio::spawn(async move {
             let mut reader = crossterm::event::EventStream::new();
             let mut tick = tokio::time::interval(tick_rate);
@@ -318,7 +325,7 @@ impl EventHandler {
                     break;
                   }
                   _ = tick_delay => {
-                    let _ = _sender.send(Event::Tick);
+                    queue_tick(&_sender, &producer_tick_queued);
                   }
                   Some(Ok(evt)) = crossterm_event => {
                     let _ = _sender.send(Event::Crossterm(evt));
@@ -330,6 +337,7 @@ impl EventHandler {
         Self {
             sender,
             receiver,
+            tick_queued,
             _task,
         }
     }
@@ -339,17 +347,22 @@ impl EventHandler {
     /// This function will block the current thread until an event is received. The event can be a
     /// tick event, a crossterm event, or an application event.
     pub async fn next(&mut self) -> color_eyre::Result<Event> {
-        self.receiver
+        let event = self
+            .receiver
             .recv()
             .await
-            .ok_or_eyre("application event channel closed unexpectedly")
+            .ok_or_eyre("application event channel closed unexpectedly")?;
+        self.mark_received(&event);
+        Ok(event)
     }
 
     /// Attempt to receive an event without blocking.
     ///
     /// This can be used to drain the event queue between frames.
     pub fn try_next(&mut self) -> Option<Event> {
-        self.receiver.try_recv().ok()
+        let event = self.receiver.try_recv().ok()?;
+        self.mark_received(&event);
+        Some(event)
     }
 
     /// Queue an app event to be sent to the event receiver.
@@ -361,6 +374,22 @@ impl EventHandler {
         // reference to it
         let _ = self.sender.send(Event::App(app_event));
     }
+
+    fn mark_received(&self, event: &Event) {
+        if matches!(event, Event::Tick) {
+            self.tick_queued.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn queue_tick(sender: &mpsc::UnboundedSender<Event>, queued: &AtomicBool) {
+    if queued
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && sender.send(Event::Tick).is_err()
+    {
+        queued.store(false, Ordering::Release);
+    }
 }
 
 fn tick_interval() -> Duration {
@@ -369,7 +398,9 @@ fn tick_interval() -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::tick_interval;
+    use super::{Event, queue_tick, tick_interval};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::mpsc;
 
     #[test]
     fn tick_interval_is_one_over_tick_fps() {
@@ -380,5 +411,20 @@ mod tests {
             (30..=35).contains(&ms),
             "expected ~33ms per tick, got {ms}ms — is the formula 1.0 / TICK_FPS?"
         );
+    }
+
+    #[test]
+    fn queued_ticks_are_coalesced_until_consumed() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let queued = AtomicBool::new(false);
+
+        queue_tick(&sender, &queued);
+        queue_tick(&sender, &queued);
+        assert!(matches!(receiver.try_recv(), Ok(Event::Tick)));
+        assert!(receiver.try_recv().is_err());
+
+        queued.store(false, Ordering::Release);
+        queue_tick(&sender, &queued);
+        assert!(matches!(receiver.try_recv(), Ok(Event::Tick)));
     }
 }

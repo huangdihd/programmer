@@ -17,6 +17,7 @@ use crate::response::message_item::MessageItem;
 use crate::ui::components::conversation_panel::conversation_panel::{
     ActivePhase, CachedLiveSlot, CachedParagraph, CachedToolGroup, ConversationPanel,
     LiveGroupHeader, LiveParagraph, LiveRenderCache, MaterializedLiveCache, ToolGroupLayout,
+    ViewportParagraphCache,
 };
 use crate::ui::components::conversation_panel::tool_group::{
     MemberHeader, ToolGroup, ToolGroupMember, build_tool_group_paragraph,
@@ -39,13 +40,12 @@ use async_openai::types::responses::{
     OutputItem, ReasoningItem,
 };
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Rect, Size};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{StatefulWidget, Widget};
+use ratatui::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tui_scrollview::{ScrollView, ScrollbarVisibility};
 
 /// Rough height estimate for an item, used to avoid expensive markdown rendering
 /// for items far from the viewport. Returns a u16 line count.
@@ -116,6 +116,117 @@ fn rough_line_count(text: &str, width: usize) -> u16 {
         .map(|l| (l.chars().count().max(1) / width.max(1)).max(1) as u16)
         .sum();
     lines.max(wrapped).max(1)
+}
+
+/// Render one paragraph from virtual conversation coordinates directly into
+/// the viewport. A paragraph crossing the top edge is vertically scrolled;
+/// everything below the viewport is clipped by the destination buffer.
+fn virtual_window(
+    item_top: u16,
+    item_height: u16,
+    viewport_top: u16,
+    viewport: Rect,
+) -> Option<(u16, Rect)> {
+    let visible_top = item_top.max(viewport_top);
+    let visible_bottom = item_top
+        .saturating_add(item_height)
+        .min(viewport_top.saturating_add(viewport.height));
+    if visible_top >= visible_bottom {
+        return None;
+    }
+
+    let source_offset = visible_top.saturating_sub(item_top);
+    let destination_y = viewport
+        .y
+        .saturating_add(visible_top.saturating_sub(viewport_top));
+    let destination = Rect::new(
+        viewport.x,
+        destination_y,
+        viewport.width,
+        visible_bottom.saturating_sub(visible_top),
+    );
+    Some((source_offset, destination))
+}
+
+fn render_virtual_paragraph(
+    paragraph: &Arc<Paragraph<'static>>,
+    item_top: u16,
+    item_height: u16,
+    viewport_top: u16,
+    viewport: Rect,
+    buf: &mut Buffer,
+    clipped: &mut ViewportParagraphCache,
+) {
+    let Some((source_offset, destination)) =
+        virtual_window(item_top, item_height, viewport_top, viewport)
+    else {
+        return;
+    };
+
+    if source_offset == 0 {
+        paragraph.as_ref().render(destination, buf);
+    } else {
+        clipped
+            .scrolled(paragraph, source_offset)
+            .as_ref()
+            .render(destination, buf);
+    }
+}
+
+fn render_virtual_borrowed_paragraph(
+    paragraph: &Paragraph<'_>,
+    item_top: u16,
+    item_height: u16,
+    viewport_top: u16,
+    viewport: Rect,
+    buf: &mut Buffer,
+) {
+    let Some((source_offset, destination)) =
+        virtual_window(item_top, item_height, viewport_top, viewport)
+    else {
+        return;
+    };
+    if source_offset == 0 {
+        paragraph.render(destination, buf);
+    } else {
+        paragraph
+            .clone()
+            .scroll((source_offset, 0))
+            .render(destination, buf);
+    }
+}
+
+/// The welcome card is small and not a paragraph, so clip it through a tiny
+/// temporary buffer when the viewport starts inside it.
+fn render_virtual_welcome(
+    welcome: &WelcomeMessage,
+    height: u16,
+    viewport_top: u16,
+    viewport: Rect,
+    buf: &mut Buffer,
+) {
+    if viewport_top >= height {
+        return;
+    }
+    if viewport_top == 0 {
+        welcome.render(
+            Rect::new(viewport.x, viewport.y, viewport.width, height),
+            buf,
+        );
+        return;
+    }
+
+    let mut card = Buffer::empty(Rect::new(0, 0, viewport.width, height));
+    welcome.render(card.area, &mut card);
+    let rows = height.saturating_sub(viewport_top).min(viewport.height);
+    for row in 0..rows {
+        for column in 0..viewport.width {
+            let source = card[(column, viewport_top + row)].clone();
+            if let Some(target) = buf.cell_mut((viewport.x + column, viewport.y + row)) {
+                *target = source;
+            }
+        }
+    }
 }
 
 fn live_cache_matches(
@@ -691,7 +802,7 @@ impl Widget for &mut ConversationPanel {
             if needs_build {
                 let entry = if hidden {
                     CachedParagraph {
-                        paragraph: Paragraph::new(""),
+                        paragraph: Arc::new(Paragraph::new("")),
                         height: 0,
                         hidden: true,
                         expanded,
@@ -702,7 +813,7 @@ impl Widget for &mut ConversationPanel {
                     }
                 } else if !in_viewport {
                     CachedParagraph {
-                        paragraph: Paragraph::new(""),
+                        paragraph: Arc::new(Paragraph::new("")),
                         height: est_heights[index],
                         hidden: false,
                         expanded,
@@ -766,7 +877,7 @@ impl Widget for &mut ConversationPanel {
                     );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
-                        paragraph,
+                        paragraph: Arc::new(paragraph),
                         height,
                         hidden: false,
                         expanded,
@@ -789,7 +900,7 @@ impl Widget for &mut ConversationPanel {
                     );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
-                        paragraph,
+                        paragraph: Arc::new(paragraph),
                         height,
                         hidden: false,
                         expanded,
@@ -977,7 +1088,7 @@ impl Widget for &mut ConversationPanel {
         let compacting = (self.phase == ActivePhase::Compacting).then(|| {
             let paragraph = CompactingMessage::into_paragraph();
             let height = paragraph.line_count(content_width) as u16;
-            (paragraph, height)
+            (Arc::new(paragraph), height)
         });
         if let Some((_, height)) = &compacting {
             content_height = content_height.saturating_add(*height);
@@ -1005,34 +1116,31 @@ impl Widget for &mut ConversationPanel {
         }
         self.last_content_height = content_height;
 
-        // Follow the bottom while the user hasn't scrolled up. Doing this here
-        // (rather than re-snapping on every incoming chunk) is what lets manual
-        // scrolling stick during streaming.
+        // Clamp the virtual scroll range after content height changes, then
+        // follow the bottom while the user hasn't manually scrolled away.
+        self.scroll_view_state.update(content_height, area.height);
         if stick_to_bottom {
             self.scroll_view_state.scroll_to_bottom();
         }
 
-        // Only the rows in the current scroll window are visible, so skip
-        // rendering paragraphs that fall entirely outside it. `render_widget`
-        // (re)wraps and writes every cell of a paragraph, so culling off-screen
-        // ones turns each frame from O(whole conversation) into O(viewport).
-        //
-        // The offset is clamped exactly as `ScrollView::render` does below, which
-        // also resolves the `u16::MAX` sentinel that `scroll_to_bottom` leaves in
-        // the state (used every frame while auto-following a streaming reply).
-        let max_y_offset = content_height.saturating_sub(area.height);
-        let visible_top = self.scroll_view_state.offset().y.min(max_y_offset);
+        // Paint directly into the viewport. This avoids `ScrollView`'s
+        // width-by-full-content-height backing buffer, which made a large
+        // expanded group expensive on every animation frame.
+        let visible_top = self.scroll_view_state.offset().y;
         let visible_bottom = visible_top.saturating_add(area.height);
         let visible =
             |y: u16, height: u16| y < visible_bottom && y.saturating_add(height) > visible_top;
+        let clipped_paragraphs = &mut self.viewport_paragraph_cache;
+        clipped_paragraphs.begin_frame(visible_top);
 
-        let mut scroll_view = ScrollView::new(Size::new(content_width, content_height))
-            .scrollbars_visibility(ScrollbarVisibility::Never);
         let mut y = 0u16;
         if visible(y, welcome_height) {
-            scroll_view.render_widget(
+            render_virtual_welcome(
                 &welcome_message,
-                Rect::new(0, y, content_width, welcome_height),
+                welcome_height,
+                visible_top,
+                content_area,
+                buf,
             );
         }
         y = y.saturating_add(welcome_height);
@@ -1063,9 +1171,14 @@ impl Widget for &mut ConversationPanel {
                 });
             }
             if visible(y, entry.height) {
-                scroll_view.render_widget(
+                render_virtual_paragraph(
                     &entry.paragraph,
-                    Rect::new(0, y, content_width, entry.height),
+                    y,
+                    entry.height,
+                    visible_top,
+                    content_area,
+                    buf,
+                    clipped_paragraphs,
                 );
             }
             y = y.saturating_add(entry.height);
@@ -1092,14 +1205,29 @@ impl Widget for &mut ConversationPanel {
                 });
             }
             if visible(y, *height) {
-                scroll_view
-                    .render_widget(paragraph.as_ref(), Rect::new(0, y, content_width, *height));
+                render_virtual_paragraph(
+                    paragraph,
+                    y,
+                    *height,
+                    visible_top,
+                    content_area,
+                    buf,
+                    clipped_paragraphs,
+                );
             }
             y = y.saturating_add(*height);
         }
         if let Some((paragraph, height)) = &compacting {
             if visible(y, *height) {
-                scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
+                render_virtual_paragraph(
+                    paragraph,
+                    y,
+                    *height,
+                    visible_top,
+                    content_area,
+                    buf,
+                    clipped_paragraphs,
+                );
             }
             y = y.saturating_add(*height);
         }
@@ -1107,13 +1235,19 @@ impl Widget for &mut ConversationPanel {
         if let Some((paragraph, height)) = &pending
             && visible(y, *height)
         {
-            scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
+            render_virtual_borrowed_paragraph(
+                paragraph,
+                y,
+                *height,
+                visible_top,
+                content_area,
+                buf,
+            );
         }
-        scroll_view.render(content_area, buf, &mut self.scroll_view_state);
+        clipped_paragraphs.finish_frame();
         crate::ui::image_preview::render_protocol_images(content_area, buf);
 
-        // The scroll view has now clamped the offset to its real value; store it
-        // and the layout for click hit-testing on the next event.
+        // Store the virtual offset and layout for click hit-testing.
         let offset = self.scroll_view_state.offset().y;
 
         // Draw a minimal custom scrollbar: no background, thin gray thumb. It
@@ -1199,7 +1333,7 @@ impl Widget for &mut ConversationPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::is_hidden_developer_input;
+    use super::{is_hidden_developer_input, render_virtual_paragraph};
     use async_openai::types::responses::{
         FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, InputContent,
         InputMessage, InputRole, InputTextContent, Item, MessageItem as ApiMessageItem, OutputItem,
@@ -1208,10 +1342,12 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::widgets::Widget;
+    use ratatui_widgets::paragraph::Paragraph;
+    use std::sync::Arc;
 
     use crate::tools::ToolOutput;
     use crate::ui::components::conversation_panel::conversation_panel::{
-        ActivePhase, ConversationPanel,
+        ActivePhase, ConversationPanel, ViewportParagraphCache,
     };
 
     #[test]
@@ -1366,6 +1502,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn virtual_paragraph_renders_only_the_requested_window() {
+        let lines = (0..1_000)
+            .map(|line| ratatui::text::Line::from(format!("row {line}")))
+            .collect::<Vec<_>>();
+        let paragraph = Arc::new(Paragraph::new(lines));
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buffer = Buffer::empty(area);
+        let mut cache = ViewportParagraphCache::default();
+        cache.begin_frame(990);
+
+        render_virtual_paragraph(&paragraph, 0, 1_000, 990, area, &mut buffer, &mut cache);
+
+        assert_eq!(buffer[(0, 0)].symbol(), "r");
+        assert!(
+            buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains("row 990")
+        );
+        assert_eq!(buffer.area.height, 4);
     }
 
     #[test]
