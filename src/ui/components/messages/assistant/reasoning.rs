@@ -19,6 +19,7 @@ use ratatui_markdown::markdown::MarkdownRenderer;
 
 use crate::ui::markdown_code_block::CodeBlockHooks;
 use crate::ui::markdown_theme::AppTheme;
+use crate::ui::text::truncate_to_width;
 
 use super::muted_style;
 
@@ -28,6 +29,9 @@ const BLOCK_PAD: u16 = 2;
 /// Extra left indent applied to expanded reasoning lines, keeping a visual
 /// nesting relationship under the "✻ Thought" header.
 const INDENT: u16 = 2;
+/// Keep the status row compact. The complete summary remains available in the
+/// expanded Markdown body.
+const SUMMARY_TITLE_WIDTH: usize = 72;
 
 /// Renders the reasoning indicator. Collapsed it's a single line ("Thinking..."
 /// while streaming with animated dots, "Thought" once done); expanded it also
@@ -140,7 +144,7 @@ pub(crate) fn reasoning_summary_title(item: &ReasoningItem) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    (!title.is_empty()).then_some(title)
+    (!title.is_empty()).then(|| truncate_to_width(&title, SUMMARY_TITLE_WIDTH))
 }
 
 /// The reasoning text, preferring the summary and falling back to the raw
@@ -201,5 +205,17 @@ mod tests {
             text.lines[0].to_string(),
             "▸ ✻ Thinking... · Checking tool grouping"
         );
+    }
+
+    #[test]
+    fn long_summary_is_truncated_only_in_the_title() {
+        let summary = "analysis ".repeat(20);
+        let item = reasoning_with_summary(&summary);
+
+        let title = reasoning_summary_title(&item).unwrap();
+        assert!(title.ends_with('…'));
+        assert!(title.len() < summary.len());
+
+        assert_eq!(reasoning_text(&item), summary);
     }
 }

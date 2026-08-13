@@ -13,7 +13,7 @@ body:
     attributes:
       label: Programmer version
       description: Run `programmer --version` or provide the release tag/commit.
-      placeholder: v0.2.2
+      placeholder: v0.2.3
     validations:
       required: true
   - type: dropdown

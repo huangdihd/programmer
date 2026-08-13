@@ -69,6 +69,10 @@ pub struct PartialResponse {
     pub cancelled: CancellationToken,
     /// Token usage from the completed response: (input_tokens, output_tokens).
     pub usage: Option<(u32, u32)>,
+    /// Monotonically changes whenever another stream event is folded into this
+    /// response. The TUI uses it to reuse an unchanged live tool-group layout
+    /// across animation/timer frames without hashing or cloning the full text.
+    render_revision: u64,
 }
 
 impl PartialResponse {
@@ -79,6 +83,7 @@ impl PartialResponse {
             finish_reason: None,
             cancelled,
             usage: None,
+            render_revision: 0,
         }
     }
 
@@ -113,6 +118,7 @@ impl PartialResponse {
     }
 
     pub fn handle_response_stream_event(&mut self, response_stream_event: ResponseStreamEvent) {
+        self.render_revision = self.render_revision.wrapping_add(1);
         match response_stream_event {
             ResponseOutputItemAdded(item_added_event) => {
                 self.set_item(item_added_event.item, item_added_event.output_index);
@@ -496,6 +502,11 @@ impl PartialResponse {
             }
             _ => {}
         }
+    }
+
+    /// A cheap cache key for the current live rendering snapshot.
+    pub fn render_revision(&self) -> u64 {
+        self.render_revision
     }
 
     pub fn into_parts(self) -> (Option<ResponseFinishReason>, Vec<OutputItem>) {

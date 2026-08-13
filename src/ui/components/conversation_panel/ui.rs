@@ -15,11 +15,13 @@
 
 use crate::response::message_item::MessageItem;
 use crate::ui::components::conversation_panel::conversation_panel::{
-    ActivePhase, CachedParagraph, CachedToolGroup, ConversationPanel, ToolGroupLayout,
+    ActivePhase, CachedLiveSlot, CachedParagraph, CachedToolGroup, ConversationPanel,
+    LiveGroupHeader, LiveParagraph, LiveRenderCache, MaterializedLiveCache, ToolGroupLayout,
+    ViewportParagraphCache,
 };
 use crate::ui::components::conversation_panel::tool_group::{
-    MemberHeader, ToolGroupMember, build_tool_group_paragraph, discover_tool_group_bridge,
-    discover_tool_groups, function_call, is_hidden_runtime_tool,
+    MemberHeader, ToolGroup, ToolGroupMember, build_tool_group_paragraph,
+    discover_tool_group_bridge, discover_tool_groups, function_call, is_hidden_runtime_tool,
 };
 use crate::ui::components::messages::assistant_message::AssistantMessage;
 use crate::ui::components::messages::compacting_message::CompactingMessage;
@@ -38,12 +40,12 @@ use async_openai::types::responses::{
     OutputItem, ReasoningItem,
 };
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Rect, Size};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{StatefulWidget, Widget};
+use ratatui::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
 use std::collections::{HashMap, HashSet};
-use tui_scrollview::{ScrollView, ScrollbarVisibility};
+use std::sync::Arc;
 
 /// Rough height estimate for an item, used to avoid expensive markdown rendering
 /// for items far from the viewport. Returns a u16 line count.
@@ -114,6 +116,313 @@ fn rough_line_count(text: &str, width: usize) -> u16 {
         .map(|l| (l.chars().count().max(1) / width.max(1)).max(1) as u16)
         .sum();
     lines.max(wrapped).max(1)
+}
+
+/// Render one paragraph from virtual conversation coordinates directly into
+/// the viewport. A paragraph crossing the top edge is vertically scrolled;
+/// everything below the viewport is clipped by the destination buffer.
+fn virtual_window(
+    item_top: u16,
+    item_height: u16,
+    viewport_top: u16,
+    viewport: Rect,
+) -> Option<(u16, Rect)> {
+    let visible_top = item_top.max(viewport_top);
+    let visible_bottom = item_top
+        .saturating_add(item_height)
+        .min(viewport_top.saturating_add(viewport.height));
+    if visible_top >= visible_bottom {
+        return None;
+    }
+
+    let source_offset = visible_top.saturating_sub(item_top);
+    let destination_y = viewport
+        .y
+        .saturating_add(visible_top.saturating_sub(viewport_top));
+    let destination = Rect::new(
+        viewport.x,
+        destination_y,
+        viewport.width,
+        visible_bottom.saturating_sub(visible_top),
+    );
+    Some((source_offset, destination))
+}
+
+fn render_virtual_paragraph(
+    paragraph: &Arc<Paragraph<'static>>,
+    item_top: u16,
+    item_height: u16,
+    viewport_top: u16,
+    viewport: Rect,
+    buf: &mut Buffer,
+    clipped: &mut ViewportParagraphCache,
+) {
+    let Some((source_offset, destination)) =
+        virtual_window(item_top, item_height, viewport_top, viewport)
+    else {
+        return;
+    };
+
+    if source_offset == 0 {
+        paragraph.as_ref().render(destination, buf);
+    } else {
+        clipped
+            .scrolled(paragraph, source_offset)
+            .as_ref()
+            .render(destination, buf);
+    }
+}
+
+fn render_virtual_borrowed_paragraph(
+    paragraph: &Paragraph<'_>,
+    item_top: u16,
+    item_height: u16,
+    viewport_top: u16,
+    viewport: Rect,
+    buf: &mut Buffer,
+) {
+    let Some((source_offset, destination)) =
+        virtual_window(item_top, item_height, viewport_top, viewport)
+    else {
+        return;
+    };
+    if source_offset == 0 {
+        paragraph.render(destination, buf);
+    } else {
+        paragraph
+            .clone()
+            .scroll((source_offset, 0))
+            .render(destination, buf);
+    }
+}
+
+/// The welcome card is small and not a paragraph, so clip it through a tiny
+/// temporary buffer when the viewport starts inside it.
+fn render_virtual_welcome(
+    welcome: &WelcomeMessage,
+    height: u16,
+    viewport_top: u16,
+    viewport: Rect,
+    buf: &mut Buffer,
+) {
+    if viewport_top >= height {
+        return;
+    }
+    if viewport_top == 0 {
+        welcome.render(
+            Rect::new(viewport.x, viewport.y, viewport.width, height),
+            buf,
+        );
+        return;
+    }
+
+    let mut card = Buffer::empty(Rect::new(0, 0, viewport.width, height));
+    welcome.render(card.area, &mut card);
+    let rows = height.saturating_sub(viewport_top).min(viewport.height);
+    for row in 0..rows {
+        for column in 0..viewport.width {
+            let source = card[(column, viewport_top + row)].clone();
+            if let Some(target) = buf.cell_mut((viewport.x + column, viewport.y + row)) {
+                *target = source;
+            }
+        }
+    }
+}
+
+fn live_cache_matches(
+    cache: &LiveRenderCache,
+    response_revision: u64,
+    content_width: u16,
+    conversation_len: usize,
+    conversation_mutation_version: u64,
+    expanded_items: &HashSet<usize>,
+    live_expanded_items: &HashSet<usize>,
+) -> bool {
+    cache.response_revision == response_revision
+        && cache.content_width == content_width
+        && cache.conversation_len == conversation_len
+        && cache.conversation_mutation_version == conversation_mutation_version
+        && cache.expanded_items == *expanded_items
+        && cache.live_expanded_items == *live_expanded_items
+}
+
+fn materialize_live_cache(
+    cache: &LiveRenderCache,
+    live_expanded_groups: &HashSet<String>,
+    expanded_tool_groups: &HashSet<String>,
+) -> MaterializedLiveCache {
+    let mut paragraphs = Vec::with_capacity(cache.slots.len());
+    let mut headers = Vec::with_capacity(cache.slots.len());
+    for slot in &cache.slots {
+        let (paragraph, group_header) =
+            materialize_live_slot(slot, live_expanded_groups, expanded_tool_groups);
+        paragraphs.push(paragraph);
+        headers.push(group_header);
+    }
+    (paragraphs, headers)
+}
+
+fn materialize_live_slot(
+    slot: &CachedLiveSlot,
+    live_expanded_groups: &HashSet<String>,
+    expanded_tool_groups: &HashSet<String>,
+) -> (LiveParagraph, LiveGroupHeader) {
+    match slot {
+        CachedLiveSlot::Fixed {
+            paragraph,
+            group_header,
+        } => (paragraph.clone(), group_header.clone()),
+        CachedLiveSlot::Explore {
+            group_key,
+            collapsed,
+            collapsed_headers,
+            expanded,
+            expanded_headers,
+        } => {
+            let is_expanded = live_expanded_groups.contains(group_key)
+                || expanded_tool_groups.contains(group_key);
+            let (paragraph, headers) = if is_expanded {
+                (expanded, expanded_headers)
+            } else {
+                (collapsed, collapsed_headers)
+            };
+            (
+                paragraph.clone(),
+                Some((group_key.clone(), headers.clone())),
+            )
+        }
+    }
+}
+
+fn empty_live_slot() -> CachedLiveSlot {
+    CachedLiveSlot::Fixed {
+        paragraph: (Arc::new(Paragraph::new("")), 0, Vec::new()),
+        group_header: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_live_group_slot<'a>(
+    group: &ToolGroup,
+    conversation_items: &'a [MessageItem],
+    receiving_items: &'a [(OutputItem, bool)],
+    outputs_by_call: &HashMap<&'a str, (&'a FunctionCallOutputItemParam, bool, Option<&'a str>)>,
+    expanded_items: &HashSet<usize>,
+    live_expanded_items: &HashSet<usize>,
+    live_index_base: usize,
+    content_width: u16,
+    group_expanded: bool,
+) -> CachedLiveSlot {
+    let live_outputs: Vec<Option<String>> = group
+        .member_indices
+        .iter()
+        .map(|&member_index| {
+            if member_index >= live_index_base {
+                return None;
+            }
+            let call = function_call(&conversation_items[member_index]).unwrap();
+            (!outputs_by_call.contains_key(call.call_id.as_str())
+                && call.name == crate::tools::command::NAME)
+                .then(|| crate::tools::command::live_output(&call.call_id))
+                .flatten()
+        })
+        .collect();
+    let members: Vec<ToolGroupMember<'_>> = group
+        .member_indices
+        .iter()
+        .enumerate()
+        .map(|(position, &member_index)| {
+            if member_index < live_index_base {
+                let call = function_call(&conversation_items[member_index]).unwrap();
+                return ToolGroupMember {
+                    index: member_index,
+                    call,
+                    output: outputs_by_call.get(call.call_id.as_str()).copied(),
+                    live_output: live_outputs[position].as_deref(),
+                    expanded: expanded_items.contains(&member_index),
+                };
+            }
+            let live_index = member_index - live_index_base;
+            let call = match &receiving_items[live_index].0 {
+                OutputItem::FunctionCall(call) => call,
+                _ => unreachable!("group members are calls"),
+            };
+            ToolGroupMember {
+                index: member_index,
+                call,
+                output: None,
+                live_output: None,
+                expanded: live_expanded_items.contains(&live_index),
+            }
+        })
+        .collect();
+    let absorbed: Vec<(usize, &ReasoningItem, bool)> = group
+        .absorbed
+        .iter()
+        .map(|&index| {
+            if index < live_index_base {
+                let item = match &conversation_items[index] {
+                    MessageItem::Output(OutputItem::Reasoning(item)) => item,
+                    _ => unreachable!("absorbed items are reasoning"),
+                };
+                return (index, item, expanded_items.contains(&index));
+            }
+            let live_index = index - live_index_base;
+            let item = match &receiving_items[live_index].0 {
+                OutputItem::Reasoning(item) => item,
+                _ => unreachable!("absorbed items are reasoning"),
+            };
+            (index, item, live_expanded_items.contains(&live_index))
+        })
+        .collect();
+    let thought_in_progress = group
+        .absorbed
+        .iter()
+        .chain(group.member_indices.iter())
+        .filter(|&&index| index >= live_index_base)
+        .any(|&index| receiving_items[index - live_index_base].1);
+
+    if group.is_explore() {
+        let (collapsed, collapsed_headers) = build_tool_group_paragraph(
+            group,
+            &members,
+            &absorbed,
+            content_width,
+            false,
+            thought_in_progress,
+        );
+        let collapsed_height = collapsed.line_count(content_width) as u16;
+        let (expanded, expanded_headers) = build_tool_group_paragraph(
+            group,
+            &members,
+            &absorbed,
+            content_width,
+            true,
+            thought_in_progress,
+        );
+        let expanded_height = expanded.line_count(content_width) as u16;
+        CachedLiveSlot::Explore {
+            group_key: group.key.clone(),
+            collapsed: (Arc::new(collapsed), collapsed_height, Vec::new()),
+            collapsed_headers,
+            expanded: (Arc::new(expanded), expanded_height, Vec::new()),
+            expanded_headers,
+        }
+    } else {
+        let (paragraph, member_headers) = build_tool_group_paragraph(
+            group,
+            &members,
+            &absorbed,
+            content_width,
+            group_expanded,
+            thought_in_progress,
+        );
+        let height = paragraph.line_count(content_width) as u16;
+        CachedLiveSlot::Fixed {
+            paragraph: (Arc::new(paragraph), height, Vec::new()),
+            group_header: Some((group.key.clone(), member_headers)),
+        }
+    }
 }
 
 /// Builds the paragraph for a finished history item. Called at most once per
@@ -219,22 +528,58 @@ impl Widget for &mut ConversationPanel {
         let conv_arc = self.conversation.clone();
         let conv = conv_arc.lock().unwrap();
 
-        let receiving_items = self
+        let live_response_revision = self
             .receiving_response
             .as_ref()
-            .map(|receiving_response| receiving_response.get_message_items())
+            .map(|response| response.render_revision())
             .unwrap_or_default();
-        let live_message_items: Vec<MessageItem> = receiving_items
-            .iter()
-            .map(|(output_item, _)| MessageItem::Output(output_item.clone()))
-            .collect();
-        let bridge_group = discover_tool_group_bridge(&conv.items, &live_message_items);
-        let bridged_committed_items: HashSet<usize> = bridge_group
-            .iter()
-            .flat_map(|group| group.member_indices.iter().chain(group.absorbed.iter()))
-            .copied()
-            .filter(|&index| index < conv.items.len())
-            .collect();
+        let live_cache_hit = self.live_render_cache.as_ref().is_some_and(|cache| {
+            live_cache_matches(
+                cache,
+                live_response_revision,
+                content_width,
+                conv.items.len(),
+                conv.mutation_version,
+                &self.expanded_items,
+                &self.live_expanded_items,
+            )
+        });
+        let (receiving_items, live_message_items, bridge_group, bridged_committed_items) =
+            if live_cache_hit {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    self.live_render_cache
+                        .as_ref()
+                        .unwrap()
+                        .bridged_committed_items
+                        .clone(),
+                )
+            } else {
+                let receiving_items = self
+                    .receiving_response
+                    .as_ref()
+                    .map(|receiving_response| receiving_response.get_message_items())
+                    .unwrap_or_default();
+                let live_message_items: Vec<MessageItem> = receiving_items
+                    .iter()
+                    .map(|(output_item, _)| MessageItem::Output(output_item.clone()))
+                    .collect();
+                let bridge_group = discover_tool_group_bridge(&conv.items, &live_message_items);
+                let bridged_committed_items: HashSet<usize> = bridge_group
+                    .iter()
+                    .flat_map(|group| group.member_indices.iter().chain(group.absorbed.iter()))
+                    .copied()
+                    .filter(|&index| index < conv.items.len())
+                    .collect();
+                (
+                    receiving_items,
+                    live_message_items,
+                    bridge_group,
+                    bridged_committed_items,
+                )
+            };
 
         // Tool calls render together with their result as one message: map each
         // call_id to its result, and collect the call ids so the standalone
@@ -457,7 +802,7 @@ impl Widget for &mut ConversationPanel {
             if needs_build {
                 let entry = if hidden {
                     CachedParagraph {
-                        paragraph: Paragraph::new(""),
+                        paragraph: Arc::new(Paragraph::new("")),
                         height: 0,
                         hidden: true,
                         expanded,
@@ -468,7 +813,7 @@ impl Widget for &mut ConversationPanel {
                     }
                 } else if !in_viewport {
                     CachedParagraph {
-                        paragraph: Paragraph::new(""),
+                        paragraph: Arc::new(Paragraph::new("")),
                         height: est_heights[index],
                         hidden: false,
                         expanded,
@@ -532,7 +877,7 @@ impl Widget for &mut ConversationPanel {
                     );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
-                        paragraph,
+                        paragraph: Arc::new(paragraph),
                         height,
                         hidden: false,
                         expanded,
@@ -555,7 +900,7 @@ impl Widget for &mut ConversationPanel {
                     );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
-                        paragraph,
+                        paragraph: Arc::new(paragraph),
                         height,
                         hidden: false,
                         expanded,
@@ -576,180 +921,166 @@ impl Widget for &mut ConversationPanel {
             content_height = content_height.saturating_add(entry.height);
         }
 
-        // The streaming response is the only content that changes between frames,
-        // so it is the only thing re-rendered here. Streaming items use the same
-        // tool-run grouping as the committed transcript (a run still growing is
-        // open), so a thought is absorbed into its group as soon as the first
-        // call of the run appears instead of standing alone until the response
-        // is committed.
         let live_index_base = conv.items.len();
-        let mut live_groups = discover_tool_groups(&live_message_items);
-        for group in &mut live_groups {
-            group.offset_indices(live_index_base);
-        }
-        if let Some(bridge_group) = bridge_group {
-            live_groups.retain(|group| {
-                !group
-                    .member_indices
-                    .iter()
-                    .chain(group.absorbed.iter())
-                    .any(|&index| {
-                        bridge_group
-                            .member_indices
-                            .iter()
-                            .chain(bridge_group.absorbed.iter())
-                            .any(|&bridge_index| bridge_index == index)
-                    })
-            });
-            live_groups.push(bridge_group);
-            live_groups.sort_by_key(|group| {
-                group
-                    .member_indices
-                    .iter()
-                    .chain(group.absorbed.iter())
-                    .filter(|&&index| index >= live_index_base)
-                    .copied()
-                    .min()
-                    .unwrap_or(usize::MAX)
-            });
-        }
-        let mut live_group_by_item = vec![None; receiving_items.len()];
-        for (group_index, group) in live_groups.iter().enumerate() {
-            for &item_index in group.member_indices.iter().chain(group.absorbed.iter()) {
-                if item_index >= live_index_base {
-                    live_group_by_item[item_index - live_index_base] = Some(group_index);
+        if live_cache_hit {
+            #[cfg(test)]
+            {
+                self.live_explore_cache_hits = self.live_explore_cache_hits.wrapping_add(1);
+            }
+            let (paragraphs, headers) = materialize_live_cache(
+                self.live_render_cache.as_ref().unwrap(),
+                &self.live_expanded_groups,
+                &self.expanded_tool_groups,
+            );
+            self.live_paragraphs = paragraphs;
+            self.live_group_headers = headers;
+        } else {
+            // Generate a new live cache only when stream content or nested view
+            // state changes. Explore groups pre-render both outer fold states.
+            let mut live_groups = discover_tool_groups(&live_message_items);
+            for group in &mut live_groups {
+                group.offset_indices(live_index_base);
+            }
+            if let Some(bridge_group) = bridge_group {
+                live_groups.retain(|group| {
+                    !group
+                        .member_indices
+                        .iter()
+                        .chain(group.absorbed.iter())
+                        .any(|&index| {
+                            bridge_group
+                                .member_indices
+                                .iter()
+                                .chain(bridge_group.absorbed.iter())
+                                .any(|&bridge_index| bridge_index == index)
+                        })
+                });
+                live_groups.push(bridge_group);
+                live_groups.sort_by_key(|group| {
+                    group
+                        .member_indices
+                        .iter()
+                        .chain(group.absorbed.iter())
+                        .filter(|&&index| index >= live_index_base)
+                        .copied()
+                        .min()
+                        .unwrap_or(usize::MAX)
+                });
+            }
+            let mut live_group_by_item = vec![None; receiving_items.len()];
+            for (group_index, group) in live_groups.iter().enumerate() {
+                for &item_index in group.member_indices.iter().chain(group.absorbed.iter()) {
+                    if item_index >= live_index_base {
+                        live_group_by_item[item_index - live_index_base] = Some(group_index);
+                    }
                 }
             }
-        }
-        // Parallel to `live_paragraphs`: the group's key and clickable member
-        // header rows (relative to that paragraph) when the slot is a group.
-        let mut live_group_headers: Vec<Option<(String, Vec<MemberHeader>)>> =
-            Vec::with_capacity(receiving_items.len());
-        let mut live_paragraphs = Vec::with_capacity(receiving_items.len());
-        for i in 0..receiving_items.len() {
-            let (output_item, in_progress) = &receiving_items[i];
-            let expanded = self.live_expanded_items.contains(&i);
-            if let Some(group_index) = live_group_by_item[i] {
-                let group = &live_groups[group_index];
-                let first_live_index = group
-                    .member_indices
-                    .iter()
-                    .chain(group.absorbed.iter())
-                    .filter(|&&index| index >= live_index_base)
-                    .copied()
-                    .min()
-                    .expect("live group has a streaming item")
-                    - live_index_base;
-                if first_live_index != i {
-                    // Hidden inside the group's own paragraph. Keep a
-                    // zero-height slot so `live_group_headers` and
-                    // `live_paragraphs` stay index-aligned with
-                    // `receiving_items` (clicks toggle live indices directly).
+
+            let mut live_group_headers = Vec::with_capacity(receiving_items.len());
+            let mut live_paragraphs = Vec::with_capacity(receiving_items.len());
+            let mut cache_slots = Vec::with_capacity(receiving_items.len());
+            let mut cacheable = !receiving_items.is_empty();
+            let mut saw_explore = false;
+            for i in 0..receiving_items.len() {
+                let (output_item, in_progress) = &receiving_items[i];
+                let expanded = self.live_expanded_items.contains(&i);
+                if let Some(group_index) = live_group_by_item[i] {
+                    let group = &live_groups[group_index];
+                    let first_live_index = group
+                        .member_indices
+                        .iter()
+                        .chain(group.absorbed.iter())
+                        .filter(|&&index| index >= live_index_base)
+                        .copied()
+                        .min()
+                        .expect("live group has a streaming item")
+                        - live_index_base;
+                    if first_live_index != i {
+                        let slot = empty_live_slot();
+                        let (paragraph, group_header) = materialize_live_slot(
+                            &slot,
+                            &self.live_expanded_groups,
+                            &self.expanded_tool_groups,
+                        );
+                        live_paragraphs.push(paragraph);
+                        live_group_headers.push(group_header);
+                        cache_slots.push(slot);
+                        continue;
+                    }
+                    if group.is_explore() {
+                        saw_explore = true;
+                        #[cfg(test)]
+                        {
+                            self.live_explore_builds = self.live_explore_builds.wrapping_add(1);
+                        }
+                    } else {
+                        cacheable = false;
+                    }
+                    let group_expanded = self.live_expanded_groups.contains(&group.key)
+                        || self.expanded_tool_groups.contains(&group.key);
+                    let slot = build_live_group_slot(
+                        group,
+                        &conv.items,
+                        &receiving_items,
+                        &outputs_by_call,
+                        &self.expanded_items,
+                        &self.live_expanded_items,
+                        live_index_base,
+                        content_width,
+                        group_expanded,
+                    );
+                    let (paragraph, group_header) = materialize_live_slot(
+                        &slot,
+                        &self.live_expanded_groups,
+                        &self.expanded_tool_groups,
+                    );
+                    live_paragraphs.push(paragraph);
+                    live_group_headers.push(group_header);
+                    cache_slots.push(slot);
+                } else {
+                    if matches!(output_item, OutputItem::FunctionCall(call) if is_hidden_runtime_tool(call))
+                    {
+                        let slot = empty_live_slot();
+                        let (paragraph, group_header) = materialize_live_slot(
+                            &slot,
+                            &self.live_expanded_groups,
+                            &self.expanded_tool_groups,
+                        );
+                        live_paragraphs.push(paragraph);
+                        live_group_headers.push(group_header);
+                        cache_slots.push(slot);
+                        continue;
+                    }
+                    cacheable = false;
+                    let (paragraph, copy_buttons) =
+                        AssistantMessage::new(output_item, content_width)
+                            .in_progress(*in_progress)
+                            .expanded(expanded)
+                            .frame_count(self.frame_count)
+                            .into_paragraph();
+                    let height = paragraph.line_count(content_width) as u16;
+                    let paragraph = (Arc::new(paragraph), height, copy_buttons);
+                    live_paragraphs.push(paragraph.clone());
                     live_group_headers.push(None);
-                    live_paragraphs.push((Paragraph::new(""), 0, Vec::new()));
-                    continue;
+                    cache_slots.push(CachedLiveSlot::Fixed {
+                        paragraph,
+                        group_header: None,
+                    });
                 }
-                let live_outputs: Vec<Option<String>> = group
-                    .member_indices
-                    .iter()
-                    .map(|&member_index| {
-                        if member_index >= live_index_base {
-                            return None;
-                        }
-                        let call = function_call(&conv.items[member_index]).unwrap();
-                        (!outputs_by_call.contains_key(call.call_id.as_str())
-                            && call.name == crate::tools::command::NAME)
-                            .then(|| crate::tools::command::live_output(&call.call_id))
-                            .flatten()
-                    })
-                    .collect();
-                let members: Vec<ToolGroupMember<'_>> = group
-                    .member_indices
-                    .iter()
-                    .enumerate()
-                    .map(|(position, &member_index)| {
-                        if member_index < live_index_base {
-                            let call = function_call(&conv.items[member_index]).unwrap();
-                            return ToolGroupMember {
-                                index: member_index,
-                                call,
-                                output: outputs_by_call.get(call.call_id.as_str()).copied(),
-                                live_output: live_outputs[position].as_deref(),
-                                expanded: self.expanded_items.contains(&member_index),
-                            };
-                        }
-                        let live_index = member_index - live_index_base;
-                        let call = match &receiving_items[live_index].0 {
-                            OutputItem::FunctionCall(call) => call,
-                            _ => unreachable!("group members are calls"),
-                        };
-                        ToolGroupMember {
-                            index: member_index,
-                            call,
-                            output: None,
-                            live_output: None,
-                            expanded: self.live_expanded_items.contains(&live_index),
-                        }
-                    })
-                    .collect();
-                let absorbed: Vec<(usize, &ReasoningItem, bool)> = group
-                    .absorbed
-                    .iter()
-                    .map(|&index| {
-                        if index < live_index_base {
-                            let item = match &conv.items[index] {
-                                MessageItem::Output(OutputItem::Reasoning(item)) => item,
-                                _ => unreachable!("absorbed items are reasoning"),
-                            };
-                            return (index, item, self.expanded_items.contains(&index));
-                        }
-                        let live_index = index - live_index_base;
-                        let item = match &receiving_items[live_index].0 {
-                            OutputItem::Reasoning(item) => item,
-                            _ => unreachable!("absorbed items are reasoning"),
-                        };
-                        (index, item, self.live_expanded_items.contains(&live_index))
-                    })
-                    .collect();
-                // Live groups stay collapsed by default, same as committed
-                // ones; the streaming thought state rides on the muted summary
-                // line under the header.
-                let group_expanded = self.live_expanded_groups.contains(&group.key)
-                    || self.expanded_tool_groups.contains(&group.key);
-                let thought_in_progress = group
-                    .absorbed
-                    .iter()
-                    .chain(group.member_indices.iter())
-                    .filter(|&&index| index >= live_index_base)
-                    .any(|&index| receiving_items[index - live_index_base].1);
-                let (paragraph, member_headers) = build_tool_group_paragraph(
-                    group,
-                    &members,
-                    &absorbed,
-                    content_width,
-                    group_expanded,
-                    thought_in_progress,
-                );
-                let height = paragraph.line_count(content_width) as u16;
-                live_group_headers.push(Some((group.key.clone(), member_headers)));
-                live_paragraphs.push((paragraph, height, Vec::new()));
-            } else {
-                live_group_headers.push(None);
-                if matches!(output_item, OutputItem::FunctionCall(call) if is_hidden_runtime_tool(call))
-                {
-                    live_paragraphs.push((Paragraph::new(""), 0, Vec::new()));
-                    continue;
-                }
-                let (paragraph, copy_buttons) = AssistantMessage::new(output_item, content_width)
-                    .in_progress(*in_progress)
-                    .expanded(expanded)
-                    .frame_count(self.frame_count)
-                    .into_paragraph();
-                let height = paragraph.line_count(content_width) as u16;
-                live_paragraphs.push((paragraph, height, copy_buttons));
             }
+            self.live_paragraphs = live_paragraphs;
+            self.live_group_headers = live_group_headers;
+            self.live_render_cache = (cacheable && saw_explore).then(|| LiveRenderCache {
+                response_revision: live_response_revision,
+                content_width,
+                conversation_len: conv.items.len(),
+                conversation_mutation_version: conv.mutation_version,
+                expanded_items: self.expanded_items.clone(),
+                live_expanded_items: self.live_expanded_items.clone(),
+                bridged_committed_items: bridged_committed_items.clone(),
+                slots: cache_slots,
+            });
         }
-        self.live_paragraphs = live_paragraphs;
         for (_, height, _) in &self.live_paragraphs {
             content_height = content_height.saturating_add(*height);
         }
@@ -757,7 +1088,7 @@ impl Widget for &mut ConversationPanel {
         let compacting = (self.phase == ActivePhase::Compacting).then(|| {
             let paragraph = CompactingMessage::into_paragraph();
             let height = paragraph.line_count(content_width) as u16;
-            (paragraph, height)
+            (Arc::new(paragraph), height)
         });
         if let Some((_, height)) = &compacting {
             content_height = content_height.saturating_add(*height);
@@ -785,34 +1116,31 @@ impl Widget for &mut ConversationPanel {
         }
         self.last_content_height = content_height;
 
-        // Follow the bottom while the user hasn't scrolled up. Doing this here
-        // (rather than re-snapping on every incoming chunk) is what lets manual
-        // scrolling stick during streaming.
+        // Clamp the virtual scroll range after content height changes, then
+        // follow the bottom while the user hasn't manually scrolled away.
+        self.scroll_view_state.update(content_height, area.height);
         if stick_to_bottom {
             self.scroll_view_state.scroll_to_bottom();
         }
 
-        // Only the rows in the current scroll window are visible, so skip
-        // rendering paragraphs that fall entirely outside it. `render_widget`
-        // (re)wraps and writes every cell of a paragraph, so culling off-screen
-        // ones turns each frame from O(whole conversation) into O(viewport).
-        //
-        // The offset is clamped exactly as `ScrollView::render` does below, which
-        // also resolves the `u16::MAX` sentinel that `scroll_to_bottom` leaves in
-        // the state (used every frame while auto-following a streaming reply).
-        let max_y_offset = content_height.saturating_sub(area.height);
-        let visible_top = self.scroll_view_state.offset().y.min(max_y_offset);
+        // Paint directly into the viewport. This avoids `ScrollView`'s
+        // width-by-full-content-height backing buffer, which made a large
+        // expanded group expensive on every animation frame.
+        let visible_top = self.scroll_view_state.offset().y;
         let visible_bottom = visible_top.saturating_add(area.height);
         let visible =
             |y: u16, height: u16| y < visible_bottom && y.saturating_add(height) > visible_top;
+        let clipped_paragraphs = &mut self.viewport_paragraph_cache;
+        clipped_paragraphs.begin_frame(visible_top);
 
-        let mut scroll_view = ScrollView::new(Size::new(content_width, content_height))
-            .scrollbars_visibility(ScrollbarVisibility::Never);
         let mut y = 0u16;
         if visible(y, welcome_height) {
-            scroll_view.render_widget(
+            render_virtual_welcome(
                 &welcome_message,
-                Rect::new(0, y, content_width, welcome_height),
+                welcome_height,
+                visible_top,
+                content_area,
+                buf,
             );
         }
         y = y.saturating_add(welcome_height);
@@ -843,9 +1171,14 @@ impl Widget for &mut ConversationPanel {
                 });
             }
             if visible(y, entry.height) {
-                scroll_view.render_widget(
+                render_virtual_paragraph(
                     &entry.paragraph,
-                    Rect::new(0, y, content_width, entry.height),
+                    y,
+                    entry.height,
+                    visible_top,
+                    content_area,
+                    buf,
+                    clipped_paragraphs,
                 );
             }
             y = y.saturating_add(entry.height);
@@ -855,7 +1188,7 @@ impl Widget for &mut ConversationPanel {
         let mut live_tool_group_layout = Vec::new();
         for (i, (paragraph, height, _)) in self.live_paragraphs.iter().enumerate() {
             live_layout.push((i, y, y.saturating_add(*height)));
-            if let Some((key, headers)) = &live_group_headers[i] {
+            if let Some((key, headers)) = &self.live_group_headers[i] {
                 live_tool_group_layout.push(ToolGroupLayout {
                     key: key.clone(),
                     top: y,
@@ -872,13 +1205,29 @@ impl Widget for &mut ConversationPanel {
                 });
             }
             if visible(y, *height) {
-                scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
+                render_virtual_paragraph(
+                    paragraph,
+                    y,
+                    *height,
+                    visible_top,
+                    content_area,
+                    buf,
+                    clipped_paragraphs,
+                );
             }
             y = y.saturating_add(*height);
         }
         if let Some((paragraph, height)) = &compacting {
             if visible(y, *height) {
-                scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
+                render_virtual_paragraph(
+                    paragraph,
+                    y,
+                    *height,
+                    visible_top,
+                    content_area,
+                    buf,
+                    clipped_paragraphs,
+                );
             }
             y = y.saturating_add(*height);
         }
@@ -886,13 +1235,19 @@ impl Widget for &mut ConversationPanel {
         if let Some((paragraph, height)) = &pending
             && visible(y, *height)
         {
-            scroll_view.render_widget(paragraph, Rect::new(0, y, content_width, *height));
+            render_virtual_borrowed_paragraph(
+                paragraph,
+                y,
+                *height,
+                visible_top,
+                content_area,
+                buf,
+            );
         }
-        scroll_view.render(content_area, buf, &mut self.scroll_view_state);
+        clipped_paragraphs.finish_frame();
         crate::ui::image_preview::render_protocol_images(content_area, buf);
 
-        // The scroll view has now clamped the offset to its real value; store it
-        // and the layout for click hit-testing on the next event.
+        // Store the virtual offset and layout for click hit-testing.
         let offset = self.scroll_view_state.offset().y;
 
         // Draw a minimal custom scrollbar: no background, thin gray thumb. It
@@ -978,7 +1333,7 @@ impl Widget for &mut ConversationPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::is_hidden_developer_input;
+    use super::{is_hidden_developer_input, render_virtual_paragraph};
     use async_openai::types::responses::{
         FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, InputContent,
         InputMessage, InputRole, InputTextContent, Item, MessageItem as ApiMessageItem, OutputItem,
@@ -987,10 +1342,12 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::widgets::Widget;
+    use ratatui_widgets::paragraph::Paragraph;
+    use std::sync::Arc;
 
     use crate::tools::ToolOutput;
     use crate::ui::components::conversation_panel::conversation_panel::{
-        ActivePhase, ConversationPanel,
+        ActivePhase, ConversationPanel, ViewportParagraphCache,
     };
 
     #[test]
@@ -1148,6 +1505,31 @@ mod tests {
     }
 
     #[test]
+    fn virtual_paragraph_renders_only_the_requested_window() {
+        let lines = (0..1_000)
+            .map(|line| ratatui::text::Line::from(format!("row {line}")))
+            .collect::<Vec<_>>();
+        let paragraph = Arc::new(Paragraph::new(lines));
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buffer = Buffer::empty(area);
+        let mut cache = ViewportParagraphCache::default();
+        cache.begin_frame(990);
+
+        render_virtual_paragraph(&paragraph, 0, 1_000, 990, area, &mut buffer, &mut cache);
+
+        assert_eq!(buffer[(0, 0)].symbol(), "r");
+        assert!(
+            buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains("row 990")
+        );
+        assert_eq!(buffer.area.height, 4);
+    }
+
+    #[test]
     fn streaming_thought_is_absorbed_into_the_tool_group() {
         // A thought plus a single call arrive in the live stream. Before this
         // fix the thought rendered standalone until the whole response was
@@ -1234,6 +1616,80 @@ mod tests {
         panel.handle_click(2, header_row as u16);
         let expanded = render_text(&mut panel, area);
         assert!(expanded.contains("grep  {}"), "{expanded}");
+    }
+
+    #[test]
+    fn live_explore_group_reuses_layout_until_content_or_view_changes() {
+        use crate::cancel::CancellationToken;
+        use async_openai::types::responses::{
+            ReasoningItem, ResponseOutputItemAddedEvent, ResponseReasoningSummaryTextDeltaEvent,
+            ResponseStreamEvent, SummaryPart, SummaryTextContent,
+        };
+
+        let mut panel = ConversationPanel::new();
+        panel.receiving_response = Some(crate::response::partial_response::PartialResponse::new(
+            CancellationToken::new(),
+        ));
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
+            ResponseOutputItemAddedEvent {
+                sequence_number: 0,
+                output_index: 0,
+                item: OutputItem::Reasoning(ReasoningItem {
+                    id: Some("reasoning-0".into()),
+                    summary: vec![SummaryPart::SummaryText(SummaryTextContent {
+                        text: "cached reasoning".into(),
+                    })],
+                    content: None,
+                    encrypted_content: None,
+                    status: None,
+                }),
+            },
+        ));
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemAdded(
+            ResponseOutputItemAddedEvent {
+                sequence_number: 1,
+                output_index: 1,
+                item: OutputItem::FunctionCall(tool_call(0, "grep")),
+            },
+        ));
+
+        let area = Rect::new(0, 0, 80, 24);
+        let collapsed = render_text(&mut panel, area);
+        assert_eq!(panel.live_explore_builds, 1);
+        let header_row = collapsed
+            .lines()
+            .position(|line| line.contains("Exploring"))
+            .unwrap() as u16;
+
+        panel.handle_click(2, header_row);
+        let expanded = render_text(&mut panel, area);
+        assert!(expanded.contains("cached reasoning"), "{expanded}");
+        assert_eq!(
+            panel.live_explore_builds, 1,
+            "the expanded form must be generated with the message"
+        );
+        assert_eq!(panel.live_explore_cache_hits, 1);
+
+        let unchanged = render_text(&mut panel, area);
+        assert!(unchanged.contains("cached reasoning"), "{unchanged}");
+        assert_eq!(
+            panel.live_explore_builds, 1,
+            "an unchanged animation/timer frame must reuse the live paragraph"
+        );
+        assert_eq!(panel.live_explore_cache_hits, 2);
+
+        panel.handle_response_stream_event(ResponseStreamEvent::ResponseReasoningSummaryTextDelta(
+            ResponseReasoningSummaryTextDeltaEvent {
+                sequence_number: 2,
+                item_id: "reasoning-0".into(),
+                output_index: 0,
+                summary_index: 0,
+                delta: " updated".into(),
+            },
+        ));
+        let updated = render_text(&mut panel, area);
+        assert!(updated.contains("cached reasoning updated"), "{updated}");
+        assert_eq!(panel.live_explore_builds, 2, "new content must invalidate");
     }
 
     #[test]
