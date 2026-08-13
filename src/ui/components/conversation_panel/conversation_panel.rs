@@ -144,8 +144,8 @@ fn is_foldable(item: &MessageItem) -> bool {
 /// Cached render output for a single finished message.
 ///
 /// Historical `items` are append-only and never mutate once added, so their
-/// markdown is parsed and laid out exactly once and reused across frames. Only
-/// the streaming `receiving_response` is re-rendered every frame.
+/// markdown is parsed and laid out exactly once and reused across frames. Live
+/// Exploring groups have their own revision-keyed cache below.
 #[derive(Debug)]
 pub(crate) struct CachedParagraph {
     pub paragraph: Paragraph<'static>,
@@ -190,6 +190,42 @@ pub(crate) struct ToolGroupLayout {
     /// both committed and streaming members. Indices at or above this base map
     /// back to `live_expanded_items`; lower indices are committed items.
     pub live_index_base: Option<usize>,
+}
+
+pub(crate) type LiveParagraph = (std::sync::Arc<Paragraph<'static>>, u16, Vec<CodeCopyButton>);
+pub(crate) type LiveGroupHeader = Option<(String, Vec<MemberHeader>)>;
+pub(crate) type MaterializedLiveCache = (Vec<LiveParagraph>, Vec<LiveGroupHeader>);
+
+/// One pre-rendered live slot. Exploring groups retain both outer fold states,
+/// so the first click only selects an `Arc` and never parses Markdown.
+#[derive(Debug, Clone)]
+pub(crate) enum CachedLiveSlot {
+    Fixed {
+        paragraph: LiveParagraph,
+        group_header: LiveGroupHeader,
+    },
+    Explore {
+        group_key: String,
+        collapsed: LiveParagraph,
+        collapsed_headers: Vec<MemberHeader>,
+        expanded: LiveParagraph,
+        expanded_headers: Vec<MemberHeader>,
+    },
+}
+
+/// A complete live Exploring snapshot generated when stream content changes.
+/// Timer/animation frames compare cheap revisions before cloning any output
+/// items, then materialize the requested fold state from these shared entries.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveRenderCache {
+    pub response_revision: u64,
+    pub content_width: u16,
+    pub conversation_len: usize,
+    pub conversation_mutation_version: u64,
+    pub expanded_items: HashSet<usize>,
+    pub live_expanded_items: HashSet<usize>,
+    pub bridged_committed_items: HashSet<usize>,
+    pub slots: Vec<CachedLiveSlot>,
 }
 
 /// A mouse text selection over the conversation, in scroll-buffer coordinates
@@ -319,8 +355,19 @@ pub struct ConversationPanel {
     /// The current mouse text selection, if any.
     pub(crate) selection: Option<Selection>,
     /// The streaming items' paragraphs from the last render (paragraph, height,
-    /// copy buttons), kept for selection extraction and copy-button clicks.
-    pub(crate) live_paragraphs: Vec<(Paragraph<'static>, u16, Vec<CodeCopyButton>)>,
+    /// copy buttons). Exploring-group entries are moved forward unchanged on a
+    /// cache hit; all entries are also kept for selection and copy-button clicks.
+    pub(crate) live_paragraphs: Vec<LiveParagraph>,
+    /// Group header hit regions parallel to `live_paragraphs`. Keeping these
+    /// with the cached paragraph avoids rebuilding click geometry on cache hits.
+    pub(crate) live_group_headers: Vec<LiveGroupHeader>,
+    /// Present only when the whole live snapshot consists of Exploring groups
+    /// (plus their hidden zero-height member slots).
+    pub(crate) live_render_cache: Option<LiveRenderCache>,
+    #[cfg(test)]
+    pub(crate) live_explore_builds: u64,
+    #[cfg(test)]
+    pub(crate) live_explore_cache_hits: u64,
     /// Vertical extent `(top, height)` of the pending-message note in the last
     /// render, for selection extraction.
     pub(crate) pending_layout: Option<(u16, u16)>,
@@ -364,6 +411,12 @@ impl ConversationPanel {
             live_expanded_groups: HashSet::new(),
             selection: None,
             live_paragraphs: Vec::new(),
+            live_group_headers: Vec::new(),
+            live_render_cache: None,
+            #[cfg(test)]
+            live_explore_builds: 0,
+            #[cfg(test)]
+            live_explore_cache_hits: 0,
             pending_layout: None,
             last_content_height: 0,
         }
@@ -636,7 +689,7 @@ impl ConversationPanel {
                     top,
                     bottom.saturating_sub(top),
                     width,
-                    |b| paragraph.render(b.area, b),
+                    |b| paragraph.as_ref().render(b.area, b),
                 );
             }
         }
@@ -818,6 +871,7 @@ impl ConversationPanel {
         self.expanded_tool_groups.clear();
         self.live_expanded_items.clear();
         self.live_expanded_groups.clear();
+        self.live_render_cache = None;
         self.selection = None;
         self.stick_to_bottom = true;
     }
@@ -853,6 +907,7 @@ impl ConversationPanel {
     /// transferring live expanded state onto the now-committed items (which sit
     /// at the tail of the conversation).
     pub fn commit_live(&mut self) {
+        self.live_render_cache = None;
         if let Some(partial) = self.receiving_response.take() {
             let committed = partial.items.iter().flatten().count();
             let base_index = self
@@ -878,6 +933,7 @@ impl ConversationPanel {
     /// nothing for a response that errored or was cancelled mid-stream — and
     /// clearing the "receiving" state so the turn is no longer considered busy.
     pub fn abort_receiving(&mut self) {
+        self.live_render_cache = None;
         if let Some(partial) = self.receiving_response.take() {
             // Transfer live expanded state before items become historical,
             // so reasoning/tool-call items the user expanded during streaming

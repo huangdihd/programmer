@@ -79,6 +79,12 @@ impl ToolGroup {
             .chain(self.absorbed.iter_mut())
             .for_each(|index| *index += offset);
     }
+
+    /// Explore groups are the common long-lived streaming groups: their
+    /// absorbed reasoning can be very large and expensive to lay out.
+    pub(crate) fn is_explore(&self) -> bool {
+        self.kind == ToolGroupKind::Explore
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
