@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem};
+use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem, ReasoningItem};
 use ratatui::prelude::Color;
 use ratatui::style::Style;
 use ratatui::text::Text;
@@ -147,6 +147,33 @@ impl<'a> AssistantMessage<'a> {
         }
         (paragraph, buttons)
     }
+}
+
+/// Render a reasoning item once and return both the wrapped paragraph used by
+/// the conversation panel and the unwrapped text used when the item is
+/// embedded in a live tool group.  Keeping this as one operation is important
+/// for the asynchronous live renderer: the Markdown parser/highlighter runs
+/// on the worker, while the UI thread only assembles already-owned lines.
+pub(crate) fn render_reasoning(
+    item: &ReasoningItem,
+    width: u16,
+    in_progress: bool,
+    expanded: bool,
+    frame_count: u64,
+) -> (Paragraph<'static>, Vec<CodeCopyButton>, Text<'static>) {
+    let (text, codes) = ReasoningMessage::new(in_progress, item, width)
+        .expanded(expanded)
+        .frame_count(Some(frame_count))
+        .into_parts();
+    let buttons = scan_copy_buttons(&text, &codes);
+    let block = Block::default()
+        .padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 1))
+        .style(if expanded {
+            Style::new().bg(EXPANDED_BG)
+        } else {
+            Style::new()
+        });
+    (Paragraph::new(text.clone()).block(block), buttons, text)
 }
 
 /// Locates the clickable copy labels rendered by `CodeBlockHooks` in `text` and

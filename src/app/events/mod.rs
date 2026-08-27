@@ -149,6 +149,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             use crate::runner::RunnerPhase;
             app.conversation_panel.phase = match p {
                 RunnerPhase::Streaming => {
+                    app.conversation_panel.begin_live_response();
                     app.conversation_panel.receiving_response =
                         Some(PartialResponse::new(app.cancel.active.child()));
                     ActivePhase::None // "Thinking" — derived from receiving_response
