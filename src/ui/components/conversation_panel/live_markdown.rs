@@ -23,10 +23,20 @@
 //! only the newest completed result for each live item. The panel owns the front results
 //! and may continue painting them while the worker prepares the next ones.
 
-use crate::ui::components::messages::assistant_message::{AssistantMessage, render_reasoning};
-use crate::ui::markdown_code_block::CodeCopyButton;
+use crate::ui::components::messages::assistant::text::{
+    markdown_source as message_markdown_source, markdown_width as message_markdown_width,
+};
+use crate::ui::components::messages::assistant_message::{
+    AssistantMessage, render_reasoning, scan_copy_buttons_from_lines,
+};
+use crate::ui::markdown_code_block::{CodeBlockHooks, CodeCopyButton};
+use crate::ui::markdown_theme::AppTheme;
 use async_openai::types::responses::OutputItem;
-use ratatui::text::Text;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::text::{Line, Text};
+use ratatui::widgets::Widget;
+use ratatui_markdown::markdown::MarkdownRenderer;
 use ratatui_widgets::paragraph::Paragraph;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -57,6 +67,9 @@ pub(crate) struct LiveMarkdownSnapshot {
     pub(crate) revision: u64,
     pub(crate) width: u16,
     pub(crate) paragraph: Arc<Paragraph<'static>>,
+    /// Incremental live messages render directly from persistent Markdown
+    /// chunks. Final snapshots still use `paragraph` for the history cache.
+    pub(crate) incremental: Option<Arc<IncrementalMarkdownParagraph>>,
     pub(crate) height: u16,
     pub(crate) copy_buttons: Arc<Vec<CodeCopyButton>>,
     /// Unwrapped reasoning lines, when this snapshot represents a reasoning
@@ -81,6 +94,284 @@ struct WorkerState {
     latest_results: HashMap<String, LiveMarkdownSnapshot>,
     next_order: u64,
     shutdown: bool,
+}
+
+#[derive(Debug, Default)]
+struct IncrementalMarkdownState {
+    generation: u64,
+    width: u16,
+    source_len: usize,
+    scan_offset: usize,
+    in_fence: bool,
+    stable_end: usize,
+    stable: Option<Arc<StableMarkdownChunk>>,
+}
+
+#[derive(Debug, Default)]
+struct CachedIncrementalMarkdown {
+    last_used: u64,
+    state: IncrementalMarkdownState,
+}
+
+struct IncrementalMarkdownRender {
+    stable: Option<Arc<StableMarkdownChunk>>,
+    tail_lines: Arc<[Line<'static>]>,
+    #[cfg(test)]
+    tail_codes: Arc<[String]>,
+    tail_buttons: Arc<[CodeCopyButton]>,
+    line_count: u16,
+    #[cfg(test)]
+    reparsed_bytes: usize,
+}
+
+#[derive(Debug)]
+struct StableMarkdownChunk {
+    previous: Option<Arc<StableMarkdownChunk>>,
+    lines: Arc<[Line<'static>]>,
+    #[cfg(test)]
+    codes: Arc<[String]>,
+    buttons: Arc<[CodeCopyButton]>,
+    total_lines: u16,
+    source_end: usize,
+}
+
+#[cfg(test)]
+impl IncrementalMarkdownRender {
+    fn lines(&self) -> Vec<Line<'static>> {
+        let mut chunks = Vec::new();
+        let mut current = self.stable.as_deref();
+        while let Some(chunk) = current {
+            chunks.push(chunk);
+            current = chunk.previous.as_deref();
+        }
+        chunks.reverse();
+        chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.lines.iter().cloned())
+            .chain(self.tail_lines.iter().cloned())
+            .collect()
+    }
+
+    fn codes(&self) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let mut current = self.stable.as_deref();
+        while let Some(chunk) = current {
+            chunks.push(chunk);
+            current = chunk.previous.as_deref();
+        }
+        chunks.reverse();
+        chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.codes.iter().cloned())
+            .chain(self.tail_codes.iter().cloned())
+            .collect()
+    }
+}
+
+/// A live Markdown paragraph backed by persistent stable chunks plus one
+/// replaceable tail. Publishing a new token snapshot only clones the head
+/// `Arc`; it never clones the already-rendered lines in the prefix.
+#[derive(Debug)]
+pub(crate) struct IncrementalMarkdownParagraph {
+    stable: Option<Arc<StableMarkdownChunk>>,
+    tail_lines: Arc<[Line<'static>]>,
+    tail_buttons: Arc<[CodeCopyButton]>,
+    height: u16,
+}
+
+impl IncrementalMarkdownParagraph {
+    fn new(rendered: IncrementalMarkdownRender) -> Self {
+        Self {
+            stable: rendered.stable,
+            tail_lines: rendered.tail_lines,
+            tail_buttons: rendered.tail_buttons,
+            height: rendered.line_count,
+        }
+    }
+
+    pub(crate) fn height(&self) -> u16 {
+        self.height
+    }
+
+    /// Paint only the requested logical rows. Markdown output is already
+    /// wrapped for the content width, so individual borrowed `Line`s can be
+    /// rendered without materializing a conversation-sized `Text`.
+    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, source_offset: u16) {
+        if area.width <= 2 || area.height == 0 {
+            return;
+        }
+        let start = source_offset;
+        let end = start.saturating_add(area.height).min(self.height);
+        self.for_each_line(start, end, |row, line| {
+            let destination_y = area.y.saturating_add(row.saturating_sub(start));
+            line.render(Rect::new(area.x + 1, destination_y, area.width - 2, 1), buf);
+        });
+    }
+
+    pub(crate) fn copy_button(&self, row: u16, x: u16) -> Option<String> {
+        let mut row_offset = 0u16;
+        for chunk in self.stable_chunks() {
+            if let Some(content) = find_chunk_button(&chunk.buttons, row, x, row_offset) {
+                return Some(content);
+            }
+            row_offset = row_offset.saturating_add(chunk.lines.len() as u16);
+        }
+        find_chunk_button(&self.tail_buttons, row, x, row_offset)
+    }
+
+    fn stable_chunks(&self) -> Vec<&StableMarkdownChunk> {
+        let mut chunks = Vec::new();
+        let mut current = self.stable.as_deref();
+        while let Some(chunk) = current {
+            chunks.push(chunk);
+            current = chunk.previous.as_deref();
+        }
+        chunks.reverse();
+        chunks
+    }
+
+    fn for_each_line(&self, start: u16, end: u16, mut visit: impl FnMut(u16, &Line<'static>)) {
+        let mut row = 0u16;
+        for chunk in self.stable_chunks() {
+            let chunk_end = row.saturating_add(chunk.lines.len() as u16);
+            if chunk_end <= start {
+                row = chunk_end;
+                continue;
+            }
+            let local_start = start.saturating_sub(row) as usize;
+            for (local_row, line) in chunk.lines.iter().enumerate().skip(local_start) {
+                let absolute_row = row.saturating_add(local_row as u16);
+                if absolute_row >= end {
+                    return;
+                }
+                visit(absolute_row, line);
+            }
+            row = chunk_end;
+        }
+        let local_start = start.saturating_sub(row) as usize;
+        for (local_row, line) in self.tail_lines.iter().enumerate().skip(local_start) {
+            let absolute_row = row.saturating_add(local_row as u16);
+            if absolute_row >= end {
+                return;
+            }
+            visit(absolute_row, line);
+        }
+    }
+}
+
+fn find_chunk_button(
+    buttons: &[CodeCopyButton],
+    row: u16,
+    x: u16,
+    row_offset: u16,
+) -> Option<String> {
+    buttons
+        .iter()
+        .find(|button| {
+            row == row_offset.saturating_add(button.row) && x >= button.x_start && x < button.x_end
+        })
+        .map(|button| button.content.clone())
+}
+
+impl IncrementalMarkdownState {
+    fn render(&mut self, source: &str, generation: u64, width: u16) -> IncrementalMarkdownRender {
+        let append_only =
+            self.generation == generation && self.width == width && source.len() >= self.source_len;
+        if !append_only {
+            self.generation = generation;
+            self.width = width;
+            self.source_len = 0;
+            self.scan_offset = 0;
+            self.in_fence = false;
+            self.stable_end = 0;
+            self.stable = None;
+        }
+
+        self.scan_appended_lines(source);
+        let next_stable_end = self.stable_end;
+        let rendered_stable_end = self.stable.as_ref().map_or(0, |chunk| chunk.source_end);
+        #[cfg(test)]
+        let old_stable_end = rendered_stable_end;
+        if next_stable_end > rendered_stable_end {
+            let stable_delta = &source[rendered_stable_end..next_stable_end];
+            let (lines, codes) = render_markdown(stable_delta, width);
+            let buttons = scan_copy_buttons_from_lines(&lines, &codes);
+            let new_lines = lines.len() as u16;
+            let previous_lines = self.stable.as_ref().map_or(0, |chunk| chunk.total_lines);
+            self.stable = Some(Arc::new(StableMarkdownChunk {
+                previous: self.stable.take(),
+                lines: lines.into(),
+                #[cfg(test)]
+                codes: codes.into(),
+                buttons: buttons.into(),
+                total_lines: previous_lines.saturating_add(new_lines),
+                source_end: next_stable_end,
+            }));
+        }
+
+        let tail = &source[self.stable_end..];
+        let (tail_lines, tail_codes) = render_markdown(tail, width);
+        let tail_buttons = scan_copy_buttons_from_lines(&tail_lines, &tail_codes);
+        let stable_lines = self.stable.as_ref().map_or(0, |chunk| chunk.total_lines);
+        let line_count = stable_lines.saturating_add(tail_lines.len() as u16);
+        self.source_len = source.len();
+
+        IncrementalMarkdownRender {
+            stable: self.stable.clone(),
+            tail_lines: tail_lines.into(),
+            #[cfg(test)]
+            tail_codes: tail_codes.into(),
+            tail_buttons: tail_buttons.into(),
+            line_count,
+            #[cfg(test)]
+            reparsed_bytes: next_stable_end.saturating_sub(old_stable_end) + tail.len(),
+        }
+    }
+
+    fn scan_appended_lines(&mut self, source: &str) {
+        let mut offset = self.scan_offset;
+        for line in source[self.scan_offset..].split_inclusive('\n') {
+            if !line.ends_with('\n') {
+                break;
+            }
+            offset += line.len();
+            let trimmed = line.trim();
+            if let Some(after_fence) = trimmed.strip_prefix("```") {
+                if !self.in_fence || after_fence.trim().is_empty() {
+                    self.in_fence = !self.in_fence;
+                }
+            } else if !self.in_fence && trimmed.is_empty() {
+                self.stable_end = offset;
+            }
+            self.scan_offset = offset;
+        }
+    }
+}
+
+/// Byte boundary after the last completed block separator. A blank line can
+/// seal everything before it only while it is outside a fenced code block;
+/// the unfinished tail remains free to change type as more tokens arrive.
+#[cfg(test)]
+fn stable_markdown_prefix_end(source: &str) -> usize {
+    let mut state = IncrementalMarkdownState::default();
+    state.scan_appended_lines(source);
+    state.stable_end
+}
+
+fn render_markdown(source: &str, width: u16) -> (Vec<Line<'static>>, Vec<String>) {
+    if source.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let hooks = CodeBlockHooks::new(width as usize);
+    let codes_handle = hooks.codes();
+    let renderer = MarkdownRenderer::new(width as usize).with_render_hooks(Box::new(hooks));
+    let blocks = renderer.parse(source);
+    let lines = renderer.render(&blocks, &AppTheme);
+    let codes = codes_handle
+        .lock()
+        .map(|codes| codes.clone())
+        .unwrap_or_default();
+    (lines, codes)
 }
 
 /// A one-worker latest-wins renderer.
@@ -195,6 +486,9 @@ impl Drop for LiveMarkdownWorker {
 }
 
 fn worker_loop(shared: Arc<(Mutex<WorkerState>, Condvar)>) {
+    const MAX_RENDER_STATES: usize = 64;
+    let mut render_states: HashMap<String, CachedIncrementalMarkdown> = HashMap::new();
+    let mut render_order = 0u64;
     loop {
         let job = {
             let (state, wake) = &*shared;
@@ -230,7 +524,28 @@ fn worker_loop(shared: Arc<(Mutex<WorkerState>, Condvar)>) {
         };
 
         let Some(job) = job else { continue };
-        let result = render_job(job);
+        render_order = render_order.wrapping_add(1);
+        let key = job.key.clone();
+        let finished = !job.in_progress;
+        let result = {
+            let cached = render_states.entry(key.clone()).or_default();
+            cached.last_used = render_order;
+            render_job(job, &mut cached.state)
+        };
+        if finished {
+            // A finalized item cannot receive more token deltas. Its immutable
+            // snapshot remains available to the panel; the extra raw source
+            // and stable-prefix cache no longer need to stay in the worker.
+            render_states.remove(&key);
+        } else if render_states.len() > MAX_RENDER_STATES
+            && let Some(oldest) = render_states
+                .iter()
+                .filter(|(candidate, _)| *candidate != &key)
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(key, _)| key.clone())
+        {
+            render_states.remove(&oldest);
+        }
         let (state, _) = &*shared;
         let mut state = state
             .lock()
@@ -254,15 +569,29 @@ fn worker_loop(shared: Arc<(Mutex<WorkerState>, Condvar)>) {
     }
 }
 
-fn render_job(job: LiveMarkdownJob) -> LiveMarkdownSnapshot {
-    let (paragraph, copy_buttons, reasoning_text) = match &job.item {
+fn render_job(
+    job: LiveMarkdownJob,
+    markdown_state: &mut IncrementalMarkdownState,
+) -> LiveMarkdownSnapshot {
+    let (paragraph, incremental, copy_buttons, reasoning_text) = match &job.item {
+        OutputItem::Message(message) if job.in_progress => {
+            let source = message_markdown_source(message);
+            let rendered =
+                markdown_state.render(&source, job.generation, message_markdown_width(job.width));
+            (
+                Paragraph::new(""),
+                Some(Arc::new(IncrementalMarkdownParagraph::new(rendered))),
+                Vec::new(),
+                None,
+            )
+        }
         OutputItem::Message(_) => {
             let (paragraph, copy_buttons) = AssistantMessage::new(&job.item, job.width)
                 .in_progress(job.in_progress)
                 .expanded(job.expanded)
                 .frame_count(job.frame_count)
                 .into_paragraph();
-            (paragraph, copy_buttons, None)
+            (paragraph, None, copy_buttons, None)
         }
         OutputItem::Reasoning(item) => {
             let (paragraph, copy_buttons, text) = render_reasoning(
@@ -272,13 +601,16 @@ fn render_job(job: LiveMarkdownJob) -> LiveMarkdownSnapshot {
                 job.expanded,
                 job.frame_count,
             );
-            (paragraph, copy_buttons, Some(Arc::new(text)))
+            (paragraph, None, copy_buttons, Some(Arc::new(text)))
         }
         // Keep a harmless empty result if a future caller accidentally submits
         // another item kind rather than parsing it on the UI thread.
-        _ => (Paragraph::new(""), Vec::new(), None),
+        _ => (Paragraph::new(""), None, Vec::new(), None),
     };
-    let height = paragraph.line_count(job.width) as u16;
+    let height = incremental.as_ref().map_or_else(
+        || paragraph.line_count(job.width) as u16,
+        |view| view.height(),
+    );
     LiveMarkdownSnapshot {
         key: job.key,
         request_id: job.request_id,
@@ -286,6 +618,7 @@ fn render_job(job: LiveMarkdownJob) -> LiveMarkdownSnapshot {
         revision: job.revision,
         width: job.width,
         paragraph: Arc::new(paragraph),
+        incremental,
         height,
         copy_buttons: Arc::new(copy_buttons),
         reasoning_text,
@@ -296,11 +629,18 @@ fn render_job(job: LiveMarkdownJob) -> LiveMarkdownSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{LiveMarkdownJob, LiveMarkdownWorker};
+    use super::{
+        AssistantMessage, IncrementalMarkdownParagraph, IncrementalMarkdownState, LiveMarkdownJob,
+        LiveMarkdownWorker, message_markdown_width, render_markdown, stable_markdown_prefix_end,
+    };
     use async_openai::types::responses::{
         AssistantRole, OutputItem, OutputMessage, OutputMessageContent, OutputStatus,
         OutputTextContent, ReasoningItem, SummaryPart, SummaryTextContent,
     };
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+    use std::sync::Arc;
 
     fn message(text: &str) -> async_openai::types::responses::OutputItem {
         async_openai::types::responses::OutputItem::Message(OutputMessage {
@@ -430,5 +770,96 @@ mod tests {
                 .as_ref()
                 .is_some_and(|text| text.to_string().contains("Heading"))
         );
+    }
+
+    #[test]
+    fn incremental_renderer_reparses_only_the_unsealed_markdown_tail() {
+        let mut state = IncrementalMarkdownState::default();
+        let first = "# Stable heading\n\nfirst streaming paragraph";
+        let rendered = state.render(first, 1, 40);
+        assert_eq!(rendered.reparsed_bytes, first.len());
+        assert_eq!(state.stable_end, "# Stable heading\n\n".len());
+        let stable_prefix = rendered.stable.as_ref().expect("sealed prefix").clone();
+
+        let appended = format!("{first} gets one more token");
+        let rendered = state.render(&appended, 1, 40);
+        assert_eq!(
+            rendered.reparsed_bytes,
+            "first streaming paragraph gets one more token".len()
+        );
+        assert!(rendered.reparsed_bytes < appended.len());
+        assert!(Arc::ptr_eq(
+            &stable_prefix,
+            rendered.stable.as_ref().expect("shared sealed prefix")
+        ));
+        assert!(
+            rendered
+                .lines()
+                .iter()
+                .any(|line| line.to_string().contains("Stable heading"))
+        );
+    }
+
+    #[test]
+    fn fenced_blank_lines_do_not_seal_an_incomplete_code_block() {
+        let source = "intro\n\n```rust\nfn main() {\n\n";
+        assert_eq!(stable_markdown_prefix_end(source), "intro\n\n".len());
+
+        let closed = format!("{source}}}\n```\n\nafter");
+        assert_eq!(
+            stable_markdown_prefix_end(&closed),
+            closed.len() - "after".len()
+        );
+    }
+
+    #[test]
+    fn incremental_blocks_match_a_full_document_render() {
+        let source = concat!(
+            "# Heading\n\n",
+            "A paragraph with **bold** text.\n\n",
+            "- first\n- second\n\n",
+            "```rust\nfn main() {}\n```\n\n",
+            "| a | b |\n| - | - |\n| 1 | 2 |\n\n",
+            "tail"
+        );
+        let mut state = IncrementalMarkdownState::default();
+        let mut last = None;
+        for boundary in source
+            .match_indices("\n\n")
+            .map(|(index, separator)| index + separator.len())
+            .chain(std::iter::once(source.len()))
+        {
+            last = Some(state.render(&source[..boundary], 3, 60));
+        }
+        let incremental = last.unwrap();
+        let (full_lines, full_codes) = render_markdown(source, 60);
+        assert_eq!(incremental.lines(), full_lines);
+        assert_eq!(incremental.codes(), full_codes);
+    }
+
+    #[test]
+    fn incremental_view_matches_the_full_message_pixels_without_flattening_prefix() {
+        let source = concat!(
+            "# Heading\n\n",
+            "A paragraph with **bold** text.\n\n",
+            "```rust\nfn main() {}\n```\n\n",
+            "streaming tail"
+        );
+        let item = message(source);
+        let width = 60;
+        let mut state = IncrementalMarkdownState::default();
+        let rendered = state.render(source, 9, message_markdown_width(width));
+        let incremental = IncrementalMarkdownParagraph::new(rendered);
+        let (full, _) = AssistantMessage::new(&item, width).into_paragraph();
+        let height = full.line_count(width) as u16;
+        assert_eq!(incremental.height(), height);
+
+        let area = Rect::new(0, 0, width, height);
+        let mut incremental_buffer = Buffer::empty(area);
+        incremental.render(area, &mut incremental_buffer, 0);
+        let mut full_buffer = Buffer::empty(area);
+        full.render(area, &mut full_buffer);
+
+        assert_eq!(incremental_buffer, full_buffer);
     }
 }

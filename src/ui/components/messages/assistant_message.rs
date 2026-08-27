@@ -123,6 +123,16 @@ impl<'a> AssistantMessage<'a> {
             ),
             other => (UnsupportedMessage::new(other).into_text(), Vec::new()),
         };
+        self.into_paragraph_from_parts(text, codes)
+    }
+
+    /// Wrap text materialized by the live Markdown worker in the same padding,
+    /// background, and copy-button geometry as the ordinary renderer.
+    pub(crate) fn into_paragraph_from_parts(
+        self,
+        text: Text<'static>,
+        codes: Vec<String>,
+    ) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
         let buttons = scan_copy_buttons(&text, &codes);
 
         let foldable = matches!(
@@ -180,11 +190,18 @@ pub(crate) fn render_reasoning(
 /// pairs each with its code block content (the k-th label belongs to the k-th
 /// block). Coordinates are relative to the paragraph, including its padding.
 fn scan_copy_buttons(text: &Text<'_>, codes: &[String]) -> Vec<CodeCopyButton> {
+    scan_copy_buttons_from_lines(&text.lines, codes)
+}
+
+pub(crate) fn scan_copy_buttons_from_lines(
+    lines: &[ratatui::text::Line<'_>],
+    codes: &[String],
+) -> Vec<CodeCopyButton> {
     let mut buttons = Vec::new();
     if codes.is_empty() {
         return buttons;
     }
-    for (row, line) in text.lines.iter().enumerate() {
+    for (row, line) in lines.iter().enumerate() {
         let mut x = 0u16;
         for span in &line.spans {
             let width = span.width() as u16;

@@ -26,7 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
-use super::live_markdown::{LiveMarkdownJob, LiveMarkdownSnapshot, LiveMarkdownWorker};
+use super::live_markdown::{
+    IncrementalMarkdownParagraph, LiveMarkdownJob, LiveMarkdownSnapshot, LiveMarkdownWorker,
+};
 use super::tool_group::MemberHeader;
 use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
@@ -149,7 +151,7 @@ fn is_foldable(item: &MessageItem) -> bool {
 /// Exploring groups have their own revision-keyed cache below.
 #[derive(Debug)]
 pub(crate) struct CachedParagraph {
-    pub paragraph: Arc<Paragraph<'static>>,
+    pub paragraph: LiveParagraphContent,
     pub height: u16,
     /// Whether this slot was intentionally hidden when cached. Bridged live
     /// groups temporarily hide their committed members, then reveal them again
@@ -231,11 +233,27 @@ pub(crate) struct ToolGroupLayout {
     pub live_index_base: Option<usize>,
 }
 
-pub(crate) type LiveParagraph = (
-    std::sync::Arc<Paragraph<'static>>,
-    u16,
-    std::sync::Arc<Vec<CodeCopyButton>>,
-);
+#[derive(Debug, Clone)]
+pub(crate) enum LiveParagraphContent {
+    Paragraph(Arc<Paragraph<'static>>),
+    Incremental(Arc<IncrementalMarkdownParagraph>),
+}
+
+impl LiveParagraphContent {
+    pub(crate) fn copy_button(
+        &self,
+        fallback: &[CodeCopyButton],
+        row: u16,
+        x: u16,
+    ) -> Option<String> {
+        match self {
+            Self::Paragraph(_) => find_copy_button(fallback, row, x),
+            Self::Incremental(paragraph) => paragraph.copy_button(row, x),
+        }
+    }
+}
+
+pub(crate) type LiveParagraph = (LiveParagraphContent, u16, Arc<Vec<CodeCopyButton>>);
 pub(crate) type LiveGroupHeader = Option<(String, Vec<MemberHeader>)>;
 pub(crate) type MaterializedLiveCache = (Vec<LiveParagraph>, Vec<LiveGroupHeader>);
 
@@ -308,6 +326,10 @@ pub(crate) struct LiveRenderCache {
 pub(crate) struct Selection {
     pub anchor: (u16, u16),
     pub head: (u16, u16),
+    /// Screen cell where the press started. The scroll-buffer row may move
+    /// while streaming content is rendered, but that must not turn a stationary
+    /// press/release into a drag.
+    pub screen_anchor: (u16, u16),
     /// True once the mouse moved to a different cell while held down; a press
     /// and release on the same cell is a click, not a selection.
     pub dragging: bool,
@@ -689,7 +711,9 @@ impl ConversationPanel {
             let hit = self
                 .live_paragraphs
                 .get(live_idx)
-                .and_then(|(_, _, buttons)| find_copy_button(buttons, buffer_y - top, x_rel));
+                .and_then(|(paragraph, _, buttons)| {
+                    paragraph.copy_button(buttons, buffer_y - top, x_rel)
+                });
             if let Some(content) = hit {
                 self.copy_code_block(&content);
                 return;
@@ -731,11 +755,11 @@ impl ConversationPanel {
             .iter()
             .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
         {
-            let hit = self
-                .render_cache
-                .entries
-                .get(index)
-                .and_then(|entry| find_copy_button(&entry.copy_buttons, buffer_y - top, x_rel));
+            let hit = self.render_cache.entries.get(index).and_then(|entry| {
+                entry
+                    .paragraph
+                    .copy_button(&entry.copy_buttons, buffer_y - top, x_rel)
+            });
             if let Some(content) = hit {
                 self.copy_code_block(&content);
                 return;
@@ -790,6 +814,7 @@ impl ConversationPanel {
         self.selection = self.to_buffer_pos(column, row, false).map(|pos| Selection {
             anchor: pos,
             head: pos,
+            screen_anchor: (column, row),
             dragging: false,
         });
     }
@@ -824,6 +849,16 @@ impl ConversationPanel {
     /// Left button released: either finish a drag selection (returning the
     /// selected text) or report a plain click.
     pub fn selection_end(&mut self, column: u16, row: u16) -> SelectionEnd {
+        // Streaming can change `view_offset` between Down and Up. Compare the
+        // physical screen cell first so a stationary title click is not
+        // mistaken for a buffer-coordinate drag after the layout moves.
+        if self
+            .selection
+            .is_some_and(|sel| !sel.dragging && sel.screen_anchor == (column, row))
+        {
+            self.selection = None;
+            return SelectionEnd::Click;
+        }
         self.selection_drag(column, row);
         match self.selection {
             None => SelectionEnd::Ignored,
@@ -861,7 +896,14 @@ impl ConversationPanel {
                     top,
                     bottom.saturating_sub(top),
                     width,
-                    |b| entry.paragraph.as_ref().render(b.area, b),
+                    |b| match &entry.paragraph {
+                        LiveParagraphContent::Paragraph(paragraph) => {
+                            paragraph.as_ref().render(b.area, b)
+                        }
+                        LiveParagraphContent::Incremental(paragraph) => {
+                            paragraph.render(b.area, b, 0)
+                        }
+                    },
                 );
             }
         }
@@ -874,7 +916,14 @@ impl ConversationPanel {
                     top,
                     bottom.saturating_sub(top),
                     width,
-                    |b| paragraph.as_ref().render(b.area, b),
+                    |b| match paragraph {
+                        LiveParagraphContent::Paragraph(paragraph) => {
+                            paragraph.as_ref().render(b.area, b)
+                        }
+                        LiveParagraphContent::Incremental(paragraph) => {
+                            paragraph.render(b.area, b, 0)
+                        }
+                    },
                 );
             }
         }
@@ -1770,6 +1819,29 @@ mod tests {
         state.update(10, 20);
         assert_eq!(state.offset().y, 0);
         assert!(state.is_at_bottom());
+    }
+
+    #[test]
+    fn stationary_release_stays_a_click_when_streaming_moves_the_view() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(0, 0, 40, 10);
+        panel.view_offset = 20;
+
+        panel.selection_begin(3, 4);
+        panel.view_offset = 24;
+
+        assert!(matches!(panel.selection_end(3, 4), SelectionEnd::Click));
+    }
+
+    #[test]
+    fn mouse_movement_still_finishes_as_a_selection() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(0, 0, 40, 10);
+
+        panel.selection_begin(3, 4);
+        panel.selection_drag(8, 4);
+
+        assert!(matches!(panel.selection_end(8, 4), SelectionEnd::Copied(_)));
     }
 
     #[test]
