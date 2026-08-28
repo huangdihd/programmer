@@ -1,3 +1,24 @@
+# programmer v0.2.4
+
+v0.2.4 focuses on streaming rendering performance and dependency updates.
+
+## Highlights
+
+- Render streaming Markdown off the UI thread: long assistant responses no
+  longer block input handling or redraws while tokens arrive.
+- Virtualize and cache conversation panel layout work so long conversations
+  scroll and render smoothly.
+- Optimize streaming Markdown rendering for fewer intermediate re-parses.
+
+## Dependencies
+
+- Bumped async-openai from 0.41.1 to 0.41.3.
+- Bumped serde from 1.0.228 to 1.0.229.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.3...v0.2.4
+
+---
+
 # programmer v0.2.2
 
 v0.2.2 adds recoverable conversation navigation, automatic context management,
