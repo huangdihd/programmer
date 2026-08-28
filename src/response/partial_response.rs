@@ -64,6 +64,10 @@ pub struct PartialResponse {
     /// being generated ("Thinking...") or complete ("Thought"), since the item's
     /// own `status` field is only populated for finalized items.
     finished_items: Vec<bool>,
+    /// Per-output-item content revisions. Unlike `render_revision`, this only
+    /// advances for events addressed to the item, so unrelated tool deltas do
+    /// not cause the live Markdown worker to clone and parse it again.
+    item_revisions: Vec<u64>,
     finish_reason: Option<ResponseFinishReason>,
     /// Cancelled when the user presses Escape to stop the current request.
     pub cancelled: CancellationToken,
@@ -73,6 +77,10 @@ pub struct PartialResponse {
     /// response. The TUI uses it to reuse an unchanged live tool-group layout
     /// across animation/timer frames without hashing or cloning the full text.
     render_revision: u64,
+    /// Changes only when an event addresses an output item. Lifecycle and
+    /// usage events leave this untouched, so a cached Markdown page survives
+    /// unrelated stream bookkeeping.
+    item_render_revision: u64,
 }
 
 impl PartialResponse {
@@ -80,10 +88,12 @@ impl PartialResponse {
         PartialResponse {
             items: vec![],
             finished_items: vec![],
+            item_revisions: vec![],
             finish_reason: None,
             cancelled,
             usage: None,
             render_revision: 0,
+            item_render_revision: 0,
         }
     }
 
@@ -92,13 +102,40 @@ impl PartialResponse {
             self.items.resize((output_index + 1) as usize, None);
             self.finished_items
                 .resize((output_index + 1) as usize, false);
+            self.item_revisions.resize((output_index + 1) as usize, 0);
         }
         self.items[output_index as usize] = Some(item);
+    }
+
+    fn bump_item_revision(&mut self, output_index: usize) {
+        if self.item_revisions.len() <= output_index {
+            self.item_revisions.resize(output_index + 1, 0);
+        }
+        self.item_revisions[output_index] = self.item_revisions[output_index].wrapping_add(1);
     }
 
     fn mark_finished(&mut self, output_index: u32) {
         if let Some(finished) = self.finished_items.get_mut(output_index as usize) {
             *finished = true;
+        }
+    }
+
+    fn mark_all_finished(&mut self) {
+        let mut changed = false;
+        for (index, slot) in self.items.iter().enumerate() {
+            if slot.is_some()
+                && !self.finished_items.get(index).copied().unwrap_or(false)
+                && let Some(finished) = self.finished_items.get_mut(index)
+            {
+                *finished = true;
+                if let Some(revision) = self.item_revisions.get_mut(index) {
+                    *revision = revision.wrapping_add(1);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.item_render_revision = self.item_render_revision.wrapping_add(1);
         }
     }
 
@@ -117,7 +154,66 @@ impl PartialResponse {
             .collect()
     }
 
+    /// Borrow the current output items for render-only inspection. The
+    /// streaming renderer should prefer this over [`Self::get_message_items`]
+    /// because cloning a growing Markdown item on every frame would put the
+    /// cache hand-off back on the UI thread.
+    pub fn message_item_refs(&self) -> Vec<(&OutputItem, bool)> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref().map(|item| {
+                    let in_progress = !self.finished_items.get(index).copied().unwrap_or(false);
+                    (item, in_progress)
+                })
+            })
+            .collect()
+    }
+
+    /// A cheap revision for layout consumers. It changes when an output item
+    /// or its finished state changes, but not for response lifecycle/usage
+    /// events that do not alter any output slot. This lets a cached live page
+    /// survive unrelated stream events without cloning its Markdown items.
+    pub fn item_render_revision(&self) -> u64 {
+        self.item_render_revision
+    }
+
+    /// Iterate over Markdown-bearing assistant items without cloning them.
+    /// The UI uses the item revision to clone only a changed item before
+    /// handing it to the background renderer.
+    pub fn markdown_items(&self) -> Vec<(usize, &OutputItem, bool, u64)> {
+        let mut live_index = 0;
+        let mut items = Vec::new();
+        for (protocol_index, slot) in self.items.iter().enumerate() {
+            let Some(item) = slot.as_ref() else {
+                continue;
+            };
+            let current_live_index = live_index;
+            live_index += 1;
+            if !matches!(item, OutputItem::Message(_) | OutputItem::Reasoning(_)) {
+                continue;
+            }
+            let in_progress = !self
+                .finished_items
+                .get(protocol_index)
+                .copied()
+                .unwrap_or(false);
+            let revision = self
+                .item_revisions
+                .get(protocol_index)
+                .copied()
+                .unwrap_or_default();
+            items.push((current_live_index, item, in_progress, revision));
+        }
+        items
+    }
+
     pub fn handle_response_stream_event(&mut self, response_stream_event: ResponseStreamEvent) {
+        if let Some(output_index) = Self::response_output_index(&response_stream_event) {
+            self.bump_item_revision(output_index);
+            self.item_render_revision = self.item_render_revision.wrapping_add(1);
+        }
         self.render_revision = self.render_revision.wrapping_add(1);
         match response_stream_event {
             ResponseOutputItemAdded(item_added_event) => {
@@ -471,6 +567,7 @@ impl PartialResponse {
             }
 
             ResponseCompleted(response_completed_event) => {
+                self.mark_all_finished();
                 if let Some(ref u) = response_completed_event.response.usage {
                     self.usage = Some((u.input_tokens, u.output_tokens));
                 }
@@ -479,6 +576,7 @@ impl PartialResponse {
                 ));
             }
             ResponseFailed(response_failed_event) => {
+                self.mark_all_finished();
                 if let Some(ref u) = response_failed_event.response.usage {
                     self.usage = Some((u.input_tokens, u.output_tokens));
                 }
@@ -486,6 +584,7 @@ impl PartialResponse {
                     Some(ResponseFinishReason::Failed(response_failed_event.response));
             }
             ResponseIncomplete(response_incomplete_event) => {
+                self.mark_all_finished();
                 if let Some(ref u) = response_incomplete_event.response.usage {
                     self.usage = Some((u.input_tokens, u.output_tokens));
                 }
@@ -501,6 +600,38 @@ impl PartialResponse {
                 });
             }
             _ => {}
+        }
+    }
+
+    /// Extract the output index before the stream event is consumed by the
+    /// folding match below. Events without an item index (response lifecycle,
+    /// errors, and usage) must not dirty any Markdown snapshot.
+    fn response_output_index(event: &ResponseStreamEvent) -> Option<usize> {
+        match event {
+            ResponseOutputItemAdded(event) => Some(event.output_index as usize),
+            ResponseOutputItemDone(event) => Some(event.output_index as usize),
+            ResponseContentPartAdded(event) => Some(event.output_index as usize),
+            ResponseContentPartDone(event) => Some(event.output_index as usize),
+            ResponseOutputTextDelta(event) => Some(event.output_index as usize),
+            ResponseOutputTextDone(event) => Some(event.output_index as usize),
+            ResponseOutputTextAnnotationAdded(event) => Some(event.output_index as usize),
+            ResponseRefusalDelta(event) => Some(event.output_index as usize),
+            ResponseRefusalDone(event) => Some(event.output_index as usize),
+            ResponseReasoningTextDelta(event) => Some(event.output_index as usize),
+            ResponseReasoningTextDone(event) => Some(event.output_index as usize),
+            ResponseReasoningSummaryPartAdded(event) => Some(event.output_index as usize),
+            ResponseReasoningSummaryPartDone(event) => Some(event.output_index as usize),
+            ResponseReasoningSummaryTextDelta(event) => Some(event.output_index as usize),
+            ResponseReasoningSummaryTextDone(event) => Some(event.output_index as usize),
+            ResponseFunctionCallArgumentsDelta(event) => Some(event.output_index as usize),
+            ResponseFunctionCallArgumentsDone(event) => Some(event.output_index as usize),
+            ResponseMCPCallArgumentsDelta(event) => Some(event.output_index as usize),
+            ResponseMCPCallArgumentsDone(event) => Some(event.output_index as usize),
+            ResponseCustomToolCallInputDelta(event) => Some(event.output_index as usize),
+            ResponseCustomToolCallInputDone(event) => Some(event.output_index as usize),
+            ResponseCodeInterpreterCallCodeDelta(event) => Some(event.output_index as usize),
+            ResponseCodeInterpreterCallCodeDone(event) => Some(event.output_index as usize),
+            _ => None,
         }
     }
 
@@ -676,6 +807,18 @@ mod tests {
     }
 
     #[test]
+    fn markdown_items_use_compact_indices_for_sparse_protocol_slots() {
+        let mut p = fresh();
+        p.set_item(msg_item(), 2);
+        p.set_item(fc_item(), 4);
+
+        let items = p.markdown_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, 0, "live UI indices skip protocol gaps");
+        assert_eq!(items[0].3, 0);
+    }
+
+    #[test]
     fn finalize_without_finish_reason_is_error() {
         let p = fresh();
         assert!(matches!(
@@ -702,5 +845,30 @@ mod tests {
         let items = p.get_message_items();
         assert_eq!(items.len(), 1);
         assert!(!items[0].1, "item should be finished");
+    }
+
+    #[test]
+    fn response_completion_finishes_items_without_item_done() {
+        let mut p = fresh();
+        p.set_item(msg_item(), 0);
+        let before = p.item_render_revision();
+        p.handle_response_stream_event(
+            async_openai::types::responses::ResponseStreamEvent::ResponseCompleted(
+                async_openai::types::responses::ResponseCompletedEvent {
+                    sequence_number: 1,
+                    response: serde_json::from_value(serde_json::json!({
+                        "created_at": 0,
+                        "id": "response-test",
+                        "model": "test",
+                        "object": "response",
+                        "output": [],
+                        "status": "completed"
+                    }))
+                    .unwrap(),
+                },
+            ),
+        );
+        assert!(!p.get_message_items()[0].1);
+        assert!(p.item_render_revision() > before);
     }
 }

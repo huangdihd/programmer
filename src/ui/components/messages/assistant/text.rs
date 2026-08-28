@@ -39,25 +39,36 @@ impl<'a> TextMessage<'a> {
     /// Renders the message, also returning the raw content of every code block
     /// (in render order) so copy buttons can be wired up.
     pub fn into_parts(self) -> (Text<'static>, Vec<String>) {
-        let md = self
-            .message
-            .content
-            .iter()
-            .map(|content| match content {
-                OutputMessageContent::OutputText(text) => text.text.clone(),
-                OutputMessageContent::Refusal(refusal) => refusal.refusal.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let render_width = self.width.saturating_sub(HORIZONTAL_PAD);
-        let hooks = CodeBlockHooks::new(render_width as usize);
-        let codes = hooks.codes();
-        let renderer =
-            MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
-        let blocks = renderer.parse(&md);
-        let text = Text::from(renderer.render(&blocks, &AppTheme));
-        let codes = codes.lock().map(|c| c.clone()).unwrap_or_default();
-        (text, codes)
+        let md = markdown_source(self.message);
+        render_markdown(&md, markdown_width(self.width))
     }
+}
+
+/// Flatten the protocol content parts into the Markdown document shown by the
+/// assistant message. Kept here so the live worker and finished-message path
+/// cannot drift while the worker renders that source incrementally.
+pub(crate) fn markdown_source(message: &OutputMessage) -> String {
+    message
+        .content
+        .iter()
+        .map(|content| match content {
+            OutputMessageContent::OutputText(text) => text.text.as_str(),
+            OutputMessageContent::Refusal(refusal) => refusal.refusal.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn markdown_width(width: u16) -> u16 {
+    width.saturating_sub(HORIZONTAL_PAD)
+}
+
+pub(crate) fn render_markdown(md: &str, render_width: u16) -> (Text<'static>, Vec<String>) {
+    let hooks = CodeBlockHooks::new(render_width as usize);
+    let codes = hooks.codes();
+    let renderer = MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
+    let blocks = renderer.parse(md);
+    let text = Text::from(renderer.render(&blocks, &AppTheme));
+    let codes = codes.lock().map(|c| c.clone()).unwrap_or_default();
+    (text, codes)
 }

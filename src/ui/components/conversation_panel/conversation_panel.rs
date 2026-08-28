@@ -26,6 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
+use super::live_markdown::{
+    IncrementalMarkdownParagraph, LiveMarkdownJob, LiveMarkdownSnapshot, LiveMarkdownWorker,
+};
 use super::tool_group::MemberHeader;
 use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
@@ -148,7 +151,7 @@ fn is_foldable(item: &MessageItem) -> bool {
 /// Exploring groups have their own revision-keyed cache below.
 #[derive(Debug)]
 pub(crate) struct CachedParagraph {
-    pub paragraph: Arc<Paragraph<'static>>,
+    pub paragraph: LiveParagraphContent,
     pub height: u16,
     /// Whether this slot was intentionally hidden when cached. Bridged live
     /// groups temporarily hide their committed members, then reveal them again
@@ -162,7 +165,7 @@ pub(crate) struct CachedParagraph {
     pub has_output: bool,
     /// Clickable copy hotspots for the item's code blocks, relative to the
     /// paragraph's top-left corner.
-    pub copy_buttons: Vec<CodeCopyButton>,
+    pub copy_buttons: Arc<Vec<CodeCopyButton>>,
     /// True when this entry's paragraph was skipped (only height estimated)
     /// to avoid expensive markdown rendering of far-offscreen items.
     pub lazy: bool,
@@ -230,9 +233,60 @@ pub(crate) struct ToolGroupLayout {
     pub live_index_base: Option<usize>,
 }
 
-pub(crate) type LiveParagraph = (std::sync::Arc<Paragraph<'static>>, u16, Vec<CodeCopyButton>);
+#[derive(Debug, Clone)]
+pub(crate) enum LiveParagraphContent {
+    Paragraph(Arc<Paragraph<'static>>),
+    Incremental(Arc<IncrementalMarkdownParagraph>),
+}
+
+impl LiveParagraphContent {
+    pub(crate) fn copy_button(
+        &self,
+        fallback: &[CodeCopyButton],
+        row: u16,
+        x: u16,
+    ) -> Option<String> {
+        match self {
+            Self::Paragraph(_) => find_copy_button(fallback, row, x),
+            Self::Incremental(paragraph) => paragraph.copy_button(row, x),
+        }
+    }
+}
+
+pub(crate) type LiveParagraph = (LiveParagraphContent, u16, Arc<Vec<CodeCopyButton>>);
 pub(crate) type LiveGroupHeader = Option<(String, Vec<MemberHeader>)>;
 pub(crate) type MaterializedLiveCache = (Vec<LiveParagraph>, Vec<LiveGroupHeader>);
+
+/// Stable key used to associate an asynchronous live Markdown result with the
+/// corresponding slot in a partial response. Provider output ids are stable
+/// within a response; the index fallback keeps synthetic test items (which
+/// sometimes omit an id) usable as well.
+pub(crate) fn live_message_key(item: &OutputItem, index: usize) -> Option<String> {
+    match item {
+        OutputItem::Message(message) if !message.id.is_empty() => {
+            Some(format!("message:{}", message.id))
+        }
+        OutputItem::Reasoning(reasoning) => reasoning
+            .id
+            .as_deref()
+            .map(|id| format!("reasoning:{id}"))
+            .or_else(|| Some(format!("reasoning-index:{index}"))),
+        OutputItem::Message(_) => Some(format!("message-index:{index}")),
+        _ => None,
+    }
+}
+
+/// Namespace a live key by response generation. Provider reasoning ids are
+/// usually unique, but synthetic/no-id items fall back to their compact index;
+/// without this namespace the first reasoning item of a new turn could reuse
+/// the previous turn's front paragraph.
+pub(crate) fn live_response_message_key(
+    item: &OutputItem,
+    index: usize,
+    generation: u64,
+) -> Option<String> {
+    live_message_key(item, index).map(|key| format!("generation:{generation}:{key}"))
+}
 
 /// One pre-rendered live slot. Exploring groups retain both outer fold states,
 /// so the first click only selects an `Arc` and never parses Markdown.
@@ -272,6 +326,10 @@ pub(crate) struct LiveRenderCache {
 pub(crate) struct Selection {
     pub anchor: (u16, u16),
     pub head: (u16, u16),
+    /// Screen cell where the press started. The scroll-buffer row may move
+    /// while streaming content is rendered, but that must not turn a stationary
+    /// press/release into a drag.
+    pub screen_anchor: (u16, u16),
     /// True once the mouse moved to a different cell while held down; a press
     /// and release on the same cell is a click, not a selection.
     pub dragging: bool,
@@ -463,9 +521,45 @@ pub struct ConversationPanel {
     /// Group header hit regions parallel to `live_paragraphs`. Keeping these
     /// with the cached paragraph avoids rebuilding click geometry on cache hits.
     pub(crate) live_group_headers: Vec<LiveGroupHeader>,
-    /// Present only when the whole live snapshot consists of Exploring groups
-    /// (plus their hidden zero-height member slots).
+    /// Present when the live snapshot contains only cacheable items (Exploring
+    /// groups and/or Markdown items). Dynamic tool-call output deliberately
+    /// bypasses this cache.
     pub(crate) live_render_cache: Option<LiveRenderCache>,
+    /// Background renderer for ordinary in-flight assistant Markdown. The
+    /// worker is lazy so idle panels do not create a thread.
+    pub(crate) live_markdown_worker: Option<LiveMarkdownWorker>,
+    /// Front-buffer candidates keyed by the API output message id. A frame may
+    /// continue painting the previous candidate while a newer revision is
+    /// being generated off-thread.
+    pub(crate) live_markdown_front: HashMap<String, LiveMarkdownSnapshot>,
+    /// Generation is bumped whenever a response is started/committed/aborted;
+    /// results from an older response are then harmlessly discarded.
+    pub(crate) live_markdown_generation: u64,
+    /// Width for which the current live Markdown job/front buffer was built.
+    pub(crate) live_markdown_width: u16,
+    /// Last submitted `(generation, item_revision, width, expanded)` per item,
+    /// used to avoid resubmitting the same snapshot on every frame.
+    pub(crate) live_markdown_last_job: HashMap<String, (u64, u64, u16, bool)>,
+    /// A completed Markdown item can remain in `PartialResponse` while a tool
+    /// call streams afterward. Submit that finished item once, then leave it
+    /// alone until its item revision, width, or expansion state changes.
+    pub(crate) live_markdown_finished_job: HashMap<String, (u64, u16, bool)>,
+    /// Newly committed items whose live front-buffer key can still receive a
+    /// background result. The value is the live key; the key in this map is
+    /// the item's absolute conversation index, which remains stable after the
+    /// response is appended.
+    pub(crate) live_markdown_history_keys: HashMap<usize, String>,
+    /// Last `(width, expanded)` request submitted for a committed hand-off
+    /// item, preventing a history frame from cloning it repeatedly while the
+    /// worker is still rendering.
+    pub(crate) live_markdown_history_last_job: HashMap<usize, (u16, bool)>,
+    /// History entries that need rebuilding after a worker result arrives.
+    /// Keeping this separate from `RenderCache` preserves unrelated old
+    /// Markdown paragraphs across the asynchronous hand-off.
+    pub(crate) live_markdown_history_dirty: HashSet<usize>,
+    /// Final per-item revisions captured at commit, used to ensure an older
+    /// front snapshot is not mistaken for the completed response.
+    pub(crate) live_markdown_history_revisions: HashMap<usize, u64>,
     #[cfg(test)]
     pub(crate) live_explore_builds: u64,
     #[cfg(test)]
@@ -516,6 +610,16 @@ impl ConversationPanel {
             live_paragraphs: Vec::new(),
             live_group_headers: Vec::new(),
             live_render_cache: None,
+            live_markdown_worker: None,
+            live_markdown_front: HashMap::new(),
+            live_markdown_generation: 0,
+            live_markdown_width: 0,
+            live_markdown_last_job: HashMap::new(),
+            live_markdown_finished_job: HashMap::new(),
+            live_markdown_history_keys: HashMap::new(),
+            live_markdown_history_last_job: HashMap::new(),
+            live_markdown_history_dirty: HashSet::new(),
+            live_markdown_history_revisions: HashMap::new(),
             #[cfg(test)]
             live_explore_builds: 0,
             #[cfg(test)]
@@ -607,7 +711,9 @@ impl ConversationPanel {
             let hit = self
                 .live_paragraphs
                 .get(live_idx)
-                .and_then(|(_, _, buttons)| find_copy_button(buttons, buffer_y - top, x_rel));
+                .and_then(|(paragraph, _, buttons)| {
+                    paragraph.copy_button(buttons, buffer_y - top, x_rel)
+                });
             if let Some(content) = hit {
                 self.copy_code_block(&content);
                 return;
@@ -649,11 +755,11 @@ impl ConversationPanel {
             .iter()
             .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
         {
-            let hit = self
-                .render_cache
-                .entries
-                .get(index)
-                .and_then(|entry| find_copy_button(&entry.copy_buttons, buffer_y - top, x_rel));
+            let hit = self.render_cache.entries.get(index).and_then(|entry| {
+                entry
+                    .paragraph
+                    .copy_button(&entry.copy_buttons, buffer_y - top, x_rel)
+            });
             if let Some(content) = hit {
                 self.copy_code_block(&content);
                 return;
@@ -708,6 +814,7 @@ impl ConversationPanel {
         self.selection = self.to_buffer_pos(column, row, false).map(|pos| Selection {
             anchor: pos,
             head: pos,
+            screen_anchor: (column, row),
             dragging: false,
         });
     }
@@ -742,6 +849,16 @@ impl ConversationPanel {
     /// Left button released: either finish a drag selection (returning the
     /// selected text) or report a plain click.
     pub fn selection_end(&mut self, column: u16, row: u16) -> SelectionEnd {
+        // Streaming can change `view_offset` between Down and Up. Compare the
+        // physical screen cell first so a stationary title click is not
+        // mistaken for a buffer-coordinate drag after the layout moves.
+        if self
+            .selection
+            .is_some_and(|sel| !sel.dragging && sel.screen_anchor == (column, row))
+        {
+            self.selection = None;
+            return SelectionEnd::Click;
+        }
         self.selection_drag(column, row);
         match self.selection {
             None => SelectionEnd::Ignored,
@@ -779,7 +896,14 @@ impl ConversationPanel {
                     top,
                     bottom.saturating_sub(top),
                     width,
-                    |b| entry.paragraph.as_ref().render(b.area, b),
+                    |b| match &entry.paragraph {
+                        LiveParagraphContent::Paragraph(paragraph) => {
+                            paragraph.as_ref().render(b.area, b)
+                        }
+                        LiveParagraphContent::Incremental(paragraph) => {
+                            paragraph.render(b.area, b, 0)
+                        }
+                    },
                 );
             }
         }
@@ -792,7 +916,14 @@ impl ConversationPanel {
                     top,
                     bottom.saturating_sub(top),
                     width,
-                    |b| paragraph.as_ref().render(b.area, b),
+                    |b| match paragraph {
+                        LiveParagraphContent::Paragraph(paragraph) => {
+                            paragraph.as_ref().render(b.area, b)
+                        }
+                        LiveParagraphContent::Incremental(paragraph) => {
+                            paragraph.render(b.area, b, 0)
+                        }
+                    },
                 );
             }
         }
@@ -881,6 +1012,10 @@ impl ConversationPanel {
         {
             // Removing an item shifts every later index used by the expansion state.
             self.expanded_items.clear();
+            // The asynchronous history map is also index-keyed; discard it
+            // rather than allowing a completed worker result to land on the
+            // item that shifted into the old slot.
+            self.invalidate_live_markdown();
         }
     }
 
@@ -944,6 +1079,9 @@ impl ConversationPanel {
         if applied {
             self.expanded_items.clear();
             self.expanded_tool_groups.clear();
+            // Compaction inserts a summary at `cutoff` and shifts every later
+            // absolute index, so any in-flight history hand-off is stale.
+            self.invalidate_live_markdown();
             self.stick_to_bottom = true;
         }
         applied
@@ -975,6 +1113,7 @@ impl ConversationPanel {
         self.live_expanded_items.clear();
         self.live_expanded_groups.clear();
         self.live_render_cache = None;
+        self.invalidate_live_markdown();
         self.selection = None;
         self.stick_to_bottom = true;
     }
@@ -984,12 +1123,17 @@ impl ConversationPanel {
         self.conversation.lock().unwrap().restore_items(items);
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
+        self.invalidate_live_markdown();
         self.stick_to_bottom = true;
     }
 
     pub fn truncate(&mut self, cutoff: usize) {
         self.conversation.lock().unwrap().truncate(cutoff);
         self.abort_receiving();
+        // `abort_receiving` intentionally preserves committed hand-offs when
+        // there is no active response. Truncation changes absolute item
+        // indices, so discard those hand-offs explicitly.
+        self.invalidate_live_markdown();
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
         self.selection = None;
@@ -1005,30 +1149,385 @@ impl ConversationPanel {
         self.conversation.lock().unwrap().usage_summary()
     }
 
+    /// Start a fresh live-response generation. A previous response may already
+    /// be committed while its final Markdown snapshot is still rendering, so
+    /// keep those history keys/front paragraphs alive; only the active live
+    /// response state is replaced.
+    pub(crate) fn begin_live_response(&mut self) {
+        self.live_markdown_generation = self.live_markdown_generation.wrapping_add(1);
+        let history_keys: HashSet<&str> = self
+            .live_markdown_history_keys
+            .values()
+            .map(String::as_str)
+            .collect();
+        self.live_markdown_front
+            .retain(|key, _| history_keys.contains(key.as_str()));
+        self.live_markdown_last_job.clear();
+        self.live_markdown_finished_job.clear();
+        self.live_render_cache = None;
+        self.prune_live_markdown_history();
+    }
+
+    /// Invalidate the asynchronous front buffer at a response hand-off (or
+    /// cancellation) boundary.
+    fn invalidate_live_markdown(&mut self) {
+        self.live_markdown_generation = self.live_markdown_generation.wrapping_add(1);
+        self.live_markdown_front.clear();
+        self.live_markdown_last_job.clear();
+        self.live_markdown_finished_job.clear();
+        self.live_markdown_history_keys.clear();
+        self.live_markdown_history_last_job.clear();
+        self.live_markdown_history_dirty.clear();
+        self.live_markdown_history_revisions.clear();
+        self.live_render_cache = None;
+    }
+
+    /// Invalidate only the currently receiving response. A later response can
+    /// be cancelled while an earlier committed item is still being handed off
+    /// to the worker; that historical front buffer must survive the abort.
+    fn invalidate_active_live_markdown(&mut self) {
+        self.live_markdown_generation = self.live_markdown_generation.wrapping_add(1);
+        let history_keys: HashSet<&str> = self
+            .live_markdown_history_keys
+            .values()
+            .map(String::as_str)
+            .collect();
+        self.live_markdown_front
+            .retain(|key, _| history_keys.contains(key.as_str()));
+        self.live_markdown_last_job.clear();
+        self.live_markdown_finished_job.clear();
+        self.live_render_cache = None;
+    }
+
+    /// Keep the asynchronous hand-off bounded. The ordinary historical
+    /// RenderCache already owns paragraphs for items that have been laid out;
+    /// retaining every completed live snapshot forever would duplicate those
+    /// paragraphs for the whole transcript. Preserve explicitly expanded
+    /// items and the newest entries, and let an older item fall back to the
+    /// normal cache/build path if it is expanded much later.
+    fn prune_live_markdown_history(&mut self) {
+        const MAX_HISTORY_ITEMS: usize = 64;
+        if self.live_markdown_history_keys.len() <= MAX_HISTORY_ITEMS {
+            return;
+        }
+
+        let mut keep = HashSet::new();
+        for &index in &self.expanded_items {
+            if self.live_markdown_history_keys.contains_key(&index) {
+                keep.insert(index);
+            }
+        }
+        let mut newest: Vec<usize> = self.live_markdown_history_keys.keys().copied().collect();
+        newest.sort_unstable_by(|left, right| right.cmp(left));
+        for index in newest {
+            if keep.len() >= MAX_HISTORY_ITEMS {
+                break;
+            }
+            keep.insert(index);
+        }
+
+        let removed: Vec<usize> = self
+            .live_markdown_history_keys
+            .keys()
+            .copied()
+            .filter(|index| !keep.contains(index))
+            .collect();
+        for index in removed {
+            if let Some(key) = self.live_markdown_history_keys.remove(&index) {
+                self.live_markdown_front.remove(&key);
+            }
+            self.live_markdown_history_last_job.remove(&index);
+            self.live_markdown_history_dirty.remove(&index);
+            self.live_markdown_history_revisions.remove(&index);
+        }
+    }
+
+    /// Consume the newest completed background result. Results are accepted
+    /// only for the active generation/width and never regress an already
+    /// visible revision.
+    pub(crate) fn poll_live_markdown_results(&mut self, width: u16) {
+        loop {
+            let Some(result) = self
+                .live_markdown_worker
+                .as_ref()
+                .and_then(LiveMarkdownWorker::take_result)
+            else {
+                break;
+            };
+            let is_history_result = self
+                .live_markdown_history_keys
+                .values()
+                .any(|key| key == &result.key);
+            if result.width != width
+                || (!is_history_result && result.generation != self.live_markdown_generation)
+            {
+                continue;
+            }
+            let history_index = self
+                .live_markdown_history_keys
+                .iter()
+                .find_map(|(&index, key)| (key == &result.key).then_some(index));
+            let accept = self
+                .live_markdown_front
+                .get(&result.key)
+                .is_none_or(|front| {
+                    result.request_id >= front.request_id
+                        && (result.revision >= front.revision || result.expanded != front.expanded)
+                });
+            if accept {
+                self.live_markdown_front.insert(result.key.clone(), result);
+                if let Some(history_index) = history_index {
+                    // A committed item may currently be represented by a
+                    // one-line placeholder in the historical cache. Mark
+                    // only that item dirty; unrelated old Markdown remains
+                    // cached and will not be reparsed on the next frame.
+                    self.live_markdown_history_dirty.insert(history_index);
+                }
+                // A live Explore paragraph may embed this reasoning item.
+                // Rebuild only the cheap group assembly on the next frame;
+                // the Markdown work itself has already completed off-thread.
+                self.live_render_cache = None;
+            }
+        }
+    }
+
+    /// Submit changed Markdown items to the worker. The request owns its
+    /// `OutputItem`, so the worker never borrows mutable stream state or the
+    /// conversation lock. The worker keeps one pending job per item, allowing
+    /// multiple reasoning blocks to make progress without starving each other.
+    fn queue_live_markdown_jobs(&mut self, width: u16) {
+        if width == 0 {
+            return;
+        }
+        let generation = self.live_markdown_generation;
+        let frame_count = self.frame_count;
+        let mut jobs = Vec::new();
+        let worker = self.live_markdown_worker.as_ref();
+        if let Some(response) = self.receiving_response.as_ref() {
+            for (index, item, in_progress, revision) in response.markdown_items() {
+                let Some(key) = live_response_message_key(item, index, generation) else {
+                    continue;
+                };
+                let expanded = self.live_expanded_items.contains(&index);
+                let job_key = (generation, revision, width, expanded);
+                if self.live_markdown_last_job.get(&key) == Some(&job_key) {
+                    continue;
+                }
+                if !in_progress
+                    && self.live_markdown_finished_job.get(&key)
+                        == Some(&(revision, width, expanded))
+                {
+                    continue;
+                }
+                if worker.is_some_and(|worker| {
+                    worker.has_pending_view(&key, generation, width, expanded)
+                }) {
+                    continue;
+                }
+                jobs.push((
+                    key.clone(),
+                    LiveMarkdownJob {
+                        key,
+                        request_id: 0,
+                        generation,
+                        revision,
+                        width,
+                        item: item.clone(),
+                        in_progress,
+                        expanded,
+                        frame_count,
+                    },
+                    job_key,
+                    !in_progress,
+                ));
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        for (key, _, job_key, finished) in &jobs {
+            self.live_markdown_last_job.insert(key.clone(), *job_key);
+            if *finished {
+                let (_, revision, width, expanded) = job_key;
+                self.live_markdown_finished_job
+                    .insert(key.clone(), (*revision, *width, *expanded));
+            }
+        }
+        let worker = self
+            .live_markdown_worker
+            .get_or_insert_with(LiveMarkdownWorker::new);
+        for (_, job, _, _) in jobs {
+            worker.submit(job);
+        }
+    }
+
+    /// Reflow a just-committed Markdown item after a resize or a post-commit
+    /// expand/collapse click. The raw item is cloned once and sent to the same
+    /// worker; the historical renderer keeps its previous snapshot (or a
+    /// placeholder) until the result arrives.
+    pub(crate) fn queue_committed_markdown_jobs(&mut self, items: &[MessageItem], width: u16) {
+        // Keep the single worker focused on the response currently arriving.
+        // Historical reflows can wait until the turn boundary; otherwise a
+        // large resize backlog could delay the live reasoning snapshot.
+        if width == 0
+            || self.live_markdown_history_keys.is_empty()
+            || self.receiving_response.is_some()
+        {
+            return;
+        }
+        let generation = self.live_markdown_generation;
+        // A resize can invalidate many committed hand-offs at once. Limit the
+        // amount of raw Markdown copied from the conversation on one UI
+        // frame; the remaining candidates stay discoverable on the next
+        // frame, while the worker continues consuming the bounded queue.
+        const MAX_COMMITTED_JOBS_PER_FRAME: usize = 1;
+        let mut candidates = Vec::new();
+        let worker = self.live_markdown_worker.as_ref();
+        for (&index, key) in &self.live_markdown_history_keys {
+            let Some(MessageItem::Output(item)) = items.get(index) else {
+                continue;
+            };
+            if !matches!(item, OutputItem::Message(_) | OutputItem::Reasoning(_)) {
+                continue;
+            }
+            let expanded = self.expanded_items.contains(&index);
+            if self.live_markdown_front.get(key).is_some_and(|snapshot| {
+                let required_revision = self
+                    .live_markdown_history_revisions
+                    .get(&index)
+                    .copied()
+                    .unwrap_or_default();
+                snapshot.width == width
+                    && snapshot.expanded == expanded
+                    && !snapshot.in_progress
+                    && snapshot.revision >= required_revision
+            }) {
+                continue;
+            }
+            if self.live_markdown_history_last_job.get(&index) == Some(&(width, expanded)) {
+                continue;
+            }
+            let revision = self
+                .live_markdown_history_revisions
+                .get(&index)
+                .copied()
+                .unwrap_or_else(|| {
+                    self.live_markdown_front
+                        .get(key)
+                        .map_or(0, |snapshot| snapshot.revision)
+                });
+            if worker
+                .is_some_and(|worker| worker.has_pending_view(key, generation, width, expanded))
+            {
+                continue;
+            }
+            candidates.push((index, key.clone(), expanded, revision));
+        }
+        // Prefer an item the user explicitly expanded, then the newest
+        // history item. HashMap iteration order must not decide which visible
+        // block gets its background render first.
+        candidates.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
+        let mut jobs = Vec::with_capacity(candidates.len().min(MAX_COMMITTED_JOBS_PER_FRAME));
+        for (index, key, expanded, revision) in
+            candidates.into_iter().take(MAX_COMMITTED_JOBS_PER_FRAME)
+        {
+            let Some(MessageItem::Output(item)) = items.get(index) else {
+                continue;
+            };
+            jobs.push((
+                index,
+                key.clone(),
+                LiveMarkdownJob {
+                    key,
+                    request_id: 0,
+                    generation,
+                    revision,
+                    width,
+                    item: item.clone(),
+                    in_progress: false,
+                    expanded,
+                    frame_count: self.frame_count,
+                },
+                (width, expanded),
+            ));
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        for (index, _, _, state) in &jobs {
+            self.live_markdown_history_last_job.insert(*index, *state);
+        }
+        let worker = self
+            .live_markdown_worker
+            .get_or_insert_with(LiveMarkdownWorker::new);
+        for (_, _, job, _) in jobs {
+            worker.submit(job);
+        }
+    }
+
+    /// Called at the beginning of a frame, after the viewport width is known.
+    /// Width changes invalidate the front buffer and schedule a fresh snapshot;
+    /// otherwise only a newly changed stream revision is submitted.
+    pub(crate) fn prepare_live_markdown(&mut self, width: u16) {
+        self.poll_live_markdown_results(width);
+        if self.live_markdown_width != width {
+            self.live_markdown_width = width;
+            self.live_markdown_front.clear();
+            self.live_markdown_last_job.clear();
+            self.live_markdown_finished_job.clear();
+            self.live_markdown_history_last_job.clear();
+            self.live_markdown_history_dirty.clear();
+        }
+        self.queue_live_markdown_jobs(width);
+    }
+
     /// The runner committed the streamed response to the shared conversation:
     /// drop the live in-progress view so the same content isn't rendered twice,
     /// transferring live expanded state onto the now-committed items (which sit
     /// at the tail of the conversation).
     pub fn commit_live(&mut self) {
         self.live_render_cache = None;
-        if let Some(partial) = self.receiving_response.take() {
-            let committed = partial.items.iter().flatten().count();
-            let base_index = self
-                .conversation
-                .lock()
-                .unwrap()
-                .items
-                .len()
-                .saturating_sub(committed);
-            for &live_idx in &self.live_expanded_items {
-                self.expanded_items.insert(base_index + live_idx);
-            }
-            self.live_expanded_items.clear();
-            // Live groups carry the same keys (first call's protocol id) as
-            // the committed ones, so keep any user expansion across the swap.
-            self.expanded_tool_groups
-                .extend(self.live_expanded_groups.drain());
+        let Some(partial) = self.receiving_response.take() else {
+            self.invalidate_live_markdown();
+            return;
+        };
+        let committed = partial.items.iter().flatten().count();
+        let base_index = self
+            .conversation
+            .lock()
+            .unwrap()
+            .items
+            .len()
+            .saturating_sub(committed);
+        for (live_index, _, _, revision) in partial.markdown_items() {
+            self.live_markdown_history_revisions
+                .insert(base_index + live_index, revision);
         }
+        for (live_index, item) in partial.items.iter().flatten().enumerate() {
+            if matches!(item, OutputItem::Message(_) | OutputItem::Reasoning(_))
+                && let Some(key) =
+                    live_response_message_key(item, live_index, self.live_markdown_generation)
+            {
+                self.live_markdown_history_keys
+                    .insert(base_index + live_index, key);
+            }
+        }
+        for &live_idx in &self.live_expanded_items {
+            self.expanded_items.insert(base_index + live_idx);
+        }
+        self.live_expanded_items.clear();
+        // Live groups carry the same keys (first call's protocol id) as the
+        // committed ones, so keep any user expansion across the swap.
+        self.expanded_tool_groups
+            .extend(self.live_expanded_groups.drain());
+        // Keep the generation/front snapshots alive so the historical cache
+        // can consume them asynchronously. A subsequent response bumps the
+        // generation but retains the bounded historical hand-off.
+        self.live_markdown_last_job.clear();
+        self.live_markdown_finished_job.clear();
+        self.live_markdown_history_last_job.clear();
+        self.live_markdown_history_dirty.clear();
+        self.prune_live_markdown_history();
     }
 
     /// Ends the in-flight response (stream error / cancellation), salvaging
@@ -1037,33 +1536,54 @@ impl ConversationPanel {
     /// clearing the "receiving" state so the turn is no longer considered busy.
     pub fn abort_receiving(&mut self) {
         self.live_render_cache = None;
-        if let Some(partial) = self.receiving_response.take() {
-            // Transfer live expanded state before items become historical,
-            // so reasoning/tool-call items the user expanded during streaming
-            // stay expanded instead of auto-collapsing.
-            let base_index = self.conversation.lock().unwrap().items.len();
-            for &live_idx in &self.live_expanded_items {
-                self.expanded_items.insert(base_index + live_idx);
+        // TurnFinished is also emitted after ResponseCommitted. In that
+        // normal path there is no live response left to abort; preserve the
+        // committed front/history hand-off until its worker result is used.
+        let Some(partial) = self.receiving_response.take() else {
+            return;
+        };
+        self.invalidate_active_live_markdown();
+        // Transfer live expanded state before items become historical,
+        // so reasoning/tool-call items the user expanded during streaming
+        // stay expanded instead of auto-collapsing.
+        let base_index = self.conversation.lock().unwrap().items.len();
+        for &live_idx in &self.live_expanded_items {
+            self.expanded_items.insert(base_index + live_idx);
+        }
+        self.expanded_tool_groups
+            .extend(self.live_expanded_groups.drain());
+        let cancelled = partial.cancelled.is_cancelled();
+        let items: Vec<OutputItem> = if cancelled {
+            // When the user cancelled, drop all function calls so they
+            // aren't shown and won't execute.
+            partial
+                .items
+                .into_iter()
+                .flatten()
+                .filter(|item| !matches!(item, OutputItem::FunctionCall(_)))
+                .collect()
+        } else {
+            partial.into_aborted_items()
+        };
+        // Salvaged Markdown is historical just like a normally committed
+        // response. Give it a hand-off key as well, so a stream error or
+        // cancellation cannot reintroduce a synchronous full-document parse
+        // on the first post-abort frame.
+        for (index, item) in items.iter().enumerate() {
+            if matches!(item, OutputItem::Message(_) | OutputItem::Reasoning(_))
+                && let Some(key) =
+                    live_response_message_key(item, index, self.live_markdown_generation)
+            {
+                let history_index = base_index + index;
+                self.live_markdown_history_keys.insert(history_index, key);
+                self.live_markdown_history_revisions
+                    .insert(history_index, 0);
             }
-            self.expanded_tool_groups
-                .extend(self.live_expanded_groups.drain());
-            let cancelled = partial.cancelled.is_cancelled();
-            let items: Vec<OutputItem> = if cancelled {
-                // When the user cancelled, drop all function calls so they
-                // aren't shown and won't execute.
-                partial
-                    .items
-                    .into_iter()
-                    .flatten()
-                    .filter(|item| !matches!(item, OutputItem::FunctionCall(_)))
-                    .collect()
-            } else {
-                partial.into_aborted_items()
-            };
-            let mut conv = self.conversation.lock().unwrap();
-            for item in items {
-                conv.add_output(item);
-            }
+        }
+        self.prune_live_markdown_history();
+        let mut conv = self.conversation.lock().unwrap();
+        for item in items {
+            conv.add_output(item);
         }
     }
 
@@ -1302,6 +1822,29 @@ mod tests {
     }
 
     #[test]
+    fn stationary_release_stays_a_click_when_streaming_moves_the_view() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(0, 0, 40, 10);
+        panel.view_offset = 20;
+
+        panel.selection_begin(3, 4);
+        panel.view_offset = 24;
+
+        assert!(matches!(panel.selection_end(3, 4), SelectionEnd::Click));
+    }
+
+    #[test]
+    fn mouse_movement_still_finishes_as_a_selection() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(0, 0, 40, 10);
+
+        panel.selection_begin(3, 4);
+        panel.selection_drag(8, 4);
+
+        assert!(matches!(panel.selection_end(8, 4), SelectionEnd::Copied(_)));
+    }
+
+    #[test]
     fn clipped_paragraph_clone_is_reused_between_ticks() {
         let source = Arc::new(Paragraph::new("line\n".repeat(10_000)));
         let mut cache = ViewportParagraphCache::default();
@@ -1323,6 +1866,37 @@ mod tests {
 
         assert!(panel.receiving_response.is_none());
         assert!(!panel.is_busy(), "aborting must clear the busy state");
+    }
+
+    #[test]
+    fn abort_without_receiving_preserves_committed_markdown_handoff() {
+        let mut panel = ConversationPanel::new();
+        panel
+            .live_markdown_history_keys
+            .insert(0, "generation:1:reasoning:done".into());
+        panel.abort_receiving();
+        assert_eq!(
+            panel.live_markdown_history_keys.get(&0).map(String::as_str),
+            Some("generation:1:reasoning:done")
+        );
+    }
+
+    #[test]
+    fn aborting_a_new_response_preserves_older_markdown_handoff() {
+        let mut panel = ConversationPanel::new();
+        panel
+            .live_markdown_history_keys
+            .insert(0, "generation:1:reasoning:done".into());
+        panel.receiving_response = Some(crate::response::partial_response::PartialResponse::new(
+            crate::cancel::CancellationToken::new(),
+        ));
+
+        panel.abort_receiving();
+
+        assert_eq!(
+            panel.live_markdown_history_keys.get(&0).map(String::as_str),
+            Some("generation:1:reasoning:done")
+        );
     }
 
     #[test]

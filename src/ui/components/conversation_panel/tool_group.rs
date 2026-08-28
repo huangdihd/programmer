@@ -37,6 +37,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Wrap;
 use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::Paragraph;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::response::message_item::MessageItem;
 use crate::ui::components::messages::assistant::reasoning::{
@@ -147,6 +149,45 @@ pub(crate) struct MemberHeader {
 /// as it has any member once reasoning is involved, so a thought is absorbed
 /// the moment its first call appears instead of waiting for a full-size run.
 pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
+    let refs: Vec<GroupItem<'_>> = items.iter().map(GroupItem::Message).collect();
+    discover_group_items(&refs)
+}
+
+/// The streaming response is owned by [`PartialResponse`], so the renderer
+/// must not clone every output item merely to discover tool groups. This is
+/// the same grouping rule as [`discover_tool_groups`], specialized to borrowed
+/// protocol output items. The returned indices are relative to `items`.
+pub(crate) fn discover_live_tool_groups(items: &[&OutputItem]) -> Vec<ToolGroup> {
+    let refs: Vec<GroupItem<'_>> = items.iter().map(|item| GroupItem::Output(item)).collect();
+    discover_group_items(&refs)
+}
+
+enum GroupItem<'a> {
+    Message(&'a MessageItem),
+    Output(&'a OutputItem),
+}
+
+fn group_function_call<'a>(item: &'a GroupItem<'a>) -> Option<&'a FunctionToolCall> {
+    match item {
+        GroupItem::Message(item) => function_call(item),
+        GroupItem::Output(OutputItem::FunctionCall(call)) => Some(call),
+        GroupItem::Output(_) => None,
+    }
+}
+
+fn group_is_reasoning(item: &GroupItem<'_>) -> bool {
+    matches!(
+        item,
+        GroupItem::Message(MessageItem::Output(OutputItem::Reasoning(_)))
+            | GroupItem::Output(OutputItem::Reasoning(_))
+    )
+}
+
+fn group_is_tool_output(item: &GroupItem<'_>) -> bool {
+    matches!(item, GroupItem::Message(MessageItem::ToolOutput { .. }))
+}
+
+fn discover_group_items(items: &[GroupItem<'_>]) -> Vec<ToolGroup> {
     let mut groups = Vec::new();
     let mut run = Vec::new();
     let mut absorbed = Vec::new();
@@ -163,7 +204,7 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
         if run.len() >= min {
             let calls: Vec<&FunctionToolCall> = run
                 .iter()
-                .filter_map(|&index| function_call(&items[index]))
+                .filter_map(|&index| group_function_call(&items[index]))
                 .collect();
             groups.push(ToolGroup {
                 key: calls[0].call_id.clone(),
@@ -179,13 +220,11 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     };
 
     for (index, item) in items.iter().enumerate() {
-        match function_call(item) {
+        match group_function_call(item) {
             Some(call) if is_hidden_runtime_tool(call) => {}
             Some(call) if !is_interactive(call) => run.push(index),
-            None if matches!(item, MessageItem::Output(OutputItem::Reasoning(_))) => {
-                absorbed.push(index)
-            }
-            None if matches!(item, MessageItem::ToolOutput { .. }) => {}
+            None if group_is_reasoning(item) => absorbed.push(index),
+            None if group_is_tool_output(item) => {}
             _ => flush(&mut run, &mut absorbed, false, &mut groups),
         }
     }
@@ -193,20 +232,17 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     groups
 }
 
-/// Find the open tool run that crosses from committed conversation history
-/// into the currently streaming response. The renderer stores those two parts
-/// separately, but they are one logical run and must therefore render as one
-/// stable block while the response is still arriving.
-pub(crate) fn discover_tool_group_bridge(
-    committed: &[MessageItem],
-    live: &[MessageItem],
+/// Discover a bridge while borrowing the live side. The live side is
+/// still owned by `PartialResponse`; keeping references here avoids cloning a
+/// long reasoning body just to determine whether the trailing tool run
+/// continues across the response boundary.
+pub(crate) fn discover_tool_group_bridge_outputs<'a>(
+    committed: &'a [MessageItem],
+    live: &'a [&'a OutputItem],
 ) -> Option<ToolGroup> {
     if live.is_empty() {
         return None;
     }
-
-    // Only the trailing run can continue into a new streamed response. Clone
-    // that small suffix instead of the whole transcript on every frame.
     let tail_start = committed
         .iter()
         .rposition(|item| !continues_tool_run(item))
@@ -216,9 +252,10 @@ pub(crate) fn discover_tool_group_bridge(
         return None;
     }
 
-    let mut joined = committed[tail_start..].to_vec();
-    joined.extend_from_slice(live);
-    let mut group = discover_tool_groups(&joined).into_iter().find(|group| {
+    let mut joined = Vec::with_capacity(committed_tail_len + live.len());
+    joined.extend(committed[tail_start..].iter().map(GroupItem::Message));
+    joined.extend(live.iter().map(|item| GroupItem::Output(item)));
+    let mut group = discover_group_items(&joined).into_iter().find(|group| {
         let has_committed_call = group
             .member_indices
             .iter()
@@ -414,6 +451,7 @@ impl ToolGroupKind {
 /// done) — so absorbed reasoning stays visible without expanding the group.
 /// `thought_in_progress` reflects the live streaming state of the absorbed
 /// reasoning (committed groups pass `false`).
+#[allow(dead_code)]
 pub(crate) fn build_tool_group_paragraph<'a>(
     group: &ToolGroup,
     members: &[ToolGroupMember<'a>],
@@ -421,6 +459,34 @@ pub(crate) fn build_tool_group_paragraph<'a>(
     width: u16,
     expanded: bool,
     thought_in_progress: bool,
+) -> (Paragraph<'static>, Vec<MemberHeader>) {
+    build_tool_group_paragraph_with_reasoning_cache(
+        group,
+        members,
+        absorbed,
+        width,
+        expanded,
+        thought_in_progress,
+        None,
+        &HashSet::new(),
+    )
+}
+
+/// Variant used by a live group.  The Markdown-heavy reasoning bodies are
+/// supplied by the background renderer when available.  A live item whose
+/// result has not arrived yet gets a tiny placeholder instead of falling back
+/// to synchronous parsing on the UI thread.  Committed reasoning (not present
+/// in `live_reasoning_indices`) keeps the original synchronous path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
+    group: &ToolGroup,
+    members: &[ToolGroupMember<'a>],
+    absorbed: &[(usize, &'a ReasoningItem, bool)],
+    width: u16,
+    expanded: bool,
+    thought_in_progress: bool,
+    reasoning_cache: Option<&HashMap<usize, Arc<Text<'static>>>>,
+    live_reasoning_indices: &HashSet<usize>,
 ) -> (Paragraph<'static>, Vec<MemberHeader>) {
     let completed = members
         .iter()
@@ -492,9 +558,22 @@ pub(crate) fn build_tool_group_paragraph<'a>(
                 lines.extend(text.lines);
             } else {
                 let (index, item, thought_expanded) = thoughts.next().unwrap();
-                let (text, _) = ReasoningMessage::new(false, item, width)
-                    .expanded(thought_expanded)
-                    .into_parts();
+                let text = if let Some(cached) = reasoning_cache.and_then(|cache| cache.get(&index))
+                {
+                    cached.as_ref().clone()
+                } else if live_reasoning_indices.contains(&index) {
+                    // The worker is still rendering this live body. Keep the
+                    // group geometry valid without doing Markdown work here.
+                    Text::from(Line::from(Span::styled(
+                        "  … rendering…",
+                        Style::new().fg(palette::MUTED),
+                    )))
+                } else {
+                    ReasoningMessage::new(false, item, width)
+                        .expanded(thought_expanded)
+                        .into_parts()
+                        .0
+                };
                 let height = text_height(&text, inner_width, wrap);
                 headers.push(MemberHeader {
                     index,

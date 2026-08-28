@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem};
+use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem, ReasoningItem};
 use ratatui::prelude::Color;
 use ratatui::style::Style;
 use ratatui::text::Text;
@@ -123,6 +123,16 @@ impl<'a> AssistantMessage<'a> {
             ),
             other => (UnsupportedMessage::new(other).into_text(), Vec::new()),
         };
+        self.into_paragraph_from_parts(text, codes)
+    }
+
+    /// Wrap text materialized by the live Markdown worker in the same padding,
+    /// background, and copy-button geometry as the ordinary renderer.
+    pub(crate) fn into_paragraph_from_parts(
+        self,
+        text: Text<'static>,
+        codes: Vec<String>,
+    ) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
         let buttons = scan_copy_buttons(&text, &codes);
 
         let foldable = matches!(
@@ -149,15 +159,49 @@ impl<'a> AssistantMessage<'a> {
     }
 }
 
+/// Render a reasoning item once and return both the wrapped paragraph used by
+/// the conversation panel and the unwrapped text used when the item is
+/// embedded in a live tool group.  Keeping this as one operation is important
+/// for the asynchronous live renderer: the Markdown parser/highlighter runs
+/// on the worker, while the UI thread only assembles already-owned lines.
+pub(crate) fn render_reasoning(
+    item: &ReasoningItem,
+    width: u16,
+    in_progress: bool,
+    expanded: bool,
+    frame_count: u64,
+) -> (Paragraph<'static>, Vec<CodeCopyButton>, Text<'static>) {
+    let (text, codes) = ReasoningMessage::new(in_progress, item, width)
+        .expanded(expanded)
+        .frame_count(Some(frame_count))
+        .into_parts();
+    let buttons = scan_copy_buttons(&text, &codes);
+    let block = Block::default()
+        .padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 1))
+        .style(if expanded {
+            Style::new().bg(EXPANDED_BG)
+        } else {
+            Style::new()
+        });
+    (Paragraph::new(text.clone()).block(block), buttons, text)
+}
+
 /// Locates the clickable copy labels rendered by `CodeBlockHooks` in `text` and
 /// pairs each with its code block content (the k-th label belongs to the k-th
 /// block). Coordinates are relative to the paragraph, including its padding.
 fn scan_copy_buttons(text: &Text<'_>, codes: &[String]) -> Vec<CodeCopyButton> {
+    scan_copy_buttons_from_lines(&text.lines, codes)
+}
+
+pub(crate) fn scan_copy_buttons_from_lines(
+    lines: &[ratatui::text::Line<'_>],
+    codes: &[String],
+) -> Vec<CodeCopyButton> {
     let mut buttons = Vec::new();
     if codes.is_empty() {
         return buttons;
     }
-    for (row, line) in text.lines.iter().enumerate() {
+    for (row, line) in lines.iter().enumerate() {
         let mut x = 0u16;
         for span in &line.spans {
             let width = span.width() as u16;

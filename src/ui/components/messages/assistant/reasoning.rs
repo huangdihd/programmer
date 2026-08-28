@@ -109,13 +109,7 @@ impl<'a> ReasoningMessage<'a> {
 
         let mut codes = Vec::new();
         if self.expanded && !text.is_empty() {
-            let render_width = self.width.saturating_sub(BLOCK_PAD + INDENT).min(100);
-            let hooks = CodeBlockHooks::new(render_width as usize);
-            let codes_handle = hooks.codes();
-            let renderer =
-                MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
-            let blocks = renderer.parse(&text);
-            let md_lines = renderer.render(&blocks, &AppTheme);
+            let (md_lines, rendered_codes) = render_markdown(&text, markdown_width(self.width));
             for line in md_lines {
                 let mut spans = vec![Span::raw("  ")];
                 spans.extend(
@@ -125,7 +119,7 @@ impl<'a> ReasoningMessage<'a> {
                 );
                 lines.push(Line::from(spans));
             }
-            codes = codes_handle.lock().map(|c| c.clone()).unwrap_or_default();
+            codes = rendered_codes;
         }
 
         (Text::from(lines), codes)
@@ -166,6 +160,23 @@ fn reasoning_text(item: &ReasoningItem) -> String {
     }
 
     parts.join("\n")
+}
+
+fn markdown_width(width: u16) -> u16 {
+    width.saturating_sub(BLOCK_PAD + INDENT).min(100)
+}
+
+fn render_markdown(source: &str, render_width: u16) -> (Vec<Line<'static>>, Vec<String>) {
+    let hooks = CodeBlockHooks::new(render_width as usize);
+    let codes_handle = hooks.codes();
+    let renderer = MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
+    let blocks = renderer.parse(source);
+    let lines = renderer.render(&blocks, &AppTheme);
+    let codes = codes_handle
+        .lock()
+        .map(|codes| codes.clone())
+        .unwrap_or_default();
+    (lines, codes)
 }
 
 #[cfg(test)]
