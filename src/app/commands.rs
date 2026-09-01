@@ -521,6 +521,51 @@ fn compact_response_text(
     }
 }
 
+/// Stream a compaction response so long summaries keep the provider connection
+/// active, then finalize the accumulated events through the same response
+/// machinery as a normal turn.
+async fn stream_compact_response(
+    client: &async_openai::Client<async_openai::config::OpenAIConfig>,
+    request: async_openai::types::responses::CreateResponse,
+    cancel: crate::cancel::CancellationToken,
+) -> Result<String, String> {
+    let mut partial = crate::response::partial_response::PartialResponse::new(cancel.clone());
+    let mut stream_error = None;
+    let retrying = std::sync::atomic::AtomicBool::new(false);
+
+    crate::runner::stream::stream_with_retries(client, &request, &cancel, &retrying, |event| {
+        match event {
+            Ok(event) => partial.handle_response_stream_event(event),
+            Err(error) => stream_error = Some(error),
+        }
+    })
+    .await;
+
+    if cancel.is_cancelled() {
+        return Err("cancelled".to_string());
+    }
+    if let Some(error) = stream_error {
+        return Err(error_chain(&error));
+    }
+
+    partial
+        .finalize()
+        .map_err(|error| error_chain(&error))
+        .and_then(compact_response_text)
+}
+
+/// Include nested transport causes hidden by reqwest's top-level Display text.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 pub(crate) fn start_compact(app: &mut App<'_>) {
     use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
     use crate::ui::event::Event;
@@ -569,16 +614,7 @@ pub(crate) fn start_compact(app: &mut App<'_>) {
     let sender = app.events.sender.clone();
     tokio::spawn(async move {
         let request = build_compact_request(input_items, model_name, thinking_level);
-        // Race the model request against cancellation so Esc doesn't leave
-        // the UI stuck in Cancelling.
-        let result = match cancel_token
-            .wait_or(client.responses().create(request))
-            .await
-        {
-            Some(Ok(response)) => compact_response_text(response),
-            Some(Err(e)) => Err(e.to_string()),
-            None => Err("cancelled".to_string()),
-        };
+        let result = stream_compact_response(&client, request, cancel_token.clone()).await;
         // Always send CompactFinished — even when cancelled — so
         // handle_compact_finished can clear active_id and reset the phase.
         let _ = sender.send(Event::App(crate::ui::event::AppEvent::CompactFinished(
@@ -637,12 +673,9 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) {
     let sender = app.events.sender.clone();
     tokio::spawn(async move {
         let request = build_compact_request(input_items, model_name, thinking_level);
-        let result = client
-            .responses()
-            .create(request)
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(compact_response_text);
+        let result =
+            stream_compact_response(&client, request, crate::cancel::CancellationToken::new())
+                .await;
         let _ = sender.send(Event::App(AppEvent::AutoCompactFinished {
             job_id,
             history_epoch,
