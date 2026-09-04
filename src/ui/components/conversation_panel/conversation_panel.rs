@@ -363,8 +363,8 @@ impl Selection {
 pub enum SelectionEnd {
     /// The press started outside the panel; nothing to do.
     Ignored,
-    /// Press and release on the same cell: treat as a click.
-    Click,
+    /// A click at the scroll-buffer position captured on mouse-down.
+    Click { column: u16, row: u16 },
     /// A drag selection finished; contains the selected text.
     Copied(String),
 }
@@ -650,20 +650,15 @@ impl ConversationPanel {
     /// Handles a left click at the given screen coordinates: if it lands on a
     /// foldable item (finished or live), toggle that item's expanded state.
     pub fn handle_click(&mut self, column: u16, row: u16) {
-        let area = self.view_area;
-        let inside = area.width > 0
-            && area.height > 0
-            && column >= area.x
-            && column < area.x + area.width
-            && row >= area.y
-            && row < area.y + area.height;
-        if !inside {
-            return;
+        if let Some((x_rel, buffer_y)) = self.to_buffer_pos(column, row, false) {
+            self.handle_buffer_click(x_rel, buffer_y);
         }
+    }
 
-        let buffer_y = (row - area.y).saturating_add(self.view_offset);
-        let x_rel = column - area.x;
-
+    /// Handles a click already mapped into scroll-buffer coordinates. Mouse
+    /// releases use the position captured on button-down so a render between
+    /// down and up cannot redirect the click to a different item.
+    pub fn handle_buffer_click(&mut self, x_rel: u16, buffer_y: u16) {
         // Live groups sit after finished content in the scroll buffer; check
         // their member hit regions before the flat live-item layout so a click
         // on the header row toggles the group and a click on a member row
@@ -852,19 +847,25 @@ impl ConversationPanel {
         // Streaming can change `view_offset` between Down and Up. Compare the
         // physical screen cell first so a stationary title click is not
         // mistaken for a buffer-coordinate drag after the layout moves.
-        if self
+        if let Some(sel) = self
             .selection
-            .is_some_and(|sel| !sel.dragging && sel.screen_anchor == (column, row))
+            .filter(|sel| !sel.dragging && sel.screen_anchor == (column, row))
         {
             self.selection = None;
-            return SelectionEnd::Click;
+            return SelectionEnd::Click {
+                column: sel.anchor.0,
+                row: sel.anchor.1,
+            };
         }
         self.selection_drag(column, row);
         match self.selection {
             None => SelectionEnd::Ignored,
             Some(sel) if !sel.dragging || sel.anchor == sel.head => {
                 self.selection = None;
-                SelectionEnd::Click
+                SelectionEnd::Click {
+                    column: sel.anchor.0,
+                    row: sel.anchor.1,
+                }
             }
             // Keep the selection so the highlight stays visible.
             Some(sel) => SelectionEnd::Copied(self.extract_selection_text(sel)),
@@ -1822,15 +1823,39 @@ mod tests {
     }
 
     #[test]
-    fn stationary_release_stays_a_click_when_streaming_moves_the_view() {
+    fn stationary_release_uses_mouse_down_position_when_streaming_moves_the_view() {
         let mut panel = ConversationPanel::new();
         panel.view_area = Rect::new(0, 0, 40, 10);
         panel.view_offset = 20;
+        panel.tool_group_layout.push(ToolGroupLayout {
+            key: "group".into(),
+            top: 23,
+            bottom: 30,
+            member_headers: vec![
+                MemberHeader {
+                    index: 7,
+                    top: 24,
+                    bottom: 25,
+                },
+                MemberHeader {
+                    index: 9,
+                    top: 28,
+                    bottom: 29,
+                },
+            ],
+            live_index_base: None,
+        });
 
         panel.selection_begin(3, 4);
         panel.view_offset = 24;
 
-        assert!(matches!(panel.selection_end(3, 4), SelectionEnd::Click));
+        let SelectionEnd::Click { column, row } = panel.selection_end(3, 4) else {
+            panic!("stationary release should remain a click");
+        };
+        assert_eq!((column, row), (3, 24));
+        panel.handle_buffer_click(column, row);
+        assert!(panel.expanded_items.contains(&7));
+        assert!(!panel.expanded_items.contains(&9));
     }
 
     #[test]
