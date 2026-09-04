@@ -95,7 +95,9 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
                 .conversation_panel
                 .selection_end(mouse.column, mouse.row)
             {
-                SelectionEnd::Click => app.conversation_panel.handle_click(mouse.column, mouse.row),
+                SelectionEnd::Click { column, row } => {
+                    app.conversation_panel.handle_buffer_click(column, row)
+                }
                 SelectionEnd::Copied(text) => {
                     if !crate::clipboard::copy(&text) {
                         app.conversation_panel

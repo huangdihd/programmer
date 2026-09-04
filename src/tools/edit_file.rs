@@ -99,23 +99,41 @@ pub(crate) async fn run_with_security_scope(
     // Normalize CRLF → LF so old_string matching works across platforms.
     let contents = contents.replace("\r\n", "\n");
     let old_normalized = args.old_string.replace("\r\n", "\n");
-    let matches_count = if let Some(offset) = args.offset {
+    let region = if let Some(offset) = args.offset {
         let limit = args.limit.unwrap_or(1);
-        let lines: Vec<&str> = contents.lines().collect();
-        let start = offset.saturating_sub(1); // 1-based → 0-based
-        let end = (start + limit).min(lines.len());
-        if start >= lines.len() {
+        let line_count = contents.lines().count();
+        let start_line = offset.saturating_sub(1); // 1-based → 0-based
+        if start_line >= line_count {
             return Err(format!(
-                "error: offset {offset} is past end of {} ({} lines)",
-                args.path,
-                lines.len()
+                "error: offset {offset} is past end of {} ({line_count} lines)",
+                args.path
             ));
         }
-        let region = lines[start..end].join("\n");
-        region.matches(&old_normalized).count()
+        let end_line = start_line.saturating_add(limit).min(line_count);
+        let mut starts = std::iter::once(0)
+            .chain(
+                contents
+                    .match_indices('\n')
+                    .map(|(index, _)| index + 1)
+                    .filter(|&index| index < contents.len()),
+            )
+            .skip(start_line);
+        let start = starts.next().unwrap();
+        let end = if end_line == start_line {
+            start
+        } else {
+            starts
+                .nth(end_line - start_line - 1)
+                .unwrap_or(contents.len())
+        };
+        Some(start..end)
     } else {
-        contents.matches(&old_normalized).count()
+        None
     };
+    let matches_count = region.as_ref().map_or_else(
+        || contents.matches(&old_normalized).count(),
+        |range| contents[range.clone()].matches(&old_normalized).count(),
+    );
 
     if matches_count == 0 {
         return Err(if let Some(offset) = args.offset {
@@ -143,7 +161,17 @@ pub(crate) async fn run_with_security_scope(
         ));
     }
 
-    let updated = contents.replacen(&old_normalized, &args.new_string, 1);
+    let updated = if let Some(range) = region {
+        let updated_region = contents[range.clone()].replacen(&old_normalized, &args.new_string, 1);
+        format!(
+            "{}{}{}",
+            &contents[..range.start],
+            updated_region,
+            &contents[range.end..]
+        )
+    } else {
+        contents.replacen(&old_normalized, &args.new_string, 1)
+    };
     match tokio::fs::write(&path, &updated).await {
         Ok(()) => {
             security.record_read_scoped(scope, &path, updated.as_bytes());
