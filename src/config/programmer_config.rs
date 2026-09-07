@@ -34,6 +34,33 @@ pub(crate) fn validate_security_profile_name(name: &str) -> Result<(), String> {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct MemoryConfig {
+    /// Enable the persistent memory tool.
+    pub enabled: bool,
+    /// Include cross-project user preferences in explicit recall results.
+    pub global_enabled: bool,
+    /// Include current-project memories in explicit recall results.
+    pub project_enabled: bool,
+    /// Maximum number of global memories returned by one recall.
+    pub max_global_results: usize,
+    /// Maximum number of project memories returned by one recall.
+    pub max_project_results: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            global_enabled: true,
+            project_enabled: true,
+            max_global_results: 3,
+            max_project_results: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ProgrammerConfig {
     /// The provider to use when none is specified in the model string.
     pub default_provider: String,
@@ -62,6 +89,9 @@ pub struct ProgrammerConfig {
     /// Number of complete recent turns kept verbatim after a compaction.
     #[serde(default = "default_compact_keep_recent_turns")]
     pub compact_keep_recent_turns: usize,
+    /// Layered persistent-memory settings.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// YOLO mode (run every tool call unchecked) is gated behind this flag so
     /// it can't be reached by the normal Ctrl+T cycle or a bare `/mode yolo`.
     #[serde(default)]
@@ -182,6 +212,7 @@ impl Default for ProgrammerConfig {
             compact_model: None,
             auto_compact_tokens: default_auto_compact_tokens(),
             compact_keep_recent_turns: default_compact_keep_recent_turns(),
+            memory: MemoryConfig::default(),
             allow_yolo: false,
             security,
             // Kept empty until normalization so deserialization can distinguish

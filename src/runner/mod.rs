@@ -236,7 +236,6 @@ impl TurnRunner {
         surface: &dyn AgentSurface,
     ) -> Result<TurnResult, RunnerError> {
         let retrying = &self.stream_retrying;
-
         let mut steps = 0usize;
         loop {
             if cancel.is_cancelled() {

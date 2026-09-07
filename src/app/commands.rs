@@ -751,6 +751,60 @@ pub(super) fn open_terminal(app: &mut App<'_>, arg: &str) {
 // Slash-command dispatch
 // ---------------------------------------------------------------------------
 
+async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::CommandOutcome {
+    app.input_panel.clear();
+    let mut parts = argument.trim().splitn(4, char::is_whitespace);
+    let action = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or("list");
+
+    if matches!(action, "on" | "off") {
+        app.config.memory.enabled = action == "on";
+        app.conversation_panel
+            .add_info_string(format!("Persistent memory {} for this run.", action));
+        return command_handlers::CommandOutcome::handled(false);
+    }
+
+    let arguments = match action {
+        "list" => serde_json::json!({
+            "action": "list",
+            "scope": parts.next().filter(|part| !part.is_empty()),
+        }),
+        "recall" => serde_json::json!({
+            "action": "recall",
+            "query": parts.collect::<Vec<_>>().join(" "),
+        }),
+        "remember" => serde_json::json!({
+            "action": "remember",
+            "scope": parts.next(),
+            "kind": parts.next(),
+            "content": parts.next(),
+        }),
+        "update" => serde_json::json!({
+            "action": "update",
+            "id": parts.next(),
+            "content": parts.next(),
+        }),
+        "forget" => serde_json::json!({
+            "action": "forget",
+            "id": parts.next(),
+        }),
+        _ => {
+            app.conversation_panel.add_warning_string(
+                "usage: /memory [list [global|project] | recall <query> | remember <global|project> <kind> <content> | update <id> <content> | forget <id> | on | off]",
+            );
+            return command_handlers::CommandOutcome::handled(false);
+        }
+    };
+
+    match crate::tools::memory::run(&arguments.to_string()).await {
+        Ok(output) => app.conversation_panel.add_info_string(output),
+        Err(error) => app.conversation_panel.add_warning_string(error),
+    }
+    command_handlers::CommandOutcome::handled(false)
+}
+
 /// Parse and execute a slash command. If the command is unknown, fall back
 /// to sending it to the AI model.
 pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
@@ -782,6 +836,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         | Command::Skill(_)
         | Command::Mcp(_)
         | Command::Diagnostics(_)) => command_handlers::integrations::execute(app, command),
+        Command::Memory(arg) => memory_command(app, &arg).await,
         command @ (Command::Init | Command::Compact(_) | Command::Plan(_)) => {
             command_handlers::workflow::execute(app, command).await
         }
@@ -862,6 +917,11 @@ mod tests {
             ),
             ("init", "/init", ExpectedCommandEffect::AppendedMessage),
             ("todo", "/todo", ExpectedCommandEffect::TodoPanel),
+            (
+                "memory",
+                "/memory off",
+                ExpectedCommandEffect::AppendedMessage,
+            ),
             ("skill", "/skill manage", ExpectedCommandEffect::SkillsPanel),
             ("mcp", "/mcp manage", ExpectedCommandEffect::McpPanel),
             (

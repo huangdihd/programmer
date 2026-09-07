@@ -46,6 +46,8 @@ pub enum Command {
     Usage,
     Rewind,
     Todo,
+    /// `/memory` — inspect or manage persistent global/project memories.
+    Memory(String),
     /// `/skill <name|list|off>` — activate, list, or clear skills.
     Skill(String),
     /// `/mcp <show|manage>` — list or manage MCP servers.
@@ -87,6 +89,7 @@ enum CommandKind {
     Usage,
     Rewind,
     Todo,
+    Memory,
     Skill,
     Mcp,
     Diagnostics,
@@ -162,6 +165,7 @@ impl CommandKind {
             Self::Usage => Command::Usage,
             Self::Rewind => Command::Rewind,
             Self::Todo => Command::Todo,
+            Self::Memory => Command::Memory(args),
             Self::Skill => Command::Skill(args),
             Self::Mcp => Command::Mcp(args),
             Self::Diagnostics => Command::Diagnostics(args),
@@ -303,6 +307,19 @@ const COMMAND_SPECS: &[CommandSpec] = &[
             order: 21,
             usage: "/todo | /t",
             description: "Open the todo list panel",
+        }],
+    },
+    CommandSpec {
+        kind: CommandKind::Memory,
+        name: "memory",
+        aliases: &[],
+        completion: CompletionKind::Fixed(&[
+            "list", "recall", "remember", "update", "forget", "on", "off",
+        ]),
+        help: &[HelpEntry {
+            order: 32,
+            usage: "/memory <list|recall|remember|update|forget|on|off>",
+            description: "Inspect or manage persistent memory",
         }],
     },
     CommandSpec {
@@ -1648,6 +1665,7 @@ mod tests {
             "classifier",
             "init",
             "todo",
+            "memory",
             "skill",
             "mcp",
             "diagnostics",
@@ -1779,6 +1797,10 @@ mod tests {
             ),
             ("/quit | /q", "Exit the application"),
             ("/help | /?", "Show this help"),
+            (
+                "/memory <list|recall|remember|update|forget|on|off>",
+                "Inspect or manage persistent memory",
+            ),
         ];
         assert_eq!(Command::descriptions(), expected);
     }

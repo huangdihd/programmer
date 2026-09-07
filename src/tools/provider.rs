@@ -25,8 +25,8 @@
 
 use super::{
     agent, ask_user, blob, command, configure_diagnostics, diagnostics, edit_file, fetch, grep,
-    load_skill, mcp_bridge, read_file, read_image, request_permission, run_local_tool, task, todo,
-    write_file,
+    load_skill, mcp_bridge, memory, read_file, read_image, request_permission, run_local_tool,
+    task, todo, write_file,
 };
 use crate::mcp::McpManager;
 use crate::ui::event::Event;
@@ -181,6 +181,7 @@ pub(crate) struct LocalToolProvider {
     security: Arc<crate::security::SecurityHandle>,
     file_scope: u64,
     checkpoint: Option<crate::checkpoint::CheckpointRecorder>,
+    memory_enabled: bool,
 }
 
 impl LocalToolProvider {
@@ -193,6 +194,7 @@ impl LocalToolProvider {
             security,
             file_scope: 0,
             checkpoint: None,
+            memory_enabled: true,
         }
     }
 
@@ -206,6 +208,7 @@ impl LocalToolProvider {
             security,
             file_scope,
             checkpoint: None,
+            memory_enabled: true,
         }
     }
 
@@ -214,6 +217,11 @@ impl LocalToolProvider {
         checkpoint: Option<crate::checkpoint::CheckpointRecorder>,
     ) -> Self {
         self.checkpoint = checkpoint;
+        self
+    }
+
+    pub(crate) fn with_memory_enabled(mut self, enabled: bool) -> Self {
+        self.memory_enabled = enabled;
         self
     }
 }
@@ -236,7 +244,7 @@ impl Default for LocalToolProvider {
 #[async_trait::async_trait]
 impl ToolProvider for LocalToolProvider {
     fn tools(&self) -> Vec<Tool> {
-        vec![
+        let mut tools = vec![
             command::tool(),
             request_permission::tool(),
             read_file::tool(),
@@ -251,7 +259,11 @@ impl ToolProvider for LocalToolProvider {
             diagnostics::tool(),
             todo::tool(),
             task::tool(),
-        ]
+        ];
+        if self.memory_enabled {
+            tools.push(memory::tool());
+        }
+        tools
     }
 
     fn is_read_only(&self, name: &str) -> bool {
@@ -307,6 +319,10 @@ impl ToolProvider for LocalToolProvider {
                 .map(FunctionCallOutput::Text)
         } else if call.name == todo::NAME {
             todo::run(&call.arguments, &self.todos)
+                .await
+                .map(FunctionCallOutput::Text)
+        } else if call.name == memory::NAME {
+            memory::run(&call.arguments)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == read_image::NAME {

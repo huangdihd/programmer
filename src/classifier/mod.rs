@@ -74,6 +74,9 @@ fn is_mutating(tool_name: &str, arguments: &str) -> bool {
     if tool_name == crate::tools::task::NAME {
         return crate::tools::task::action_is_mutating(arguments);
     }
+    if tool_name == crate::tools::memory::NAME {
+        return crate::tools::memory::action_is_mutating(arguments);
+    }
     DANGEROUS_TOOLS.contains(&tool_name)
 }
 
@@ -323,6 +326,9 @@ mod tests {
         assert!(!needs_review("read_file", "{}"));
         assert!(!needs_review("grep", "{}"));
         assert!(!needs_review("todo", "{}"));
+        assert!(!needs_review("memory", r#"{"action":"recall"}"#));
+        assert!(needs_review("memory", r#"{"action":"remember"}"#));
+        assert!(needs_review("memory", r#"{"action":"forget"}"#));
     }
 
     #[test]

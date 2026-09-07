@@ -187,6 +187,16 @@ auto_update_check = true
 # "" to disable. (GitHub organizations can't be commit co-authors.)
 git_coauthor = "programmer <noreply@programmer.local>"
 
+[memory]
+# Durable memory is local JSON outside the repository. It is recalled only
+# through the explicit memory tool or /memory command; requests are not
+# automatically modified with retrieved context.
+enabled = true
+global_enabled = true
+project_enabled = true
+max_global_results = 3
+max_project_results = 8
+
 [security]
 enabled = true
 protect_file_changes = true
@@ -230,6 +240,9 @@ api_key = "sk-your-key-here"
 | `compact_model` | (chat model) | `provider/model` used for manual and automatic context compaction. |
 | `auto_compact_tokens` | `100000` | Provider-reported input-token threshold for seamless background compaction. `0` disables it. Providers that do not report usage do not trigger it. |
 | `compact_keep_recent_turns` | `2` | Number of recent complete turns kept verbatim when context is compacted. |
+| `memory.enabled` | `true` | Advertise the persistent-memory tool. Memory is recalled explicitly and is never injected automatically. |
+| `memory.global_enabled` / `project_enabled` | `true` | Include cross-project preferences and current-project memories in explicit recall. |
+| `memory.max_global_results` / `max_project_results` | `3` / `8` | Per-scope explicit recall limits. |
 | `allow_yolo` | `false` | Whether `/mode yolo` and `Ctrl+T` can reach YOLO mode. |
 | `auto_update_check` | `true` | Check GitHub Releases at startup and show a non-blocking update notice. |
 | `git_coauthor` | `programmer <noreply@programmer.local>` | `Co-Authored-By:` trailer added to the agent's git commits. Use a GitHub-linked email for an avatar; `""` disables. |
@@ -428,6 +441,12 @@ programmer
 | `/select [on\|off]` | Toggle native terminal text selection and copying |
 | `/permission` `/sandbox` | Show sandbox, file protection, and permission status |
 | `/todo` `/t` | Open this session's todo list |
+| `/memory list [global\|project]` | List active persistent memories |
+| `/memory recall <query>` | Search relevant memories |
+| `/memory remember <global\|project> <kind> <content>` | Store an explicit stable preference, fact, or decision |
+| `/memory update <id> <content>` | Correct an existing memory |
+| `/memory forget <id>` | Permanently remove a memory |
+| `/memory <on\|off>` | Enable or disable memory for this run |
 | `/skill <name\|list\|off>` | Activate, list, or clear skills |
 | `/skill manage` | Open the skills management panel |
 | `/mcp show` | List MCP server status |
@@ -443,6 +462,12 @@ programmer
 | `/clear` `/c` | Delete the current session and reset its chat, todos, images, and diagnostics |
 | `/quit` `/q` | Exit the application |
 | `/help` `/?` | Show all commands |
+
+Memory files are versioned JSON under the platform config directory at
+`programmer/memory/global.json` and `programmer/memory/projects/<workspace-id>.json`.
+They are not written into the repository. Credential-like content is rejected.
+Stored entries are never injected into model requests automatically; the agent
+or user must explicitly call `memory recall` or `/memory recall`.
 
 ### Provider management panel
 
@@ -642,7 +667,7 @@ Terminal emulators generally reserve `Cmd+V` for text paste, so image paste uses
 
 | Flag / command | Action |
 |---|---|
-| `programmer --resume` | Interactive picker to choose a saved session |
+| `programmer --resume` | Interactive picker, filtered to the current working directory by default; press `f` to show all sessions |
 | `programmer --resume <uuid>` | Resume a specific session |
 | `/new` `/n` | Save current session and start fresh |
 | `/session` `/s` | Show current session UUID |

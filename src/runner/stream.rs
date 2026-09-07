@@ -58,6 +58,13 @@ pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(base) + std::time::Duration::from_millis(jitter_ms)
 }
 
+async fn next_or_cancel<S>(stream: &mut S, cancel: &CancellationToken) -> Option<Option<S::Item>>
+where
+    S: futures::Stream + Unpin,
+{
+    cancel.wait_or(stream.next()).await
+}
+
 /// Open `request` as a streaming response and pump every event into `sink`.
 ///
 /// Retries the initial connection on transient failures (up to
@@ -77,7 +84,14 @@ pub(crate) async fn stream_with_retries(
     retrying.store(false, Ordering::Relaxed);
     let mut attempt: u32 = 0;
     let stream = loop {
-        match client.responses().create_stream(request.clone()).await {
+        let Some(opened) = cancel
+            .wait_or(client.responses().create_stream(request.clone()))
+            .await
+        else {
+            retrying.store(false, Ordering::Relaxed);
+            return;
+        };
+        match opened {
             Ok(stream) => break Ok(stream),
             Err(e) if is_retryable(&e) && attempt < crate::consts::MAX_STREAM_RETRIES => {
                 if cancel.is_cancelled() {
@@ -103,14 +117,15 @@ pub(crate) async fn stream_with_retries(
     };
     retrying.store(false, Ordering::Relaxed);
     match stream {
-        Ok(mut response_stream) => {
-            while let Some(response_stream_event) = response_stream.next().await {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                sink(response_stream_event);
-            }
-        }
+        Ok(mut response_stream) => loop {
+            let Some(next_event) = next_or_cancel(&mut response_stream, cancel).await else {
+                return;
+            };
+            let Some(response_stream_event) = next_event else {
+                break;
+            };
+            sink(response_stream_event);
+        },
         Err(openai_error) => {
             if !cancel.is_cancelled() {
                 sink(Err(openai_error));
@@ -122,6 +137,23 @@ pub(crate) async fn stream_with_retries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn waiting_for_a_stalled_stream_is_cancelled_promptly() {
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        let mut stream = futures::stream::pending::<Result<ResponseStreamEvent, OpenAIError>>();
+        let waiting = tokio::spawn(async move { next_or_cancel(&mut stream, &child).await });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
+            .await
+            .expect("stalled stream cancellation timed out")
+            .expect("stream task panicked");
+        assert!(result.is_none());
+    }
 
     #[test]
     fn backoff_grows_exponentially_and_caps() {

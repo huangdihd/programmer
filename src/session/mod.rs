@@ -24,7 +24,7 @@ use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, InputItem, Item, OutputItem,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +185,10 @@ pub(crate) struct Session {
     /// Number of messages (derived from items).
     pub(crate) message_count: usize,
     pub(crate) items: Vec<SerializableMessageItem>,
+    /// Parsed structure from the newest compact boundary. Older sessions and
+    /// unparsable summaries leave this empty and continue using summary text.
+    #[serde(default)]
+    pub(crate) session_memory: Option<crate::memory::SessionMemory>,
     /// Input history (most recent last).
     #[serde(default)]
     pub(crate) history: Vec<String>,
@@ -280,6 +284,7 @@ impl SessionManager {
             working_dir,
             message_count: 0,
             items: Vec::new(),
+            session_memory: None,
             history: Vec::new(),
             work_mode: None,
             current_model: None,
@@ -360,6 +365,23 @@ impl SessionManager {
 // Interactive session picker (TUI)
 // ---------------------------------------------------------------------------
 
+fn sessions_for_working_dir(sessions: &[SessionMeta], working_dir: &Path) -> Vec<SessionMeta> {
+    let working_dir = working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| working_dir.to_path_buf());
+    sessions
+        .iter()
+        .filter(|session| {
+            let session_dir = Path::new(&session.working_dir);
+            session_dir
+                .canonicalize()
+                .unwrap_or_else(|_| session_dir.to_path_buf())
+                == working_dir
+        })
+        .cloned()
+        .collect()
+}
+
 /// Show a ratatui TUI list of sessions and let the user pick one with arrow keys.
 /// Runs its own terminal setup/teardown; the main app will re-init the terminal.
 /// Returns the chosen UUID, or `None` if the user chose "new session".
@@ -398,7 +420,10 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).expect("terminal init");
 
-        let mut sessions = sessions.to_vec();
+        let mut all_sessions = sessions.to_vec();
+        let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut filter_working_dir = true;
+        let mut sessions = sessions_for_working_dir(&all_sessions, &working_dir);
         let mut list_state = ListState::default();
         if !sessions.is_empty() {
             list_state.select(Some(0));
@@ -419,18 +444,43 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                     ])
                     .split(area);
 
-                // -- Title --
+                // -- Title and working-directory filter toggle --
+                let title_chunks = Layout::default()
+                    .direction(ratatui::layout::Direction::Horizontal)
+                    .constraints([Constraint::Min(24), Constraint::Length(24)])
+                    .split(chunks[0]);
                 let title = Paragraph::new(Line::from(vec![
                     Span::styled(
                         "📂  Saved sessions",
                         Style::default().fg(Color::Cyan).bold(),
                     ),
                     Span::styled(
-                        format!("  ({} total, newest first)", sessions.len()),
+                        format!(
+                            "  ({} of {}, newest first)",
+                            sessions.len(),
+                            all_sessions.len()
+                        ),
                         Style::default().fg(Color::Gray).italic(),
                     ),
                 ]));
-                f.render_widget(title, chunks[0]);
+                f.render_widget(title, title_chunks[0]);
+                let filter_label = if filter_working_dir {
+                    "f current dir: ON"
+                } else {
+                    "f current dir: OFF"
+                };
+                let filter = Paragraph::new(Span::styled(
+                    filter_label,
+                    Style::default()
+                        .fg(if filter_working_dir {
+                            Color::Green
+                        } else {
+                            Color::DarkGray
+                        })
+                        .bold(),
+                ))
+                .alignment(ratatui::layout::Alignment::Right);
+                f.render_widget(filter, title_chunks[1]);
 
                 // -- Session list --
                 let highlight_style = Style::default()
@@ -507,6 +557,8 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                         Span::styled(" new  ", Style::default().fg(Color::Gray)),
                         Span::styled("d", Style::default().fg(Color::Red).bold()),
                         Span::styled(" delete  ", Style::default().fg(Color::Gray)),
+                        Span::styled("f", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(" current dir  ", Style::default().fg(Color::Gray)),
                         Span::styled("q/Esc", Style::default().fg(Color::Cyan).bold()),
                         Span::styled(" quit", Style::default().fg(Color::Gray)),
                     ]);
@@ -529,15 +581,18 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                         let _ = mgr.delete(uuid);
                         match mgr.list_all() {
                             Ok(fresh) => {
-                                sessions = fresh;
-                                if sessions.is_empty() {
-                                    break Outcome::NewSession;
-                                }
-                                list_state.select(Some(0));
+                                all_sessions = fresh;
+                                sessions = if filter_working_dir {
+                                    sessions_for_working_dir(&all_sessions, &working_dir)
+                                } else {
+                                    all_sessions.clone()
+                                };
+                                list_state.select((!sessions.is_empty()).then_some(0));
                             }
                             Err(_) => {
+                                all_sessions.clear();
                                 sessions.clear();
-                                break Outcome::NewSession;
+                                list_state.select(None);
                             }
                         }
                         confirm_uuid = None;
@@ -554,6 +609,15 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break Outcome::Quit,
                 KeyCode::Char('n') => break Outcome::NewSession,
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    filter_working_dir = !filter_working_dir;
+                    sessions = if filter_working_dir {
+                        sessions_for_working_dir(&all_sessions, &working_dir)
+                    } else {
+                        all_sessions.clone()
+                    };
+                    list_state.select((!sessions.is_empty()).then_some(0));
+                }
                 KeyCode::Char('d') => {
                     if let Some(i) = list_state.selected()
                         && let Some(s) = sessions.get(i)
@@ -668,6 +732,63 @@ mod tests {
     }
 
     #[test]
+    fn working_directory_filter_keeps_only_matching_sessions() {
+        let current = std::env::temp_dir().join("programmer-project-a");
+        let sessions = vec![
+            SessionMeta {
+                uuid: "matching".to_string(),
+                first_message: String::new(),
+                created_at: 0,
+                updated_at: 2,
+                working_dir: current.display().to_string(),
+                message_count: 0,
+            },
+            SessionMeta {
+                uuid: "other".to_string(),
+                first_message: String::new(),
+                created_at: 0,
+                updated_at: 1,
+                working_dir: std::env::temp_dir()
+                    .join("programmer-project-b")
+                    .display()
+                    .to_string(),
+                message_count: 0,
+            },
+        ];
+
+        let filtered = sessions_for_working_dir(&sessions, &current);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].uuid, "matching");
+    }
+
+    #[test]
+    fn working_directory_filter_preserves_newest_first_order() {
+        let current = std::env::temp_dir().join("programmer-project");
+        let sessions = ["newest", "older"]
+            .into_iter()
+            .map(|uuid| SessionMeta {
+                uuid: uuid.to_string(),
+                first_message: String::new(),
+                created_at: 0,
+                updated_at: 0,
+                working_dir: current.display().to_string(),
+                message_count: 0,
+            })
+            .collect::<Vec<_>>();
+
+        let filtered = sessions_for_working_dir(&sessions, &current);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|session| session.uuid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "older"]
+        );
+    }
+
+    #[test]
     fn older_sessions_default_to_auto_thinking() {
         let sessions_dir =
             std::env::temp_dir().join(format!("programmer-session-test-{}", uuid_v4()));
@@ -681,6 +802,22 @@ mod tests {
 
         let loaded: Session = serde_json::from_value(value).unwrap();
         assert_eq!(loaded.thinking_level, crate::thinking::ThinkingLevel::Auto);
+    }
+
+    #[test]
+    fn older_sessions_load_without_structured_memory() {
+        let sessions_dir =
+            std::env::temp_dir().join(format!("programmer-session-test-{}", uuid_v4()));
+        let mgr = SessionManager { sessions_dir };
+        let mut value = serde_json::to_value(mgr.create()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("session_memory")
+            .unwrap();
+
+        let loaded: Session = serde_json::from_value(value).unwrap();
+        assert!(loaded.session_memory.is_none());
     }
 
     #[test]

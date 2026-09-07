@@ -33,6 +33,7 @@ mod conversation;
 mod diagnostics;
 mod headless;
 mod mcp;
+mod memory;
 mod prompts;
 mod providers;
 mod response;

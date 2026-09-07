@@ -1164,6 +1164,7 @@ mod tests {
             compact_model: None,
             auto_compact_tokens: 100_000,
             compact_keep_recent_turns: 2,
+            memory: Default::default(),
             allow_yolo: false,
             security: Default::default(),
             security_profiles: Default::default(),

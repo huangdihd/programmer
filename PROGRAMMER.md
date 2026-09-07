@@ -6,7 +6,7 @@
 connects to OpenAI-compatible APIs (Responses API), streams responses, and
 gives the model local tools including `command`, `read_file`, `write_file`,
 `edit_file`, `grep`, `blob`, `ask_user`, `configure_diagnostics`, `fetch`,
-`task`, `todo`, and `agent`,
+`task`, `todo`, `memory`, and `agent`,
 plus MCP-bridged external tools. The TUI is built with Ratatui and crossterm.
 The binary is a single crate at the repo root.
 
@@ -14,7 +14,8 @@ Key features beyond the chat loop:
 - **Multi-provider**: add/edit/delete/switch API backends at runtime.
 - **Multi-session**: UUID-keyed JSON persistence in `~/.config/programmer/sessions/`.
 - **Rewind checkpoints**: prompt-level conversation checkpoints plus content-addressed snapshots for built-in file edits.
-- **Context compaction**: manual and provider-usage-triggered background summaries with session overrides.
+- **Context compaction**: manual and provider-usage-triggered background summaries with session overrides and a parsed structured working-state snapshot.
+- **Persistent memory**: explicit-only bounded lexical recall over inspectable global/project JSON stores, with no automatic request injection, explicit memory management, and credential rejection.
 - **Auto-mode classifier**: per-mode LLM classifier that approves/denies/defers tool calls.
 - **MCP (Model Context Protocol)**: connect to external MCP servers (stdio + HTTP);
   their tools are advertised to the model as `mcp__<server>__<tool>`.
@@ -113,6 +114,9 @@ src/
 │   ├── runner.rs             #   Run checkers, collect diagnostics
 │   └── lsp.rs                #   LSP-based checker (spawn + query over stdio)
 │
+├── memory/                   # Layered persistent memory store, retrieval, and L1 session state
+│   └── mod.rs
+│
 ├── mcp/                      # Model Context Protocol integration
 │   ├── mod.rs                #   McpManager: connect, discover tools, route calls
 │   ├── types.rs              #   JSON-RPC types, McpTool, McpServerConfig, tool annotations
@@ -156,6 +160,7 @@ src/
 │   ├── fetch.rs              #   HTTP fetch (html2text conversion)
 │   ├── task.rs               #   Background task management (create/list/output/write/wait/kill)
 │   ├── agent.rs              #   Sub-agent spawn/list/result/wait/cancel lifecycle
+│   ├── memory.rs             #   Persistent memory remember/recall/list/update/forget tool
 │   ├── todo.rs               #   Todo list management (add/list/update/delete)
 │   └── mcp_bridge.rs         #   Internal: route MCP-prefixed calls to McpManager
 │

@@ -178,7 +178,10 @@ impl HeadlessAgent {
                 color_eyre::eyre::eyre!("built-in initialize-project skill is unavailable")
             })?;
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
-            Arc::new(LocalToolProvider::new(todo_store.clone(), security.clone())),
+            Arc::new(
+                LocalToolProvider::new(todo_store.clone(), security.clone())
+                    .with_memory_enabled(config.memory.enabled),
+            ),
             Arc::new(SkillToolProvider::new(skill_registry.clone())),
         ];
 
@@ -238,6 +241,7 @@ impl HeadlessAgent {
             coauthor: config.git_coauthor.clone(),
             vision_enabled: false,
             thinking_level: args.thinking,
+            memory_config: config.memory.clone(),
             skill_registry,
             skill_prompt: skill_prompt.clone(),
             approval_label: format!(

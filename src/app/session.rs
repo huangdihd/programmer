@@ -86,6 +86,10 @@ fn persist_session(app: &mut App<'_>) -> Result<bool, String> {
     {
         session.first_message = crate::session::truncate_first_line(&text, 80);
     }
+    session.session_memory = items.iter().rev().find_map(|item| match item {
+        MessageItem::Compacted { summary } => crate::memory::SessionMemory::from_summary(summary),
+        _ => None,
+    });
     SessionManager::set_items(&mut session, items);
     session.history = app.input_panel.history.clone();
     session.work_mode = Some(app.work_mode);
