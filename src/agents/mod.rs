@@ -369,6 +369,7 @@ pub(crate) struct AgentRuntime {
     pub(crate) coauthor: Option<String>,
     pub(crate) vision_enabled: bool,
     pub(crate) thinking_level: crate::thinking::ThinkingLevel,
+    pub(crate) memory_config: crate::config::programmer_config::MemoryConfig,
     pub(crate) skill_registry: crate::skills::SkillRegistry,
     pub(crate) skill_prompt: Option<String>,
     pub(crate) approval_label: String,
@@ -415,7 +416,8 @@ impl AgentRuntime {
                     self.security.clone(),
                     file_scope,
                 )
-                .with_checkpoint(self.checkpoint.clone()),
+                .with_checkpoint(self.checkpoint.clone())
+                .with_memory_enabled(self.memory_config.enabled),
             ),
             Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
         ];

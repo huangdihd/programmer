@@ -67,7 +67,7 @@ const SCROLL_LINES_BASE: usize = 1;
 /// Maximum rows per notch when scrolling fast.
 const SCROLL_LINES_MAX: usize = 5;
 /// Time window (ms) for consecutive scrolls to count as "fast" scrolling.
-const SCROLL_ACCEL_WINDOW_MS: u128 = 150;
+const SCROLL_ACCEL_WINDOW_MS: u128 = 250;
 /// How long (ms) the scrollbar thumb stays visible after the last scroll
 /// interaction. It is an overlay on the last content column, so hiding it
 /// costs no layout space.

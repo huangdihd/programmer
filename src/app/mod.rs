@@ -650,7 +650,8 @@ impl App<'_> {
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
             Arc::new(
                 LocalToolProvider::new(self.todo_store.clone(), self.security.clone())
-                    .with_checkpoint(self.checkpoint_recorder()),
+                    .with_checkpoint(self.checkpoint_recorder())
+                    .with_memory_enabled(self.config.memory.enabled),
             ),
             Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
         ];
@@ -696,6 +697,7 @@ impl App<'_> {
             coauthor: self.config.git_coauthor.clone(),
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,
+            memory_config: self.config.memory.clone(),
             skill_registry: self.skill_registry.clone(),
             skill_prompt: self.skill_registry.catalog_prompt(),
             approval_label: format!(

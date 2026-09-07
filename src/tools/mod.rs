@@ -24,6 +24,7 @@ pub mod fetch;
 pub mod grep;
 pub mod load_skill;
 pub(crate) mod mcp_bridge;
+pub mod memory;
 pub(crate) mod provider;
 pub mod read_file;
 pub mod read_image;
@@ -261,6 +262,7 @@ pub(crate) async fn run_local_tool(name: &str, arguments: &str) -> Result<String
         fetch::NAME => fetch::run(arguments).await,
         configure_diagnostics::NAME => configure_diagnostics::run(arguments).await,
         diagnostics::NAME => diagnostics::run(arguments).await,
+        memory::NAME => memory::run(arguments).await,
         todo::NAME => Err(
             "error: the todo tool requires a session and is unavailable in standalone MCP mode"
                 .to_string(),

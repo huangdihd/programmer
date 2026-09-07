@@ -45,15 +45,16 @@ pub(crate) fn build_request(
     model_name: String,
     tools: Vec<Tool>,
 ) -> CreateResponse {
+    let input = conversation.to_input_param_with_vision(
+        ctx.current_model,
+        ctx.skill_prompt,
+        ctx.plan_prompt,
+        ctx.coauthor,
+        ctx.vision_enabled,
+    );
     CreateResponse {
         stream: Some(true),
-        input: conversation.to_input_param_with_vision(
-            ctx.current_model,
-            ctx.skill_prompt,
-            ctx.plan_prompt,
-            ctx.coauthor,
-            ctx.vision_enabled,
-        ),
+        input,
         model: Some(model_name),
         tools: Some(tools),
         reasoning: ctx.thinking_level.reasoning(),
@@ -124,7 +125,7 @@ mod tests {
             dev_text.contains("Ada <ada@example.com>"),
             "coauthor trailer"
         );
-        // The user message follows.
+        // The user message follows the stable developer context directly.
         assert!(matches!(
             &items[1],
             InputItem::Item(Item::Message(ApiMessageItem::Input(m)))

@@ -79,6 +79,22 @@ responses rendered in a terminal UI, so keep output compact.
   filtered searches over dumping whole files or verbose command output.
 - Never fabricate tool output, file contents, or command results.
 
+# Persistent memory
+
+- When the user explicitly asks to remember something, or explicitly states a
+  stable preference, confirmed decision, reusable constraint, or verified fact,
+  use the `memory` tool when it is available. Do not merely claim it was saved.
+- Before writing, check relevant existing memories. Update an existing entry
+  when it represents the same fact instead of creating a duplicate.
+- Keep each entry atomic and independently updateable. If the material combines
+  unrelated subjects, scopes, or lifecycles, make multiple `remember` calls.
+- Choose the narrowest valid scope. Use `global` only for information reusable
+  across unrelated repositories, such as user preferences or stable machine and
+  access-environment facts. Use `project` for repository-specific paths,
+  services, architecture, deployment procedures, and conventions.
+- Never store credentials, secrets, transient task progress, or unverified
+  inferences. Do not report success until every required memory call succeeds.
+
 # Editing rules
 
 - Preserve surrounding code exactly; do not drop comments or unrelated lines.
@@ -216,7 +232,11 @@ conversation:
 3. IN FLIGHT — the task being worked on right now and its exact status.
 4. NEXT — concrete pending steps or open questions, if any.
 
-Do not invent details. Do not call tools. Output only the summary text.";
+Use exactly these four headings, each on its own line: `## INTENT`, `## STATE`, \
+`## IN FLIGHT`, and `## NEXT`. This format is parsed into the session's \
+structured short-term memory; if parsing fails, the text is still retained as \
+a backward-compatible summary. Do not invent details. Do not call tools. \
+Output only the summary text.";
 
 // ---------------------------------------------------------------------------
 // Post-edit reminders
