@@ -347,7 +347,7 @@ pub(crate) fn build_classifier_context(items: &[&MessageItem]) -> (String, Strin
             MessageItem::Meta { label, text } => {
                 full_ctx.push(format!("\n[{label}]\n{text}"));
             }
-            MessageItem::Usage(_, _) => {
+            MessageItem::Usage(_, _, _) => {
                 // Token usage counters — not useful for classification.
             }
             MessageItem::Compacted { summary } => {

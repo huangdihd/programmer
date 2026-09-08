@@ -135,6 +135,10 @@ pub(crate) struct SessionState {
     /// so a burst of changes within a turn collapses into a single save at turn
     /// end instead of writing after every event.
     pub(crate) dirty: bool,
+    /// Model-generated title persisted with the session.
+    pub(crate) title: String,
+    /// Prevent duplicate title requests while the first one is in flight.
+    pub(crate) title_generation_started: bool,
     pub(crate) classifier_model_override: ModelOverride,
     pub(crate) compact_model_override: ModelOverride,
     pub(crate) auto_compact_override: AutoCompactOverride,
@@ -389,6 +393,7 @@ impl App<'_> {
         let mut compact_model_override = ModelOverride::Inherit;
         let mut auto_compact_override = AutoCompactOverride::Inherit;
         let mut compact_keep_recent_turns_override = None;
+        let mut session_title = String::new();
 
         let mut saved_activated_skills: Option<Vec<String>> = None;
         if let Some(mgr) = &session_mgr
@@ -402,6 +407,7 @@ impl App<'_> {
             {
                 current_model = model;
             }
+            session_title = saved.title;
             vision_enabled = saved.vision_enabled;
             thinking_level = saved.thinking_level;
             classifier_model_override = saved.classifier_model_override;
@@ -503,6 +509,8 @@ impl App<'_> {
                 mgr: session_mgr,
                 dirty: false,
                 did_save: false,
+                title_generation_started: !session_title.is_empty(),
+                title: session_title,
                 classifier_model_override,
                 compact_model_override,
                 auto_compact_override,
@@ -595,6 +603,13 @@ impl App<'_> {
             &self.session.compact_model_override,
             self.config.compact_model.as_deref(),
         )
+    }
+
+    pub(crate) fn effective_title_model(&self) -> String {
+        self.config
+            .title_model
+            .clone()
+            .unwrap_or_else(|| self.current_model.clone())
     }
 
     pub(crate) fn effective_auto_compact_tokens(&self) -> Option<u32> {
@@ -694,6 +709,7 @@ impl App<'_> {
             security: self.security.clone(),
             mcp_manager: self.mcp_manager.clone(),
             policy: child_policy,
+            soul: self.config.soul.clone(),
             coauthor: self.config.git_coauthor.clone(),
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,
@@ -719,6 +735,7 @@ impl App<'_> {
             model_str,
             tools,
             policy,
+            soul: self.config.soul.clone(),
             coauthor: self.config.git_coauthor.clone(),
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,

@@ -73,6 +73,8 @@ pub(crate) enum SerializableMessageItem {
     Usage {
         input_tokens: u32,
         output_tokens: u32,
+        #[serde(default)]
+        cached_input_tokens: u32,
     },
     /// A `/compact` boundary carrying the summary of everything before it.
     Compacted {
@@ -101,9 +103,10 @@ impl From<MessageItem> for SerializableMessageItem {
             MessageItem::Warning(s) => SerializableMessageItem::Warning(s),
             MessageItem::Info(s) => SerializableMessageItem::Info(s),
             MessageItem::Meta { label, text } => SerializableMessageItem::Meta { label, text },
-            MessageItem::Usage(i, o) => SerializableMessageItem::Usage {
+            MessageItem::Usage(i, o, cached) => SerializableMessageItem::Usage {
                 input_tokens: i,
                 output_tokens: o,
+                cached_input_tokens: cached,
             },
             MessageItem::Compacted { summary } => SerializableMessageItem::Compacted { summary },
         }
@@ -151,7 +154,8 @@ impl From<SerializableMessageItem> for MessageItem {
             SerializableMessageItem::Usage {
                 input_tokens,
                 output_tokens,
-            } => MessageItem::Usage(input_tokens, output_tokens),
+                cached_input_tokens,
+            } => MessageItem::Usage(input_tokens, output_tokens, cached_input_tokens),
             SerializableMessageItem::Compacted { summary } => MessageItem::Compacted { summary },
         }
     }
@@ -165,6 +169,9 @@ impl From<SerializableMessageItem> for MessageItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionMeta {
     pub(crate) uuid: String,
+    /// Model-generated title. Empty for legacy or not-yet-titled sessions.
+    #[serde(default)]
+    pub(crate) title: String,
     /// Truncated first user message for preview.
     pub(crate) first_message: String,
     pub(crate) created_at: u64,
@@ -178,6 +185,8 @@ pub(crate) struct SessionMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Session {
     pub(crate) uuid: String,
+    #[serde(default)]
+    pub(crate) title: String,
     pub(crate) first_message: String,
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
@@ -278,6 +287,7 @@ impl SessionManager {
             std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
         Session {
             uuid,
+            title: String::new(),
             first_message: String::new(),
             created_at: now,
             updated_at: now,
@@ -382,13 +392,19 @@ fn sessions_for_working_dir(sessions: &[SessionMeta], working_dir: &Path) -> Vec
         .collect()
 }
 
+const PICKER_QUIT_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn picker_quit_is_confirmed(previous: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    previous.is_some_and(|pressed_at| now.duration_since(pressed_at) <= PICKER_QUIT_CONFIRM_TIMEOUT)
+}
+
 /// Show a ratatui TUI list of sessions and let the user pick one with arrow keys.
 /// Runs its own terminal setup/teardown; the main app will re-init the terminal.
 /// Returns the chosen UUID, or `None` if the user chose "new session".
 /// On quit (q / Esc) the process exits after cleanup.
 /// Press `d` on a session to delete it after confirmation.
 pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Option<String> {
-    use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
+    use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::execute;
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -431,6 +447,7 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
 
         // Confirmation state: when set, shows a confirmation overlay.
         let mut confirm_uuid: Option<String> = None;
+        let mut quit_requested_at: Option<std::time::Instant> = None;
 
         let result = loop {
             let _ = terminal.draw(|f: &mut Frame| {
@@ -491,10 +508,12 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                 let items: Vec<ListItem> = sessions
                     .iter()
                     .map(|s| {
-                        let preview = if s.first_message.is_empty() {
-                            "(empty)".to_string()
-                        } else {
+                        let preview = if !s.title.is_empty() {
+                            truncate_first_line(&s.title, 60)
+                        } else if !s.first_message.is_empty() {
                             truncate_first_line(&s.first_message, 60)
+                        } else {
+                            "(empty)".to_string()
                         };
                         let time_str = unix_to_local(s.updated_at);
                         let short_uuid = &s.uuid[..8.min(s.uuid.len())];
@@ -534,7 +553,13 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                 f.render_stateful_widget(list, chunks[1], &mut list_state);
 
                 // -- Help bar (or confirmation prompt) --
-                if let Some(ref uuid) = confirm_uuid {
+                if quit_requested_at.is_some() {
+                    let warning = Span::styled(
+                        " Press Ctrl+C again within 2 seconds to exit.",
+                        Style::default().fg(Color::Yellow).bold(),
+                    );
+                    f.render_widget(Paragraph::new(warning), chunks[2]);
+                } else if let Some(ref uuid) = confirm_uuid {
                     let short = &uuid[..8.min(uuid.len())];
                     let confirm = Line::from(vec![
                         Span::styled(
@@ -571,6 +596,21 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
             };
             if key.kind != KeyEventKind::Press {
                 continue;
+            }
+
+            let now = std::time::Instant::now();
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if picker_quit_is_confirmed(quit_requested_at, now) {
+                    break Outcome::Quit;
+                }
+                quit_requested_at = Some(now);
+                confirm_uuid = None;
+                continue;
+            }
+            if quit_requested_at.is_some_and(|pressed_at| {
+                now.duration_since(pressed_at) > PICKER_QUIT_CONFIRM_TIMEOUT
+            }) {
+                quit_requested_at = None;
             }
 
             // ---- confirmation mode ----
@@ -737,6 +777,7 @@ mod tests {
         let sessions = vec![
             SessionMeta {
                 uuid: "matching".to_string(),
+                title: String::new(),
                 first_message: String::new(),
                 created_at: 0,
                 updated_at: 2,
@@ -745,6 +786,7 @@ mod tests {
             },
             SessionMeta {
                 uuid: "other".to_string(),
+                title: String::new(),
                 first_message: String::new(),
                 created_at: 0,
                 updated_at: 1,
@@ -763,12 +805,27 @@ mod tests {
     }
 
     #[test]
+    fn picker_requires_two_ctrl_c_presses_within_timeout() {
+        let now = std::time::Instant::now();
+        assert!(!picker_quit_is_confirmed(None, now));
+        assert!(picker_quit_is_confirmed(
+            Some(now - std::time::Duration::from_secs(1)),
+            now
+        ));
+        assert!(!picker_quit_is_confirmed(
+            Some(now - std::time::Duration::from_secs(3)),
+            now
+        ));
+    }
+
+    #[test]
     fn working_directory_filter_preserves_newest_first_order() {
         let current = std::env::temp_dir().join("programmer-project");
         let sessions = ["newest", "older"]
             .into_iter()
             .map(|uuid| SessionMeta {
                 uuid: uuid.to_string(),
+                title: String::new(),
                 first_message: String::new(),
                 created_at: 0,
                 updated_at: 0,
@@ -802,6 +859,23 @@ mod tests {
 
         let loaded: Session = serde_json::from_value(value).unwrap();
         assert_eq!(loaded.thinking_level, crate::thinking::ThinkingLevel::Auto);
+    }
+
+    #[test]
+    fn older_usage_items_default_cached_tokens_to_zero() {
+        let item: SerializableMessageItem = serde_json::from_value(serde_json::json!({
+            "variant": "Usage",
+            "payload": {
+                "input_tokens": 10,
+                "output_tokens": 2
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            MessageItem::from(item),
+            MessageItem::Usage(10, 2, 0)
+        ));
     }
 
     #[test]

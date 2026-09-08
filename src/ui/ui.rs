@@ -404,8 +404,12 @@ impl Widget for &mut App<'_> {
                 Constraint::Min(1),    // content area
             ])
             .split(area);
-        let logo = Logo::new();
-        logo.render(vert[0], buf);
+        let title = if self.session.title.is_empty() {
+            "Programmer"
+        } else {
+            &self.session.title
+        };
+        Logo::new(title).render(vert[0], buf);
         let content_area = vert[1];
 
         // ---- sidebar: conditionally split the content area horizontally ----

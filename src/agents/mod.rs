@@ -366,6 +366,7 @@ pub(crate) struct AgentRuntime {
     pub(crate) security: Arc<crate::security::SecurityHandle>,
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     pub(crate) policy: AgentPolicyFactory,
+    pub(crate) soul: Option<String>,
     pub(crate) coauthor: Option<String>,
     pub(crate) vision_enabled: bool,
     pub(crate) thinking_level: crate::thinking::ThinkingLevel,
@@ -430,6 +431,7 @@ impl AgentRuntime {
             model_str: self.model_str.clone(),
             tools: Arc::new(ToolRegistry::new(providers)),
             policy: self.policy.build(),
+            soul: self.soul.clone(),
             coauthor: self.coauthor.clone(),
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,
@@ -534,7 +536,7 @@ mod tests {
             first.id,
             Ok(crate::runner::TurnResult {
                 final_text: "done".into(),
-                usage: (1, 2),
+                usage: (1, 2, 0),
             }),
         );
         let snapshot = manager.snapshot(first.id).unwrap();

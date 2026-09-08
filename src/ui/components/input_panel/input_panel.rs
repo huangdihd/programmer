@@ -33,6 +33,9 @@ pub struct InputPanel<'a> {
     /// Clipboard images associated with placeholders still present in the draft.
     images: Vec<(String, InputImageContent)>,
     next_image_id: usize,
+    /// Details shown in the title until the next model turn consumes a freshly
+    /// compacted context.
+    pub(crate) next_turn_compaction: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +68,20 @@ impl InputPanel<'_> {
             pastes: Vec::new(),
             images: Vec::new(),
             next_image_id: 1,
+            next_turn_compaction: None,
         }
+    }
+
+    pub(crate) fn show_next_turn_compaction(&mut self, details: String) {
+        self.next_turn_compaction = Some(details);
+    }
+
+    pub(crate) fn clear_next_turn_compaction(&mut self) {
+        self.next_turn_compaction = None;
+    }
+
+    pub(crate) fn take_next_turn_compaction(&mut self) -> Option<String> {
+        self.next_turn_compaction.take()
     }
 
     pub fn get_content(&self) -> String {

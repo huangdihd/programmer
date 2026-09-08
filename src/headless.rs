@@ -238,6 +238,7 @@ impl HeadlessAgent {
             security,
             mcp_manager: None,
             policy: child_policy,
+            soul: config.soul.clone(),
             coauthor: config.git_coauthor.clone(),
             vision_enabled: false,
             thinking_level: args.thinking,
@@ -270,6 +271,7 @@ impl HeadlessAgent {
             model_str: model.clone(),
             tools,
             policy,
+            soul: config.soul,
             coauthor: config.git_coauthor,
             vision_enabled: false,
             thinking_level: args.thinking,
@@ -500,6 +502,7 @@ struct AgentResult<'a> {
 struct Usage {
     input_tokens: u32,
     output_tokens: u32,
+    cached_input_tokens: u32,
 }
 
 fn emit_agent_result(
@@ -515,6 +518,7 @@ fn emit_agent_result(
         usage: Usage {
             input_tokens: result.usage.0,
             output_tokens: result.usage.1,
+            cached_input_tokens: result.usage.2,
         },
         check,
         passed: check.is_none_or(|report| report.passed),

@@ -241,17 +241,21 @@ fn background_hint() -> Line<'static> {
 /// Lines of live command output shown while a running call is collapsed.
 const LIVE_TAIL_LINES: usize = 8;
 
-/// Append a running command's output to `lines`, each row dimmed and marked
-/// with the result gutter. Collapsed calls pass a line limit and get a leading
-/// `⋯` when earlier rows are hidden; expanded calls pass `None` to show all
-/// output retained by the task.
+/// Append a running command's output to `lines`, marked with the result gutter.
+/// Collapsed calls pass a line limit and render a dim tail (with a leading `⋯`
+/// when earlier rows are hidden); expanded calls pass `None` and use the normal
+/// detail style so the full output remains readable.
 fn push_live_output(
     lines: &mut Vec<Line<'static>>,
     live: &str,
     muted: Style,
     tail_lines: Option<usize>,
 ) {
-    let dim = muted.add_modifier(Modifier::DIM);
+    let output_style = if tail_lines.is_some() {
+        muted.add_modifier(Modifier::DIM)
+    } else {
+        detail_style()
+    };
     let all: Vec<&str> = live.lines().collect();
     // A trailing newline yields no final empty entry from `.lines()`, so this is
     // simply every non-terminated line the command has produced so far.
@@ -263,10 +267,16 @@ fn push_live_output(
         .map(|limit| all.len().saturating_sub(limit))
         .unwrap_or(0);
     if start > 0 {
-        lines.push(Line::from(Span::styled("  \u{23BF} \u{22EF}", dim)));
+        lines.push(Line::from(Span::styled(
+            "  \u{23BF} \u{22EF}",
+            output_style,
+        )));
     }
     for line in &all[start..] {
-        lines.push(Line::from(Span::styled(format!("  \u{23BF} {line}"), dim)));
+        lines.push(Line::from(Span::styled(
+            format!("  \u{23BF} {line}"),
+            output_style,
+        )));
     }
 }
 
@@ -483,6 +493,21 @@ mod tests {
     fn command_background_hint_shows_the_shortcut() {
         let hint = plain(&[background_hint()]);
         assert_eq!(hint, ["  Ctrl+Z move to background"]);
+    }
+
+    #[test]
+    fn expanded_live_command_output_uses_readable_detail_style() {
+        let mut lines = Vec::new();
+        push_live_output(
+            &mut lines,
+            "visible output",
+            Style::new().fg(palette::MUTED),
+            None,
+        );
+
+        let style = lines[0].spans[0].style;
+        assert_eq!(style.fg, detail_style().fg);
+        assert!(!style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]

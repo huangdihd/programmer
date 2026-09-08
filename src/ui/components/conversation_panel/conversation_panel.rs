@@ -991,6 +991,14 @@ impl ConversationPanel {
         self.stick_to_bottom = true;
     }
 
+    pub fn insert_info_string(&mut self, index: usize, message: impl Into<String>) {
+        self.conversation
+            .lock()
+            .unwrap()
+            .insert_info_string(index, message);
+        self.stick_to_bottom = true;
+    }
+
     pub fn add_meta(&mut self, label: impl Into<String>, text: impl Into<String>) {
         self.conversation.lock().unwrap().add_meta(label, text);
         self.stick_to_bottom = true;
@@ -1058,15 +1066,24 @@ impl ConversationPanel {
             .compaction_cutoff_before(keep_recent_turns, stable_end)
     }
 
+    pub fn compaction_turn_count(&self, cutoff: usize) -> usize {
+        self.conversation
+            .lock()
+            .unwrap()
+            .compaction_turn_count(cutoff)
+    }
+
     pub fn input_param_for_prefix(
         &self,
         cutoff: usize,
         current_model: &str,
+        soul: Option<&str>,
         vision_enabled: bool,
     ) -> InputParam {
         self.conversation.lock().unwrap().input_param_for_prefix(
             cutoff,
             current_model,
+            soul,
             vision_enabled,
         )
     }
@@ -1088,11 +1105,12 @@ impl ConversationPanel {
         applied
     }
 
-    pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
-        self.conversation
-            .lock()
-            .unwrap()
-            .add_usage(input_tokens, output_tokens);
+    pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32, cached_input_tokens: u32) {
+        self.conversation.lock().unwrap().add_usage(
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+        );
     }
 
     /// Flush the accumulated usage as a message and reset the counter.
@@ -1797,7 +1815,7 @@ mod tests {
         (&mut panel).render(area, &mut Buffer::empty(area));
         let before = panel.scroll_view_state.offset().y;
 
-        panel.add_usage(13, 7);
+        panel.add_usage(13, 7, 5);
         panel.flush_usage();
         (&mut panel).render(area, &mut Buffer::empty(area));
 

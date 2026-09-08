@@ -20,18 +20,20 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
-pub struct Logo {}
+pub struct Logo<'a> {
+    title: &'a str,
+}
 
-impl Logo {
-    pub fn new() -> Self {
-        Logo {}
+impl<'a> Logo<'a> {
+    pub fn new(title: &'a str) -> Self {
+        Logo { title }
     }
 }
 
-impl Widget for Logo {
+impl Widget for Logo<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let title = Line::styled(
-            "Programmer",
+            self.title,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -43,5 +45,24 @@ impl Widget for Logo {
         Paragraph::new(vec![title, separator])
             .centered()
             .render(area, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_the_supplied_session_title() {
+        let area = Rect::new(0, 0, 30, 2);
+        let mut buffer = Buffer::empty(area);
+
+        Logo::new("Fix session header").render(area, &mut buffer);
+
+        let first_line = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(first_line.contains("Fix session header"));
+        assert!(!first_line.contains("Programmer"));
     }
 }

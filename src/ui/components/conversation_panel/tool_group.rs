@@ -31,7 +31,9 @@
 //! [`MIN_TOOL_GROUP_SIZE`] threshold so short, finished sequences stay easy to
 //! scan as ordinary calls.
 
-use async_openai::types::responses::{FunctionCallOutputItemParam, FunctionToolCall, OutputItem};
+use async_openai::types::responses::{
+    FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, OutputItem,
+};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Wrap;
@@ -396,18 +398,78 @@ impl ToolGroup {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn title(&self, completed: usize, failed: usize) -> String {
+        self.title_with_members(&[], completed, failed)
+    }
+
+    fn title_with_members(
+        &self,
+        members: &[ToolGroupMember<'_>],
+        completed: usize,
+        failed: usize,
+    ) -> String {
         let total = self.member_indices.len();
+        let purpose = todo_purpose(members);
         let mut title = if completed < total {
-            format!("{}… · {completed}/{total}", self.kind.active_title())
+            format!("{}…", self.kind.active_title())
         } else {
-            self.kind.completed_title().to_string()
+            self.kind.completed_title()
         };
+        if let Some(purpose) = purpose {
+            title.push_str(" · ");
+            title.push_str(&purpose);
+        }
+        if completed < total {
+            title.push_str(&format!(" · {completed}/{total}"));
+        }
         if failed > 0 {
             title.push_str(&format!(" · {failed} failed"));
         }
         title
     }
+}
+
+/// A todo mutation names the task that the surrounding run of tools is serving.
+/// Prefer the title supplied in call arguments, then recover it from the update
+/// result (updates commonly carry only an id and status).
+fn todo_purpose(members: &[ToolGroupMember<'_>]) -> Option<String> {
+    members.iter().rev().find_map(|member| {
+        if member.call.name != crate::tools::todo::NAME {
+            return None;
+        }
+        let arguments: serde_json::Value = serde_json::from_str(&member.call.arguments).ok()?;
+        match arguments.get("action")?.as_str()? {
+            "add" | "update" => {}
+            _ => return None,
+        }
+        if let Some(title) = arguments.get("title").and_then(|value| value.as_str()) {
+            return clean_todo_purpose(title);
+        }
+        let (output, failed, _) = member.output?;
+        if failed {
+            return None;
+        }
+        let FunctionCallOutput::Text(text) = &output.output else {
+            return None;
+        };
+        let encoded = text.split_once("title=")?.1.split_once(" status=")?.0;
+        serde_json::from_str::<String>(encoded)
+            .ok()
+            .and_then(|title| clean_todo_purpose(&title))
+    })
+}
+
+fn clean_todo_purpose(title: &str) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let mut shortened = title.chars().take(60).collect::<String>();
+    if title.chars().count() > 60 {
+        shortened.push('…');
+    }
+    Some(shortened)
 }
 
 impl ToolGroupKind {
@@ -508,7 +570,10 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("{arrow} "), muted),
         Span::styled(
-            format!("\u{1F6E0} {}", group.title(completed, failed)),
+            format!(
+                "\u{1F6E0} {}",
+                group.title_with_members(members, completed, failed)
+            ),
             Style::new().fg(color).add_modifier(Modifier::BOLD),
         ),
     ])];
@@ -896,6 +961,45 @@ mod tests {
 
         assert_eq!(group.title(1, 0), "Implementing… · 1/3");
         assert_eq!(group.title(3, 1), "Implemented · 1 failed");
+    }
+
+    #[test]
+    fn todo_change_describes_the_surrounding_tool_run() {
+        let call = FunctionToolCall {
+            arguments: r#"{"action":"update","id":"abc","status":"in_progress"}"#.into(),
+            call_id: "todo-call".into(),
+            namespace: None,
+            name: crate::tools::todo::NAME.into(),
+            id: None,
+            status: None,
+        };
+        let output = FunctionCallOutputItemParam {
+            call_id: "todo-call".into(),
+            output: FunctionCallOutput::Text(
+                "updated todo abc: title=\"Add session titles\" status=in progress".into(),
+            ),
+            id: None,
+            status: None,
+        };
+        let members = [ToolGroupMember {
+            index: 0,
+            call: &call,
+            output: Some((&output, false, None)),
+            live_output: None,
+            expanded: false,
+        }];
+        let group = ToolGroup {
+            key: "todo-call".into(),
+            member_indices: vec![0, 1, 2],
+            absorbed: Vec::new(),
+            open: false,
+            kind: ToolGroupKind::General,
+        };
+
+        assert_eq!(
+            group.title_with_members(&members, 3, 0),
+            "Used tools · Add session titles"
+        );
     }
 
     #[test]

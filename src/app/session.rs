@@ -80,6 +80,7 @@ fn persist_session(app: &mut App<'_>) -> Result<bool, String> {
         s.uuid = app.session.uuid.clone();
         s
     });
+    session.title = app.session.title.clone();
     // Capture first user message for the picker preview.
     if session.first_message.is_empty()
         && let Some(text) = helpers::first_user_text(&items)
@@ -138,6 +139,8 @@ pub(crate) fn persist_config(app: &mut App<'_>) {
 
 /// Delete the session file and start a fresh session with a new UUID.
 pub(crate) fn delete_session(app: &mut App<'_>) {
+    app.session.title.clear();
+    app.session.title_generation_started = false;
     if let Some(store) = &app.checkpoint_store {
         let _ = store.lock().unwrap().delete_all();
     }

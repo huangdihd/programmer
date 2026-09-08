@@ -41,7 +41,7 @@ pub enum MessageItem {
         label: String,
         text: String,
     },
-    Usage(u32, u32), // (input_tokens, output_tokens)
+    Usage(u32, u32, u32), // (input_tokens, output_tokens, cached_input_tokens)
     /// A `/compact` boundary: everything before this item was summarized into
     /// `summary`, which is sent to the model in place of that history. The
     /// older items stay in the list for the UI scrollback but are no longer
@@ -73,7 +73,7 @@ impl Clone for MessageItem {
                 label: label.clone(),
                 text: text.clone(),
             },
-            MessageItem::Usage(i, o) => MessageItem::Usage(*i, *o),
+            MessageItem::Usage(i, o, cached) => MessageItem::Usage(*i, *o, *cached),
             MessageItem::Compacted { summary } => MessageItem::Compacted {
                 summary: summary.clone(),
             },

@@ -62,6 +62,10 @@ impl Default for MemoryConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProgrammerConfig {
+    /// Replaces Programmer's built-in identity and mindset section in the
+    /// developer prompt. When absent, the built-in identity is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul: Option<String>,
     /// The provider to use when none is specified in the model string.
     pub default_provider: String,
     /// All configured providers, keyed by name.
@@ -82,6 +86,10 @@ pub struct ProgrammerConfig {
     /// the current chat model is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_model: Option<String>,
+    /// Model used to generate concise session titles. When absent, the current
+    /// chat model is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_model: Option<String>,
     /// Start a background context compaction after an API response reports at
     /// least this many input tokens. Zero disables automatic compaction.
     #[serde(default = "default_auto_compact_tokens")]
@@ -205,11 +213,13 @@ impl Default for ProgrammerConfig {
         );
         let security = crate::security::SecurityConfig::default();
         ProgrammerConfig {
+            soul: None,
             default_provider: "openai".to_string(),
             providers,
             classifier_model: None,
             classifier_top_logprobs: default_classifier_top_logprobs(),
             compact_model: None,
+            title_model: None,
             auto_compact_tokens: default_auto_compact_tokens(),
             compact_keep_recent_turns: default_compact_keep_recent_turns(),
             memory: MemoryConfig::default(),
@@ -363,6 +373,25 @@ mod tests {
         let config = ProgrammerConfig::default();
         let serialized = toml::to_string(&config).expect("serialize");
         assert!(!serialized.contains("mcp_servers"));
+    }
+
+    #[test]
+    fn soul_is_optional_and_round_trips() {
+        let defaulted: ProgrammerConfig = toml::from_str("").expect("deserialize defaults");
+        assert_eq!(defaulted.soul, None);
+
+        let configured: ProgrammerConfig =
+            toml::from_str("soul = 'You are a careful pair programmer.'")
+                .expect("deserialize configured soul");
+        assert_eq!(
+            configured.soul.as_deref(),
+            Some("You are a careful pair programmer.")
+        );
+        assert!(
+            toml::to_string(&configured)
+                .expect("serialize")
+                .contains("soul")
+        );
     }
 
     #[test]

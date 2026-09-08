@@ -220,7 +220,7 @@ src/
 
 - **Error handling:** `color_eyre::Result<T>` throughout; `.wrap_err()` for context; `?` propagation. `thiserror` for library-style error types.
 - **Async:** `#[tokio::main]` on `main()`, `tokio::spawn` for concurrent tasks. All tool execution is async.
-- **Configuration:** `ProgrammerConfig` deserializes from TOML via the `config` crate. Environment variables prefixed with `Programmer` override file values. Config lives at `~/.config/programmer/config.toml`.
+- **Configuration:** `ProgrammerConfig` deserializes from TOML via the `config` crate. Environment variables prefixed with `Programmer` override file values. Config lives at `~/.config/programmer/config.toml`. The optional top-level `soul` value replaces only the identity/mindset section of the developer prompt.
 - **Sessions:** Stored as JSON at `~/.config/programmer/sessions/<uuid>.json`. Each session contains message items, history, todos, and persisted task state.
 - **Module visibility:** `pub(crate)` for internal visibility; `pub` only where needed externally. UI internals are `mod` (private). Tool modules are `pub` within `tools/`.
 - **Tests:** Inline `#[cfg(test)]` modules at the bottom of source files. No separate `tests/` directory.

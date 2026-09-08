@@ -71,8 +71,9 @@ pub struct PartialResponse {
     finish_reason: Option<ResponseFinishReason>,
     /// Cancelled when the user presses Escape to stop the current request.
     pub cancelled: CancellationToken,
-    /// Token usage from the completed response: (input_tokens, output_tokens).
-    pub usage: Option<(u32, u32)>,
+    /// Token usage from the completed response:
+    /// (input_tokens, output_tokens, cached_input_tokens).
+    pub usage: Option<(u32, u32, u32)>,
     /// Monotonically changes whenever another stream event is folded into this
     /// response. The TUI uses it to reuse an unchanged live tool-group layout
     /// across animation/timer frames without hashing or cloning the full text.
@@ -569,7 +570,11 @@ impl PartialResponse {
             ResponseCompleted(response_completed_event) => {
                 self.mark_all_finished();
                 if let Some(ref u) = response_completed_event.response.usage {
-                    self.usage = Some((u.input_tokens, u.output_tokens));
+                    self.usage = Some((
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.input_tokens_details.cached_tokens,
+                    ));
                 }
                 self.finish_reason = Some(ResponseFinishReason::Completed(
                     response_completed_event.response,
@@ -578,7 +583,11 @@ impl PartialResponse {
             ResponseFailed(response_failed_event) => {
                 self.mark_all_finished();
                 if let Some(ref u) = response_failed_event.response.usage {
-                    self.usage = Some((u.input_tokens, u.output_tokens));
+                    self.usage = Some((
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.input_tokens_details.cached_tokens,
+                    ));
                 }
                 self.finish_reason =
                     Some(ResponseFinishReason::Failed(response_failed_event.response));
@@ -586,7 +595,11 @@ impl PartialResponse {
             ResponseIncomplete(response_incomplete_event) => {
                 self.mark_all_finished();
                 if let Some(ref u) = response_incomplete_event.response.usage {
-                    self.usage = Some((u.input_tokens, u.output_tokens));
+                    self.usage = Some((
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.input_tokens_details.cached_tokens,
+                    ));
                 }
                 self.finish_reason = Some(ResponseFinishReason::Incomplete(
                     response_incomplete_event.response,
@@ -862,13 +875,21 @@ mod tests {
                         "model": "test",
                         "object": "response",
                         "output": [],
-                        "status": "completed"
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": 100,
+                            "input_tokens_details": { "cached_tokens": 64 },
+                            "output_tokens": 20,
+                            "output_tokens_details": { "reasoning_tokens": 0 },
+                            "total_tokens": 120
+                        }
                     }))
                     .unwrap(),
                 },
             ),
         );
         assert!(!p.get_message_items()[0].1);
+        assert_eq!(p.usage, Some((100, 20, 64)));
         assert!(p.item_render_revision() > before);
     }
 }
