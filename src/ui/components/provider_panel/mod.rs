@@ -280,6 +280,13 @@ impl ProviderPanel {
                 {
                     config.title_model = None;
                 }
+                if config
+                    .suggestion_model
+                    .as_deref()
+                    .is_some_and(|model| model.starts_with(&format!("{name}/")))
+                {
+                    config.suggestion_model = None;
+                }
                 // Keep default_provider pointing at something that exists.
                 if config.default_provider == name {
                     config.default_provider = Self::sorted_names(config)
@@ -448,6 +455,7 @@ impl ProviderPanel {
                     rename_global_model_provider(&mut config.classifier_model, original, &name);
                     rename_global_model_provider(&mut config.compact_model, original, &name);
                     rename_global_model_provider(&mut config.title_model, original, &name);
+                    rename_global_model_provider(&mut config.suggestion_model, original, &name);
                 }
                 config.providers.insert(
                     name.clone(),
@@ -587,7 +595,7 @@ impl ProviderPanel {
                 PanelAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                *selected = (*selected + 1).min(6);
+                *selected = (*selected + 1).min(8);
                 PanelAction::None
             }
             KeyCode::Enter => {
@@ -601,9 +609,11 @@ impl ProviderPanel {
                     1 => config.classifier_model = Some(qualified),
                     2 => config.compact_model = Some(qualified),
                     3 => config.title_model = Some(qualified),
-                    4 => config.classifier_model = None,
-                    5 => config.compact_model = None,
-                    6 => config.title_model = None,
+                    4 => config.suggestion_model = Some(qualified),
+                    5 => config.classifier_model = None,
+                    6 => config.compact_model = None,
+                    7 => config.title_model = None,
+                    8 => config.suggestion_model = None,
                     _ => unreachable!(),
                 }
                 self.mode = Mode::List;
@@ -957,6 +967,8 @@ impl ProviderPanel {
                         let is_compact =
                             config.compact_model.as_deref() == Some(qualified.as_str());
                         let is_title = config.title_model.as_deref() == Some(qualified.as_str());
+                        let is_suggestion =
+                            config.suggestion_model.as_deref() == Some(qualified.as_str());
                         let mut spans = if f.is_empty() {
                             vec![Span::styled((*m).to_string(), style)]
                         } else {
@@ -1001,6 +1013,12 @@ impl ProviderPanel {
                             spans.push(Span::styled(
                                 "  title",
                                 Style::default().fg(palette::YELLOW),
+                            ));
+                        }
+                        if is_suggestion {
+                            spans.push(Span::styled(
+                                "  suggestion",
+                                Style::default().fg(palette::BLUE),
                             ));
                         }
                         ListItem::new(Line::from(spans))
@@ -1073,9 +1091,11 @@ impl ProviderPanel {
                     "Set as global classifier model",
                     "Set as global compact model",
                     "Set as global title model",
+                    "Set as global suggestion model",
                     "Clear global classifier model",
                     "Clear global compact model",
                     "Clear global title model",
+                    "Clear global suggestion model",
                 ];
                 let items = choices.iter().enumerate().map(|(index, choice)| {
                     let style = if index == *selected {
@@ -1183,6 +1203,7 @@ mod tests {
             classifier_top_logprobs: crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS,
             compact_model: None,
             title_model: None,
+            suggestion_model: None,
             auto_compact_tokens: 100_000,
             compact_keep_recent_turns: 2,
             memory: Default::default(),
@@ -1321,6 +1342,35 @@ mod tests {
             &panel.mode,
             Mode::Models { filter, .. } if filter == "deepseek"
         ));
+    }
+
+    #[test]
+    fn model_role_menu_sets_and_clears_suggestion_model() {
+        let mut config = config_with(&["alpha"]);
+        let pm = pm_stub();
+        let mut panel = ProviderPanel::new();
+        panel.mode = Mode::RoleMenu {
+            provider: "alpha".to_string(),
+            model: "fast".to_string(),
+            selected: 4,
+        };
+
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config, &pm),
+            PanelAction::Saved
+        );
+        assert_eq!(config.suggestion_model.as_deref(), Some("alpha/fast"));
+
+        panel.mode = Mode::RoleMenu {
+            provider: "alpha".to_string(),
+            model: "fast".to_string(),
+            selected: 8,
+        };
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config, &pm),
+            PanelAction::Saved
+        );
+        assert!(config.suggestion_model.is_none());
     }
 
     #[test]

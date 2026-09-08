@@ -24,9 +24,9 @@
 //! never sniffs prefixes.
 
 use super::{
-    agent, ask_user, blob, command, configure_diagnostics, diagnostics, edit_file, fetch, grep,
-    load_skill, mcp_bridge, memory, read_file, read_image, request_permission, run_local_tool,
-    task, todo, write_file,
+    agent, ask_user, blob, command, configure_diagnostics, conversation_history, diagnostics,
+    edit_file, fetch, grep, load_skill, mcp_bridge, memory, read_file, read_image,
+    request_permission, run_local_tool, task, todo, write_file,
 };
 use crate::mcp::McpManager;
 use crate::ui::event::Event;
@@ -182,6 +182,7 @@ pub(crate) struct LocalToolProvider {
     file_scope: u64,
     checkpoint: Option<crate::checkpoint::CheckpointRecorder>,
     memory_enabled: bool,
+    conversation_history: Option<Arc<Mutex<crate::conversation::Conversation>>>,
 }
 
 impl LocalToolProvider {
@@ -195,6 +196,7 @@ impl LocalToolProvider {
             file_scope: 0,
             checkpoint: None,
             memory_enabled: true,
+            conversation_history: None,
         }
     }
 
@@ -209,6 +211,7 @@ impl LocalToolProvider {
             file_scope,
             checkpoint: None,
             memory_enabled: true,
+            conversation_history: None,
         }
     }
 
@@ -222,6 +225,14 @@ impl LocalToolProvider {
 
     pub(crate) fn with_memory_enabled(mut self, enabled: bool) -> Self {
         self.memory_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn with_conversation_history(
+        mut self,
+        conversation: Option<Arc<Mutex<crate::conversation::Conversation>>>,
+    ) -> Self {
+        self.conversation_history = conversation;
         self
     }
 }
@@ -262,6 +273,13 @@ impl ToolProvider for LocalToolProvider {
         ];
         if self.memory_enabled {
             tools.push(memory::tool());
+        }
+        if self
+            .conversation_history
+            .as_ref()
+            .is_some_and(conversation_history::available)
+        {
+            tools.push(conversation_history::tool());
         }
         tools
     }
@@ -323,6 +341,13 @@ impl ToolProvider for LocalToolProvider {
                 .map(FunctionCallOutput::Text)
         } else if call.name == memory::NAME {
             memory::run(&call.arguments)
+                .await
+                .map(FunctionCallOutput::Text)
+        } else if call.name == conversation_history::NAME {
+            let conversation = self.conversation_history.as_ref().ok_or_else(|| {
+                "error: this session has no compacted conversation history".to_string()
+            })?;
+            conversation_history::run(&call.arguments, conversation)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == read_image::NAME {
@@ -604,6 +629,27 @@ mod tests {
         assert!(p.requires_interaction(ask_user::NAME));
         assert!(p.requires_interaction(request_permission::NAME));
         assert!(!p.requires_interaction(read_file::NAME));
+        assert!(!names.contains(&conversation_history::NAME.to_string()));
+    }
+
+    #[test]
+    fn conversation_history_is_advertised_only_after_compaction() {
+        let conversation = Arc::new(Mutex::new(crate::conversation::Conversation::new()));
+        conversation
+            .lock()
+            .unwrap()
+            .add_info_string("archived detail");
+        conversation
+            .lock()
+            .unwrap()
+            .apply_compaction("summary".to_string());
+        let provider = LocalToolProvider::default().with_conversation_history(Some(conversation));
+
+        assert!(provider.tools().iter().any(|tool| matches!(
+            tool,
+            Tool::Function(function) if function.name == conversation_history::NAME
+        )));
+        assert!(provider.is_read_only(conversation_history::NAME));
     }
 
     #[test]

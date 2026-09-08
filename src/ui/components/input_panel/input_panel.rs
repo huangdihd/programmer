@@ -18,6 +18,8 @@ use async_openai::types::responses::InputImageContent;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui_textarea::{CursorMove, Input, TextArea};
 
+const DEFAULT_PLACEHOLDER: &str = "Talk with the programmer…";
+
 #[derive(Debug, Clone)]
 pub struct InputPanel<'a> {
     pub text_area: TextArea<'a>,
@@ -36,6 +38,8 @@ pub struct InputPanel<'a> {
     /// Details shown in the title until the next model turn consumes a freshly
     /// compacted context.
     pub(crate) next_turn_compaction: Option<String>,
+    /// Model-predicted next user message shown as the empty input placeholder.
+    suggestion: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +57,7 @@ impl InputPanel<'_> {
         text_area.set_style(Style::default().fg(Color::White));
         text_area.set_cursor_line_style(Style::default());
         text_area.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
-        text_area.set_placeholder_text("Talk with the programmer…");
+        text_area.set_placeholder_text(DEFAULT_PLACEHOLDER);
         text_area.set_placeholder_style(
             Style::default()
                 .fg(Color::DarkGray)
@@ -69,7 +73,34 @@ impl InputPanel<'_> {
             images: Vec::new(),
             next_image_id: 1,
             next_turn_compaction: None,
+            suggestion: None,
         }
+    }
+
+    pub(crate) fn set_suggestion(&mut self, suggestion: String) {
+        self.text_area.set_placeholder_text(suggestion.clone());
+        self.suggestion = Some(suggestion);
+    }
+
+    pub(crate) fn suggestion(&self) -> Option<&str> {
+        self.suggestion.as_deref()
+    }
+
+    pub(crate) fn clear_suggestion(&mut self) {
+        self.text_area.set_placeholder_text(DEFAULT_PLACEHOLDER);
+        self.suggestion = None;
+    }
+
+    pub(crate) fn accept_suggestion(&mut self) -> bool {
+        if !self.get_content().is_empty() {
+            return false;
+        }
+        let Some(suggestion) = self.suggestion.take() else {
+            return false;
+        };
+        self.text_area.set_placeholder_text(DEFAULT_PLACEHOLDER);
+        self.set_content(&suggestion);
+        true
     }
 
     pub(crate) fn show_next_turn_compaction(&mut self, details: String) {
@@ -268,6 +299,7 @@ impl InputPanel<'_> {
     }
 
     pub fn clear(&mut self) -> bool {
+        self.clear_suggestion();
         self.pastes.clear();
         self.images.clear();
         self.next_image_id = 1;
@@ -277,6 +309,7 @@ impl InputPanel<'_> {
 
     /// Replace the entire content of the text area with `text`.
     pub fn set_content(&mut self, text: &str) {
+        self.clear_suggestion();
         self.text_area.clear();
         self.text_area.insert_str(text);
     }
@@ -374,6 +407,32 @@ mod tests {
 
         assert!(panel.get_content().is_empty());
         assert!(panel.completion.is_none());
+    }
+
+    #[test]
+    fn suggestion_is_accepted_only_into_an_empty_input() {
+        let mut panel = InputPanel::new();
+        panel.set_suggestion("继续修复测试".to_string());
+        assert!(panel.accept_suggestion());
+        assert_eq!(panel.get_content(), "继续修复测试");
+        assert!(!panel.accept_suggestion());
+
+        panel.clear();
+        panel.set_suggestion("删除草稿后恢复".to_string());
+        panel.input(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!panel.accept_suggestion());
+        panel.input(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Backspace,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(
+            panel.accept_suggestion(),
+            "emptying the draft restores the hint"
+        );
+        assert_eq!(panel.get_content(), "删除草稿后恢复");
     }
 
     #[test]

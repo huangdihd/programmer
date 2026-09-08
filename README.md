@@ -93,8 +93,10 @@ Use `--version v0.2.4` with `install.sh`, or `-Version v0.2.4` with
    ```
 
    Use `/init` if you want Programmer to create project guidance and configure
-   diagnostics before making changes. The default Auto mode asks a classifier
-   model to review mutating tool calls; use a non-reasoning model for that role.
+   diagnostics before making changes. If several edits are made before those
+   project artifacts exist, post-edit feedback may remind the agent to suggest
+   `/init` to you. The default Auto mode asks a classifier model to review
+   mutating tool calls; use a non-reasoning model for that role.
 
 If the provider works but the model list is empty, configure `models` and
 `default_model` explicitly in `config.toml`; see
@@ -178,6 +180,10 @@ compact_model = "openai/gpt-4o-mini"
 # back to the current chat model when absent.
 title_model = "openai/gpt-4o-mini"
 
+# Model used after each completed turn to predict the user's next message for
+# the input placeholder. Falls back to the current chat model when absent.
+suggestion_model = "openai/gpt-4o-mini"
+
 # Automatically compact after a response reports at least this many input
 # tokens. This uses provider-reported usage (not an estimate); 0 disables it.
 auto_compact_tokens = 100000
@@ -250,6 +256,7 @@ api_key = "sk-your-key-here"
 | `classifier_top_logprobs` | `20` | Alternative-token count for the fast classifier probe (`0`–`20`). Lower this for providers with a smaller limit; Qwen accepts at most `5`. |
 | `compact_model` | (chat model) | `provider/model` used for manual and automatic context compaction. |
 | `title_model` | (chat model) | `provider/model` used to generate a concise title for each new session. |
+| `suggestion_model` | (chat model) | `provider/model` used after successful turns to predict the next user message shown in the input placeholder. |
 | `auto_compact_tokens` | `100000` | Provider-reported input-token threshold for seamless background compaction. `0` disables it. Providers that do not report usage do not trigger it. |
 | `compact_keep_recent_turns` | `2` | Number of recent complete turns kept verbatim when context is compacted. |
 | `memory.enabled` | `true` | Advertise the persistent-memory tool. Memory is recalled explicitly and is never injected automatically. |
@@ -419,6 +426,8 @@ programmer
 | Key | Action |
 |---|---|
 | `Enter` | Send message |
+| `Right` | Accept the model-generated next-message suggestion when the input is empty; typing hides it, and deleting the draft reveals it again |
+| `Up` | Move a queued message back into the empty input for editing |
 | `Esc` | Cancel the active request; before any model output, restore the original draft to the input |
 | `Ctrl+T` | Cycle work mode (Manual → Auto → Plan → optional YOLO) |
 | `Ctrl+C` / `Ctrl+Q` twice | Quit |
@@ -468,6 +477,7 @@ programmer
 | `/usage` | Show token usage for the session and latest turn |
 | `/new` `/n` | Start a new session (auto-saves current) |
 | `/session` `/s` | Show current session UUID and info |
+| `/title [text]` | Regenerate the current session title, or set it manually when text is provided |
 | `/providers show` | List all configured providers and models |
 | `/providers manage` | Open the provider management panel |
 | `/providers refresh [provider]` | Refetch auto-discovered model lists (optionally for one provider) |
@@ -516,10 +526,15 @@ recovery checkpoint so its file changes can be undone from the same panel.
 Automatic compaction observes the real `input_tokens` returned after every API
 response. For tool-using responses it waits until all call outputs are recorded,
 then summarizes a stable prefix in the background. Input stays usable and new
-messages remain outside that prefix. The input title announces that the next
-turn will use compacted context; when that turn starts, a marker is inserted
-immediately before its messages. A stale summary is discarded after `/clear`,
-`/new`, or `/rewind`.
+messages remain outside that prefix. Once the summary is installed, the session
+is saved immediately when idle (or at the next safe turn boundary), so reopening
+the conversation reuses the generated summary. The input title announces that
+the next turn will use compacted context; when that turn starts, a marker is
+inserted immediately before its messages. The read-only `conversation_history` tool is
+then exposed to the main agent and its sub-agents, allowing them to search the
+exact pre-compaction items and page through a matching message or tool result
+when the summary omits a needed detail. A stale summary is discarded after
+`/clear`, `/new`, or `/rewind`.
 
 **In model browser (`m`):**
 
@@ -658,10 +673,14 @@ classifier, while `manual` waits for you at the console.
 ### Session management
 
 Sessions are saved to `~/.config/programmer/sessions/<uuid>.json`. Conversation
-history, model/work mode, the `/vision` switch, generated title, and todos are
-restored independently for each session. A background request using
+history, model/work mode, the `/vision` switch, generated title, latest input
+suggestion, and todos are restored independently for each session. Completed
+suggestions are saved immediately when idle, so the gray hint is available after
+`--resume` without another model request. A background request using
 `title_model` (or the current chat model) names a new session from its first
-message; the resume picker and `/session` show that title.
+message; the resume picker and `/session` show that title. Once available, the
+generated title also replaces the project directory name in the terminal window
+title; untitled sessions continue to show the directory name.
 
 With `/vision on`, referencing a local PNG, JPEG, WEBP, or non-animated GIF as
 `@path` attaches it as an image input. `/vision off` stops sending both new and
@@ -687,6 +706,7 @@ Terminal emulators generally reserve `Cmd+V` for text paste, so image paste uses
 | `programmer --resume <uuid>` | Resume a specific session |
 | `/new` `/n` | Save current session and start fresh |
 | `/session` `/s` | Show current session UUID |
+| `/title [text]` | Regenerate the current session title, or set it manually |
 | `/usage` | Show session and most recent turn token usage |
 
 ## Project structure

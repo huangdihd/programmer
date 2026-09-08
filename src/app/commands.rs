@@ -206,6 +206,11 @@ async fn start_ready_request(
     )>,
 ) {
     debug_assert!(app.cancel.active_id.is_none());
+    app.active_suggestion_operation_id = None;
+    if let Some(cancel) = app.input_suggestion_cancel.take() {
+        cancel.cancel();
+    }
+    app.input_panel.clear_suggestion();
     let conversation_cutoff = app.conversation_panel.items_snapshot().len();
     let title_source = (app.session.title.is_empty() && !app.session.title_generation_started)
         .then(|| inputs.first().map(|(text, _, _)| text.clone()))
@@ -470,7 +475,7 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
     }
 }
 
-fn maybe_start_session_title(app: &mut App<'_>, first_message: String) {
+fn maybe_start_session_title(app: &mut App<'_>, first_message: String) -> bool {
     use crate::ui::event::{AppEvent, Event};
 
     app.session.title_generation_started = true;
@@ -479,9 +484,11 @@ fn maybe_start_session_title(app: &mut App<'_>, first_message: String) {
         app.conversation_panel.add_warning_string(format!(
             "session title generation skipped: unknown provider/model {target_model}"
         ));
-        return;
+        return false;
     };
     let client = client.clone();
+    app.session.title_generation_id = app.session.title_generation_id.wrapping_add(1);
+    let generation_id = app.session.title_generation_id;
     let session_uuid = app.session.uuid.clone();
     let prompt = format!("{}{first_message}", crate::prompts::SESSION_TITLE_PROMPT);
     let request = async_openai::types::responses::CreateResponse {
@@ -498,9 +505,39 @@ fn maybe_start_session_title(app: &mut App<'_>, first_message: String) {
                 .and_then(|response| normalize_session_title(&response.summary));
         let _ = sender.send(Event::App(AppEvent::SessionTitleGenerated {
             session_uuid,
+            generation_id,
             result,
         }));
     });
+    true
+}
+
+pub(in crate::app) fn set_or_regenerate_session_title(app: &mut App<'_>, requested: &str) {
+    if !requested.trim().is_empty() {
+        let Ok(title) = normalize_session_title(requested) else {
+            app.conversation_panel
+                .add_warning_string("session title cannot be empty");
+            return;
+        };
+        app.session.title_generation_id = app.session.title_generation_id.wrapping_add(1);
+        app.session.title_generation_started = true;
+        app.session.title = title.clone();
+        session::mark_dirty(app);
+        app.conversation_panel
+            .add_info_string(format!("Session title set to: {title}"));
+        return;
+    }
+
+    let items = app.conversation_panel.items_snapshot();
+    let Some(first_message) = super::helpers::first_user_text(&items) else {
+        app.conversation_panel
+            .add_warning_string("cannot generate a title before the first user message");
+        return;
+    };
+    if maybe_start_session_title(app, first_message) {
+        app.conversation_panel
+            .add_info_string("Regenerating session title…");
+    }
 }
 
 fn normalize_session_title(response: &str) -> Result<String, String> {
@@ -515,6 +552,78 @@ fn normalize_session_title(response: &str) -> Result<String, String> {
         Err("the model returned an empty title".to_string())
     } else {
         Ok(title.chars().take(80).collect())
+    }
+}
+
+pub(super) fn maybe_start_input_suggestion(app: &mut App<'_>, operation_id: u64) {
+    use async_openai::types::responses::{InputItem, InputParam, Item};
+
+    if !app.input_panel.get_content().is_empty() || app.cancel.active_id.is_some() {
+        return;
+    }
+    let target_model = app.effective_suggestion_model();
+    let Some((client, model_name)) = app.provider_manager.resolve(&target_model) else {
+        return;
+    };
+    let mut input =
+        match app
+            .conversation_panel
+            .get_input_param(&target_model, None, None, None, false)
+        {
+            InputParam::Items(items) => items,
+            InputParam::Text(text) => vec![InputItem::from(Item::Message(ApiMessageItem::Input(
+                InputMessage {
+                    content: vec![InputContent::InputText(InputTextContent { text })],
+                    role: InputRole::User,
+                    status: Some(OutputStatus::Completed),
+                },
+            )))],
+        };
+    input.push(InputItem::from(Item::Message(ApiMessageItem::Input(
+        InputMessage {
+            content: vec![InputContent::InputText(InputTextContent {
+                text: crate::prompts::INPUT_SUGGESTION_PROMPT.to_string(),
+            })],
+            role: InputRole::User,
+            status: Some(OutputStatus::Completed),
+        },
+    ))));
+
+    app.active_suggestion_operation_id = Some(operation_id);
+    let cancel = crate::cancel::CancellationToken::new();
+    app.input_suggestion_cancel = Some(cancel.clone());
+    let request = async_openai::types::responses::CreateResponse {
+        input: InputParam::Items(input),
+        model: Some(model_name),
+        max_output_tokens: Some(120),
+        ..Default::default()
+    };
+    let client = client.clone();
+    let session_uuid = app.session.uuid.clone();
+    let sender = app.events.sender.clone();
+    tokio::spawn(async move {
+        let result = stream_compact_response(&client, request, cancel)
+            .await
+            .and_then(|response| normalize_input_suggestion(&response.summary));
+        let _ = sender.send(Event::App(AppEvent::InputSuggestionGenerated {
+            session_uuid,
+            operation_id,
+            result,
+        }));
+    });
+}
+
+fn normalize_input_suggestion(response: &str) -> Result<String, String> {
+    let suggestion = response
+        .trim()
+        .trim_matches(['"', '\'', '“', '”'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if suggestion.is_empty() {
+        Err("the model returned an empty input suggestion".to_string())
+    } else {
+        Ok(suggestion.chars().take(240).collect())
     }
 }
 
@@ -892,6 +1001,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         | Command::Clear
         | Command::New
         | Command::Session
+        | Command::Title(_)
         | Command::Usage
         | Command::Rewind
         | Command::Todo
@@ -926,8 +1036,8 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
 mod tests {
     use super::{
         ConversationPanel, build_compact_request, execute_command, format_agent_updates,
-        format_task_updates, normalize_session_title, ordered_message_content,
-        queue_pending_request,
+        format_task_updates, normalize_input_suggestion, normalize_session_title,
+        ordered_message_content, queue_pending_request,
     };
     use async_openai::types::responses::{ImageDetail, InputContent, InputImageContent};
     use std::sync::Arc;
@@ -980,6 +1090,7 @@ mod tests {
                 "/session",
                 ExpectedCommandEffect::AppendedMessage,
             ),
+            ("title", "/title", ExpectedCommandEffect::AppendedMessage),
             ("usage", "/usage", ExpectedCommandEffect::AppendedMessage),
             ("rewind", "/rewind", ExpectedCommandEffect::AppendedMessage),
             ("mode", "/mode auto", ExpectedCommandEffect::AppendedMessage),
@@ -1092,6 +1203,17 @@ mod tests {
         assert!(auto.reasoning.is_none());
     }
 
+    #[tokio::test]
+    async fn title_command_sets_a_manual_title() {
+        let mut app = command_test_app().await;
+
+        execute_command(&mut app, "/title  Fix queued editing  ").await;
+
+        assert_eq!(app.session.title, "Fix queued editing");
+        assert!(app.session.title_generation_started);
+        assert_eq!(app.session.title_generation_id, 1);
+    }
+
     #[test]
     fn generated_session_title_is_cleaned_and_bounded() {
         assert_eq!(
@@ -1108,6 +1230,22 @@ mod tests {
                 .chars()
                 .count(),
             80
+        );
+    }
+
+    #[test]
+    fn generated_input_suggestion_is_cleaned_and_bounded() {
+        assert_eq!(
+            normalize_input_suggestion("  “继续  修复测试”\n  ").unwrap(),
+            "继续 修复测试"
+        );
+        assert!(normalize_input_suggestion("  \n ").is_err());
+        assert_eq!(
+            normalize_input_suggestion(&"x".repeat(300))
+                .unwrap()
+                .chars()
+                .count(),
+            240
         );
     }
 

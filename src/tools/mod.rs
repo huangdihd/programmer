@@ -18,6 +18,7 @@ pub mod ask_user;
 pub mod blob;
 pub mod command;
 pub mod configure_diagnostics;
+pub mod conversation_history;
 pub mod diagnostics;
 pub mod edit_file;
 pub mod fetch;
@@ -119,7 +120,7 @@ pub fn environment_info() -> String {
         .or_else(|_| std::env::var("LC_ALL"))
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let mut info = format!(
+    format!(
         "# Environment info\n\
          - Operating system: {os} ({arch})\n\
          - Shell for the `command` tool: {shell}\n\
@@ -130,25 +131,7 @@ pub fn environment_info() -> String {
         shell = program,
         cwd = cwd,
         locale = locale,
-    );
-
-    // Point the model at project resources without spending tokens on their
-    // contents — it can read them on demand when relevant.
-    if std::path::Path::new("PROGRAMMER.md").exists() {
-        info.push_str(
-            "\n- A project overview exists at PROGRAMMER.md — read it with \
-             read_file when you need project context.",
-        );
-    }
-    if std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
-        info.push_str(
-            "\n- A diagnostics profile is configured; edits are checked \
-             automatically. Re-run setup any time with the /init flow or by \
-             calling configure_diagnostics.",
-        );
-    }
-
-    info
+    )
 }
 
 // The advertised tool list is now assembled by the `provider` layer: the
@@ -317,7 +300,12 @@ pub(crate) fn mcp_server_tools() -> Vec<Tool> {
 pub(crate) fn is_read_only_builtin(name: &str) -> bool {
     matches!(
         name,
-        read_file::NAME | read_image::NAME | grep::NAME | blob::NAME | fetch::NAME
+        read_file::NAME
+            | read_image::NAME
+            | grep::NAME
+            | blob::NAME
+            | fetch::NAME
+            | conversation_history::NAME
     )
 }
 
@@ -450,6 +438,13 @@ fn function_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_info_does_not_encode_project_initialization_state() {
+        let info = environment_info();
+        assert!(!info.contains("PROGRAMMER.md"));
+        assert!(!info.contains("diagnostics profile"));
+    }
 
     #[tokio::test]
     async fn command_runs_and_captures_output() {

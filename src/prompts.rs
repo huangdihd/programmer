@@ -87,6 +87,9 @@ responses rendered in a terminal UI, so keep output compact.
   use the `memory` tool when it is available. Do not merely claim it was saved.
 - Before writing, check relevant existing memories. Update an existing entry
   when it represents the same fact instead of creating a duplicate.
+- If you encounter an error and do not know how to resolve it, recall relevant
+  memory before asking the user. Ask only if memory does not provide a workable
+  answer and user input is still necessary.
 - Keep each entry atomic and independently updateable. If the material combines
   unrelated subjects, scopes, or lifecycles, make multiple `remember` calls.
 - Choose the narrowest valid scope. Use `global` only for information reusable
@@ -225,6 +228,12 @@ message. Use the same language as the message when practical. Keep it under \
 50 characters, do not end with punctuation, and output only the title with no \
 quotes or explanation.\n\nFirst message:\n";
 
+pub(crate) const INPUT_SUGGESTION_PROMPT: &str = "\
+Predict the single most likely next message the user would type in this coding \
+conversation. Write it from the user's perspective, in the language they have \
+been using. Keep it concise and actionable. Output only the suggested message, \
+with no quotes, label, or explanation.";
+
 // ---------------------------------------------------------------------------
 // /compact — context compaction
 // ---------------------------------------------------------------------------
@@ -261,3 +270,19 @@ pub(crate) const OVERVIEW_REMINDER: &str = "Reminder: several edits have \
     build/test commands, directory layout, or conventions have changed, update \
     PROGRAMMER.md now with write_file so it stays an accurate map for future \
     sessions. If nothing meaningful changed, ignore this.";
+
+pub(crate) const INIT_REMINDER: &str = "Reminder: several file edits have been \
+    made, but this project does not appear to have been initialized for \
+    Programmer. Briefly tell the user they can run `/init` to create \
+    PROGRAMMER.md and configure project diagnostics. Do not run `/init` unless \
+    the user explicitly asks.";
+
+#[cfg(test)]
+mod tests {
+    use super::SYSTEM_PROMPT;
+
+    #[test]
+    fn unknown_errors_trigger_memory_recall_before_user_questions() {
+        assert!(SYSTEM_PROMPT.contains("recall relevant\n  memory before asking the user"));
+    }
+}

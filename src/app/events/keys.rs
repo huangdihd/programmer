@@ -373,6 +373,11 @@ pub(crate) async fn handle_key_events(
             }
             update_completions(app);
         }
+        KeyCode::Right
+            if key_event.modifiers == KeyModifiers::NONE && app.input_panel.accept_suggestion() =>
+        {
+            update_completions(app);
+        }
         KeyCode::PageUp => {
             app.conversation_panel.scroll_page_up();
         }

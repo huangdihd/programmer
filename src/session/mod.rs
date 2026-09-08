@@ -201,6 +201,9 @@ pub(crate) struct Session {
     /// Input history (most recent last).
     #[serde(default)]
     pub(crate) history: Vec<String>,
+    /// Latest model-predicted next message, restored as the empty-input hint.
+    #[serde(default)]
+    pub(crate) input_suggestion: Option<String>,
     /// Work mode in effect when the session was last saved, restored on resume.
     #[serde(default)]
     pub(crate) work_mode: Option<crate::classifier::WorkMode>,
@@ -296,6 +299,7 @@ impl SessionManager {
             items: Vec::new(),
             session_memory: None,
             history: Vec::new(),
+            input_suggestion: None,
             work_mode: None,
             current_model: None,
             vision_enabled: false,
@@ -895,6 +899,22 @@ mod tests {
     }
 
     #[test]
+    fn older_sessions_load_without_an_input_suggestion() {
+        let sessions_dir =
+            std::env::temp_dir().join(format!("programmer-session-test-{}", uuid_v4()));
+        let mgr = SessionManager { sessions_dir };
+        let mut value = serde_json::to_value(mgr.create()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("input_suggestion")
+            .unwrap();
+
+        let loaded: Session = serde_json::from_value(value).unwrap();
+        assert!(loaded.input_suggestion.is_none());
+    }
+
+    #[test]
     fn legacy_sessions_have_no_explicit_skill_selection() {
         let sessions_dir =
             std::env::temp_dir().join(format!("programmer-session-test-{}", uuid_v4()));
@@ -921,6 +941,7 @@ mod tests {
         let mut first = mgr.create();
         first.vision_enabled = true;
         first.thinking_level = crate::thinking::ThinkingLevel::High;
+        first.input_suggestion = Some("continue first session".to_string());
         let mut first_todos = crate::todos::TodoList::default();
         first_todos.add("first session only".to_string(), None);
         first.todos = first_todos.todos;
@@ -949,6 +970,11 @@ mod tests {
         );
         assert_eq!(loaded_first.todos[0].title, "first session only");
         assert_eq!(loaded_second.todos[0].title, "second session only");
+        assert_eq!(
+            loaded_first.input_suggestion.as_deref(),
+            Some("continue first session")
+        );
+        assert!(loaded_second.input_suggestion.is_none());
 
         std::fs::remove_dir_all(sessions_dir).unwrap();
     }

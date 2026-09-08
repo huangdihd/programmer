@@ -111,6 +111,13 @@ pub enum AppEvent {
     /// Background generation of the current session's display title finished.
     SessionTitleGenerated {
         session_uuid: String,
+        generation_id: u64,
+        result: Result<String, String>,
+    },
+    /// Background prediction of the next user message finished.
+    InputSuggestionGenerated {
+        session_uuid: String,
+        operation_id: u64,
         result: Result<String, String>,
     },
     /// A background process entered a terminal state.
@@ -248,9 +255,20 @@ impl std::fmt::Debug for AppEvent {
             Self::SessionTitleGenerated {
                 session_uuid,
                 result,
+                ..
             } => f
                 .debug_struct("SessionTitleGenerated")
                 .field("session_uuid", session_uuid)
+                .field("result", &result.as_ref().map(|_| ".."))
+                .finish(),
+            Self::InputSuggestionGenerated {
+                session_uuid,
+                operation_id,
+                result,
+            } => f
+                .debug_struct("InputSuggestionGenerated")
+                .field("session_uuid", session_uuid)
+                .field("operation_id", operation_id)
                 .field("result", &result.as_ref().map(|_| ".."))
                 .finish(),
             Self::TaskStateChanged(event) => f

@@ -20,6 +20,10 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::Clear => clear(app),
         Command::New => new(app),
         Command::Session => show_session(app),
+        Command::Title(title) => {
+            commands::set_or_regenerate_session_title(app, &title);
+            CommandOutcome::handled(true)
+        }
         Command::Usage => usage(app),
         Command::Rewind => rewind(app),
         Command::Todo => {
@@ -158,6 +162,11 @@ fn clear(app: &mut App<'_>) -> CommandOutcome {
 
 fn new(app: &mut App<'_>) -> CommandOutcome {
     commands::invalidate_auto_compaction(app);
+    app.active_suggestion_operation_id = None;
+    if let Some(cancel) = app.input_suggestion_cancel.take() {
+        cancel.cancel();
+    }
+    app.input_panel.clear_suggestion();
     session::save_session(app);
     app.conversation_panel.clear_messages();
     diagnostics::reset_diagnostics_state(app);
@@ -176,6 +185,7 @@ fn new(app: &mut App<'_>) -> CommandOutcome {
     app.current_checkpoint_id = None;
     app.session.title.clear();
     app.session.title_generation_started = false;
+    app.session.title_generation_id = app.session.title_generation_id.wrapping_add(1);
     app.todo_list = crate::todos::TodoList::default();
     app.sync_todos_to_store();
     app.vision_enabled = false;

@@ -375,6 +375,7 @@ pub(crate) struct AgentRuntime {
     pub(crate) skill_prompt: Option<String>,
     pub(crate) approval_label: String,
     pub(crate) checkpoint: Option<crate::checkpoint::CheckpointRecorder>,
+    pub(crate) conversation_history: Option<Arc<Mutex<crate::conversation::Conversation>>>,
 }
 
 impl AgentRuntime {
@@ -418,7 +419,8 @@ impl AgentRuntime {
                     file_scope,
                 )
                 .with_checkpoint(self.checkpoint.clone())
-                .with_memory_enabled(self.memory_config.enabled),
+                .with_memory_enabled(self.memory_config.enabled)
+                .with_conversation_history(self.conversation_history.clone()),
             ),
             Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
         ];

@@ -6,15 +6,16 @@
 connects to OpenAI-compatible APIs (Responses API), streams responses, and
 gives the model local tools including `command`, `read_file`, `write_file`,
 `edit_file`, `grep`, `blob`, `ask_user`, `configure_diagnostics`, `fetch`,
-`task`, `todo`, `memory`, and `agent`,
+`task`, `todo`, `memory`, `conversation_history`, and `agent`,
 plus MCP-bridged external tools. The TUI is built with Ratatui and crossterm.
 The binary is a single crate at the repo root.
 
 Key features beyond the chat loop:
 - **Multi-provider**: add/edit/delete/switch API backends at runtime.
 - **Multi-session**: UUID-keyed JSON persistence in `~/.config/programmer/sessions/`.
+- **Input suggestions**: after successful turns, a configurable model predicts the next user message as an accept-with-Right placeholder.
 - **Rewind checkpoints**: prompt-level conversation checkpoints plus content-addressed snapshots for built-in file edits.
-- **Context compaction**: manual and provider-usage-triggered background summaries with session overrides and a parsed structured working-state snapshot.
+- **Context compaction**: manual and provider-usage-triggered background summaries with session overrides, immediate safe-boundary persistence for generated summaries, a parsed structured working-state snapshot, and read-only search/paging over exact pre-compaction items.
 - **Persistent memory**: explicit-only bounded lexical recall over inspectable global/project JSON stores, with no automatic request injection, explicit memory management, and credential rejection.
 - **Auto-mode classifier**: per-mode LLM classifier that approves/denies/defers tool calls.
 - **MCP (Model Context Protocol)**: connect to external MCP servers (stdio + HTTP);
@@ -156,6 +157,7 @@ src/
 │   ├── blob.rs               #   File glob (find by name pattern)
 │   ├── ask_user.rs           #   Prompt user for input (yes/no, multi-choice, text)
 │   ├── configure_diagnostics.rs  # Write .programmer/diagnostics.toml
+│   ├── conversation_history.rs   # Search/page exact items hidden by compaction
 │   ├── diagnostics.rs        #   Run diagnostics + return current errors/warnings
 │   ├── fetch.rs              #   HTTP fetch (html2text conversion)
 │   ├── task.rs               #   Background task management (create/list/output/write/wait/kill)
@@ -221,7 +223,7 @@ src/
 - **Error handling:** `color_eyre::Result<T>` throughout; `.wrap_err()` for context; `?` propagation. `thiserror` for library-style error types.
 - **Async:** `#[tokio::main]` on `main()`, `tokio::spawn` for concurrent tasks. All tool execution is async.
 - **Configuration:** `ProgrammerConfig` deserializes from TOML via the `config` crate. Environment variables prefixed with `Programmer` override file values. Config lives at `~/.config/programmer/config.toml`. The optional top-level `soul` value replaces only the identity/mindset section of the developer prompt.
-- **Sessions:** Stored as JSON at `~/.config/programmer/sessions/<uuid>.json`. Each session contains message items, history, todos, and persisted task state.
+- **Sessions:** Stored as JSON at `~/.config/programmer/sessions/<uuid>.json`. Each session contains message items, history, the latest input suggestion, todos, and persisted task state.
 - **Module visibility:** `pub(crate)` for internal visibility; `pub` only where needed externally. UI internals are `mod` (private). Tool modules are `pub` within `tools/`.
 - **Tests:** Inline `#[cfg(test)]` modules at the bottom of source files. No separate `tests/` directory.
 - **Copyright header:** GPL-3.0-or-later header block on every `.rs` file.
@@ -229,6 +231,6 @@ src/
 - **No `unwrap()` in production code:** Prefer `?`, `.unwrap_or_default()`, or explicit `match`.
 - **The diagnostics system** is language-agnostic: it reads `.programmer/diagnostics.toml` for checker definitions. Each checker can be a one-shot command (parsed via `rustc-json`, `tsc`, `gnu`, or regex) or an LSP server (`kind = "lsp"`). The `configure_diagnostics` tool writes this file.
 - **Constants** live in `src/consts.rs` — tunable values like output length limits, concurrency caps, tick rate, and classifier budgets.
-- **Prompts** are centralised in `src/prompts.rs`: system prompt, classifier instructions, and plan-mode injection.
+- **Prompts** are centralised in `src/prompts.rs`: system prompt, classifier instructions, plan-mode injection, and post-edit reminders. Project initialization state is kept out of the system prompt for cache stability; periodic runner hooks surface `/init` guidance after edits when its artifacts are missing.
 - **MCP integration** supports both stdio and HTTP transports. Tools are prefixed `mcp__<server>__<tool>` and merged into the advertised tool list.
 - **Skills** are compiled from `src/skills/builtin/<name>/SKILL.md` or discovered from `~/.agents/skills/<name>/SKILL.md` (shared), the platform config directory's `programmer/skills/<name>/SKILL.md` (global), and `.programmer/skills/<name>/SKILL.md` (project). Precedence is project > global > shared > built-in.
