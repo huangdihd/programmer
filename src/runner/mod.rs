@@ -85,6 +85,7 @@ pub(crate) struct TurnRunner {
     /// read-only / interaction metadata, and call routing.
     pub tools: Arc<crate::tools::provider::ToolRegistry>,
     pub policy: RunnerPolicy,
+    pub soul: Option<String>,
     pub coauthor: Option<String>,
     /// Include stored image parts in API requests. When false, the conversation
     /// preserves them but sends textual placeholders instead.
@@ -121,7 +122,7 @@ pub(crate) struct DiagnosticsState {
 pub struct TurnResult {
     pub final_text: String,
     #[allow(dead_code)]
-    pub usage: (u32, u32),
+    pub usage: (u32, u32, u32),
 }
 
 /// Why a turn could not complete.
@@ -260,6 +261,7 @@ impl TurnRunner {
             let req = {
                 let ctx = request::SystemContext {
                     current_model: &self.model_str,
+                    soul: self.soul.as_deref(),
                     skill_prompt: skill_prompt.as_deref(),
                     plan_prompt: surface.plan_prompt(),
                     coauthor: self.coauthor.as_deref(),
@@ -321,8 +323,8 @@ impl TurnRunner {
                 for item in items {
                     conv.add_output(item);
                 }
-                if let Some((input, output)) = usage {
-                    conv.add_usage(input, output);
+                if let Some((input, output, cached)) = usage {
+                    conv.add_usage(input, output, cached);
                 }
             }
             // Committed to the shared conversation: tell a live renderer to drop
@@ -335,7 +337,7 @@ impl TurnRunner {
 
             // ---- no tool calls → the turn is done ----
             if calls.is_empty() {
-                if let Some((input_tokens, _)) = usage {
+                if let Some((input_tokens, _, _)) = usage {
                     surface.on_event(RunnerEvent::UsageSafePoint { input_tokens });
                 }
                 let usage = conversation.lock().unwrap().accumulated_usage;
@@ -412,7 +414,7 @@ impl TurnRunner {
                         )
                         .await;
                     }
-                    if let Some((input_tokens, _)) = usage {
+                    if let Some((input_tokens, _, _)) = usage {
                         surface.on_event(RunnerEvent::UsageSafePoint { input_tokens });
                     }
                 }
@@ -753,6 +755,7 @@ mod tests {
                 std::sync::Arc::new(crate::tools::provider::LocalToolProvider::default()),
             ])),
             policy: RunnerPolicy::Yolo,
+            soul: None,
             coauthor: None,
             vision_enabled: true,
             thinking_level: crate::thinking::ThinkingLevel::Auto,
@@ -1024,6 +1027,7 @@ mod tests {
                 std::sync::Arc::new(crate::tools::provider::LocalToolProvider::default()),
             ])),
             policy: RunnerPolicy::Sync(policy_mode.classifier()),
+            soul: None,
             coauthor: None,
             vision_enabled: true,
             thinking_level: crate::thinking::ThinkingLevel::Auto,

@@ -23,18 +23,24 @@ use crate::ui::markdown_theme::palette;
 pub struct UsageMessage {
     input_tokens: u32,
     output_tokens: u32,
+    cached_input_tokens: u32,
 }
 
 impl UsageMessage {
-    pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
+    pub fn new(input_tokens: u32, output_tokens: u32, cached_input_tokens: u32) -> Self {
         Self {
             input_tokens,
             output_tokens,
+            cached_input_tokens,
         }
     }
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
         let total = self.input_tokens + self.output_tokens;
+        let cached_percent = u64::from(self.cached_input_tokens)
+            .saturating_mul(100)
+            .checked_div(u64::from(self.input_tokens))
+            .unwrap_or(0);
 
         Paragraph::new(Line::from(vec![
             Span::styled("↳  ", Style::new().fg(palette::FAINT)),
@@ -43,6 +49,15 @@ impl UsageMessage {
                 Style::new().fg(palette::CYAN),
             ),
             Span::styled(" input", Style::new().fg(palette::MUTED)),
+            Span::styled("  ·  ", Style::new().fg(palette::FAINT)),
+            Span::styled(
+                self.cached_input_tokens.to_string(),
+                Style::new().fg(palette::CYAN),
+            ),
+            Span::styled(
+                format!(" cached ({cached_percent}%)"),
+                Style::new().fg(palette::MUTED),
+            ),
             Span::styled("  ·  ", Style::new().fg(palette::FAINT)),
             Span::styled(
                 self.output_tokens.to_string(),
@@ -66,9 +81,9 @@ mod tests {
 
     #[test]
     fn usage_is_a_compact_borderless_summary() {
-        let area = Rect::new(0, 0, 60, 1);
+        let area = Rect::new(0, 0, 80, 1);
         let mut buffer = Buffer::empty(area);
-        UsageMessage::new(13, 7)
+        UsageMessage::new(13, 7, 5)
             .into_paragraph()
             .render(area, &mut buffer);
 
@@ -77,7 +92,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.starts_with("↳  13 input  ·  7 output  ·  20 total tokens"));
+        assert!(
+            rendered.starts_with("↳  13 input  ·  5 cached (38%)  ·  7 output  ·  20 total tokens")
+        );
         assert!(!rendered.contains('│'));
     }
 }

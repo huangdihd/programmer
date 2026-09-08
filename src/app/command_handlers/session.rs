@@ -63,9 +63,14 @@ fn show_session(app: &mut App<'_>) -> CommandOutcome {
     let message = match &app.session.mgr {
         Some(manager) => {
             let path = manager.session_path(&app.session.uuid);
-            format_session_info(item_count, &app.session.uuid, Some((&path, path.exists())))
+            format_session_info(
+                item_count,
+                &app.session.uuid,
+                &app.session.title,
+                Some((&path, path.exists())),
+            )
         }
-        None => format_session_info(item_count, &app.session.uuid, None),
+        None => format_session_info(item_count, &app.session.uuid, &app.session.title, None),
     };
     app.conversation_panel.add_info_string(message);
     CommandOutcome::handled(true)
@@ -74,8 +79,14 @@ fn show_session(app: &mut App<'_>) -> CommandOutcome {
 fn format_session_info(
     item_count: usize,
     uuid: &str,
+    title: &str,
     session_file: Option<(&std::path::Path, bool)>,
 ) -> String {
+    let title_line = if title.is_empty() {
+        String::new()
+    } else {
+        format!("\n  title: {title}")
+    };
     match session_file {
         Some((path, exists)) => {
             let status = if exists {
@@ -84,11 +95,13 @@ fn format_session_info(
                 "not yet saved"
             };
             format!(
-                "Session: {item_count} messages, {status}\n  uuid: {uuid}\n  path: {}",
+                "Session: {item_count} messages, {status}{title_line}\n  uuid: {uuid}\n  path: {}",
                 path.display()
             )
         }
-        None => format!("Session: {item_count} messages (no session manager)\n  uuid: {uuid}"),
+        None => format!(
+            "Session: {item_count} messages (no session manager){title_line}\n  uuid: {uuid}"
+        ),
     }
 }
 
@@ -99,20 +112,32 @@ fn usage(app: &mut App<'_>) -> CommandOutcome {
     CommandOutcome::handled(true)
 }
 
+fn cache_percent(cached_tokens: u64, input_tokens: u64) -> u64 {
+    cached_tokens
+        .saturating_mul(100)
+        .checked_div(input_tokens)
+        .unwrap_or(0)
+}
+
 fn format_usage(summary: crate::conversation::UsageSummary) -> String {
     match summary.last_turn {
-        Some((last_input, last_output)) => format!(
+        Some((last_input, last_output, last_cached)) => format!(
             "Token usage for this session:\n\
              \u{20} input: {} tokens\n\
+             \u{20} cached input: {} tokens ({}%)\n\
              \u{20} output: {} tokens\n\
              \u{20} total: {} tokens\n\
              \u{20} recorded turns: {}\n\
-             Last turn: {} input + {} output = {} tokens",
+             Last turn: {} input ({} cached, {}%) + {} output = {} tokens",
             summary.input_tokens,
+            summary.cached_input_tokens,
+            cache_percent(summary.cached_input_tokens, summary.input_tokens),
             summary.output_tokens,
             summary.total_tokens(),
             summary.turns,
             last_input,
+            last_cached,
+            cache_percent(u64::from(last_cached), u64::from(last_input)),
             last_output,
             u64::from(last_input) + u64::from(last_output),
         ),
@@ -149,6 +174,8 @@ fn new(app: &mut App<'_>) -> CommandOutcome {
     app.checkpoint_store = crate::checkpoint::CheckpointStore::for_session(&app.session.uuid)
         .map(|store| std::sync::Arc::new(std::sync::Mutex::new(store)));
     app.current_checkpoint_id = None;
+    app.session.title.clear();
+    app.session.title_generation_started = false;
     app.todo_list = crate::todos::TodoList::default();
     app.sync_todos_to_store();
     app.vision_enabled = false;
@@ -186,19 +213,20 @@ mod tests {
         let message = format_session_info(
             7,
             "session-uuid",
+            "Fix login retries",
             Some((Path::new("/tmp/session-uuid.json"), true)),
         );
 
         assert_eq!(
             message,
-            "Session: 7 messages, saved on disk\n  uuid: session-uuid\n  path: /tmp/session-uuid.json"
+            "Session: 7 messages, saved on disk\n  title: Fix login retries\n  uuid: session-uuid\n  path: /tmp/session-uuid.json"
         );
     }
 
     #[test]
     fn session_info_handles_unavailable_session_manager() {
         assert_eq!(
-            format_session_info(0, "session-uuid", None),
+            format_session_info(0, "session-uuid", "", None),
             "Session: 0 messages (no session manager)\n  uuid: session-uuid"
         );
     }
@@ -208,15 +236,17 @@ mod tests {
         let message = format_usage(UsageSummary {
             input_tokens: 13,
             output_tokens: 7,
+            cached_input_tokens: 5,
             turns: 2,
-            last_turn: Some((3, 2)),
+            last_turn: Some((3, 2, 2)),
         });
 
         assert!(message.contains("input: 13 tokens"));
+        assert!(message.contains("cached input: 5 tokens (38%)"));
         assert!(message.contains("output: 7 tokens"));
         assert!(message.contains("total: 20 tokens"));
         assert!(message.contains("recorded turns: 2"));
-        assert!(message.contains("Last turn: 3 input + 2 output = 5 tokens"));
+        assert!(message.contains("Last turn: 3 input (2 cached, 66%) + 2 output = 5 tokens"));
     }
 
     #[test]

@@ -26,7 +26,7 @@
 //!
 //! [`ConversationPanel`]: crate::ui::components::conversation_panel::conversation_panel::ConversationPanel
 
-use crate::prompts::SYSTEM_PROMPT;
+use crate::prompts::{DEFAULT_SOUL, SYSTEM_PROMPT};
 use crate::response::message_item::MessageItem;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::MessageItem as ApiMessageItem;
@@ -42,10 +42,10 @@ pub struct Conversation {
     /// Every message in the conversation, in order. Rendered by the panel and
     /// mapped to API input items by [`Conversation::to_input_param`].
     pub(crate) items: Vec<MessageItem>,
-    /// Accumulated token usage `(input, output)` across all responses in the
-    /// current turn (a turn may span multiple responses when tool calls are
-    /// involved). Flushed to a [`MessageItem::Usage`] at turn end.
-    pub accumulated_usage: (u32, u32),
+    /// Accumulated token usage `(input, output, cached input)` across all
+    /// responses in the current turn (a turn may span multiple responses when
+    /// tool calls are involved). Flushed to a [`MessageItem::Usage`] at turn end.
+    pub accumulated_usage: (u32, u32, u32),
     /// Bumped whenever an *existing* item is mutated in place (or the list is
     /// replaced wholesale), as opposed to appended to. The renderer's cache is
     /// keyed by item index, so appends are naturally cache-coherent — this
@@ -59,8 +59,9 @@ pub struct Conversation {
 pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
     pub turns: usize,
-    pub last_turn: Option<(u32, u32)>,
+    pub last_turn: Option<(u32, u32, u32)>,
 }
 
 impl UsageSummary {
@@ -156,6 +157,15 @@ impl Conversation {
 
     pub fn add_info_string(&mut self, message: impl Into<String>) {
         self.items.push(MessageItem::Info(message.into()));
+    }
+
+    /// Insert UI-only information at a stable conversation boundary.
+    pub fn insert_info_string(&mut self, index: usize, message: impl Into<String>) {
+        self.items.insert(
+            index.min(self.items.len()),
+            MessageItem::Info(message.into()),
+        );
+        self.mutation_version = self.mutation_version.wrapping_add(1);
     }
 
     pub fn add_meta(&mut self, label: impl Into<String>, text: impl Into<String>) {
@@ -254,19 +264,43 @@ impl Conversation {
             .then_some(cutoff)
     }
 
+    /// Count the complete request turns replaced by a compaction boundary at
+    /// `cutoff`. Adjacent user/developer inputs belong to the same turn.
+    pub fn compaction_turn_count(&self, cutoff: usize) -> usize {
+        let cutoff = cutoff.min(self.items.len());
+        let start = self.items[..cutoff]
+            .iter()
+            .rposition(|item| matches!(item, MessageItem::Compacted { .. }))
+            .map_or(0, |index| index + 1);
+        let mut turns = 0;
+        let mut in_input_group = false;
+        for item in &self.items[start..cutoff] {
+            let is_request_input = matches!(
+                item,
+                MessageItem::Input(InputItem::Item(Item::Message(ApiMessageItem::Input(_))))
+            );
+            if is_request_input && !in_input_group {
+                turns += 1;
+            }
+            in_input_group = is_request_input;
+        }
+        turns
+    }
+
     /// Build the model input for the stable prefix ending at `cutoff`.
     pub fn input_param_for_prefix(
         &self,
         cutoff: usize,
         current_model: &str,
+        soul: Option<&str>,
         vision_enabled: bool,
     ) -> InputParam {
         let prefix = Conversation {
             items: self.items[..cutoff.min(self.items.len())].to_vec(),
-            accumulated_usage: (0, 0),
+            accumulated_usage: (0, 0, 0),
             mutation_version: 0,
         };
-        prefix.to_input_param_with_vision(current_model, None, None, None, vision_enabled)
+        prefix.to_input_param_with_soul(current_model, soul, None, None, None, vision_enabled)
     }
 
     /// Install a compaction boundary at a snapshotted historical cutoff. New
@@ -281,28 +315,31 @@ impl Conversation {
         true
     }
 
-    pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32) {
+    pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32, cached_input_tokens: u32) {
         self.accumulated_usage.0 += input_tokens;
         self.accumulated_usage.1 += output_tokens;
+        self.accumulated_usage.2 += cached_input_tokens;
     }
 
     pub fn usage_summary(&self) -> UsageSummary {
         let mut summary = UsageSummary::default();
         for item in &self.items {
-            if let MessageItem::Usage(input, output) = item {
+            if let MessageItem::Usage(input, output, cached) = item {
                 summary.input_tokens += u64::from(*input);
                 summary.output_tokens += u64::from(*output);
+                summary.cached_input_tokens += u64::from(*cached);
                 summary.turns += 1;
-                summary.last_turn = Some((*input, *output));
+                summary.last_turn = Some((*input, *output, *cached));
             }
         }
 
-        let (input, output) = self.accumulated_usage;
+        let (input, output, cached) = self.accumulated_usage;
         if input > 0 || output > 0 {
             summary.input_tokens += u64::from(input);
             summary.output_tokens += u64::from(output);
+            summary.cached_input_tokens += u64::from(cached);
             summary.turns += 1;
-            summary.last_turn = Some((input, output));
+            summary.last_turn = Some((input, output, cached));
         }
         summary
     }
@@ -311,10 +348,10 @@ impl Conversation {
     /// counter. Returns whether anything was pushed (so a caller can update its
     /// own view state).
     pub fn flush_usage(&mut self) -> bool {
-        let (input, output) = self.accumulated_usage;
+        let (input, output, cached) = self.accumulated_usage;
         if input > 0 || output > 0 {
-            self.items.push(MessageItem::Usage(input, output));
-            self.accumulated_usage = (0, 0);
+            self.items.push(MessageItem::Usage(input, output, cached));
+            self.accumulated_usage = (0, 0, 0);
             true
         } else {
             false
@@ -323,13 +360,13 @@ impl Conversation {
 
     /// Reset the accumulated usage counter (on /clear, new session, etc.).
     pub fn reset_accumulated_usage(&mut self) {
-        self.accumulated_usage = (0, 0);
+        self.accumulated_usage = (0, 0, 0);
     }
 
     /// Clear all conversation history and usage.
     pub fn clear(&mut self) {
         self.items.clear();
-        self.accumulated_usage = (0, 0);
+        self.accumulated_usage = (0, 0, 0);
         self.mutation_version += 1;
     }
 
@@ -341,7 +378,7 @@ impl Conversation {
 
     pub fn truncate(&mut self, cutoff: usize) {
         self.items.truncate(cutoff);
-        self.accumulated_usage = (0, 0);
+        self.accumulated_usage = (0, 0, 0);
         self.mutation_version = self.mutation_version.wrapping_add(1);
     }
 
@@ -375,8 +412,30 @@ impl Conversation {
         coauthor: Option<&str>,
         vision_enabled: bool,
     ) -> InputParam {
+        self.to_input_param_with_soul(
+            current_model,
+            None,
+            skill_prompt,
+            plan_prompt,
+            coauthor,
+            vision_enabled,
+        )
+    }
+
+    /// Build API input with an optional replacement for Programmer's default
+    /// identity and mindset section.
+    pub fn to_input_param_with_soul(
+        &self,
+        current_model: &str,
+        soul: Option<&str>,
+        skill_prompt: Option<&str>,
+        plan_prompt: Option<&str>,
+        coauthor: Option<&str>,
+        vision_enabled: bool,
+    ) -> InputParam {
+        let soul = soul.map(str::trim).unwrap_or(DEFAULT_SOUL);
         let mut system_prompt = format!(
-            "{SYSTEM_PROMPT}\n\nYou are running as model: {current_model}\n\n{}",
+            "{soul}\n\n{SYSTEM_PROMPT}\n\nYou are running as model: {current_model}\n\n{}",
             crate::tools::environment_info()
         );
         if let Some(coauthor) = coauthor.map(str::trim).filter(|c| !c.is_empty()) {
@@ -687,12 +746,32 @@ mod tests {
     }
 
     #[test]
+    fn info_can_be_inserted_at_the_next_turn_boundary() {
+        let mut conv = Conversation::new();
+        conv.add_info_string("older history");
+        let boundary = conv.items.len();
+        conv.add_input_message(user_message("next prompt"));
+
+        conv.insert_info_string(boundary, "compacted context starts here");
+
+        assert!(matches!(
+            &conv.items[boundary],
+            MessageItem::Info(text) if text == "compacted context starts here"
+        ));
+        assert!(matches!(
+            &conv.items[boundary + 1],
+            MessageItem::Input(InputItem::Item(Item::Message(_)))
+        ));
+        assert_eq!(conv.mutation_version, 1);
+    }
+
+    #[test]
     fn compaction_cutoff_keeps_recent_complete_and_active_turns() {
         let mut conv = Conversation::new();
         for turn in 1..=3 {
             conv.add_input_message(user_message(&format!("turn {turn}")));
             conv.add_output(assistant_text(&format!("answer {turn}")));
-            conv.add_usage(10, 2);
+            conv.add_usage(10, 2, 4);
             conv.flush_usage();
         }
         let stable_end = conv.items.len();
@@ -701,7 +780,10 @@ mod tests {
         let cutoff = conv
             .compaction_cutoff_before(1, stable_end)
             .expect("old prefix");
-        assert!(matches!(conv.items[cutoff - 1], MessageItem::Usage(_, _)));
+        assert!(matches!(
+            conv.items[cutoff - 1],
+            MessageItem::Usage(_, _, _)
+        ));
         assert!(
             conv.items[cutoff..]
                 .iter()
@@ -720,6 +802,19 @@ mod tests {
     }
 
     #[test]
+    fn compaction_turn_count_only_includes_the_replaced_prefix() {
+        let mut conv = Conversation::new();
+        for turn in 1..=3 {
+            conv.add_input_message(user_message(&format!("turn {turn}")));
+            conv.add_output(assistant_text(&format!("answer {turn}")));
+        }
+
+        let cutoff = conv.compaction_cutoff(1).expect("old prefix");
+
+        assert_eq!(conv.compaction_turn_count(cutoff), 2);
+    }
+
+    #[test]
     fn compaction_cutoff_does_not_require_provider_usage() {
         let mut conv = Conversation::new();
         for turn in 1..=3 {
@@ -730,7 +825,7 @@ mod tests {
         let cutoff = conv.compaction_cutoff(1).expect("old prefix");
         let prefix = format!(
             "{:?}",
-            conv.input_param_for_prefix(cutoff, "test/model", false)
+            conv.input_param_for_prefix(cutoff, "test/model", None, false)
         );
         assert!(prefix.contains("turn 1"));
         assert!(prefix.contains("turn 2"));
@@ -960,12 +1055,15 @@ mod tests {
     #[test]
     fn usage_accumulates_and_flushes_once() {
         let mut conv = Conversation::new();
-        conv.add_usage(10, 5);
-        conv.add_usage(3, 2);
-        assert_eq!(conv.accumulated_usage, (13, 7));
+        conv.add_usage(10, 5, 4);
+        conv.add_usage(3, 2, 2);
+        assert_eq!(conv.accumulated_usage, (13, 7, 6));
         assert!(conv.flush_usage());
-        assert_eq!(conv.accumulated_usage, (0, 0));
-        assert!(matches!(conv.items.last(), Some(MessageItem::Usage(13, 7))));
+        assert_eq!(conv.accumulated_usage, (0, 0, 0));
+        assert!(matches!(
+            conv.items.last(),
+            Some(MessageItem::Usage(13, 7, 6))
+        ));
         // A second flush with nothing accumulated pushes nothing.
         assert!(!conv.flush_usage());
     }
@@ -973,17 +1071,18 @@ mod tests {
     #[test]
     fn usage_summary_includes_finished_and_current_turns() {
         let mut conv = Conversation::new();
-        conv.add_usage(10, 5);
+        conv.add_usage(10, 5, 4);
         assert!(conv.flush_usage());
-        conv.add_usage(3, 2);
+        conv.add_usage(3, 2, 2);
 
         assert_eq!(
             conv.usage_summary(),
             UsageSummary {
                 input_tokens: 13,
                 output_tokens: 7,
+                cached_input_tokens: 6,
                 turns: 2,
-                last_turn: Some((3, 2)),
+                last_turn: Some((3, 2, 2)),
             }
         );
         assert_eq!(conv.usage_summary().total_tokens(), 20);

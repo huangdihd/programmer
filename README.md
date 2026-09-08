@@ -156,6 +156,12 @@ api_key = "sk-your-key-here"
 ```toml
 default_provider = "openai"
 
+# Optional replacement for Programmer's built-in identity and mindset section.
+# All environment, safety, tool-use, and editing instructions remain in place.
+soul = """
+You are a thoughtful, direct pair programmer.
+"""
+
 # Separate model for the Auto-mode classifier (faster = better).
 # Falls back to the chat model when absent. Must be a non-reasoning model.
 classifier_model = "openai/gpt-4o-mini"
@@ -167,6 +173,10 @@ classifier_top_logprobs = 20
 # Model used for manual and automatic context compaction. Falls back to the
 # current chat model when absent.
 compact_model = "openai/gpt-4o-mini"
+
+# Model used to generate a concise title from a session's first message. Falls
+# back to the current chat model when absent.
+title_model = "openai/gpt-4o-mini"
 
 # Automatically compact after a response reports at least this many input
 # tokens. This uses provider-reported usage (not an estimate); 0 disables it.
@@ -235,9 +245,11 @@ api_key = "sk-your-key-here"
 | Field | Default | Description |
 |---|---|---|
 | `default_provider` | `"openai"` | Active provider at startup. |
+| `soul` | (built-in identity) | Replaces only Programmer's identity and mindset section in the developer prompt; operational and safety instructions remain active. Supports TOML multiline strings. |
 | `classifier_model` | (chat model) | `provider/model` for the Auto-mode classifier. Must be a **non-reasoning** model (see [Auto mode](#work-modes)). |
 | `classifier_top_logprobs` | `20` | Alternative-token count for the fast classifier probe (`0`–`20`). Lower this for providers with a smaller limit; Qwen accepts at most `5`. |
 | `compact_model` | (chat model) | `provider/model` used for manual and automatic context compaction. |
+| `title_model` | (chat model) | `provider/model` used to generate a concise title for each new session. |
 | `auto_compact_tokens` | `100000` | Provider-reported input-token threshold for seamless background compaction. `0` disables it. Providers that do not report usage do not trigger it. |
 | `compact_keep_recent_turns` | `2` | Number of recent complete turns kept verbatim when context is compacted. |
 | `memory.enabled` | `true` | Advertise the persistent-memory tool. Memory is recalled explicitly and is never injected automatically. |
@@ -504,8 +516,10 @@ recovery checkpoint so its file changes can be undone from the same panel.
 Automatic compaction observes the real `input_tokens` returned after every API
 response. For tool-using responses it waits until all call outputs are recorded,
 then summarizes a stable prefix in the background. Input stays usable and new
-messages remain outside that prefix. A stale summary is discarded after
-`/clear`, `/new`, or `/rewind`.
+messages remain outside that prefix. The input title announces that the next
+turn will use compacted context; when that turn starts, a marker is inserted
+immediately before its messages. A stale summary is discarded after `/clear`,
+`/new`, or `/rewind`.
 
 **In model browser (`m`):**
 
@@ -644,8 +658,10 @@ classifier, while `manual` waits for you at the console.
 ### Session management
 
 Sessions are saved to `~/.config/programmer/sessions/<uuid>.json`. Conversation
-history, model/work mode, the `/vision` switch, and todos are restored
-independently for each session.
+history, model/work mode, the `/vision` switch, generated title, and todos are
+restored independently for each session. A background request using
+`title_model` (or the current chat model) names a new session from its first
+message; the resume picker and `/session` show that title.
 
 With `/vision on`, referencing a local PNG, JPEG, WEBP, or non-animated GIF as
 `@path` attaches it as an image input. `/vision off` stops sending both new and

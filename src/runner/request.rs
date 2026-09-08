@@ -25,6 +25,8 @@ use async_openai::types::responses::{CreateResponse, Tool};
 pub(crate) struct SystemContext<'a> {
     /// The active `provider/model`, named in the system prompt banner.
     pub current_model: &'a str,
+    /// Optional replacement for Programmer's built-in identity and mindset.
+    pub soul: Option<&'a str>,
     /// Combined instructions from active skills, if any.
     pub skill_prompt: Option<&'a str>,
     /// Plan-mode instructions, computed by the TUI; the runner passes `None`.
@@ -45,8 +47,9 @@ pub(crate) fn build_request(
     model_name: String,
     tools: Vec<Tool>,
 ) -> CreateResponse {
-    let input = conversation.to_input_param_with_vision(
+    let input = conversation.to_input_param_with_soul(
         ctx.current_model,
+        ctx.soul,
         ctx.skill_prompt,
         ctx.plan_prompt,
         ctx.coauthor,
@@ -81,6 +84,7 @@ mod tests {
 
         let ctx = SystemContext {
             current_model: "prov/model-x",
+            soul: Some("CUSTOM-SOUL-MARKER"),
             skill_prompt: Some("SKILL-PROMPT-MARKER"),
             plan_prompt: None,
             coauthor: Some("Ada <ada@example.com>"),
@@ -117,6 +121,11 @@ mod tests {
             _ => panic!("developer message should be text"),
         };
         assert!(dev_text.contains("prov/model-x"), "model banner");
+        assert!(dev_text.contains("CUSTOM-SOUL-MARKER"), "custom soul");
+        assert!(
+            !dev_text.contains("You are a collaborator"),
+            "default soul replaced"
+        );
         assert!(
             dev_text.contains("SKILL-PROMPT-MARKER"),
             "skill prompt appended"

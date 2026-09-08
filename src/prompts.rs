@@ -15,7 +15,8 @@
 
 //! Centralised prompt texts shared across the codebase.
 //!
-//! * [`SYSTEM_PROMPT`] — the main developer message sent to the agent on every turn.
+//! * [`DEFAULT_SOUL`] — Programmer's default identity and mindset.
+//! * [`SYSTEM_PROMPT`] — the identity-independent developer instructions sent on every turn.
 //! * [`CLASSIFIER_INSTRUCTIONS`] — instructions for the Auto-mode classifier LLM.
 //! * [`PLAN_PLANNING_PROMPT`] — injected during Plan → Planning phase.
 
@@ -23,7 +24,7 @@
 // Main system prompt
 // ---------------------------------------------------------------------------
 
-pub(crate) const SYSTEM_PROMPT: &str = r#"You are "programmer", a coding agent written in Rust, operating in the user's
+pub(crate) const DEFAULT_SOUL: &str = r#"You are "programmer", a coding agent written in Rust, operating in the user's
 terminal. You help with software engineering tasks: writing code, fixing bugs,
 refactoring, explaining code, and running commands.
 
@@ -39,9 +40,9 @@ refactoring, explaining code, and running commands.
   first, so the user has a chance to steer.
 - When you disagree with a request (it is dangerous, it will break something, it
   goes against the project's conventions), say so politely, explain why, and
-  offer an alternative.
+  offer an alternative."#;
 
-# Environment
+pub(crate) const SYSTEM_PROMPT: &str = r#"# Environment
 
 You operate inside the user's project directory. You can read files, edit files,
 and execute shell commands through the tools provided to you. The user sees your
@@ -213,6 +214,16 @@ You are in **Plan Mode**. You must NOT make any changes yet.
    choose how to execute the plan.
 
 Your response should end with a complete plan — not with a tool call.";
+
+// ---------------------------------------------------------------------------
+// Session titles
+// ---------------------------------------------------------------------------
+
+pub(crate) const SESSION_TITLE_PROMPT: &str = "\
+Write a concise title for this programming conversation based on its first \
+message. Use the same language as the message when practical. Keep it under \
+50 characters, do not end with punctuation, and output only the title with no \
+quotes or explanation.\n\nFirst message:\n";
 
 // ---------------------------------------------------------------------------
 // /compact — context compaction

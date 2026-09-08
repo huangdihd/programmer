@@ -1,6 +1,6 @@
 [package]
 name = "programmer"
-version = "0.2.7"
+version = "0.2.8"
 description = "A coding agent written in rust"
 authors = ["huangdihd <hd20100104@163.com>"]
 license = "GPL-3.0-or-later"

@@ -295,8 +295,13 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 return;
             }
             match result {
-                Ok(summary) => {
-                    if app.conversation_panel.apply_compaction_at(cutoff, summary) {
+                Ok(compaction) => {
+                    let turns = app.conversation_panel.compaction_turn_count(cutoff);
+                    let details = compaction_details(turns, &compaction);
+                    if app
+                        .conversation_panel
+                        .apply_compaction_at(cutoff, compaction.summary)
+                    {
                         if let Some(store) = &app.checkpoint_store
                             && let Err(error) =
                                 store.lock().unwrap().record_conversation_insertion(cutoff)
@@ -305,12 +310,30 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                                 "could not update rewind checkpoints after compaction: {error}"
                             ));
                         }
+                        app.input_panel.show_next_turn_compaction(details);
                         session::mark_dirty(app);
                     }
                 }
                 Err(error) => app
                     .conversation_panel
                     .add_warning_string(format!("automatic context compaction failed: {error}")),
+            }
+        }
+        AppEvent::SessionTitleGenerated {
+            session_uuid,
+            result,
+        } => {
+            if app.session.uuid != session_uuid {
+                return;
+            }
+            match result {
+                Ok(title) => {
+                    app.session.title = title;
+                    session::mark_dirty(app);
+                }
+                Err(error) => app
+                    .conversation_panel
+                    .add_warning_string(format!("session title generation failed: {error}")),
             }
         }
         AppEvent::Quit => handle_quit_request(app),
@@ -675,13 +698,23 @@ fn handle_start_init(app: &mut App<'_>, prompt: String) {
     });
 }
 
+fn compaction_details(turns: usize, compaction: &crate::ui::event::CompactionResult) -> String {
+    let turn_label = if turns == 1 { "turn" } else { "turns" };
+    match (compaction.input_tokens, compaction.output_tokens) {
+        (Some(input), Some(output)) => {
+            format!("{turns} {turn_label}, {input}→{output} tokens")
+        }
+        _ => format!("{turns} {turn_label}"),
+    }
+}
+
 /// `/compact` finished: install the summary as the new context boundary, or
 /// surface the error. Always clears the active operation id and phase so a
 /// cancelled compaction doesn't leave the UI stuck in Cancelling.
 fn handle_compact_finished(
     app: &mut App<'_>,
     cutoff: usize,
-    result: Result<String, String>,
+    result: Result<crate::ui::event::CompactionResult, String>,
     cancel_token: CancellationToken,
 ) {
     app.cancel.active_id = None;
@@ -691,8 +724,10 @@ fn handle_compact_finished(
         return;
     }
     match result {
-        Ok(summary) => {
-            if app.conversation_panel.apply_compaction_at(cutoff, summary)
+        Ok(compaction) => {
+            if app
+                .conversation_panel
+                .apply_compaction_at(cutoff, compaction.summary)
                 && let Some(store) = &app.checkpoint_store
                 && let Err(error) = store.lock().unwrap().record_conversation_insertion(cutoff)
             {

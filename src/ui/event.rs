@@ -44,6 +44,14 @@ pub enum Event {
     App(AppEvent),
 }
 
+/// A completed context-compaction request and its provider-reported token
+/// usage.
+pub struct CompactionResult {
+    pub(crate) summary: String,
+    pub(crate) input_tokens: Option<u32>,
+    pub(crate) output_tokens: Option<u32>,
+}
+
 /// Application events.
 ///
 /// You can extend this enum with your own custom events.
@@ -86,13 +94,23 @@ pub enum AppEvent {
     /// context boundary, `Err` the error to surface. The token identifies the
     /// run so a summary from a cancelled compaction is dropped. Tagged with
     /// the operation id.
-    CompactFinished(u64, usize, Result<String, String>, CancellationToken),
+    CompactFinished(
+        u64,
+        usize,
+        Result<CompactionResult, String>,
+        CancellationToken,
+    ),
     /// A seamless background compaction finished. The job id and history
     /// epoch make stale summaries harmless after clear/rewind/session changes.
     AutoCompactFinished {
         job_id: u64,
         history_epoch: u64,
         cutoff: usize,
+        result: Result<CompactionResult, String>,
+    },
+    /// Background generation of the current session's display title finished.
+    SessionTitleGenerated {
+        session_uuid: String,
         result: Result<String, String>,
     },
     /// A background process entered a terminal state.
@@ -225,6 +243,14 @@ impl std::fmt::Debug for AppEvent {
             Self::AutoCompactFinished { job_id, result, .. } => f
                 .debug_struct("AutoCompactFinished")
                 .field("job_id", job_id)
+                .field("result", &result.as_ref().map(|_| ".."))
+                .finish(),
+            Self::SessionTitleGenerated {
+                session_uuid,
+                result,
+            } => f
+                .debug_struct("SessionTitleGenerated")
+                .field("session_uuid", session_uuid)
                 .field("result", &result.as_ref().map(|_| ".."))
                 .finish(),
             Self::TaskStateChanged(event) => f

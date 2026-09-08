@@ -32,12 +32,16 @@ impl Widget for &InputPanel<'_> {
         let bang = self.get_content().starts_with('!');
         let (title, accent, prompt) = if bang {
             (
-                " ! Shell — runs in the interactive terminal ",
+                " ! Shell — runs in the interactive terminal ".to_string(),
                 BANG_ACCENT,
                 "$ ",
             )
         } else {
-            (" Input ", ACCENT, "❯ ")
+            let title = self.next_turn_compaction.as_ref().map_or_else(
+                || " Input ".to_string(),
+                |details| format!(" Input — next turn uses compacted context · {details} "),
+            );
+            (title, ACCENT, "❯ ")
         };
 
         let block = Block::default()
@@ -93,7 +97,7 @@ mod tests {
     use super::*;
 
     fn render_to_text(panel: &InputPanel<'_>) -> String {
-        let area = Rect::new(0, 0, 60, 5);
+        let area = Rect::new(0, 0, 100, 5);
         let mut buf = Buffer::empty(area);
         panel.render(area, &mut buf);
         (0..area.height)
@@ -122,6 +126,20 @@ mod tests {
         panel.set_content("cargo test");
         let back = render_to_text(&panel);
         assert!(back.contains(" Input "), "back to normal: {back}");
+    }
+
+    #[test]
+    fn compacted_context_is_announced_for_the_next_turn() {
+        let mut panel = InputPanel::new();
+        panel.show_next_turn_compaction("3 turns, 120000→4000 tokens".to_string());
+
+        let rendered = render_to_text(&panel);
+
+        assert!(
+            rendered
+                .contains("Input — next turn uses compacted context · 3 turns, 120000→4000 tokens"),
+            "compaction title: {rendered}"
+        );
     }
 
     #[test]

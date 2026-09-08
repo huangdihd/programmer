@@ -207,6 +207,9 @@ async fn start_ready_request(
 ) {
     debug_assert!(app.cancel.active_id.is_none());
     let conversation_cutoff = app.conversation_panel.items_snapshot().len();
+    let title_source = (app.session.title.is_empty() && !app.session.title_generation_started)
+        .then(|| inputs.first().map(|(text, _, _)| text.clone()))
+        .flatten();
     let user_prompt = inputs
         .iter()
         .find(|(_, role, _)| matches!(role, InputRole::User))
@@ -233,6 +236,9 @@ async fn start_ready_request(
                 role,
                 status: Some(OutputStatus::Completed),
             }));
+    }
+    if let Some(source) = title_source {
+        maybe_start_session_title(app, source);
     }
     app.conversation_panel.reset_accumulated_usage();
     diagnostics::maybe_seed_diagnostics_baseline(app);
@@ -261,6 +267,15 @@ async fn start_ready_request(
             .add_error_string(format!("unknown provider/model: {}", app.current_model));
         return;
     };
+    if let Some(details) = app.input_panel.take_next_turn_compaction() {
+        app.conversation_panel.insert_info_string(
+            conversation_cutoff,
+            format!(
+                "Automatic context compaction — {details} summarized. The model turn below is \
+                 the first to use the compacted context; older history remains visible above."
+            ),
+        );
+    }
     let surface = TuiSurface {
         tx: app.events.sender.clone(),
         skill_prompt: app.skill_registry.catalog_prompt(),
@@ -455,6 +470,54 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
     }
 }
 
+fn maybe_start_session_title(app: &mut App<'_>, first_message: String) {
+    use crate::ui::event::{AppEvent, Event};
+
+    app.session.title_generation_started = true;
+    let target_model = app.effective_title_model();
+    let Some((client, model_name)) = app.provider_manager.resolve(&target_model) else {
+        app.conversation_panel.add_warning_string(format!(
+            "session title generation skipped: unknown provider/model {target_model}"
+        ));
+        return;
+    };
+    let client = client.clone();
+    let session_uuid = app.session.uuid.clone();
+    let prompt = format!("{}{first_message}", crate::prompts::SESSION_TITLE_PROMPT);
+    let request = async_openai::types::responses::CreateResponse {
+        input: async_openai::types::responses::InputParam::Text(prompt),
+        model: Some(model_name),
+        max_output_tokens: Some(80),
+        ..Default::default()
+    };
+    let sender = app.events.sender.clone();
+    tokio::spawn(async move {
+        let result =
+            stream_compact_response(&client, request, crate::cancel::CancellationToken::new())
+                .await
+                .and_then(|response| normalize_session_title(&response.summary));
+        let _ = sender.send(Event::App(AppEvent::SessionTitleGenerated {
+            session_uuid,
+            result,
+        }));
+    });
+}
+
+fn normalize_session_title(response: &str) -> Result<String, String> {
+    let title = response
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim()
+        .trim_matches(['"', '\'', '“', '”'])
+        .trim();
+    if title.is_empty() {
+        Err("the model returned an empty title".to_string())
+    } else {
+        Ok(title.chars().take(80).collect())
+    }
+}
+
 /// Build the no-tools request shared by foreground and background compaction.
 fn build_compact_request(
     input_items: Vec<async_openai::types::responses::InputItem>,
@@ -528,7 +591,7 @@ async fn stream_compact_response(
     client: &async_openai::Client<async_openai::config::OpenAIConfig>,
     request: async_openai::types::responses::CreateResponse,
     cancel: crate::cancel::CancellationToken,
-) -> Result<String, String> {
+) -> Result<crate::ui::event::CompactionResult, String> {
     let mut partial = crate::response::partial_response::PartialResponse::new(cancel.clone());
     let mut stream_error = None;
     let retrying = std::sync::atomic::AtomicBool::new(false);
@@ -548,10 +611,16 @@ async fn stream_compact_response(
         return Err(error_chain(&error));
     }
 
-    partial
+    let usage = partial.usage;
+    let summary = partial
         .finalize()
         .map_err(|error| error_chain(&error))
-        .and_then(compact_response_text)
+        .and_then(compact_response_text)?;
+    Ok(crate::ui::event::CompactionResult {
+        summary,
+        input_tokens: usage.map(|(input, _, _)| input),
+        output_tokens: usage.map(|(_, output, _)| output),
+    })
 }
 
 /// Include nested transport causes hidden by reqwest's top-level Display text.
@@ -601,6 +670,7 @@ pub(crate) fn start_compact(app: &mut App<'_>) {
     let input_items = compact_input_items(app.conversation_panel.input_param_for_prefix(
         cutoff,
         &target_model,
+        app.config.soul.as_deref(),
         app.vision_enabled,
     ));
 
@@ -662,6 +732,7 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) {
     let input_items = compact_input_items(app.conversation_panel.input_param_for_prefix(
         cutoff,
         &target_model,
+        app.config.soul.as_deref(),
         app.vision_enabled,
     ));
     app.auto_compact.next_id = app.auto_compact.next_id.wrapping_add(1);
@@ -689,6 +760,7 @@ pub(crate) fn invalidate_auto_compaction(app: &mut App<'_>) {
     app.auto_compact.history_epoch = app.auto_compact.history_epoch.wrapping_add(1);
     app.auto_compact.active_id = None;
     app.auto_compact.last_cutoff = None;
+    app.input_panel.clear_next_turn_compaction();
 }
 
 /// Open the full-screen task panel. Interactive tasks can grab input; pipe
@@ -854,7 +926,8 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
 mod tests {
     use super::{
         ConversationPanel, build_compact_request, execute_command, format_agent_updates,
-        format_task_updates, ordered_message_content, queue_pending_request,
+        format_task_updates, normalize_session_title, ordered_message_content,
+        queue_pending_request,
     };
     use async_openai::types::responses::{ImageDetail, InputContent, InputImageContent};
     use std::sync::Arc;
@@ -1017,6 +1090,25 @@ mod tests {
             crate::thinking::ThinkingLevel::Auto,
         );
         assert!(auto.reasoning.is_none());
+    }
+
+    #[test]
+    fn generated_session_title_is_cleaned_and_bounded() {
+        assert_eq!(
+            normalize_session_title("  “修复登录重试”  \nextra").unwrap(),
+            "修复登录重试"
+        );
+        assert_eq!(
+            normalize_session_title("   \n"),
+            Err("the model returned an empty title".to_string())
+        );
+        assert_eq!(
+            normalize_session_title(&"x".repeat(100))
+                .unwrap()
+                .chars()
+                .count(),
+            80
+        );
     }
 
     #[tokio::test]
