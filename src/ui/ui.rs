@@ -25,6 +25,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
+fn terminal_title_subject<'a>(session_title: &'a str, project_name: &'a str) -> &'a str {
+    let session_title = session_title.trim();
+    if session_title.is_empty() {
+        project_name
+    } else {
+        session_title
+    }
+}
+
 impl App<'_> {
     /// The single status the footer shows, by precedence: user-input waits
     /// first, then the current busy phase, then idle.
@@ -345,11 +354,14 @@ impl Widget for &mut App<'_> {
         // Resolve the single status the footer should show, then let the
         // status bar track its own busy timer.
         self.footer.status.set(self.resolve_status());
-        // Keep the terminal title in sync with the current status.
+        // Keep the terminal title in sync with the current status. Once the
+        // session has a generated title, use it in place of the project
+        // directory so several Programmer windows remain distinguishable.
+        let title_subject = terminal_title_subject(&self.session.title, &self.project_name);
         crate::terminal::set_terminal_title(&format!(
             "{} {} \u{b7} programmer",
             self.footer.status.status.emoji_label(),
-            self.project_name,
+            title_subject,
         ));
         self.footer.status.detail = None;
         self.footer.work_mode = self.work_mode;
@@ -461,5 +473,19 @@ impl Widget for &mut App<'_> {
             self.sidebar_area = None;
             self.render_main(content_area, buf, bottom_height);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_title_subject;
+
+    #[test]
+    fn session_title_replaces_project_name_in_terminal_title() {
+        assert_eq!(
+            terminal_title_subject("Fix compaction", "programmer"),
+            "Fix compaction"
+        );
+        assert_eq!(terminal_title_subject("   ", "programmer"), "programmer");
     }
 }

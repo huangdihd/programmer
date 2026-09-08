@@ -93,6 +93,7 @@ fn persist_session(app: &mut App<'_>) -> Result<bool, String> {
     });
     SessionManager::set_items(&mut session, items);
     session.history = app.input_panel.history.clone();
+    session.input_suggestion = app.input_panel.suggestion().map(str::to_owned);
     session.work_mode = Some(app.work_mode);
     session.current_model = Some(app.current_model.clone());
     session.vision_enabled = app.vision_enabled;
@@ -139,8 +140,14 @@ pub(crate) fn persist_config(app: &mut App<'_>) {
 
 /// Delete the session file and start a fresh session with a new UUID.
 pub(crate) fn delete_session(app: &mut App<'_>) {
+    app.active_suggestion_operation_id = None;
+    if let Some(cancel) = app.input_suggestion_cancel.take() {
+        cancel.cancel();
+    }
+    app.input_panel.clear_suggestion();
     app.session.title.clear();
     app.session.title_generation_started = false;
+    app.session.title_generation_id = app.session.title_generation_id.wrapping_add(1);
     if let Some(store) = &app.checkpoint_store {
         let _ = store.lock().unwrap().delete_all();
     }

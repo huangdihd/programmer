@@ -251,6 +251,7 @@ impl HeadlessAgent {
                 args.work_mode.label()
             ),
             checkpoint: None,
+            conversation_history: None,
         };
         base_providers.push(Arc::new(AgentToolProvider::new(
             agents.clone(),

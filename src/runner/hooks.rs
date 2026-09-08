@@ -171,10 +171,11 @@ impl TurnHook for DiagnosticsHook {
     }
 }
 
-/// Periodic PROGRAMMER.md refresh reminder. Every `every` editing batches — when
-/// the project actually has a `PROGRAMMER.md` — nudge the model to keep the
-/// overview current. Shares the edit-batch counter with the diagnostics baseline
-/// state so both reset together when diagnostics is reconfigured.
+/// Periodic project-maintenance reminder. Every `every` editing batches, nudge
+/// the model either to keep an initialized project's PROGRAMMER.md current or to
+/// tell the user about `/init` when its project artifacts are absent. Shares the
+/// edit-batch counter with the diagnostics baseline state so both reset together
+/// when diagnostics is reconfigured.
 pub(crate) struct OverviewReminderHook {
     pub state: Arc<Mutex<DiagnosticsState>>,
     pub every: usize,
@@ -197,13 +198,62 @@ impl TurnHook for OverviewReminderHook {
             st.mutating_turns += 1;
             st.mutating_turns
         };
-        let due = self.every != 0
-            && count.is_multiple_of(self.every)
-            && std::path::Path::new("PROGRAMMER.md").exists();
-        if due {
-            Some(crate::prompts::OVERVIEW_REMINDER.to_string())
-        } else {
-            None
-        }
+        maintenance_reminder(
+            count,
+            self.every,
+            std::path::Path::new("PROGRAMMER.md").exists(),
+            std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists(),
+        )
+        .map(str::to_string)
+    }
+}
+
+fn maintenance_reminder(
+    edit_batches: usize,
+    every: usize,
+    has_overview: bool,
+    has_diagnostics: bool,
+) -> Option<&'static str> {
+    if every == 0 || !edit_batches.is_multiple_of(every) {
+        return None;
+    }
+    if has_overview && has_diagnostics {
+        Some(crate::prompts::OVERVIEW_REMINDER)
+    } else {
+        Some(crate::prompts::INIT_REMINDER)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maintenance_reminder;
+
+    #[test]
+    fn maintenance_reminder_preserves_its_edit_cadence() {
+        assert_eq!(maintenance_reminder(4, 5, false, false), None);
+        assert_eq!(maintenance_reminder(5, 0, false, false), None);
+    }
+
+    #[test]
+    fn maintenance_reminder_suggests_init_when_project_artifacts_are_missing() {
+        let reminder = maintenance_reminder(5, 5, false, false).unwrap();
+        assert!(reminder.contains("/init"));
+        assert!(
+            maintenance_reminder(5, 5, true, false)
+                .unwrap()
+                .contains("/init")
+        );
+        assert!(
+            maintenance_reminder(5, 5, false, true)
+                .unwrap()
+                .contains("/init")
+        );
+    }
+
+    #[test]
+    fn maintenance_reminder_refreshes_initialized_project_overview() {
+        let reminder = maintenance_reminder(5, 5, true, true).unwrap();
+        assert!(reminder.contains("update PROGRAMMER.md"));
+        assert!(!reminder.contains("/init"));
     }
 }

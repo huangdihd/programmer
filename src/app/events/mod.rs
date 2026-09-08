@@ -255,6 +255,9 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             // current TUI/native-selection choice.
             let _ = crate::terminal::set_mouse_capture(!app.native_selection_mode);
             start_queued_work(app).await;
+            if was_ok && app.cancel.active_id.is_none() {
+                commands::maybe_start_input_suggestion(app, op_id);
+            }
         }
         AppEvent::Start => {
             diagnostics::maybe_seed_diagnostics_baseline(app);
@@ -312,6 +315,12 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                         }
                         app.input_panel.show_next_turn_compaction(details);
                         session::mark_dirty(app);
+                        // Make the generated summary durable immediately when
+                        // the foreground is idle, so reopening the session can
+                        // reuse it instead of compacting the same history again.
+                        // If another turn is active, the normal idle flush saves
+                        // it at the next safe turn boundary.
+                        session::flush_if_dirty(app);
                     }
                 }
                 Err(error) => app
@@ -321,9 +330,11 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         }
         AppEvent::SessionTitleGenerated {
             session_uuid,
+            generation_id,
             result,
         } => {
-            if app.session.uuid != session_uuid {
+            if app.session.uuid != session_uuid || app.session.title_generation_id != generation_id
+            {
                 return;
             }
             match result {
@@ -334,6 +345,27 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 Err(error) => app
                     .conversation_panel
                     .add_warning_string(format!("session title generation failed: {error}")),
+            }
+        }
+        AppEvent::InputSuggestionGenerated {
+            session_uuid,
+            operation_id,
+            result,
+        } => {
+            if app.session.uuid != session_uuid
+                || app.active_suggestion_operation_id != Some(operation_id)
+            {
+                return;
+            }
+            app.active_suggestion_operation_id = None;
+            app.input_suggestion_cancel = None;
+            if let Ok(suggestion) = result
+                && app.cancel.active_id.is_none()
+                && app.input_panel.get_content().is_empty()
+            {
+                app.input_panel.set_suggestion(suggestion);
+                session::mark_dirty(app);
+                session::flush_if_dirty(app);
             }
         }
         AppEvent::Quit => handle_quit_request(app),

@@ -43,6 +43,8 @@ pub enum Command {
     Init,
     Help,
     Session,
+    /// `/title [text]` — regenerate the current session title, or set it manually.
+    Title(String),
     Usage,
     Rewind,
     Todo,
@@ -86,6 +88,7 @@ enum CommandKind {
     Init,
     Help,
     Session,
+    Title,
     Usage,
     Rewind,
     Todo,
@@ -162,6 +165,7 @@ impl CommandKind {
             Self::Init => Command::Init,
             Self::Help => Command::Help,
             Self::Session => Command::Session,
+            Self::Title => Command::Title(args),
             Self::Usage => Command::Usage,
             Self::Rewind => Command::Rewind,
             Self::Todo => Command::Todo,
@@ -244,12 +248,23 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         }],
     },
     CommandSpec {
+        kind: CommandKind::Title,
+        name: "title",
+        aliases: &[],
+        completion: CompletionKind::None,
+        help: &[HelpEntry {
+            order: 27,
+            usage: "/title [text]",
+            description: "Regenerate the session title, or set it manually",
+        }],
+    },
+    CommandSpec {
         kind: CommandKind::Usage,
         name: "usage",
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 27,
+            order: 28,
             usage: "/usage",
             description: "Show token usage for the current session",
         }],
@@ -260,7 +275,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 28,
+            order: 29,
             usage: "/rewind",
             description: "Restore conversation and built-in file edits to a user prompt",
         }],
@@ -317,7 +332,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
             "list", "recall", "remember", "update", "forget", "on", "off",
         ]),
         help: &[HelpEntry {
-            order: 32,
+            order: 33,
             usage: "/memory <list|recall|remember|update|forget|on|off>",
             description: "Inspect or manage persistent memory",
         }],
@@ -485,7 +500,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["c"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 29,
+            order: 30,
             usage: "/clear | /c",
             description: "Delete this session; reset chat, todos, images, and diagnostics",
         }],
@@ -496,7 +511,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["q", "exit"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 30,
+            order: 31,
             usage: "/quit | /q",
             description: "Exit the application",
         }],
@@ -507,7 +522,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["?"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 31,
+            order: 32,
             usage: "/help | /?",
             description: "Show this help",
         }],
@@ -1659,6 +1674,7 @@ mod tests {
             "new",
             "providers",
             "session",
+            "title",
             "usage",
             "rewind",
             "mode",
@@ -1786,6 +1802,10 @@ mod tests {
                 "Refetch auto-discovered provider models",
             ),
             ("/session | /s", "Show current session info"),
+            (
+                "/title [text]",
+                "Regenerate the session title, or set it manually",
+            ),
             ("/usage", "Show token usage for the current session"),
             (
                 "/rewind",

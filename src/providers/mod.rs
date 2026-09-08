@@ -331,6 +331,7 @@ mod tests {
             classifier_top_logprobs: crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS,
             compact_model: None,
             title_model: None,
+            suggestion_model: None,
             auto_compact_tokens: 100_000,
             compact_keep_recent_turns: 2,
             memory: Default::default(),

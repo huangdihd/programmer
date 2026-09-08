@@ -139,6 +139,8 @@ pub(crate) struct SessionState {
     pub(crate) title: String,
     /// Prevent duplicate title requests while the first one is in flight.
     pub(crate) title_generation_started: bool,
+    /// Monotonic id used to ignore stale title-generation results.
+    pub(crate) title_generation_id: u64,
     pub(crate) classifier_model_override: ModelOverride,
     pub(crate) compact_model_override: ModelOverride,
     pub(crate) auto_compact_override: AutoCompactOverride,
@@ -338,6 +340,10 @@ pub struct App<'a> {
     /// Background automatic compaction bookkeeping. This is deliberately
     /// independent from the foreground turn phase and cancellation token.
     pub(crate) auto_compact: AutoCompactState,
+    /// Operation whose completed turn is currently generating an input hint.
+    pub(crate) active_suggestion_operation_id: Option<u64>,
+    /// Cancels obsolete hint requests when another user turn starts.
+    pub(crate) input_suggestion_cancel: Option<crate::cancel::CancellationToken>,
     pub(crate) checkpoint_store: Option<Arc<Mutex<crate::checkpoint::CheckpointStore>>>,
     pub(crate) current_checkpoint_id: Option<u64>,
     /// Project directory name for the terminal title.
@@ -394,6 +400,7 @@ impl App<'_> {
         let mut auto_compact_override = AutoCompactOverride::Inherit;
         let mut compact_keep_recent_turns_override = None;
         let mut session_title = String::new();
+        let mut saved_input_suggestion = None;
 
         let mut saved_activated_skills: Option<Vec<String>> = None;
         if let Some(mgr) = &session_mgr
@@ -408,6 +415,7 @@ impl App<'_> {
                 current_model = model;
             }
             session_title = saved.title;
+            saved_input_suggestion = saved.input_suggestion;
             vision_enabled = saved.vision_enabled;
             thinking_level = saved.thinking_level;
             classifier_model_override = saved.classifier_model_override;
@@ -432,6 +440,9 @@ impl App<'_> {
         }
         let mut input_panel = InputPanel::new();
         input_panel.history = saved_history;
+        if let Some(suggestion) = saved_input_suggestion {
+            input_panel.set_suggestion(suggestion);
+        }
         let todo_list = crate::todos::TodoList { todos: saved_todos };
         let todo_store = Arc::new(Mutex::new(todo_list.clone()));
         let security_manager = Arc::new(
@@ -510,6 +521,7 @@ impl App<'_> {
                 dirty: false,
                 did_save: false,
                 title_generation_started: !session_title.is_empty(),
+                title_generation_id: 0,
                 title: session_title,
                 classifier_model_override,
                 compact_model_override,
@@ -517,6 +529,8 @@ impl App<'_> {
                 compact_keep_recent_turns_override,
             },
             auto_compact: AutoCompactState::default(),
+            active_suggestion_operation_id: None,
+            input_suggestion_cancel: None,
             checkpoint_store,
             current_checkpoint_id: None,
             skill_registry: crate::skills::SkillRegistry::load(),
@@ -612,6 +626,13 @@ impl App<'_> {
             .unwrap_or_else(|| self.current_model.clone())
     }
 
+    pub(crate) fn effective_suggestion_model(&self) -> String {
+        self.config
+            .suggestion_model
+            .clone()
+            .unwrap_or_else(|| self.current_model.clone())
+    }
+
     pub(crate) fn effective_auto_compact_tokens(&self) -> Option<u32> {
         match self.session.auto_compact_override {
             AutoCompactOverride::Inherit => {
@@ -666,7 +687,8 @@ impl App<'_> {
             Arc::new(
                 LocalToolProvider::new(self.todo_store.clone(), self.security.clone())
                     .with_checkpoint(self.checkpoint_recorder())
-                    .with_memory_enabled(self.config.memory.enabled),
+                    .with_memory_enabled(self.config.memory.enabled)
+                    .with_conversation_history(Some(self.conversation_panel.shared_conversation())),
             ),
             Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
         ];
@@ -722,6 +744,7 @@ impl App<'_> {
                 self.work_mode.label()
             ),
             checkpoint: self.checkpoint_recorder(),
+            conversation_history: Some(self.conversation_panel.shared_conversation()),
         };
         base_providers.push(Arc::new(crate::tools::provider::AgentToolProvider::new(
             self.agents.clone(),

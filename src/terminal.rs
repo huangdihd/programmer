@@ -37,6 +37,9 @@ static LAST_TITLE_HASH: AtomicU64 = AtomicU64::new(0);
 /// Write an OSC 0 terminal title sequence to stdout.  No-ops when `title` is
 /// the same as the last call (fast hash compare — no allocation).
 pub(crate) fn set_terminal_title(title: &str) {
+    // Session titles come from a model and restored JSON, so never allow them
+    // to inject control sequences into OSC 0.
+    let title = sanitize_terminal_title(title);
     let mut hasher = DefaultHasher::new();
     title.hash(&mut hasher);
     let h = hasher.finish();
@@ -46,6 +49,13 @@ pub(crate) fn set_terminal_title(title: &str) {
     use std::io::Write;
     print!("\x1b]0;{}\x07", title);
     let _ = io::stdout().flush();
+}
+
+fn sanitize_terminal_title(title: &str) -> String {
+    title
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
 }
 
 /// Initialises the fullscreen TUI, returning the terminal handle and a guard
@@ -117,5 +127,18 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         // Invalidate the title cache so a future run starts fresh.
         LAST_TITLE_HASH.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_terminal_title;
+
+    #[test]
+    fn terminal_titles_cannot_inject_control_sequences() {
+        assert_eq!(
+            sanitize_terminal_title("session\n\x1b]0;spoofed\x07"),
+            "session]0;spoofed"
+        );
     }
 }

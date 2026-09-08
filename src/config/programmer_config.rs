@@ -90,6 +90,10 @@ pub struct ProgrammerConfig {
     /// chat model is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_model: Option<String>,
+    /// Model used to predict the user's next message for the input placeholder.
+    /// When absent, the current chat model is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion_model: Option<String>,
     /// Start a background context compaction after an API response reports at
     /// least this many input tokens. Zero disables automatic compaction.
     #[serde(default = "default_auto_compact_tokens")]
@@ -220,6 +224,7 @@ impl Default for ProgrammerConfig {
             classifier_top_logprobs: default_classifier_top_logprobs(),
             compact_model: None,
             title_model: None,
+            suggestion_model: None,
             auto_compact_tokens: default_auto_compact_tokens(),
             compact_keep_recent_turns: default_compact_keep_recent_turns(),
             memory: MemoryConfig::default(),
