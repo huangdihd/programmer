@@ -21,6 +21,24 @@ use crate::ui::components::conversation_panel::conversation_panel::SelectionEnd;
 use crate::ui::components::sidebar::ClickTarget;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
+/// While a tool run bridges from committed history into a live response, the
+/// same stable group key can temporarily be present in both expansion sets.
+/// The live view owns that key until commit. Canonicalize duplicates before a
+/// conversation click so one click can always collapse the group; otherwise
+/// the live click handler removes only the first set because of short-circuit
+/// evaluation and the committed copy keeps the group visually expanded.
+fn normalize_live_group_expansion_state(app: &mut App<'_>) {
+    let duplicates: Vec<String> = app
+        .conversation_panel
+        .live_expanded_groups
+        .intersection(&app.conversation_panel.expanded_tool_groups)
+        .cloned()
+        .collect();
+    for key in duplicates {
+        app.conversation_panel.expanded_tool_groups.remove(&key);
+    }
+}
+
 /// Route a mouse event to the sidebar or the conversation panel.
 pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
     match mouse.kind {
@@ -62,6 +80,7 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
                 app.conversation_panel.scroll_to_bottom();
                 return;
             }
+            normalize_live_group_expansion_state(app);
             app.conversation_panel
                 .selection_begin(mouse.column, mouse.row)
         }
