@@ -359,6 +359,14 @@ impl Selection {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FoldTarget {
+    LiveToolGroup(String),
+    LiveItem(usize),
+    ToolGroup(String),
+    Item(usize),
+}
+
 /// The outcome of releasing the left mouse button over the conversation.
 pub enum SelectionEnd {
     /// The press started outside the panel; nothing to do.
@@ -514,6 +522,11 @@ pub struct ConversationPanel {
     pub(crate) live_expanded_groups: HashSet<String>,
     /// The current mouse text selection, if any.
     pub(crate) selection: Option<Selection>,
+    /// Semantic fold target captured on mouse-down. Streaming can change the
+    /// virtual row layout before mouse-up, so a stationary click must act on
+    /// the item the user pressed rather than re-resolving that old row against
+    /// the new layout. Only title/header rows are captured for groups.
+    pending_fold_target: Option<FoldTarget>,
     /// The streaming items' paragraphs from the last render (paragraph, height,
     /// copy buttons). Exploring-group entries are moved forward unchanged on a
     /// cache hit; all entries are also kept for selection and copy-button clicks.
@@ -607,6 +620,7 @@ impl ConversationPanel {
             live_expanded_items: HashSet::new(),
             live_expanded_groups: HashSet::new(),
             selection: None,
+            pending_fold_target: None,
             live_paragraphs: Vec::new(),
             live_group_headers: Vec::new(),
             live_render_cache: None,
@@ -647,9 +661,121 @@ impl ConversationPanel {
         self.live_tool_group_layout = live_tool_group_layout;
     }
 
+    fn fold_target_at(&self, x_rel: u16, buffer_y: u16) -> Option<FoldTarget> {
+        if let Some(group) = self
+            .live_tool_group_layout
+            .iter()
+            .find(|group| buffer_y >= group.top && buffer_y < group.bottom)
+        {
+            if buffer_y == group.top {
+                return Some(FoldTarget::LiveToolGroup(group.key.clone()));
+            }
+            if let Some(header) = group
+                .member_headers
+                .iter()
+                .find(|header| buffer_y >= header.top && buffer_y < header.bottom)
+            {
+                if let Some(base) = group.live_index_base
+                    && header.index >= base
+                {
+                    return Some(FoldTarget::LiveItem(header.index - base));
+                }
+                return Some(FoldTarget::Item(header.index));
+            }
+            return None;
+        }
+
+        if let Some(&(live_idx, top, _)) = self
+            .live_item_layout
+            .iter()
+            .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
+        {
+            let copy_hit = self
+                .live_paragraphs
+                .get(live_idx)
+                .and_then(|(paragraph, _, buttons)| {
+                    paragraph.copy_button(buttons, buffer_y - top, x_rel)
+                })
+                .is_some();
+            return (!copy_hit).then_some(FoldTarget::LiveItem(live_idx));
+        }
+
+        if let Some(group) = self
+            .tool_group_layout
+            .iter()
+            .find(|group| buffer_y >= group.top && buffer_y < group.bottom)
+        {
+            if buffer_y == group.top {
+                return Some(FoldTarget::ToolGroup(group.key.clone()));
+            }
+            return group
+                .member_headers
+                .iter()
+                .find(|header| buffer_y >= header.top && buffer_y < header.bottom)
+                .map(|header| FoldTarget::Item(header.index));
+        }
+
+        if let Some(&(index, top, _)) = self
+            .item_layout
+            .iter()
+            .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
+        {
+            let copy_hit = self.render_cache.entries.get(index).is_some_and(|entry| {
+                entry
+                    .paragraph
+                    .copy_button(&entry.copy_buttons, buffer_y - top, x_rel)
+                    .is_some()
+            });
+            if copy_hit {
+                return None;
+            }
+            let foldable = self
+                .conversation
+                .lock()
+                .unwrap()
+                .items
+                .get(index)
+                .is_some_and(is_foldable);
+            return foldable.then_some(FoldTarget::Item(index));
+        }
+
+        None
+    }
+
+    fn apply_fold_target(&mut self, target: FoldTarget) {
+        match target {
+            FoldTarget::LiveToolGroup(key) => {
+                // Bridged groups can temporarily be represented in both sets.
+                // Remove from both before deciding whether this click is an
+                // expand, so one click always collapses an expanded group.
+                let removed_live = self.live_expanded_groups.remove(&key);
+                let removed_committed = self.expanded_tool_groups.remove(&key);
+                if !(removed_live || removed_committed) {
+                    self.live_expanded_groups.insert(key);
+                }
+            }
+            FoldTarget::LiveItem(index) => {
+                if !self.live_expanded_items.remove(&index) {
+                    self.live_expanded_items.insert(index);
+                }
+            }
+            FoldTarget::ToolGroup(key) => {
+                if !self.expanded_tool_groups.remove(&key) {
+                    self.expanded_tool_groups.insert(key);
+                }
+            }
+            FoldTarget::Item(index) => {
+                if !self.expanded_items.remove(&index) {
+                    self.expanded_items.insert(index);
+                }
+            }
+        }
+    }
+
     /// Handles a left click at the given screen coordinates: if it lands on a
     /// foldable item (finished or live), toggle that item's expanded state.
     pub fn handle_click(&mut self, column: u16, row: u16) {
+        self.pending_fold_target = None;
         if let Some((x_rel, buffer_y)) = self.to_buffer_pos(column, row, false) {
             self.handle_buffer_click(x_rel, buffer_y);
         }
@@ -659,6 +785,11 @@ impl ConversationPanel {
     /// releases use the position captured on button-down so a render between
     /// down and up cannot redirect the click to a different item.
     pub fn handle_buffer_click(&mut self, x_rel: u16, buffer_y: u16) {
+        if let Some(target) = self.pending_fold_target.take() {
+            self.apply_fold_target(target);
+            return;
+        }
+
         // Live groups sit after finished content in the scroll buffer; check
         // their member hit regions before the flat live-item layout so a click
         // on the header row toggles the group and a click on a member row
@@ -670,9 +801,9 @@ impl ConversationPanel {
         {
             if buffer_y == group.top {
                 let key = group.key.clone();
-                if !self.live_expanded_groups.remove(&key)
-                    && !self.expanded_tool_groups.remove(&key)
-                {
+                let removed_live = self.live_expanded_groups.remove(&key);
+                let removed_committed = self.expanded_tool_groups.remove(&key);
+                if !(removed_live || removed_committed) {
                     self.live_expanded_groups.insert(key);
                 }
             } else if let Some(header) = group
@@ -806,7 +937,13 @@ impl ConversationPanel {
 
     /// Left button pressed: start a potential selection at this point.
     pub fn selection_begin(&mut self, column: u16, row: u16) {
-        self.selection = self.to_buffer_pos(column, row, false).map(|pos| Selection {
+        let Some(pos) = self.to_buffer_pos(column, row, false) else {
+            self.selection = None;
+            self.pending_fold_target = None;
+            return;
+        };
+        self.pending_fold_target = self.fold_target_at(pos.0, pos.1);
+        self.selection = Some(Selection {
             anchor: pos,
             head: pos,
             screen_anchor: (column, row),
@@ -833,11 +970,16 @@ impl ConversationPanel {
         let Some(pos) = self.to_buffer_pos(column, row, true) else {
             return;
         };
+        let mut moved = false;
         if let Some(sel) = self.selection.as_mut() {
-            if pos != sel.anchor {
+            moved = pos != sel.anchor;
+            if moved {
                 sel.dragging = true;
             }
             sel.head = pos;
+        }
+        if moved {
+            self.pending_fold_target = None;
         }
     }
 
@@ -859,7 +1001,10 @@ impl ConversationPanel {
         }
         self.selection_drag(column, row);
         match self.selection {
-            None => SelectionEnd::Ignored,
+            None => {
+                self.pending_fold_target = None;
+                SelectionEnd::Ignored
+            }
             Some(sel) if !sel.dragging || sel.anchor == sel.head => {
                 self.selection = None;
                 SelectionEnd::Click {
@@ -868,7 +1013,10 @@ impl ConversationPanel {
                 }
             }
             // Keep the selection so the highlight stays visible.
-            Some(sel) => SelectionEnd::Copied(self.extract_selection_text(sel)),
+            Some(sel) => {
+                self.pending_fold_target = None;
+                SelectionEnd::Copied(self.extract_selection_text(sel))
+            }
         }
     }
 
@@ -1134,6 +1282,7 @@ impl ConversationPanel {
         self.live_render_cache = None;
         self.invalidate_live_markdown();
         self.selection = None;
+        self.pending_fold_target = None;
         self.stick_to_bottom = true;
     }
 
@@ -1143,6 +1292,7 @@ impl ConversationPanel {
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
         self.invalidate_live_markdown();
+        self.pending_fold_target = None;
         self.stick_to_bottom = true;
     }
 
@@ -1156,6 +1306,7 @@ impl ConversationPanel {
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
         self.selection = None;
+        self.pending_fold_target = None;
         self.stick_to_bottom = true;
     }
 
@@ -1841,7 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn stationary_release_uses_mouse_down_position_when_streaming_moves_the_view() {
+    fn stationary_release_keeps_mouse_down_fold_target_when_layout_changes() {
         let mut panel = ConversationPanel::new();
         panel.view_area = Rect::new(0, 0, 40, 10);
         panel.view_offset = 20;
@@ -1865,6 +2016,9 @@ mod tests {
         });
 
         panel.selection_begin(3, 4);
+        // A streaming re-layout moves a different member under the same old
+        // virtual row before mouse-up.
+        panel.tool_group_layout[0].member_headers[0].index = 9;
         panel.view_offset = 24;
 
         let SelectionEnd::Click { column, row } = panel.selection_end(3, 4) else {
@@ -1874,6 +2028,25 @@ mod tests {
         panel.handle_buffer_click(column, row);
         assert!(panel.expanded_items.contains(&7));
         assert!(!panel.expanded_items.contains(&9));
+    }
+
+    #[test]
+    fn live_group_click_collapses_duplicate_expansion_state_in_one_click() {
+        let mut panel = ConversationPanel::new();
+        panel.live_tool_group_layout.push(ToolGroupLayout {
+            key: "group".into(),
+            top: 5,
+            bottom: 7,
+            member_headers: Vec::new(),
+            live_index_base: Some(0),
+        });
+        panel.live_expanded_groups.insert("group".into());
+        panel.expanded_tool_groups.insert("group".into());
+
+        panel.handle_buffer_click(0, 5);
+
+        assert!(!panel.live_expanded_groups.contains("group"));
+        assert!(!panel.expanded_tool_groups.contains("group"));
     }
 
     #[test]
@@ -1956,7 +2129,7 @@ mod tests {
 
         // After TurnFinished clears the phase, it goes back to idle.
         panel.phase = ActivePhase::None;
-        assert!(!panel.is_busy());
+        assert!(!panel.is_busy(), "Cancelling must be treated as busy");
     }
 
     #[test]
