@@ -53,10 +53,18 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Keep input bursts from starving terminal redraws. Four events per frame
-/// sustains 120 events/second at the normal 30 FPS tick rate while giving
-/// trackpad scrolling and streamed output a frame boundary every few events.
+/// Bound how many already-queued events are folded into state in one pass.
+/// Streaming chunks do not request an immediate redraw; the regular Tick event
+/// presents their accumulated state at TICK_FPS instead of drawing once every
+/// few provider deltas. Interactive and lifecycle events still redraw at once.
 const MAX_EVENTS_PER_FRAME: usize = 4;
+
+fn event_requests_immediate_redraw(event: &Event) -> bool {
+    !matches!(
+        event,
+        Event::App(crate::ui::event::AppEvent::ChunkReceived(_, _))
+    )
+}
 
 /// A pending tool-call review request from the runner. Manual mode now gets
 /// per-call reviews (no batch), driven by the runner's `review()` callback.
@@ -777,21 +785,29 @@ impl App<'_> {
         crate::app::diagnostics::maybe_seed_diagnostics_baseline(&mut self);
 
         let result = async {
+            // Paint startup state immediately. After this, raw stream chunks only
+            // mutate the in-flight response; Tick presents their accumulated
+            // state at the configured frame rate. User input and lifecycle
+            // events still request an immediate frame.
+            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
             while self.running {
-                terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
-
                 let mut event = Some(self.events.next().await?);
+                let mut redraw = false;
                 for index in 0..MAX_EVENTS_PER_FRAME {
                     let Some(current) = event.take() else {
                         break;
                     };
+                    redraw |= event_requests_immediate_redraw(&current);
                     self.handle_event(current).await?;
-                    if !self.running {
+                    if !self.running || redraw {
                         break;
                     }
                     if index + 1 < MAX_EVENTS_PER_FRAME {
                         event = self.events.try_next();
                     }
+                }
+                if self.running && redraw {
+                    terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
                 }
             }
             Ok(())
@@ -846,6 +862,7 @@ mod tests {
             new_status: crate::tasks::TaskStatus::Completed,
             name: "test".to_string(),
             command: "true".to_string(),
+            status: crate::tasks::TaskStatus::Completed,
             exit_code: Some(0),
             elapsed: Duration::ZERO,
             stdout_tail: String::new(),
