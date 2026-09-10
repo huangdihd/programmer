@@ -862,7 +862,6 @@ mod tests {
             new_status: crate::tasks::TaskStatus::Completed,
             name: "test".to_string(),
             command: "true".to_string(),
-            status: crate::tasks::TaskStatus::Completed,
             exit_code: Some(0),
             elapsed: Duration::ZERO,
             stdout_tail: String::new(),
