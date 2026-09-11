@@ -41,7 +41,7 @@ vt100 = "0.15"
 # HTTP MCP server (`programmer mcp http`): a plain-HTTP JSON-RPC endpoint served alongside
 # a ratatui approval console.
 axum = "0.8"
-base64 = "0.22.1"
+base64 = "0.23.1"
 arboard = { version = "3.6.1", features = ["image-data"] }
 image = { version = "0.25.10", default-features = false, features = [
     "gif",
