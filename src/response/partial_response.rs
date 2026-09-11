@@ -183,31 +183,30 @@ impl PartialResponse {
     /// Iterate over Markdown-bearing assistant items without cloning them.
     /// The UI uses the item revision to clone only a changed item before
     /// handing it to the background renderer.
-    pub fn markdown_items(&self) -> Vec<(usize, &OutputItem, bool, u64)> {
+    pub fn markdown_items(&self) -> impl Iterator<Item = (usize, &OutputItem, bool, u64)> + '_ {
         let mut live_index = 0;
-        let mut items = Vec::new();
-        for (protocol_index, slot) in self.items.iter().enumerate() {
-            let Some(item) = slot.as_ref() else {
-                continue;
-            };
-            let current_live_index = live_index;
-            live_index += 1;
-            if !matches!(item, OutputItem::Message(_) | OutputItem::Reasoning(_)) {
-                continue;
-            }
-            let in_progress = !self
-                .finished_items
-                .get(protocol_index)
-                .copied()
-                .unwrap_or(false);
-            let revision = self
-                .item_revisions
-                .get(protocol_index)
-                .copied()
-                .unwrap_or_default();
-            items.push((current_live_index, item, in_progress, revision));
-        }
-        items
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(move |(protocol_index, slot)| {
+                let item = slot.as_ref()?;
+                let current_live_index = live_index;
+                live_index += 1;
+                if !matches!(item, OutputItem::Message(_) | OutputItem::Reasoning(_)) {
+                    return None;
+                }
+                let in_progress = !self
+                    .finished_items
+                    .get(protocol_index)
+                    .copied()
+                    .unwrap_or(false);
+                let revision = self
+                    .item_revisions
+                    .get(protocol_index)
+                    .copied()
+                    .unwrap_or_default();
+                Some((current_live_index, item, in_progress, revision))
+            })
     }
 
     pub fn handle_response_stream_event(&mut self, response_stream_event: ResponseStreamEvent) {
@@ -825,7 +824,7 @@ mod tests {
         p.set_item(msg_item(), 2);
         p.set_item(fc_item(), 4);
 
-        let items = p.markdown_items();
+        let items: Vec<_> = p.markdown_items().collect();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].0, 0, "live UI indices skip protocol gaps");
         assert_eq!(items[0].3, 0);

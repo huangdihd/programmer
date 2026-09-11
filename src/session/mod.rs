@@ -241,6 +241,9 @@ pub(crate) struct Session {
     /// are restored as killed — their processes died with the old instance.
     #[serde(default)]
     pub(crate) tasks: Vec<crate::tasks::PersistedTask>,
+    /// File content fingerprints read in this session, used by file protection after resume.
+    #[serde(default)]
+    pub(crate) file_snapshots: Vec<crate::security::policy::PersistedFileSnapshot>,
 }
 
 pub(crate) struct SessionManager {
@@ -312,6 +315,7 @@ impl SessionManager {
             activated_skills: Vec::new(),
             skill_selection_saved: false,
             tasks: Vec::new(),
+            file_snapshots: Vec::new(),
         }
     }
 

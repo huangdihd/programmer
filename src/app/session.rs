@@ -106,6 +106,7 @@ fn persist_session(app: &mut App<'_>) -> Result<bool, String> {
     session.activated_skills = app.skill_registry.activated_names().to_vec();
     session.skill_selection_saved = true;
     session.tasks = crate::tasks::persist_all();
+    session.file_snapshots = app.security.snapshot().persisted_snapshots();
     mgr.save(&mut session)?;
     app.session.did_save = true;
     Ok(true)

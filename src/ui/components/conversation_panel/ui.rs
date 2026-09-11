@@ -261,6 +261,12 @@ fn render_virtual_welcome(
     }
 }
 
+fn restore_bottom_follow(panel: &mut ConversationPanel) {
+    if !panel.stick_to_bottom && panel.scroll_view_state.is_at_bottom() {
+        panel.stick_to_bottom = true;
+    }
+}
+
 fn live_cache_matches(
     cache: &LiveRenderCache,
     response_revision: u64,
@@ -576,6 +582,12 @@ impl Widget for &mut ConversationPanel {
         // before calculating live layout. No Markdown parser is run on this
         // render thread.
         self.prepare_live_markdown(content_width);
+        // Keep the semantic follow flag consistent with the actual scroll
+        // position. A response can finish between frames and increase the
+        // virtual height; if the previous frame was already at the bottom,
+        // continue following the new bottom even if an intermediate event did
+        // not update the flag.
+        restore_bottom_follow(self);
         let stick_to_bottom = self.stick_to_bottom;
         let welcome_message = WelcomeMessage;
         let welcome_height = welcome_message.line_count(content_width);
@@ -1556,7 +1568,10 @@ impl Widget for &mut ConversationPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_hidden_developer_input, render_virtual_paragraph};
+    use super::{
+        is_hidden_developer_input, live_cache_matches, render_virtual_paragraph,
+        restore_bottom_follow,
+    };
     use async_openai::types::responses::{
         FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, InputContent,
         InputMessage, InputRole, InputTextContent, Item, MessageItem as ApiMessageItem, OutputItem,
@@ -1570,8 +1585,85 @@ mod tests {
 
     use crate::tools::ToolOutput;
     use crate::ui::components::conversation_panel::conversation_panel::{
-        ActivePhase, ConversationPanel, ViewportParagraphCache,
+        ActivePhase, ConversationPanel, LiveRenderCache, ViewportParagraphCache,
     };
+    use std::collections::HashSet;
+
+    #[test]
+    fn streaming_output_growth_keeps_a_previous_bottom_view_at_the_bottom() {
+        let mut panel = ConversationPanel::new();
+        panel.stick_to_bottom = false;
+        panel.scroll_view_state.update(20, 10);
+        panel.scroll_view_state.scroll_to_bottom();
+
+        // The flag may be stale when the response finishes, but the view was
+        // still at the old bottom before the virtual content grew.
+        restore_bottom_follow(&mut panel);
+        assert!(panel.stick_to_bottom);
+
+        panel.scroll_view_state.update(40, 10);
+        if panel.stick_to_bottom {
+            panel.scroll_view_state.scroll_to_bottom();
+        }
+        assert_eq!(panel.scroll_view_state.offset().y, 30);
+        assert!(panel.scroll_view_state.is_at_bottom());
+    }
+
+    #[test]
+    fn live_layout_cache_key_invalidates_revision_width_and_fold_state() {
+        let cache = LiveRenderCache {
+            response_revision: 7,
+            content_width: 80,
+            conversation_len: 12,
+            conversation_mutation_version: 3,
+            expanded_items: HashSet::from([2]),
+            live_expanded_items: HashSet::from([0]),
+            bridged_committed_items: HashSet::from([4]),
+            slots: Vec::new(),
+        };
+        let expanded_items = HashSet::from([2]);
+        let live_expanded_items = HashSet::from([0]);
+
+        assert!(live_cache_matches(
+            &cache,
+            7,
+            80,
+            12,
+            3,
+            &expanded_items,
+            &live_expanded_items
+        ));
+        assert!(!live_cache_matches(
+            &cache,
+            8,
+            80,
+            12,
+            3,
+            &expanded_items,
+            &live_expanded_items
+        ));
+        assert!(!live_cache_matches(
+            &cache,
+            7,
+            81,
+            12,
+            3,
+            &expanded_items,
+            &live_expanded_items
+        ));
+
+        let mut changed_folds = expanded_items.clone();
+        changed_folds.insert(5);
+        assert!(!live_cache_matches(
+            &cache,
+            7,
+            80,
+            12,
+            3,
+            &changed_folds,
+            &live_expanded_items,
+        ));
+    }
 
     #[test]
     fn developer_runtime_inputs_are_hidden_from_chat_rendering() {
