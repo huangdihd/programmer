@@ -36,7 +36,6 @@ use async_openai::types::responses::{
 };
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::Wrap;
 use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::Paragraph;
 use std::collections::{HashMap, HashSet};
@@ -586,10 +585,8 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
         )));
     }
     let mut headers = Vec::new();
-    let wrap = members.iter().any(|member| member.expanded)
-        || absorbed.iter().any(|(_, _, expanded)| *expanded);
     let inner_width = width.saturating_sub(2).max(1);
-    let mut rendered_rows = text_height(&Text::from(lines.clone()), inner_width, wrap);
+    let mut rendered_rows = lines.len() as u16;
 
     if expanded {
         // Calls and reasoning interleave in the transcript; render them in
@@ -613,7 +610,12 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
                     .live_output(member.live_output)
                     .expanded(member.expanded)
                     .into_text();
-                let height = text_height(&text, inner_width, wrap);
+                let text = if member.expanded {
+                    wrap_text(text, inner_width)
+                } else {
+                    text
+                };
+                let height = text.lines.len() as u16;
                 headers.push(MemberHeader {
                     index: member.index,
                     top: rendered_rows,
@@ -639,7 +641,12 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
                         .into_parts()
                         .0
                 };
-                let height = text_height(&text, inner_width, wrap);
+                let text = if thought_expanded {
+                    wrap_text(text, inner_width)
+                } else {
+                    text
+                };
+                let height = text.lines.len() as u16;
                 headers.push(MemberHeader {
                     index,
                     top: rendered_rows,
@@ -658,21 +665,45 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
         } else {
             Style::new()
         });
-    let mut paragraph = Paragraph::new(Text::from(lines)).block(block);
-    if wrap {
-        paragraph = paragraph.wrap(Wrap { trim: false });
-    }
+    let paragraph = Paragraph::new(Text::from(lines)).block(block);
     (paragraph, headers)
 }
 
-fn text_height(text: &Text<'static>, width: u16, wrap: bool) -> u16 {
-    let paragraph = Paragraph::new(text.clone());
-    let paragraph = if wrap {
-        paragraph.wrap(Wrap { trim: false })
-    } else {
-        paragraph
-    };
-    paragraph.line_count(width) as u16
+/// Wrap only expanded member bodies. Applying a Paragraph-wide wrap would also
+/// wrap every collapsed sibling in the group, making their one-line summaries
+/// look expanded and leaving them in the muted summary style.
+fn wrap_text(text: Text<'static>, width: u16) -> Text<'static> {
+    let width = width.max(1) as usize;
+    let mut wrapped = Vec::new();
+
+    for line in text.lines {
+        let mut current = Vec::new();
+        let mut current_width = 0usize;
+        for span in &line.spans {
+            let mut chunk = String::new();
+            for character in span.content.chars() {
+                let character_width =
+                    unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                if current_width > 0 && current_width + character_width > width {
+                    current.push(Span::styled(std::mem::take(&mut chunk), span.style));
+                    wrapped.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                }
+                chunk.push(character);
+                current_width = current_width.saturating_add(character_width);
+            }
+            if !chunk.is_empty() {
+                current.push(Span::styled(chunk, span.style));
+            }
+        }
+        if current.is_empty() {
+            wrapped.push(Line::default());
+        } else {
+            wrapped.push(Line::from(current));
+        }
+    }
+
+    Text::from(wrapped)
 }
 
 /// The muted detail line under a collapsed group header: the tool names, the
@@ -743,6 +774,71 @@ mod tests {
             id: None,
             status: None,
         }))
+    }
+
+    #[test]
+    fn expanding_one_member_does_not_wrap_collapsed_siblings() {
+        let first = FunctionToolCall {
+            arguments: r#"{"path":"src/main.rs","old_string":"old","new_string":"new"}"#.into(),
+            call_id: "call-0".into(),
+            namespace: None,
+            name: "edit_file".into(),
+            id: None,
+            status: None,
+        };
+        let second = FunctionToolCall {
+            arguments: r#"{"command":"this is a deliberately long collapsed summary"}"#.into(),
+            call_id: "call-1".into(),
+            namespace: None,
+            name: "command".into(),
+            id: None,
+            status: None,
+        };
+        let third = FunctionToolCall {
+            arguments: r#"{"command":"another deliberately long collapsed summary"}"#.into(),
+            call_id: "call-2".into(),
+            namespace: None,
+            name: "command".into(),
+            id: None,
+            status: None,
+        };
+        let items = vec![
+            MessageItem::Output(OutputItem::FunctionCall(first.clone())),
+            MessageItem::Output(OutputItem::FunctionCall(second.clone())),
+            MessageItem::Output(OutputItem::FunctionCall(third.clone())),
+        ];
+        let group = discover_tool_groups(&items).pop().unwrap();
+        let members = vec![
+            ToolGroupMember {
+                index: 0,
+                call: &first,
+                output: None,
+                live_output: None,
+                expanded: true,
+            },
+            ToolGroupMember {
+                index: 1,
+                call: &second,
+                output: None,
+                live_output: None,
+                expanded: false,
+            },
+            ToolGroupMember {
+                index: 2,
+                call: &third,
+                output: None,
+                live_output: None,
+                expanded: false,
+            },
+        ];
+
+        let (_, headers) = build_tool_group_paragraph(&group, &members, &[], 24, true, false);
+
+        assert_eq!(headers.len(), 3);
+        // A collapsed command has its summary, waiting line, and hint. Its
+        // long summary must remain one physical row; only the expanded first
+        // member is wrapped.
+        assert_eq!(headers[2].top - headers[1].top, 3);
     }
 
     #[test]

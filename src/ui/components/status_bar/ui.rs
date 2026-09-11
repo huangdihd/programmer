@@ -41,6 +41,7 @@ impl Widget for &StatusBar {
             StatusState::Cancelling => ("✖", "Cancelling", WARN),
             StatusState::WaitingAnswer => ("?", "Waiting for answer", ACCENT),
             StatusState::WaitingApproval => ("🛡", "Waiting for approval", WARN),
+            StatusState::WaitingSubagents => ("⏳", "waiting subagents", ACCENT),
         };
 
         let busy = self.status.is_busy();

@@ -44,6 +44,8 @@ pub enum StatusState {
     WaitingAnswer,
     /// Tool calls are queued for approval in Manual mode.
     WaitingApproval,
+    /// The parent agent is waiting for one or more sub-agents to finish.
+    WaitingSubagents,
 }
 
 impl StatusState {
@@ -60,6 +62,7 @@ impl StatusState {
                 | StatusState::Classifying
                 | StatusState::Compacting
                 | StatusState::Cancelling
+                | StatusState::WaitingSubagents
         )
     }
 
@@ -79,6 +82,7 @@ impl StatusState {
             StatusState::Cancelling => "\u{2716} Cancelling",
             StatusState::WaitingAnswer => "? Waiting for answer",
             StatusState::WaitingApproval => "\u{1f6e1} Waiting for approval",
+            StatusState::WaitingSubagents => "⏳ Waiting subagents",
         }
     }
 }
@@ -137,6 +141,7 @@ mod tests {
             StatusState::Compacting,
             StatusState::WaitingAnswer,
             StatusState::WaitingApproval,
+            StatusState::WaitingSubagents,
         ];
         for v in variants {
             let label = v.emoji_label();
@@ -162,6 +167,7 @@ mod tests {
             StatusState::Compacting,
             StatusState::WaitingAnswer,
             StatusState::WaitingApproval,
+            StatusState::WaitingSubagents,
         ];
         let labels: HashSet<&str> = variants.iter().map(|v| v.emoji_label()).collect();
         assert_eq!(labels.len(), variants.len(), "duplicate labels detected");

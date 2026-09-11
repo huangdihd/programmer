@@ -1388,10 +1388,15 @@ impl ConversationPanel {
         // Keep the single worker focused on the response currently arriving.
         // Historical reflows can wait until the turn boundary; otherwise a
         // large resize backlog could delay the live reasoning snapshot.
-        if width == 0
-            || self.live_markdown_history_keys.is_empty()
-            || self.receiving_response.is_some()
-        {
+        // Historical reasoning still needs to reflow when a request is only
+        // connecting. In that state there are no live output items competing
+        // for the worker, and skipping these jobs makes an expand/collapse
+        // click leave the item stuck on the old front snapshot.
+        let live_output_started = self
+            .receiving_response
+            .as_ref()
+            .is_some_and(|response| !response.message_item_refs().is_empty());
+        if width == 0 || self.live_markdown_history_keys.is_empty() || live_output_started {
             return;
         }
         let generation = self.live_markdown_generation;
@@ -1763,7 +1768,9 @@ impl ConversationPanel {
 mod tests {
     use super::*;
     use crate::cancel::CancellationToken;
-    use async_openai::types::responses::{InputContent, InputMessage, InputRole, OutputStatus};
+    use async_openai::types::responses::{
+        InputContent, InputMessage, InputRole, OutputStatus, ReasoningItem,
+    };
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget;
 
@@ -1897,6 +1904,29 @@ mod tests {
         let second = cache.scrolled(&source, 9_900);
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn connecting_does_not_block_committed_reasoning_reflow() {
+        let mut panel = ConversationPanel::new();
+        panel
+            .live_markdown_history_keys
+            .insert(0, "generation:1:reasoning:done".into());
+        panel.receiving_response = Some(PartialResponse::new(CancellationToken::new()));
+        let items = vec![MessageItem::Output(OutputItem::Reasoning(ReasoningItem {
+            id: Some("done".into()),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: None,
+            status: None,
+        }))];
+
+        panel.queue_committed_markdown_jobs(&items, 80);
+
+        assert_eq!(
+            panel.live_markdown_history_last_job.get(&0),
+            Some(&(80, false))
+        );
     }
 
     #[test]

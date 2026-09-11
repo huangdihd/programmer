@@ -34,6 +34,16 @@ fn terminal_title_subject<'a>(session_title: &'a str, project_name: &'a str) -> 
     }
 }
 
+fn status_for_pending_turn(active_turn: bool, retrying: bool) -> StatusState {
+    if retrying {
+        StatusState::Retrying
+    } else if active_turn {
+        StatusState::Connecting
+    } else {
+        StatusState::Idle
+    }
+}
+
 impl App<'_> {
     /// The single status the footer shows, by precedence: user-input waits
     /// first, then the current busy phase, then idle.
@@ -43,6 +53,14 @@ impl App<'_> {
         }
         if self.pending_review.is_some() {
             return StatusState::WaitingApproval;
+        }
+        if self
+            .agents
+            .snapshot_all()
+            .iter()
+            .any(|agent| agent.status == crate::agents::AgentStatus::Running)
+        {
+            return StatusState::WaitingSubagents;
         }
         let cp = &self.conversation_panel;
         match cp.phase {
@@ -56,17 +74,12 @@ impl App<'_> {
             ActivePhase::None => match &cp.receiving_response {
                 // Request in flight but nothing has streamed back yet: either
                 // still connecting, or backing off between retries.
-                Some(partial) if !partial.started() => {
-                    if self
-                        .cancel
+                Some(partial) if !partial.started() => status_for_pending_turn(
+                    true,
+                    self.cancel
                         .stream_retrying
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        StatusState::Retrying
-                    } else {
-                        StatusState::Connecting
-                    }
-                }
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ),
                 // Streaming: derive the state from what the model is emitting
                 // right now — reasoning, visible text, or a tool call.
                 Some(partial) => match partial.streaming_kind() {
@@ -78,7 +91,12 @@ impl App<'_> {
                     }
                     _ => StatusState::Thinking,
                 },
-                None => StatusState::Idle,
+                None => status_for_pending_turn(
+                    self.cancel.active_id.is_some(),
+                    self.cancel
+                        .stream_retrying
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ),
             },
         }
     }
@@ -478,7 +496,18 @@ impl Widget for &mut App<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_title_subject;
+    use super::{status_for_pending_turn, terminal_title_subject};
+    use crate::ui::components::status_bar::status_bar::StatusState;
+
+    #[test]
+    fn active_turn_is_connecting_before_streaming_phase_arrives() {
+        assert_eq!(
+            status_for_pending_turn(true, false),
+            StatusState::Connecting
+        );
+        assert_eq!(status_for_pending_turn(true, true), StatusState::Retrying);
+        assert_eq!(status_for_pending_turn(false, false), StatusState::Idle);
+    }
 
     #[test]
     fn session_title_replaces_project_name_in_terminal_title() {
