@@ -39,9 +39,6 @@ pub(crate) const MAX_CONCURRENT_READ_TOOLS: usize = 8;
 /// connection error before giving up.
 pub(crate) const MAX_STREAM_RETRIES: u32 = 10;
 
-/// The frequency at which tick events are emitted.
-pub(crate) const TICK_FPS: f64 = 30.0;
-
 /// How many file-editing turns pass between reminders to refresh PROGRAMMER.md.
 pub(crate) const OVERVIEW_REMINDER_EVERY: usize = 5;
 

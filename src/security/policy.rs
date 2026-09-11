@@ -192,6 +192,12 @@ struct CompiledRule {
     matcher: GlobMatcher,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct PersistedFileSnapshot {
+    pub(crate) path: PathBuf,
+    pub(crate) hash: [u8; 32],
+}
+
 pub(crate) struct SecurityManager {
     workspace: PathBuf,
     config: SecurityConfig,
@@ -411,6 +417,34 @@ impl SecurityManager {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| "missing path for security check".to_string())?;
         self.authorize_path(operation, path).map(|_| ())
+    }
+
+    pub(crate) fn persisted_snapshots(&self) -> Vec<PersistedFileSnapshot> {
+        self.snapshots
+            .lock()
+            .map(|snapshots| {
+                snapshots
+                    .iter()
+                    .filter_map(|((scope, path), hash)| {
+                        (*scope == 0).then_some(PersistedFileSnapshot {
+                            path: path.clone(),
+                            hash: *hash.as_bytes(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn restore_snapshots(&self, snapshots: &[PersistedFileSnapshot]) {
+        if let Ok(mut current) = self.snapshots.lock() {
+            for snapshot in snapshots {
+                current.insert(
+                    (0, snapshot.path.clone()),
+                    blake3::Hash::from_bytes(snapshot.hash),
+                );
+            }
+        }
     }
 
     pub(crate) fn record_read(&self, path: &Path, contents: &[u8]) {

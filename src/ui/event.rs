@@ -21,7 +21,6 @@ use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Representation of all possible events.
@@ -353,23 +352,16 @@ pub struct EventHandler {
 impl EventHandler {
     /// Constructs a new instance of [`EventHandler`].
     pub fn new() -> Self {
-        let tick_rate = tick_interval();
         let (sender, receiver) = mpsc::unbounded_channel();
         let _sender = sender.clone();
         let tick_queued = Arc::new(AtomicBool::new(false));
-        let producer_tick_queued = tick_queued.clone();
         let _task = tokio::spawn(async move {
             let mut reader = crossterm::event::EventStream::new();
-            let mut tick = tokio::time::interval(tick_rate);
             loop {
-                let tick_delay = tick.tick();
                 let crossterm_event = reader.next().fuse();
                 tokio::select! {
                   _ = _sender.closed() => {
                     break;
-                  }
-                  _ = tick_delay => {
-                    queue_tick(&_sender, &producer_tick_queued);
                   }
                   Some(Ok(evt)) = crossterm_event => {
                     let _ = _sender.send(Event::Crossterm(evt));
@@ -414,61 +406,32 @@ impl EventHandler {
     /// This is useful for sending events to the event handler which will be processed by the next
     /// iteration of the application's event loop.
     pub fn send(&mut self, app_event: AppEvent) {
-        // Ignore the result as the reciever cannot be dropped while this struct still has a
-        // reference to it
         let _ = self.sender.send(Event::App(app_event));
+    }
+
+    /// Schedule one coalesced redraw at the maximum refresh rate. Unlike a
+    /// periodic ticker this creates no events while the UI is idle.
+    pub fn schedule_redraw(&self) {
+        if self
+            .tick_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let sender = self.sender.clone();
+        let queued = self.tick_queued.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+            if sender.send(Event::Tick).is_err() {
+                queued.store(false, Ordering::Release);
+            }
+        });
     }
 
     fn mark_received(&self, event: &Event) {
         if matches!(event, Event::Tick) {
             self.tick_queued.store(false, Ordering::Release);
         }
-    }
-}
-
-fn queue_tick(sender: &mpsc::UnboundedSender<Event>, queued: &AtomicBool) {
-    if queued
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-        && sender.send(Event::Tick).is_err()
-    {
-        queued.store(false, Ordering::Release);
-    }
-}
-
-fn tick_interval() -> Duration {
-    Duration::from_secs_f64(1.0 / crate::consts::TICK_FPS)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Event, queue_tick, tick_interval};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::sync::mpsc;
-
-    #[test]
-    fn tick_interval_is_one_over_tick_fps() {
-        // EventHandler::new() uses this exact helper, so the production call
-        // site cannot accidentally pass FPS as a duration again.
-        let ms = tick_interval().as_millis();
-        assert!(
-            (30..=35).contains(&ms),
-            "expected ~33ms per tick, got {ms}ms — is the formula 1.0 / TICK_FPS?"
-        );
-    }
-
-    #[test]
-    fn queued_ticks_are_coalesced_until_consumed() {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let queued = AtomicBool::new(false);
-
-        queue_tick(&sender, &queued);
-        queue_tick(&sender, &queued);
-        assert!(matches!(receiver.try_recv(), Ok(Event::Tick)));
-        assert!(receiver.try_recv().is_err());
-
-        queued.store(false, Ordering::Release);
-        queue_tick(&sender, &queued);
-        assert!(matches!(receiver.try_recv(), Ok(Event::Tick)));
     }
 }

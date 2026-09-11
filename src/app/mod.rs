@@ -53,10 +53,30 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Keep input bursts from starving terminal redraws. Four events per frame
-/// sustains 120 events/second at the normal 30 FPS tick rate while giving
-/// trackpad scrolling and streamed output a frame boundary every few events.
+/// Bound how many already-queued events are folded into state in one pass.
+/// Bound how many non-streaming events are folded into state in one pass.
 const MAX_EVENTS_PER_FRAME: usize = 4;
+/// Streaming chunks are cheap to merge and must not consume the interaction
+/// event budget, otherwise a fast provider can delay keyboard and mouse input.
+const MAX_CHUNKS_PER_BATCH: usize = 256;
+
+fn event_requests_immediate_redraw(event: &Event) -> bool {
+    !matches!(
+        event,
+        Event::App(crate::ui::event::AppEvent::ChunkReceived(_, _))
+    )
+}
+
+fn scroll_direction(event: &Event) -> Option<crossterm::event::MouseEventKind> {
+    match event {
+        Event::Crossterm(crossterm::event::Event::Mouse(mouse)) => match mouse.kind {
+            crossterm::event::MouseEventKind::ScrollUp
+            | crossterm::event::MouseEventKind::ScrollDown => Some(mouse.kind),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 /// A pending tool-call review request from the runner. Manual mode now gets
 /// per-call reviews (no batch), driven by the runner's `review()` callback.
@@ -403,6 +423,8 @@ impl App<'_> {
         let mut saved_input_suggestion = None;
 
         let mut saved_activated_skills: Option<Vec<String>> = None;
+        let mut saved_file_snapshots: Vec<crate::security::policy::PersistedFileSnapshot> =
+            Vec::new();
         if let Some(mgr) = &session_mgr
             && let Some(saved) = mgr.load(&session_uuid)
         {
@@ -416,6 +438,7 @@ impl App<'_> {
             }
             session_title = saved.title;
             saved_input_suggestion = saved.input_suggestion;
+            saved_file_snapshots = saved.file_snapshots;
             vision_enabled = saved.vision_enabled;
             thinking_level = saved.thinking_level;
             classifier_model_override = saved.classifier_model_override;
@@ -450,6 +473,7 @@ impl App<'_> {
                 .expect("security configuration should be validated before starting the app"),
         );
         crate::security::install_active(security_manager.clone());
+        security_manager.restore_snapshots(&saved_file_snapshots);
         let security = Arc::new(crate::security::SecurityHandle::new(security_manager));
         let mcp_server_statuses = config
             .mcp_servers
@@ -777,21 +801,64 @@ impl App<'_> {
         crate::app::diagnostics::maybe_seed_diagnostics_baseline(&mut self);
 
         let result = async {
+            // Paint startup state immediately. After this, raw stream chunks only
+            // mutate the in-flight response; Tick presents their accumulated state
+            // at the configured frame rate. User input and lifecycle events still
+            // request an immediate frame.
+            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
             while self.running {
-                terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
-
                 let mut event = Some(self.events.next().await?);
-                for index in 0..MAX_EVENTS_PER_FRAME {
+                let mut redraw = false;
+                let mut regular_events = 0;
+                let mut chunks = 0;
+                loop {
                     let Some(current) = event.take() else {
                         break;
                     };
+                    let chunk_received = matches!(
+                        &current,
+                        Event::App(crate::ui::event::AppEvent::ChunkReceived(_, _))
+                    );
+                    let current_scroll_direction = scroll_direction(&current);
+                    redraw |= matches!(&current, Event::Tick)
+                        || event_requests_immediate_redraw(&current);
                     self.handle_event(current).await?;
-                    if !self.running {
+                    if chunk_received {
+                        chunks += 1;
+                    } else {
+                        regular_events += 1;
+                    }
+                    // Busy status labels contain a live elapsed timer. Keep
+                    // that timer moving only while a busy phase is active;
+                    // idle sessions still produce no synthetic Tick events.
+                    if self.footer.status.status.is_busy() {
+                        self.events.schedule_redraw();
+                    }
+                    // Mouse wheel events are often delivered in a burst. Consume
+                    // only the contiguous events with the same direction, so a
+                    // reverse scroll or any keyboard/input event remains next.
+                    if let Some(direction) = current_scroll_direction {
+                        while let Some(next) = self.events.try_next() {
+                            if scroll_direction(&next) != Some(direction) {
+                                event = Some(next);
+                                break;
+                            }
+                            redraw |= event_requests_immediate_redraw(&next);
+                            self.handle_event(next).await?;
+                        }
+                    }
+                    if !self.running || redraw {
                         break;
                     }
-                    if index + 1 < MAX_EVENTS_PER_FRAME {
+                    if regular_events >= MAX_EVENTS_PER_FRAME || chunks >= MAX_CHUNKS_PER_BATCH {
+                        break;
+                    }
+                    if event.is_none() {
                         event = self.events.try_next();
                     }
+                }
+                if self.running && redraw {
+                    terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
                 }
             }
             Ok(())
@@ -831,10 +898,17 @@ impl App<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::TaskNotificationState;
+    use super::{TaskNotificationState, event_requests_immediate_redraw};
+    use crate::ui::event::{AppEvent, Event};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn redraw_policy_keeps_ticks_and_interaction_immediate_but_throttles_chunks() {
+        assert!(event_requests_immediate_redraw(&Event::Tick));
+        assert!(event_requests_immediate_redraw(&Event::App(AppEvent::Quit)));
+    }
 
     fn event(sequence: u64) -> crate::tasks::TaskLifecycleEvent {
         crate::tasks::TaskLifecycleEvent {
