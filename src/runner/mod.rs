@@ -182,6 +182,8 @@ pub(crate) enum RunnerEvent<'a> {
     /// A completed API response reported its real input token count and all
     /// function calls from that response (if any) now have paired outputs.
     UsageSafePoint { input_tokens: u32 },
+    /// The main runner entered or left a blocking `agent wait` call.
+    WaitingSubagents(bool),
 }
 
 /// When a turn is cancelled after assistant function calls have already been
@@ -338,7 +340,7 @@ impl TurnRunner {
             // ---- no tool calls → the turn is done ----
             if calls.is_empty() {
                 if let Some((input_tokens, _, _)) = usage {
-                    surface.on_event(RunnerEvent::UsageSafePoint { input_tokens });
+                    surface.usage_safe_point(input_tokens).await;
                 }
                 let usage = conversation.lock().unwrap().accumulated_usage;
                 return Ok(TurnResult {
@@ -415,7 +417,7 @@ impl TurnRunner {
                         .await;
                     }
                     if let Some((input_tokens, _, _)) = usage {
-                        surface.on_event(RunnerEvent::UsageSafePoint { input_tokens });
+                        surface.usage_safe_point(input_tokens).await;
                     }
                 }
                 None => {
@@ -519,6 +521,12 @@ impl TurnRunner {
         // dropped receiver — safe because ask_user is already pre-denied there.
         let sender = tool_sender.unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().0);
         let op_id = surface.operation_id();
+        let waiting_subagents = allowed.iter().any(|call| {
+            call.name == crate::tools::agent::NAME && crate::tools::agent::is_wait(&call.arguments)
+        });
+        if waiting_subagents {
+            surface.on_event(RunnerEvent::WaitingSubagents(true));
+        }
         let outputs = tools::run_tool_batch(
             allowed,
             denied,
@@ -529,6 +537,9 @@ impl TurnRunner {
             op_id,
         )
         .await;
+        if waiting_subagents {
+            surface.on_event(RunnerEvent::WaitingSubagents(false));
+        }
         Some(outputs)
     }
 
@@ -992,7 +1003,8 @@ mod tests {
                 RunnerEvent::StreamChunk(_)
                 | RunnerEvent::ResponseCommitted
                 | RunnerEvent::Phase(_)
-                | RunnerEvent::UsageSafePoint { .. } => return,
+                | RunnerEvent::UsageSafePoint { .. }
+                | RunnerEvent::WaitingSubagents(_) => return,
             };
             self.events.lock().unwrap().push(label);
         }

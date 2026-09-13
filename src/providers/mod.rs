@@ -333,6 +333,7 @@ mod tests {
             title_model: None,
             suggestion_model: None,
             auto_compact_tokens: 100_000,
+            mandatory_compact_tokens: 150_000,
             compact_keep_recent_turns: 2,
             memory: Default::default(),
             allow_yolo: false,

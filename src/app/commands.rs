@@ -129,6 +129,28 @@ async fn start_request_as_with_images(
         return;
     }
 
+    if app.mandatory_compact_tokens().is_some_and(|limit| {
+        app.auto_compact
+            .last_input_tokens
+            .is_some_and(|tokens| tokens >= limit)
+    }) {
+        queue_pending_request(
+            &mut app.conversation_panel,
+            &mut app.pending_images,
+            text,
+            images,
+        );
+        app.auto_compact.mandatory_waiting = true;
+        let input_tokens = app.auto_compact.last_input_tokens.unwrap_or_default();
+        if !maybe_start_auto_compact(app, input_tokens) {
+            app.auto_compact.mandatory_waiting = false;
+            app.conversation_panel.add_error_string(
+                "mandatory context compaction could not start; request remains queued".to_string(),
+            );
+        }
+        return;
+    }
+
     start_ready_request(app, vec![(text, role, images)], original_draft).await;
 }
 
@@ -808,26 +830,49 @@ pub(crate) fn start_compact(app: &mut App<'_>) {
 /// Observe a provider-reported input-token count and, when the session's
 /// threshold is crossed, snapshot a complete historical prefix for seamless
 /// background compaction. The foreground turn and input remain interactive.
-pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) {
+pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> bool {
     app.auto_compact.last_input_tokens = Some(input_tokens);
-    let Some(threshold) = app.effective_auto_compact_tokens() else {
-        return;
+    let threshold = if app.auto_compact.mandatory_waiting {
+        app.mandatory_compact_tokens()
+    } else {
+        app.effective_auto_compact_tokens()
     };
-    if input_tokens < threshold || app.auto_compact.active_id.is_some() {
-        return;
+    let Some(threshold) = threshold else {
+        return false;
+    };
+    if input_tokens < threshold {
+        return false;
     }
+    if app.auto_compact.active_id.is_some() {
+        return true;
+    }
+    let snapshot = app.conversation_panel.items_snapshot();
     let stable_end = app
         .cancel
         .turn_conversation_cutoff
-        .unwrap_or_else(|| app.conversation_panel.items_snapshot().len());
-    let Some(cutoff) = app
+        .unwrap_or(snapshot.len())
+        .min(snapshot.len());
+    let cutoff = app
         .conversation_panel
         .compaction_cutoff_before(app.effective_compact_keep_recent_turns(), stable_end)
-    else {
-        return;
+        .or_else(|| {
+            // A mandatory retry may need to summarize the summary installed by
+            // the previous attempt. Appending another boundary at the stable
+            // edge replaces that summary without touching the in-flight turn.
+            (app.auto_compact.mandatory_waiting
+                && snapshot[..stable_end].iter().any(|item| {
+                    matches!(
+                        item,
+                        crate::response::message_item::MessageItem::Compacted { .. }
+                    )
+                }))
+            .then_some(stable_end)
+        });
+    let Some(cutoff) = cutoff else {
+        return false;
     };
     if app.auto_compact.last_cutoff == Some(cutoff) {
-        return;
+        return false;
     }
     let target_model = app.effective_compact_model();
     let Some((client, model_name)) = app.provider_manager.resolve(&target_model) else {
@@ -835,7 +880,7 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) {
             "automatic context compaction skipped: unknown provider/model {target_model}"
         ));
         app.auto_compact.last_cutoff = Some(cutoff);
-        return;
+        return false;
     };
     let client = client.clone();
     let input_items = compact_input_items(app.conversation_panel.input_param_for_prefix(
@@ -863,12 +908,20 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) {
             result,
         }));
     });
+    true
 }
 
 pub(crate) fn invalidate_auto_compaction(app: &mut App<'_>) {
     app.auto_compact.history_epoch = app.auto_compact.history_epoch.wrapping_add(1);
     app.auto_compact.active_id = None;
     app.auto_compact.last_cutoff = None;
+    app.auto_compact.mandatory_waiting = false;
+    if app.auto_compact.mandatory_resume.is_some() {
+        app.cancel.active.cancel();
+    }
+    if let Some(resume) = app.auto_compact.mandatory_resume.take() {
+        let _ = resume.send(());
+    }
     app.input_panel.clear_next_turn_compaction();
 }
 

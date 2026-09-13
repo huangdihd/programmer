@@ -21,7 +21,7 @@ use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Representation of all possible events.
 #[derive(Debug)]
@@ -67,7 +67,9 @@ pub enum AppEvent {
     /// Tagged with the operation id.
     RunnerPhase(u64, crate::runner::RunnerPhase),
     /// Real input usage reported by a response at a call/output-safe point.
-    UsageSafePoint(u64, u32),
+    UsageSafePoint(u64, u32, oneshot::Sender<()>),
+    /// The main runner entered or left an `agent wait` tool call.
+    WaitingSubagents(u64, bool),
     /// The runner asks the user to review a tool call the classifier flagged
     /// (`Ask` verdict). Carries the call, the classifier's reason, the call's
     /// 1-based position and batch total, and the oneshot the decision goes
@@ -223,10 +225,15 @@ impl std::fmt::Debug for AppEvent {
                 .finish(),
             Self::ResponseCommitted(id) => f.debug_tuple("ResponseCommitted").field(id).finish(),
             Self::RunnerPhase(id, _) => f.debug_tuple("RunnerPhase").field(id).finish(),
-            Self::UsageSafePoint(id, tokens) => f
+            Self::UsageSafePoint(id, tokens, _) => f
                 .debug_tuple("UsageSafePoint")
                 .field(id)
                 .field(tokens)
+                .finish(),
+            Self::WaitingSubagents(id, waiting) => f
+                .debug_tuple("WaitingSubagents")
+                .field(id)
+                .field(waiting)
                 .finish(),
             Self::ReviewRequest {
                 call, operation_id, ..

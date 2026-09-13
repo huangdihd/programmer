@@ -34,6 +34,10 @@ fn terminal_title_subject<'a>(session_title: &'a str, project_name: &'a str) -> 
     }
 }
 
+fn status_for_waiting_subagents(waiting: bool) -> Option<StatusState> {
+    waiting.then_some(StatusState::WaitingSubagents)
+}
+
 fn status_for_pending_turn(active_turn: bool, retrying: bool) -> StatusState {
     if retrying {
         StatusState::Retrying
@@ -54,13 +58,11 @@ impl App<'_> {
         if self.pending_review.is_some() {
             return StatusState::WaitingApproval;
         }
-        if self
-            .agents
-            .snapshot_all()
-            .iter()
-            .any(|agent| agent.status == crate::agents::AgentStatus::Running)
-        {
-            return StatusState::WaitingSubagents;
+        // This is set only while the main runner is executing an `agent wait`
+        // tool call. Merely having running children does not mean the parent is
+        // waiting for them.
+        if let Some(status) = status_for_waiting_subagents(self.waiting_for_subagents) {
+            return status;
         }
         let cp = &self.conversation_panel;
         match cp.phase {
@@ -496,7 +498,7 @@ impl Widget for &mut App<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{status_for_pending_turn, terminal_title_subject};
+    use super::{status_for_pending_turn, status_for_waiting_subagents, terminal_title_subject};
     use crate::ui::components::status_bar::status_bar::StatusState;
 
     #[test]
@@ -507,6 +509,15 @@ mod tests {
         );
         assert_eq!(status_for_pending_turn(true, true), StatusState::Retrying);
         assert_eq!(status_for_pending_turn(false, false), StatusState::Idle);
+    }
+
+    #[test]
+    fn waiting_subagents_requires_an_active_agent_wait_call() {
+        assert_eq!(
+            status_for_waiting_subagents(true),
+            Some(StatusState::WaitingSubagents)
+        );
+        assert_eq!(status_for_waiting_subagents(false), None);
     }
 
     #[test]
