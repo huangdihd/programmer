@@ -370,7 +370,7 @@ impl AgentSurface for CliSurface {
                 "type": "phase",
                 "phase": phase_label(phase),
             }),
-            RunnerEvent::UsageSafePoint { .. } => return,
+            RunnerEvent::UsageSafePoint { .. } | RunnerEvent::WaitingSubagents(_) => return,
         };
         println!("{event}");
     }

@@ -53,6 +53,13 @@ pub(crate) trait AgentSurface: Send + Sync {
     /// it inline between iterations.
     fn on_event(&self, event: RunnerEvent<'_>);
 
+    /// Reach a response boundary where the front-end may need to compact
+    /// before the runner sends another request. Non-interactive surfaces keep
+    /// the historical non-blocking behaviour.
+    async fn usage_safe_point(&self, input_tokens: u32) {
+        self.on_event(RunnerEvent::UsageSafePoint { input_tokens });
+    }
+
     /// A classifier `Ask` verdict needs a decision. `reason` is the classifier's
     /// explanation for why the call was flagged; `position` is this call's
     /// 1-based index and the batch total, so an interactive surface can show

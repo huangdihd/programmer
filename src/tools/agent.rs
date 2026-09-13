@@ -83,6 +83,10 @@ pub(crate) fn is_observational(arguments: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn is_wait(arguments: &str) -> bool {
+    serde_json::from_str::<Args>(arguments).is_ok_and(|args| args.action == "wait")
+}
+
 pub(crate) async fn run(
     arguments: &str,
     manager: &AgentManager,
@@ -184,6 +188,8 @@ mod tests {
         assert!(is_observational(r#"{"action":"list"}"#));
         assert!(is_observational(r#"{"action":"result","id":1}"#));
         assert!(is_observational(r#"{"action":"wait","id":1}"#));
+        assert!(is_wait(r#"{"action":"wait","id":1}"#));
+        assert!(!is_wait(r#"{"action":"spawn","prompt":"x"}"#));
         assert!(!is_observational(r#"{"action":"spawn","prompt":"x"}"#));
         assert!(!is_observational(r#"{"action":"cancel","id":1}"#));
     }

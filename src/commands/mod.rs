@@ -2167,6 +2167,10 @@ mod tests {
         let interactive_id =
             crate::tasks::spawn_interactive("cat", None, Some("catname"), 10, 40).expect("spawn");
         let pipe_id = crate::tasks::spawn("sleep 5", None, Some("sleep")).expect("spawn");
+        // Task registration is asynchronous; yield once so both entries are
+        // visible before querying completion when the full suite runs in
+        // parallel with other task lifecycle tests.
+        tokio::task::yield_now().await;
         let state = CompletionEngine::complete_terminal("terminal ", "terminal")
             .expect("candidates for running tasks");
         assert!(

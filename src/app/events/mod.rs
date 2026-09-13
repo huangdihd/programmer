@@ -159,9 +159,30 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 RunnerPhase::Checking => ActivePhase::Checking,
             };
         }
-        AppEvent::UsageSafePoint(op_id, input_tokens) => {
+        AppEvent::WaitingSubagents(op_id, waiting) => {
             if is_live_turn(app, op_id) {
-                commands::maybe_start_auto_compact(app, input_tokens);
+                app.waiting_for_subagents = waiting;
+            }
+        }
+        AppEvent::UsageSafePoint(op_id, input_tokens, resume) => {
+            if !is_live_turn(app, op_id) {
+                return;
+            }
+            if app
+                .mandatory_compact_tokens()
+                .is_some_and(|limit| input_tokens >= limit)
+            {
+                app.auto_compact.mandatory_waiting = true;
+                app.auto_compact.mandatory_resume = Some(resume);
+                if !commands::maybe_start_auto_compact(app, input_tokens) {
+                    fail_mandatory_compaction(
+                        app,
+                        "mandatory context compaction could not start at the provider boundary"
+                            .to_string(),
+                    );
+                }
+            } else {
+                let _ = resume.send(());
             }
         }
         AppEvent::ReviewRequest {
@@ -214,6 +235,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             app.cancel.active_id = None;
             app.cancel.turn_conversation_cutoff = None;
             app.cancel.active_user_request = None;
+            app.waiting_for_subagents = false;
             // A prompt may have been installed just before cancellation won the
             // race. Turn completion is the final defensive cleanup boundary.
             discard_reviews_for_operation(app, op_id);
@@ -297,35 +319,76 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             if app.auto_compact.history_epoch != history_epoch {
                 return;
             }
-            match result {
-                Ok(compaction) => {
-                    let turns = app.conversation_panel.compaction_turn_count(cutoff);
-                    let details = compaction_details(turns, &compaction);
-                    if app
-                        .conversation_panel
-                        .apply_compaction_at(cutoff, compaction.summary)
-                    {
-                        if let Some(store) = &app.checkpoint_store
-                            && let Err(error) =
-                                store.lock().unwrap().record_conversation_insertion(cutoff)
-                        {
-                            app.conversation_panel.add_warning_string(format!(
-                                "could not update rewind checkpoints after compaction: {error}"
-                            ));
-                        }
-                        app.input_panel.show_next_turn_compaction(details);
-                        session::mark_dirty(app);
-                        // Make the generated summary durable immediately when
-                        // the foreground is idle, so reopening the session can
-                        // reuse it instead of compacting the same history again.
-                        // If another turn is active, the normal idle flush saves
-                        // it at the next safe turn boundary.
-                        session::flush_if_dirty(app);
-                    }
+            let compaction = match result {
+                Ok(compaction) => compaction,
+                Err(error) => {
+                    fail_mandatory_compaction(
+                        app,
+                        format!("automatic context compaction failed: {error}"),
+                    );
+                    return;
                 }
-                Err(error) => app
-                    .conversation_panel
-                    .add_warning_string(format!("automatic context compaction failed: {error}")),
+            };
+            let Some((input_tokens, output_tokens)) = reducing_compaction_usage(&compaction) else {
+                fail_mandatory_compaction(
+                    app,
+                    "automatic context compaction rejected: provider did not prove the summary was smaller"
+                        .to_string(),
+                );
+                return;
+            };
+            let turns = app.conversation_panel.compaction_turn_count(cutoff);
+            let details = compaction_details(turns, &compaction);
+            if !app
+                .conversation_panel
+                .apply_compaction_at(cutoff, compaction.summary)
+            {
+                fail_mandatory_compaction(
+                    app,
+                    "automatic context compaction rejected: history changed before installation"
+                        .to_string(),
+                );
+                return;
+            }
+            if let Some(stable_end) = app.cancel.turn_conversation_cutoff.as_mut()
+                && cutoff <= *stable_end
+            {
+                *stable_end = stable_end.saturating_add(1);
+            }
+            if let Some(store) = &app.checkpoint_store
+                && let Err(error) = store.lock().unwrap().record_conversation_insertion(cutoff)
+            {
+                app.conversation_panel.add_warning_string(format!(
+                    "could not update rewind checkpoints after compaction: {error}"
+                ));
+            }
+            app.input_panel.show_next_turn_compaction(details);
+            session::mark_dirty(app);
+            session::flush_if_dirty(app);
+
+            let previous_tokens = app.auto_compact.last_input_tokens.unwrap_or(input_tokens);
+            let estimated_tokens =
+                estimated_tokens_after_compaction(previous_tokens, input_tokens, output_tokens);
+            app.auto_compact.last_input_tokens = Some(estimated_tokens);
+
+            if app.auto_compact.mandatory_waiting
+                && app
+                    .mandatory_compact_tokens()
+                    .is_some_and(|limit| estimated_tokens >= limit)
+            {
+                app.auto_compact.last_cutoff = None;
+                if commands::maybe_start_auto_compact(app, estimated_tokens) {
+                    return;
+                }
+                fail_mandatory_compaction(
+                    app,
+                    "mandatory context compaction made progress but could not reduce the context below the hard limit"
+                        .to_string(),
+                );
+                return;
+            }
+            if app.auto_compact.mandatory_waiting {
+                finish_mandatory_compaction(app).await;
             }
         }
         AppEvent::SessionTitleGenerated {
@@ -730,6 +793,50 @@ fn handle_start_init(app: &mut App<'_>, prompt: String) {
     });
 }
 
+fn reducing_compaction_usage(
+    compaction: &crate::ui::event::CompactionResult,
+) -> Option<(u32, u32)> {
+    compaction
+        .input_tokens
+        .zip(compaction.output_tokens)
+        .filter(|(input, output)| output < input)
+}
+
+fn estimated_tokens_after_compaction(
+    previous_tokens: u32,
+    compact_input_tokens: u32,
+    compact_output_tokens: u32,
+) -> u32 {
+    previous_tokens
+        .saturating_sub(compact_input_tokens)
+        .saturating_add(compact_output_tokens)
+}
+
+fn fail_mandatory_compaction(app: &mut App<'_>, message: String) {
+    app.conversation_panel.add_warning_string(message);
+    if !app.auto_compact.mandatory_waiting {
+        return;
+    }
+    app.auto_compact.mandatory_waiting = false;
+    // Never let a blocked in-flight runner continue above the hard limit. A
+    // queued user request remains queued for a later retry.
+    if app.auto_compact.mandatory_resume.is_some() {
+        app.cancel.active.cancel();
+    }
+    if let Some(resume) = app.auto_compact.mandatory_resume.take() {
+        let _ = resume.send(());
+    }
+}
+
+async fn finish_mandatory_compaction(app: &mut App<'_>) {
+    app.auto_compact.mandatory_waiting = false;
+    if let Some(resume) = app.auto_compact.mandatory_resume.take() {
+        let _ = resume.send(());
+    } else {
+        start_queued_work(app).await;
+    }
+}
+
 fn compaction_details(turns: usize, compaction: &crate::ui::event::CompactionResult) -> String {
     let turn_label = if turns == 1 { "turn" } else { "turns" };
     match (compaction.input_tokens, compaction.output_tokens) {
@@ -757,6 +864,15 @@ fn handle_compact_finished(
     }
     match result {
         Ok(compaction) => {
+            let Some((_input_tokens, output_tokens)) = reducing_compaction_usage(&compaction)
+            else {
+                app.conversation_panel.add_warning_string(
+                    "context compaction rejected: provider did not prove the summary was smaller"
+                        .to_string(),
+                );
+                return;
+            };
+            app.auto_compact.last_input_tokens = Some(output_tokens);
             if app
                 .conversation_panel
                 .apply_compaction_at(cutoff, compaction.summary)
@@ -1070,12 +1186,54 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationPanel, QUIT_CONFIRM_TIMEOUT, QUIT_CONFIRM_WARNING, handle_cancel,
-        is_current_turn_id, is_live_turn_id, quit_confirmation_expired, quit_is_confirmed,
+        ConversationPanel, QUIT_CONFIRM_TIMEOUT, QUIT_CONFIRM_WARNING,
+        estimated_tokens_after_compaction, handle_cancel, is_current_turn_id, is_live_turn_id,
+        quit_confirmation_expired, quit_is_confirmed, reducing_compaction_usage,
         remove_quit_confirmation_warning, take_pending_request,
     };
     use crate::response::message_item::MessageItem;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn compaction_usage_requires_proven_reduction() {
+        use crate::ui::event::CompactionResult;
+
+        let result = |input_tokens, output_tokens| CompactionResult {
+            summary: "summary".to_string(),
+            input_tokens,
+            output_tokens,
+        };
+        assert_eq!(
+            reducing_compaction_usage(&result(Some(100), Some(40))),
+            Some((100, 40))
+        );
+        assert_eq!(
+            reducing_compaction_usage(&result(Some(100), Some(100))),
+            None
+        );
+        assert_eq!(
+            reducing_compaction_usage(&result(Some(100), Some(101))),
+            None
+        );
+        assert_eq!(reducing_compaction_usage(&result(None, Some(40))), None);
+        assert_eq!(reducing_compaction_usage(&result(Some(100), None)), None);
+    }
+
+    #[test]
+    fn mandatory_compaction_estimate_tracks_replaced_tokens() {
+        assert_eq!(
+            estimated_tokens_after_compaction(180_000, 80_000, 20_000),
+            120_000
+        );
+        assert_eq!(
+            estimated_tokens_after_compaction(180_000, 20_000, 10_000),
+            170_000
+        );
+        assert_eq!(
+            estimated_tokens_after_compaction(10_000, 20_000, 3_000),
+            3_000
+        );
+    }
 
     #[test]
     fn quit_requires_a_second_request_within_timeout() {

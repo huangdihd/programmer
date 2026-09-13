@@ -49,12 +49,26 @@ impl AgentSurface for TuiSurface {
             RunnerEvent::ResponseCommitted => AppEvent::ResponseCommitted(self.operation_id),
             RunnerEvent::Phase(p) => AppEvent::RunnerPhase(self.operation_id, p),
             RunnerEvent::UsageSafePoint { input_tokens } => {
-                AppEvent::UsageSafePoint(self.operation_id, input_tokens)
+                let (resume, _receiver) = oneshot::channel();
+                AppEvent::UsageSafePoint(self.operation_id, input_tokens, resume)
+            }
+            RunnerEvent::WaitingSubagents(waiting) => {
+                AppEvent::WaitingSubagents(self.operation_id, waiting)
             }
             // These are read from the shared conversation directly.
             RunnerEvent::Assistant(_) | RunnerEvent::ToolCall { .. } => return,
         };
         let _ = self.tx.send(Event::App(app_ev));
+    }
+
+    async fn usage_safe_point(&self, input_tokens: u32) {
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let _ = self.tx.send(Event::App(AppEvent::UsageSafePoint(
+            self.operation_id,
+            input_tokens,
+            resume_tx,
+        )));
+        let _ = self.cancel.wait_or(resume_rx).await;
     }
 
     async fn review(
@@ -102,5 +116,35 @@ impl AgentSurface for TuiSurface {
 
     fn operation_id(&self) -> u64 {
         self.operation_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn usage_safe_point_waits_for_frontend_resume() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let surface = TuiSurface {
+            tx,
+            skill_prompt: None,
+            plan_prompt: None,
+            approval_label: "test".to_string(),
+            operation_id: 42,
+            cancel: CancellationToken::new(),
+        };
+        let waiter = tokio::spawn(async move { surface.usage_safe_point(150_000).await });
+
+        let Event::App(AppEvent::UsageSafePoint(operation_id, tokens, resume)) =
+            rx.recv().await.expect("safe-point event")
+        else {
+            panic!("unexpected event")
+        };
+        assert_eq!(operation_id, 42);
+        assert_eq!(tokens, 150_000);
+        assert!(!waiter.is_finished());
+        resume.send(()).expect("resume runner");
+        waiter.await.expect("runner resumed");
     }
 }

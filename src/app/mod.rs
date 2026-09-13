@@ -174,6 +174,9 @@ pub(crate) struct AutoCompactState {
     pub(crate) history_epoch: u64,
     pub(crate) last_cutoff: Option<usize>,
     pub(crate) last_input_tokens: Option<u32>,
+    /// A user/runtime request is queued behind a mandatory compaction.
+    pub(crate) mandatory_waiting: bool,
+    pub(crate) mandatory_resume: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 pub(crate) struct TaskNotificationState {
@@ -360,6 +363,7 @@ pub struct App<'a> {
     /// Background automatic compaction bookkeeping. This is deliberately
     /// independent from the foreground turn phase and cancellation token.
     pub(crate) auto_compact: AutoCompactState,
+    pub(crate) waiting_for_subagents: bool,
     /// Operation whose completed turn is currently generating an input hint.
     pub(crate) active_suggestion_operation_id: Option<u64>,
     /// Cancels obsolete hint requests when another user turn starts.
@@ -553,6 +557,7 @@ impl App<'_> {
                 compact_keep_recent_turns_override,
             },
             auto_compact: AutoCompactState::default(),
+            waiting_for_subagents: false,
             active_suggestion_operation_id: None,
             input_suggestion_cancel: None,
             checkpoint_store,
@@ -655,6 +660,10 @@ impl App<'_> {
             .suggestion_model
             .clone()
             .unwrap_or_else(|| self.current_model.clone())
+    }
+
+    pub(crate) fn mandatory_compact_tokens(&self) -> Option<u32> {
+        (self.config.mandatory_compact_tokens > 0).then_some(self.config.mandatory_compact_tokens)
     }
 
     pub(crate) fn effective_auto_compact_tokens(&self) -> Option<u32> {

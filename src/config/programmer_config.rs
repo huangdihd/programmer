@@ -98,6 +98,9 @@ pub struct ProgrammerConfig {
     /// least this many input tokens. Zero disables automatic compaction.
     #[serde(default = "default_auto_compact_tokens")]
     pub auto_compact_tokens: u32,
+    /// Hard context limit. Reaching it requires compaction before the next turn.
+    #[serde(default = "default_mandatory_compact_tokens")]
+    pub mandatory_compact_tokens: u32,
     /// Number of complete recent turns kept verbatim after a compaction.
     #[serde(default = "default_compact_keep_recent_turns")]
     pub compact_keep_recent_turns: usize,
@@ -184,6 +187,10 @@ fn default_auto_compact_tokens() -> u32 {
     100_000
 }
 
+fn default_mandatory_compact_tokens() -> u32 {
+    150_000
+}
+
 fn default_compact_keep_recent_turns() -> usize {
     2
 }
@@ -226,6 +233,7 @@ impl Default for ProgrammerConfig {
             title_model: None,
             suggestion_model: None,
             auto_compact_tokens: default_auto_compact_tokens(),
+            mandatory_compact_tokens: default_mandatory_compact_tokens(),
             compact_keep_recent_turns: default_compact_keep_recent_turns(),
             memory: MemoryConfig::default(),
             allow_yolo: false,
@@ -345,6 +353,16 @@ impl ProgrammerConfig {
 mod tests {
     use super::*;
     use crate::mcp::types::McpServerConfig;
+
+    #[test]
+    fn mandatory_compact_limit_defaults_to_150000_and_round_trips() {
+        let config = ProgrammerConfig::default();
+        assert_eq!(config.mandatory_compact_tokens, 150_000);
+
+        let serialized = toml::to_string(&config).expect("serialize");
+        let parsed: ProgrammerConfig = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(parsed.mandatory_compact_tokens, 150_000);
+    }
 
     #[test]
     fn mcp_servers_round_trip_through_toml() {

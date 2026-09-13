@@ -188,6 +188,11 @@ suggestion_model = "openai/gpt-4o-mini"
 # tokens. This uses provider-reported usage (not an estimate); 0 disables it.
 auto_compact_tokens = 100000
 
+# Hard limit checked from provider-reported usage. At or above this value,
+# Programmer blocks the next model request until compaction reduces the context.
+# 0 disables the hard gate.
+mandatory_compact_tokens = 150000
+
 # Keep this many recent complete turns verbatim after compaction.
 compact_keep_recent_turns = 2
 
@@ -258,6 +263,7 @@ api_key = "sk-your-key-here"
 | `title_model` | (chat model) | `provider/model` used to generate a concise title for each new session. |
 | `suggestion_model` | (chat model) | `provider/model` used after successful turns to predict the next user message shown in the input placeholder. |
 | `auto_compact_tokens` | `100000` | Provider-reported input-token threshold for seamless background compaction. `0` disables it. Providers that do not report usage do not trigger it. |
+| `mandatory_compact_tokens` | `150000` | Hard provider-reported context limit. Programmer blocks further model requests until a proven-smaller compaction drops below it. `0` disables the gate. |
 | `compact_keep_recent_turns` | `2` | Number of recent complete turns kept verbatim when context is compacted. |
 | `memory.enabled` | `true` | Advertise the persistent-memory tool. Memory is recalled explicitly and is never injected automatically. |
 | `memory.global_enabled` / `project_enabled` | `true` | Include cross-project preferences and current-project memories in explicit recall. |
