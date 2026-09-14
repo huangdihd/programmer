@@ -328,11 +328,6 @@ impl App<'_> {
 
 impl Widget for &mut App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if let Some(guide) = &self.setup_guide {
-            guide.render(area, buf);
-            return;
-        }
-        // The provider management panel is modal and replaces the whole UI.
         if let Some(panel) = &self.provider_panel {
             panel.render(&self.config, &self.provider_manager, area, buf);
             return;

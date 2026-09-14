@@ -17,9 +17,9 @@
 //! receive input; pipe-based tasks render their captured output read-only.
 //!
 //! Opened with `/terminal [id]` or a `!command`. `Ctrl+O` toggles input grab:
-//! while grabbed, every key is translated to terminal bytes and written to the
-//! child; while released, the panel handles its own keys (`Esc`/`q` to close).
-//! Read-only tasks support scrolling but never forward keyboard or mouse input.
+//! while grabbed, every key (including `Esc`/`q`) is written to the child;
+//! while released, the panel handles `Esc`/`q` to close. Read-only tasks support
+//! scrolling but never forward keyboard or mouse input.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -349,7 +349,7 @@ pub fn render(pane: &TerminalPane, area: Rect, buf: &mut Buffer) {
         ))
     } else if pane.grabbed {
         Line::from(Span::styled(
-            " Ctrl+O release   keys & mouse → program   wheel: scroll back",
+            " Ctrl+O release   keys (including Esc/q) & mouse → program   wheel: scroll back",
             Style::new().fg(palette::FAINT),
         ))
     } else {
@@ -486,6 +486,14 @@ mod tests {
         assert_eq!(
             key_event_to_bytes(key(KeyCode::Enter, KeyModifiers::NONE), false),
             Some(vec![b'\r'])
+        );
+        assert_eq!(
+            key_event_to_bytes(key(KeyCode::Esc, KeyModifiers::NONE), false),
+            Some(vec![0x1b])
+        );
+        assert_eq!(
+            key_event_to_bytes(key(KeyCode::Char('q'), KeyModifiers::NONE), false),
+            Some(vec![b'q'])
         );
         // Alt prefixes ESC.
         assert_eq!(

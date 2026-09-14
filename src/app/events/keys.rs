@@ -20,7 +20,7 @@
 use super::super::{App, commands, session};
 use super::update_completions;
 use crate::classifier::WorkMode;
-use crate::ui::components::provider_panel::{PanelAction, ProviderPanel};
+use crate::ui::components::provider_panel::PanelAction;
 use crate::ui::event::AppEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -29,20 +29,6 @@ pub(crate) async fn handle_key_events(
     app: &mut App<'_>,
     key_event: KeyEvent,
 ) -> color_eyre::Result<()> {
-    if app.provider_panel.is_none()
-        && let Some(mut guide) = app.setup_guide.take()
-    {
-        match guide.handle(key_event) {
-            crate::app::setup::SetupAction::Providers => {
-                app.provider_panel = Some(ProviderPanel::new());
-                app.setup_guide = Some(guide);
-            }
-            crate::app::setup::SetupAction::Close => {}
-            crate::app::setup::SetupAction::None => app.setup_guide = Some(guide),
-        }
-        return Ok(());
-    }
-
     // ---- Esc while a turn is active: cancel unless an independent overlay
     // owns the key. Approval/question prompts belong to the active turn and
     // intentionally are not listed here, so Esc still cancels that turn.
@@ -182,12 +168,6 @@ pub(crate) async fn handle_key_events(
             PanelAction::Saved => {
                 session::persist_config(app);
                 app.events.send(AppEvent::ProvidersChanged);
-                if let Some(guide) = &app.setup_guide
-                    && guide.is_complete(&app.config)
-                {
-                    guide.mark_done();
-                    app.setup_guide = None;
-                }
             }
             PanelAction::RefreshModels => {
                 app.events.send(AppEvent::RefreshProviderModels {
@@ -736,15 +716,7 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
         return;
     }
 
-    // Esc always closes the panel, even while input is grabbed. Previously it
-    // was forwarded to the PTY, making short-lived commands such as `!pwd`
-    // appear impossible to exit from.
-    if key_event.code == KeyCode::Esc {
-        app.terminal_pane = None;
-        return;
-    }
-
-    // Ctrl+O is the escape hatch — never forwarded.
+    // Ctrl+O toggles whether subsequent input belongs to the child.
     if key_event.code == KeyCode::Char('o') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
         pane.grabbed = !pane.grabbed;
         return;
@@ -762,12 +734,9 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
         return;
     }
 
-    // Released: the panel owns its keys.
-    match key_event.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.terminal_pane = None;
-        }
-        _ => {}
+    // Released: the panel owns Esc/q and uses them to close.
+    if matches!(key_event.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.terminal_pane = None;
     }
 }
 

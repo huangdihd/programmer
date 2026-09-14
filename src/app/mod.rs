@@ -22,7 +22,6 @@ pub(crate) mod diagnostics;
 pub(crate) mod events;
 pub(crate) mod helpers;
 pub(crate) mod session;
-mod setup;
 pub(crate) mod surface;
 
 use crate::cancel::CancellationToken;
@@ -65,6 +64,24 @@ fn event_requests_immediate_redraw(event: &Event) -> bool {
     !matches!(
         event,
         Event::App(crate::ui::event::AppEvent::ChunkReceived(_, _))
+            | Event::Crossterm(crossterm::event::Event::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Moved,
+                    ..
+                }
+            ))
+    )
+}
+
+fn is_left_drag(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Crossterm(crossterm::event::Event::Mouse(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                ..
+            }
+        ))
     )
 }
 
@@ -297,7 +314,6 @@ pub struct App<'a> {
     pub footer: Footer,
     /// Full-screen provider management panel, when open.
     pub provider_panel: Option<ProviderPanel>,
-    pub(crate) setup_guide: Option<setup::SetupGuide>,
     /// Full-screen skills management panel, when open.
     pub skills_panel: Option<SkillsPanel>,
     /// Full-screen MCP server management panel, when open.
@@ -419,7 +435,6 @@ impl App<'_> {
         project_name: String,
     ) -> Self {
         config.normalize_security_profiles();
-        let setup_guide = setup::SetupGuide::first_launch();
         let provider_manager = ProviderManager::from_config(&config);
         let mut current_model = provider_manager.default_model();
         let mut work_mode = WorkMode::default();
@@ -514,7 +529,6 @@ impl App<'_> {
             conversation_panel,
             footer: Footer::new(),
             provider_panel: open_provider_panel.then(ProviderPanel::new),
-            setup_guide,
             skills_panel: None,
             mcp_panel: None,
             diagnostics_panel: None,
@@ -861,6 +875,7 @@ impl App<'_> {
                         Event::App(crate::ui::event::AppEvent::ChunkReceived(_, _))
                     );
                     let current_scroll_direction = scroll_direction(&current);
+                    let current_is_left_drag = is_left_drag(&current);
                     redraw |= matches!(&current, Event::Tick)
                         || event_requests_immediate_redraw(&current);
                     self.handle_event(current).await?;
@@ -874,6 +889,22 @@ impl App<'_> {
                     // idle sessions still produce no synthetic Tick events.
                     if self.footer.status.status.is_busy() {
                         self.events.schedule_redraw();
+                    }
+                    // Drag reports can arrive much faster than a full terminal
+                    // frame can be drawn. Apply only the latest contiguous point
+                    // so stale coordinates cannot build up behind rendering.
+                    if current_is_left_drag {
+                        let mut latest_drag = None;
+                        while let Some(next) = self.events.try_next() {
+                            if !is_left_drag(&next) {
+                                event = Some(next);
+                                break;
+                            }
+                            latest_drag = Some(next);
+                        }
+                        if let Some(latest_drag) = latest_drag {
+                            self.handle_event(latest_drag).await?;
+                        }
                     }
                     // Mouse wheel events are often delivered in a burst. Consume
                     // only the contiguous events with the same direction, so a
@@ -939,8 +970,11 @@ impl App<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskNotificationState, event_requests_immediate_redraw};
+    use super::{TaskNotificationState, event_requests_immediate_redraw, is_left_drag};
     use crate::ui::event::{AppEvent, Event};
+    use crossterm::event::{
+        Event as CrosstermEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -949,6 +983,31 @@ mod tests {
     fn redraw_policy_keeps_ticks_and_interaction_immediate_but_throttles_chunks() {
         assert!(event_requests_immediate_redraw(&Event::Tick));
         assert!(event_requests_immediate_redraw(&Event::App(AppEvent::Quit)));
+        assert!(!event_requests_immediate_redraw(&mouse_event(
+            MouseEventKind::Moved
+        )));
+    }
+
+    #[test]
+    fn left_drag_events_can_be_coalesced() {
+        assert!(is_left_drag(&mouse_event(MouseEventKind::Drag(
+            MouseButton::Left
+        ))));
+        assert!(!is_left_drag(&mouse_event(MouseEventKind::Drag(
+            MouseButton::Right
+        ))));
+        assert!(!is_left_drag(&mouse_event(MouseEventKind::Up(
+            MouseButton::Left
+        ))));
+    }
+
+    fn mouse_event(kind: MouseEventKind) -> Event {
+        Event::Crossterm(CrosstermEvent::Mouse(MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }))
     }
 
     fn event(sequence: u64) -> crate::tasks::TaskLifecycleEvent {
