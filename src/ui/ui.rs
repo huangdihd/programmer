@@ -67,6 +67,7 @@ impl App<'_> {
         let cp = &self.conversation_panel;
         match cp.phase {
             ActivePhase::Classifying => StatusState::Classifying,
+            ActivePhase::Associating => StatusState::Associating,
             ActivePhase::Checking => StatusState::Checking,
             ActivePhase::Compacting => StatusState::Compacting,
             ActivePhase::Cancelling => StatusState::Cancelling,
@@ -327,7 +328,6 @@ impl App<'_> {
 
 impl Widget for &mut App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // The provider management panel is modal and replaces the whole UI.
         if let Some(panel) = &self.provider_panel {
             panel.render(&self.config, &self.provider_manager, area, buf);
             return;

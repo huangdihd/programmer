@@ -290,12 +290,13 @@ fn render_item(index: usize, item: &MessageItem, pretty: bool) -> Result<String,
         MessageItem::Meta { label, text } => {
             json!({ "index": index, "kind": "meta", "label": label, "text": text })
         }
-        MessageItem::Usage(input, output, cached) => json!({
+        MessageItem::Usage(input, output, cached, recalled) => json!({
             "index": index,
             "kind": "usage",
             "input_tokens": input,
             "output_tokens": output,
-            "cached_input_tokens": cached
+            "cached_input_tokens": cached,
+            "recalled_memories": recalled
         }),
         MessageItem::Compacted { summary } => {
             json!({ "index": index, "kind": "earlier_compaction", "summary": summary })
@@ -341,7 +342,7 @@ fn item_kind(item: &MessageItem) -> &'static str {
         MessageItem::Warning(_) => "warning",
         MessageItem::Info(_) => "info",
         MessageItem::Meta { .. } => "meta",
-        MessageItem::Usage(_, _, _) => "usage",
+        MessageItem::Usage(_, _, _, _) => "usage",
         MessageItem::Compacted { .. } => "earlier_compaction",
     }
 }

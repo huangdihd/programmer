@@ -155,6 +155,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                     ActivePhase::None // "Thinking" — derived from receiving_response
                 }
                 RunnerPhase::Classifying => ActivePhase::Classifying,
+                RunnerPhase::Associating => ActivePhase::Associating,
                 RunnerPhase::RunningTools => ActivePhase::ToolRunning,
                 RunnerPhase::Checking => ActivePhase::Checking,
             };
@@ -290,6 +291,18 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         AppEvent::AgentStateChanged { generation, id } => {
             handle_agent_state_changed(app, generation, id)
         }
+        AppEvent::AgentPhase {
+            generation,
+            id,
+            phase,
+        } => handle_agent_phase(app, generation, id, phase),
+        AppEvent::Notice(op_id, text) => {
+            // A notice from a superseded turn would be noise, so it is held to
+            // the same liveness rule as phase updates.
+            if is_live_turn(app, op_id) {
+                app.conversation_panel.add_info_string(text);
+            }
+        }
         AppEvent::FlushTaskNotifications(token) => {
             flush_task_notifications(app, token).await;
         }
@@ -349,6 +362,10 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                         .to_string(),
                 );
                 return;
+            }
+            if !app.auto_compact.mandatory_waiting {
+                app.auto_compact.last_completed_item_count =
+                    Some(app.conversation_panel.items_snapshot().len());
             }
             if let Some(stable_end) = app.cancel.turn_conversation_cutoff.as_mut()
                 && cutoff <= *stable_end
@@ -606,6 +623,20 @@ fn handle_task_state_changed(app: &mut App<'_>, event: crate::tasks::TaskLifecyc
         return;
     }
     app.task_notifications.push(event);
+}
+
+/// Record a running sub-agent's turn phase so its sidebar row can show it.
+/// Phases from a previous manager generation belong to a replaced agent
+/// registry and are dropped.
+fn handle_agent_phase(
+    app: &mut App<'_>,
+    generation: u64,
+    id: u64,
+    phase: crate::runner::RunnerPhase,
+) {
+    if generation == app.agents.generation() {
+        app.agents.set_phase(id, phase);
+    }
 }
 
 fn handle_agent_state_changed(app: &mut App<'_>, generation: u64, id: u64) {

@@ -81,10 +81,6 @@ impl Sidebar {
     pub fn new() -> Self {
         let sections = vec![
             SectionState {
-                key: SidebarSection::Agents,
-                collapsed: false,
-            },
-            SectionState {
                 key: SidebarSection::Providers,
                 collapsed: false,
             },
@@ -102,6 +98,10 @@ impl Sidebar {
             },
             SectionState {
                 key: SidebarSection::Tasks,
+                collapsed: false,
+            },
+            SectionState {
+                key: SidebarSection::Agents,
                 collapsed: false,
             },
             SectionState {

@@ -262,20 +262,12 @@ Output only the summary text.";
 // Post-edit reminders
 // ---------------------------------------------------------------------------
 
-/// The hidden developer message nudging the agent to keep PROGRAMMER.md current,
-/// injected every few file-editing turns. Lives here (not in the UI) because the
-/// reminder is an agent-loop behaviour the runner drives, not view chrome.
-pub(crate) const OVERVIEW_REMINDER: &str = "Reminder: several edits have \
-    accumulated since PROGRAMMER.md was last written. If the architecture, \
-    build/test commands, directory layout, or conventions have changed, update \
-    PROGRAMMER.md now with write_file so it stays an accurate map for future \
-    sessions. If nothing meaningful changed, ignore this.";
-
-pub(crate) const INIT_REMINDER: &str = "Reminder: several file edits have been \
-    made, but this project does not appear to have been initialized for \
-    Programmer. Briefly tell the user they can run `/init` to create \
-    PROGRAMMER.md and configure project diagnostics. Do not run `/init` unless \
-    the user explicitly asks.";
+/// Hidden developer message appended once after the first successful file edit
+/// in a turn, so maintenance is considered before the model finishes its work.
+pub(crate) const POST_EDIT_REMINDER: &str = "You edited one or more files in this \
+    turn. Before finishing, check whether PROGRAMMER.md and related documentation \
+    or tests need to be updated. Update them when the change makes them stale; \
+    otherwise continue without changing them.";
 
 #[cfg(test)]
 mod tests {

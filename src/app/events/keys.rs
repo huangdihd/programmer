@@ -716,15 +716,7 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
         return;
     }
 
-    // Esc always closes the panel, even while input is grabbed. Previously it
-    // was forwarded to the PTY, making short-lived commands such as `!pwd`
-    // appear impossible to exit from.
-    if key_event.code == KeyCode::Esc {
-        app.terminal_pane = None;
-        return;
-    }
-
-    // Ctrl+O is the escape hatch — never forwarded.
+    // Ctrl+O toggles whether subsequent input belongs to the child.
     if key_event.code == KeyCode::Char('o') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
         pane.grabbed = !pane.grabbed;
         return;
@@ -742,12 +734,9 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
         return;
     }
 
-    // Released: the panel owns its keys.
-    match key_event.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.terminal_pane = None;
-        }
-        _ => {}
+    // Released: the panel owns Esc/q and uses them to close.
+    if matches!(key_event.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.terminal_pane = None;
     }
 }
 

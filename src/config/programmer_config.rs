@@ -86,6 +86,10 @@ pub struct ProgrammerConfig {
     /// the current chat model is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_model: Option<String>,
+    /// Model used for semantic memory recall. When absent, memory recall falls
+    /// back to the current chat model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_model: Option<String>,
     /// Model used to generate concise session titles. When absent, the current
     /// chat model is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +108,11 @@ pub struct ProgrammerConfig {
     /// Number of complete recent turns kept verbatim after a compaction.
     #[serde(default = "default_compact_keep_recent_turns")]
     pub compact_keep_recent_turns: usize,
+    /// Suppress another automatic compaction until this many user turns have
+    /// occurred after the latest compaction. Mandatory and manual compaction
+    /// are never suppressed. Zero disables the cooldown.
+    #[serde(default = "default_auto_compact_cooldown_turns")]
+    pub auto_compact_cooldown_turns: usize,
     /// Layered persistent-memory settings.
     #[serde(default)]
     pub memory: MemoryConfig,
@@ -195,6 +204,10 @@ fn default_compact_keep_recent_turns() -> usize {
     2
 }
 
+fn default_auto_compact_cooldown_turns() -> usize {
+    5
+}
+
 fn deserialize_classifier_top_logprobs<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: Deserializer<'de>,
@@ -230,11 +243,13 @@ impl Default for ProgrammerConfig {
             classifier_model: None,
             classifier_top_logprobs: default_classifier_top_logprobs(),
             compact_model: None,
+            memory_model: None,
             title_model: None,
             suggestion_model: None,
             auto_compact_tokens: default_auto_compact_tokens(),
             mandatory_compact_tokens: default_mandatory_compact_tokens(),
             compact_keep_recent_turns: default_compact_keep_recent_turns(),
+            auto_compact_cooldown_turns: default_auto_compact_cooldown_turns(),
             memory: MemoryConfig::default(),
             allow_yolo: false,
             security,

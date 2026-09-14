@@ -840,6 +840,18 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> 
     let Some(threshold) = threshold else {
         return false;
     };
+    if !app.auto_compact.mandatory_waiting
+        && app.config.auto_compact_cooldown_turns > 0
+        && app
+            .auto_compact
+            .last_completed_item_count
+            .is_some_and(|start| {
+                app.conversation_panel.user_turns_after(start)
+                    <= app.config.auto_compact_cooldown_turns
+            })
+    {
+        return false;
+    }
     if input_tokens < threshold {
         return false;
     }
@@ -915,6 +927,7 @@ pub(crate) fn invalidate_auto_compaction(app: &mut App<'_>) {
     app.auto_compact.history_epoch = app.auto_compact.history_epoch.wrapping_add(1);
     app.auto_compact.active_id = None;
     app.auto_compact.last_cutoff = None;
+    app.auto_compact.last_completed_item_count = None;
     app.auto_compact.mandatory_waiting = false;
     if app.auto_compact.mandatory_resume.is_some() {
         app.cancel.active.cancel();
@@ -1032,7 +1045,34 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
         }
     };
 
-    match crate::tools::memory::run(&arguments.to_string()).await {
+    let is_recall = crate::tools::memory::action_is_recall(&arguments.to_string());
+    let memory_model = is_recall.then(|| {
+        let target = app
+            .config
+            .memory_model
+            .as_deref()
+            .unwrap_or(&app.current_model);
+        app.provider_manager.resolve(target).map(|(client, model)| {
+            crate::tools::memory::MemoryModel {
+                client: client.clone(),
+                model,
+            }
+        })
+    });
+    if is_recall {
+        app.conversation_panel.phase =
+            crate::ui::components::conversation_panel::conversation_panel::ActivePhase::Associating;
+    }
+    let result = crate::tools::memory::run(
+        &arguments.to_string(),
+        memory_model.as_ref().and_then(Option::as_ref),
+    )
+    .await;
+    if is_recall {
+        app.conversation_panel.phase =
+            crate::ui::components::conversation_panel::conversation_panel::ActivePhase::None;
+    }
+    match result {
         Ok(output) => app.conversation_panel.add_info_string(output),
         Err(error) => app.conversation_panel.add_warning_string(error),
     }
@@ -1404,6 +1444,7 @@ mod tests {
             status: crate::agents::AgentStatus::Completed,
             elapsed: Duration::from_secs(2),
             result: Some("x".repeat(13_000)),
+            phase: None,
         }]);
 
         assert!(prompt.contains("<sub_agent_updates>"));

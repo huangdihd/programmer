@@ -79,7 +79,7 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
         | MessageItem::Warning(_)
         | MessageItem::Info(_) => 1,
         MessageItem::Meta { .. } => 1,
-        MessageItem::Usage(_, _, _) => 1,
+        MessageItem::Usage(_, _, _, _) => 1,
         // Usually collapsed to its one-line divider (like Reasoning, the
         // estimate ignores the expanded state — the real height comes from the
         // built paragraph).
@@ -537,8 +537,8 @@ fn build_item_paragraph(
             WarningMessage::new(message.clone()).into_paragraph(),
             Vec::new(),
         ),
-        MessageItem::Usage(input, output, cached) => (
-            UsageMessage::new(*input, *output, *cached).into_paragraph(),
+        MessageItem::Usage(input, output, cached, recalled) => (
+            UsageMessage::new(*input, *output, *cached, *recalled).into_paragraph(),
             Vec::new(),
         ),
         MessageItem::Compacted { summary } => {

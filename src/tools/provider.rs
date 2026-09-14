@@ -182,6 +182,7 @@ pub(crate) struct LocalToolProvider {
     file_scope: u64,
     checkpoint: Option<crate::checkpoint::CheckpointRecorder>,
     memory_enabled: bool,
+    memory_model: Option<memory::MemoryModel>,
     conversation_history: Option<Arc<Mutex<crate::conversation::Conversation>>>,
 }
 
@@ -196,6 +197,7 @@ impl LocalToolProvider {
             file_scope: 0,
             checkpoint: None,
             memory_enabled: true,
+            memory_model: None,
             conversation_history: None,
         }
     }
@@ -211,6 +213,7 @@ impl LocalToolProvider {
             file_scope,
             checkpoint: None,
             memory_enabled: true,
+            memory_model: None,
             conversation_history: None,
         }
     }
@@ -225,6 +228,11 @@ impl LocalToolProvider {
 
     pub(crate) fn with_memory_enabled(mut self, enabled: bool) -> Self {
         self.memory_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn with_memory_model(mut self, model: Option<memory::MemoryModel>) -> Self {
+        self.memory_model = model;
         self
     }
 
@@ -340,7 +348,7 @@ impl ToolProvider for LocalToolProvider {
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == memory::NAME {
-            memory::run(&call.arguments)
+            memory::run(&call.arguments, self.memory_model.as_ref())
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == conversation_history::NAME {

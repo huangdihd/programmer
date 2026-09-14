@@ -23,7 +23,9 @@ use crate::response::message_item::MessageItem;
 use async_openai::types::responses::{
     FunctionCallOutput, FunctionCallOutputItemParam, InputItem, Item, OutputItem,
 };
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +77,8 @@ pub(crate) enum SerializableMessageItem {
         output_tokens: u32,
         #[serde(default)]
         cached_input_tokens: u32,
+        #[serde(default)]
+        recalled_memories: Option<usize>,
     },
     /// A `/compact` boundary carrying the summary of everything before it.
     Compacted {
@@ -103,10 +107,11 @@ impl From<MessageItem> for SerializableMessageItem {
             MessageItem::Warning(s) => SerializableMessageItem::Warning(s),
             MessageItem::Info(s) => SerializableMessageItem::Info(s),
             MessageItem::Meta { label, text } => SerializableMessageItem::Meta { label, text },
-            MessageItem::Usage(i, o, cached) => SerializableMessageItem::Usage {
+            MessageItem::Usage(i, o, cached, recalled_memories) => SerializableMessageItem::Usage {
                 input_tokens: i,
                 output_tokens: o,
                 cached_input_tokens: cached,
+                recalled_memories,
             },
             MessageItem::Compacted { summary } => SerializableMessageItem::Compacted { summary },
         }
@@ -155,7 +160,13 @@ impl From<SerializableMessageItem> for MessageItem {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
-            } => MessageItem::Usage(input_tokens, output_tokens, cached_input_tokens),
+                recalled_memories,
+            } => MessageItem::Usage(
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                recalled_memories,
+            ),
             SerializableMessageItem::Compacted { summary } => MessageItem::Compacted { summary },
         }
     }
@@ -210,6 +221,9 @@ pub(crate) struct Session {
     /// Chat model in use when last saved (`provider/model`), restored on resume.
     #[serde(default)]
     pub(crate) current_model: Option<String>,
+    /// Provider-reported input tokens for the latest individual model request.
+    #[serde(default)]
+    pub(crate) last_request_input_tokens: Option<u32>,
     /// Whether image attachments are sent to the model in this session.
     #[serde(default)]
     pub(crate) vision_enabled: bool,
@@ -244,6 +258,23 @@ pub(crate) struct Session {
     /// File content fingerprints read in this session, used by file protection after resume.
     #[serde(default)]
     pub(crate) file_snapshots: Vec<crate::security::policy::PersistedFileSnapshot>,
+}
+
+/// An OS-backed exclusive lock held for the lifetime of an open session.
+pub(crate) struct SessionLock {
+    file: std::fs::File,
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SessionLockError {
+    InUse { pid: Option<u32> },
+    Io(String),
 }
 
 pub(crate) struct SessionManager {
@@ -305,6 +336,7 @@ impl SessionManager {
             input_suggestion: None,
             work_mode: None,
             current_model: None,
+            last_request_input_tokens: None,
             vision_enabled: false,
             thinking_level: crate::thinking::ThinkingLevel::default(),
             classifier_model_override: ModelOverride::Inherit,
@@ -357,6 +389,54 @@ impl SessionManager {
             std::fs::remove_file(&path).map_err(|e| format!("delete: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Try to exclusively lock a session. The lock file contains the owning PID
+    /// for a useful conflict message; the OS lock, not that PID, is authoritative.
+    pub(crate) fn try_lock(&self, uuid: &str) -> Result<SessionLock, SessionLockError> {
+        self.ensure_dir().map_err(SessionLockError::Io)?;
+        let path = self.sessions_dir.join(format!("{uuid}.lock"));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| SessionLockError::Io(format!("open {}: {error}", path.display())))?;
+        if let Err(error) = file.try_lock_exclusive() {
+            let mut owner = String::new();
+            let _ = file.rewind();
+            let _ = file.read_to_string(&mut owner);
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(SessionLockError::InUse {
+                    pid: owner.trim().parse().ok(),
+                });
+            }
+            return Err(SessionLockError::Io(format!(
+                "lock {}: {error}",
+                path.display()
+            )));
+        }
+        file.set_len(0)
+            .and_then(|()| file.rewind())
+            .and_then(|()| writeln!(file, "{}", std::process::id()))
+            .and_then(|()| file.sync_data())
+            .map_err(|error| SessionLockError::Io(format!("write {}: {error}", path.display())))?;
+        Ok(SessionLock { file })
+    }
+
+    /// Clone a loaded conversation into a separately persisted session.
+    pub(crate) fn fork(&self, source: &Session) -> Result<Session, String> {
+        let mut forked = source.clone();
+        forked.uuid = uuid_v4();
+        let now = now_secs();
+        forked.created_at = now;
+        forked.updated_at = now;
+        if !forked.title.is_empty() {
+            forked.title.push_str(" (fork)");
+        }
+        self.save(&mut forked)?;
+        Ok(forked)
     }
 
     /// Convert session items into MessageItems.
@@ -882,7 +962,7 @@ mod tests {
 
         assert!(matches!(
             MessageItem::from(item),
-            MessageItem::Usage(10, 2, 0)
+            MessageItem::Usage(10, 2, 0, None)
         ));
     }
 
@@ -980,6 +1060,43 @@ mod tests {
         );
         assert!(loaded_second.input_suggestion.is_none());
 
+        std::fs::remove_dir_all(sessions_dir).unwrap();
+    }
+
+    #[test]
+    fn session_lock_reports_the_owning_process_and_releases_on_drop() {
+        let sessions_dir =
+            std::env::temp_dir().join(format!("programmer-session-lock-test-{}", uuid_v4()));
+        let mgr = SessionManager {
+            sessions_dir: sessions_dir.clone(),
+        };
+        let session = mgr.create();
+        let lock = mgr.try_lock(&session.uuid).unwrap();
+        assert!(matches!(
+            mgr.try_lock(&session.uuid),
+            Err(SessionLockError::InUse { pid: Some(pid) }) if pid == std::process::id()
+        ));
+        drop(lock);
+        let reacquired = mgr.try_lock(&session.uuid).unwrap();
+        drop(reacquired);
+        std::fs::remove_dir_all(sessions_dir).unwrap();
+    }
+
+    #[test]
+    fn fork_copies_session_content_under_a_new_uuid() {
+        let sessions_dir =
+            std::env::temp_dir().join(format!("programmer-session-fork-test-{}", uuid_v4()));
+        let mgr = SessionManager {
+            sessions_dir: sessions_dir.clone(),
+        };
+        let mut source = mgr.create();
+        source.title = "Original".to_string();
+        source.history.push("previous command".to_string());
+        let forked = mgr.fork(&source).unwrap();
+        assert_ne!(forked.uuid, source.uuid);
+        assert_eq!(forked.title, "Original (fork)");
+        assert_eq!(forked.history, source.history);
+        assert!(mgr.load(&forked.uuid).is_some());
         std::fs::remove_dir_all(sessions_dir).unwrap();
     }
 }

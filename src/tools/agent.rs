@@ -203,6 +203,7 @@ mod tests {
             status: AgentStatus::Completed,
             elapsed: Duration::from_secs(2),
             result: Some("no issues".into()),
+            phase: None,
         };
         let rendered = render_full(&snapshot);
         assert!(rendered.contains("[4] completed"));

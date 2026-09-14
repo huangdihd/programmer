@@ -52,6 +52,8 @@ pub enum ActivePhase {
     ToolRunning,
     /// The Auto-mode LLM classifier is deciding tool-call approvals.
     Classifying,
+    /// The memory model is selecting relevant memories.
+    Associating,
     /// Diagnostics checkers are running after an edit.
     Checking,
     /// `/compact` is summarizing the conversation to shrink the context.
@@ -1071,6 +1073,10 @@ impl ConversationPanel {
             .lock()
             .unwrap()
             .compaction_turn_count(cutoff)
+    }
+
+    pub fn user_turns_after(&self, start: usize) -> usize {
+        self.conversation.lock().unwrap().user_turns_after(start)
     }
 
     pub fn input_param_for_prefix(

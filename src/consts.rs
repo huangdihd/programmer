@@ -39,8 +39,16 @@ pub(crate) const MAX_CONCURRENT_READ_TOOLS: usize = 8;
 /// connection error before giving up.
 pub(crate) const MAX_STREAM_RETRIES: u32 = 10;
 
-/// How many file-editing turns pass between reminders to refresh PROGRAMMER.md.
-pub(crate) const OVERVIEW_REMINDER_EVERY: usize = 5;
+/// Seconds allowed for one memory-association request. The lookup runs before
+/// the turn's first model call but is off the critical path — the user can
+/// cancel it — and it crosses a provider gateway, so it gets more slack than a
+/// classifier call. Nothing waits on it beyond this budget.
+pub(crate) const MEMORY_ASSOCIATION_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum time a later model step waits for a still-running memory prefetch.
+/// The first step never waits; this small grace period only applies after a
+/// tool round, when recalled context can still affect the turn.
+pub(crate) const MEMORY_ASSOCIATION_GRACE_MS: u64 = 2_500;
 
 /// Character budget for each user/assistant message in the classifier's *light*
 /// context (the fast yes/no path).

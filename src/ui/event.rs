@@ -128,6 +128,17 @@ pub enum AppEvent {
         generation: u64,
         id: u64,
     },
+    /// A running sub-agent moved to a new turn phase. Carries the agent id so
+    /// it is shown on that agent's sidebar row instead of the main turn's
+    /// status bar.
+    AgentPhase {
+        generation: u64,
+        id: u64,
+        phase: crate::runner::RunnerPhase,
+    },
+    /// A recoverable problem reported by the runner, shown as an
+    /// informational conversation line.
+    Notice(u64, String),
     /// Debounced request to hand accumulated task updates to the agent.
     FlushTaskNotifications(u64),
     /// Debounced request to hand completed sub-agent results to the parent.
@@ -286,6 +297,21 @@ impl std::fmt::Debug for AppEvent {
                 .debug_struct("AgentStateChanged")
                 .field("generation", generation)
                 .field("id", id)
+                .finish(),
+            Self::AgentPhase {
+                generation,
+                id,
+                phase,
+            } => f
+                .debug_struct("AgentPhase")
+                .field("generation", generation)
+                .field("id", id)
+                .field("phase", phase)
+                .finish(),
+            Self::Notice(op_id, text) => f
+                .debug_struct("Notice")
+                .field("operation_id", op_id)
+                .field("text", text)
                 .finish(),
             Self::FlushTaskNotifications(token) => f
                 .debug_tuple("FlushTaskNotifications")
