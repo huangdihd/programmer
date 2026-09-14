@@ -116,6 +116,13 @@ async fn request_sandbox(
     if current == mode {
         return Ok(format!("sandbox mode is already {}", mode.label()));
     }
+    if !current.can_request(mode) {
+        return Err(format!(
+            "error: sandbox mode request rejected: '{}' is stricter than the current '{}' mode; permission requests may only relax sandbox restrictions",
+            mode.label(),
+            current.label()
+        ));
+    }
 
     let approved = prompt_approval(
         format!(
@@ -150,6 +157,12 @@ async fn request_filesystem(
 ) -> Result<String, String> {
     if operation == AccessKind::Network {
         return Err("error: filesystem permission does not support network access".to_string());
+    }
+    if context.security.sandbox_mode() == SandboxMode::Off {
+        return Err(
+            "error: filesystem permission request rejected because the sandbox is off; there is no active sandbox policy to grant additional access through"
+                .to_string(),
+        );
     }
     let path = path.trim();
     if path.is_empty() {
@@ -230,10 +243,53 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[test]
+    fn sandbox_permission_only_allows_relaxing_modes() {
+        assert!(!SandboxMode::Off.can_request(SandboxMode::Network));
+        assert!(!SandboxMode::Network.can_request(SandboxMode::Restricted));
+        assert!(SandboxMode::Restricted.can_request(SandboxMode::Network));
+        assert!(SandboxMode::Network.can_request(SandboxMode::Off));
+    }
+
+    #[tokio::test]
+    async fn off_sandbox_rejects_filesystem_permission_without_prompt() {
+        let manager = SecurityManager::standalone().expect("standalone security");
+        let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
+        assert_eq!(security.sandbox_mode(), SandboxMode::Off);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let args = r#"{"kind":"filesystem","mode":null,"operation":"read","path":"/tmp/outside","reason":"inspect a file"}"#;
+        let output = run(args, &tx, &cancel, 6, &security).await;
+        assert!(
+            output
+                .expect_err("off sandbox must reject")
+                .contains("sandbox is off")
+        );
+        assert!(rx.try_recv().is_err(), "must not prompt for approval");
+    }
+
+    #[tokio::test]
+    async fn stricter_sandbox_request_is_rejected_without_prompt() {
+        let manager = SecurityManager::standalone().expect("standalone security");
+        let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
+        security.set_sandbox_mode(SandboxMode::Network).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let args = r#"{"kind":"sandbox","mode":"restricted","operation":null,"path":null,"reason":"tighten security"}"#;
+        let output = run(args, &tx, &cancel, 7, &security).await;
+        assert!(
+            output
+                .expect_err("stricter mode must be rejected")
+                .contains("stricter than the current")
+        );
+        assert!(rx.try_recv().is_err(), "must not prompt for approval");
+    }
+
     #[tokio::test]
     async fn permission_change_requires_an_explicit_approval() {
         let manager = SecurityManager::standalone().expect("standalone security");
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
+        security.set_sandbox_mode(SandboxMode::Restricted).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let args = r#"{"kind":"sandbox","mode":"network","operation":null,"path":null,"reason":"download dependencies"}"#;
@@ -275,6 +331,7 @@ mod tests {
             SecurityManager::new(crate::security::SecurityConfig::default(), root.clone())
                 .expect("security manager");
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
+        security.set_sandbox_mode(SandboxMode::Restricted).unwrap();
         assert!(
             security
                 .snapshot()
@@ -346,6 +403,7 @@ mod tests {
             SecurityManager::new(crate::security::SecurityConfig::default(), root.clone())
                 .expect("security manager");
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
+        security.set_sandbox_mode(SandboxMode::Restricted).unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();

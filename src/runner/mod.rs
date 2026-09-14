@@ -40,7 +40,8 @@ use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
-    FunctionToolCall, OutputItem, OutputMessageContent, ResponseStreamEvent,
+    FunctionToolCall, InputContent, InputMessage, InputRole, MessageItem as ApiMessageItem,
+    OutputItem, OutputMessageContent, OutputStatus, ResponseStreamEvent,
 };
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
@@ -92,6 +93,8 @@ pub(crate) struct TurnRunner {
     pub vision_enabled: bool,
     /// Reasoning effort for main chat requests.
     pub thinking_level: crate::thinking::ThinkingLevel,
+    /// Dedicated model used for automatic memory association before each user turn.
+    pub memory_model: Option<crate::tools::memory::MemoryModel>,
     /// Pluggable turn hooks (post-edit diagnostics, the PROGRAMMER.md reminder,
     /// and any future check) run around each tool batch.
     pub hooks: Vec<Arc<dyn hooks::TurnHook>>,
@@ -145,7 +148,7 @@ pub enum RunnerError {
 
 /// A coarse turn phase, surfaced so a front-end can show a status indicator.
 /// Mirrors the TUI's `ActivePhase`; the headless surface ignores it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum RunnerPhase {
     /// Streaming a model response.
@@ -154,8 +157,24 @@ pub enum RunnerPhase {
     Classifying,
     /// Executing approved tool calls.
     RunningTools,
+    /// A dedicated memory model is associating the query with stored memories.
+    Associating,
     /// Running post-edit diagnostics.
     Checking,
+}
+
+impl RunnerPhase {
+    /// Short lowercase label for compact spaces such as a sidebar row, where
+    /// the status bar's icon-and-title wording would not fit.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Streaming => "streaming",
+            Self::Classifying => "evaluating",
+            Self::RunningTools => "running tools",
+            Self::Associating => "associating",
+            Self::Checking => "checking",
+        }
+    }
 }
 
 /// Progress events emitted during a turn. Print mode ignores these; the TUI
@@ -179,6 +198,10 @@ pub(crate) enum RunnerEvent<'a> {
     ToolCall { name: &'a str },
     /// The turn moved to a new phase.
     Phase(RunnerPhase),
+    /// A recoverable problem worth telling the user about, such as a memory
+    /// association that failed and therefore recalled nothing. Front-ends
+    /// render it as an informational line; it never stops the turn.
+    Notice(&'a str),
     /// A completed API response reported its real input token count and all
     /// function calls from that response (if any) now have paired outputs.
     UsageSafePoint { input_tokens: u32 },
@@ -191,6 +214,71 @@ pub(crate) enum RunnerEvent<'a> {
 /// output per unmatched call so the API message ordering stays valid (every
 /// function-call item must be followed by a matching tool-output item before
 /// the next request).
+struct MemoryAssociationTask {
+    handle: Option<tokio::task::JoinHandle<Result<Vec<crate::memory::MemoryEntry>, String>>>,
+}
+
+impl MemoryAssociationTask {
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+}
+
+impl Drop for MemoryAssociationTask {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+enum AssociationPoll {
+    Pending,
+    Finished(Result<Vec<crate::memory::MemoryEntry>, String>),
+}
+
+fn spawn_memory_association(
+    model: crate::tools::memory::MemoryModel,
+    context: String,
+    query: String,
+) -> MemoryAssociationTask {
+    MemoryAssociationTask {
+        handle: Some(tokio::spawn(async move {
+            model.associate(&context, &query).await
+        })),
+    }
+}
+
+async fn poll_memory_association(
+    task: &mut MemoryAssociationTask,
+    grace: std::time::Duration,
+) -> AssociationPoll {
+    let Some(handle) = task.handle.as_mut() else {
+        return AssociationPoll::Pending;
+    };
+    if !handle.is_finished() && grace.is_zero() {
+        return AssociationPoll::Pending;
+    }
+    let joined = if handle.is_finished() {
+        task.handle.take().unwrap().await
+    } else {
+        match tokio::time::timeout(grace, handle).await {
+            Ok(joined) => {
+                // The borrowed handle has completed; remove it so Drop does
+                // not retain or abort a finished task.
+                task.handle.take();
+                joined
+            }
+            Err(_) => return AssociationPoll::Pending,
+        }
+    };
+    AssociationPoll::Finished(
+        joined.unwrap_or_else(|error| Err(format!("memory association task failed: {error}"))),
+    )
+}
+
 fn ensure_tool_output_pairing(conversation: &Mutex<Conversation>) {
     use async_openai::types::responses::{FunctionCallOutput, OutputItem};
     use std::collections::HashSet;
@@ -238,12 +326,50 @@ impl TurnRunner {
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
     ) -> Result<TurnResult, RunnerError> {
+        conversation.lock().unwrap().recalled_memories = Some(0);
         let retrying = &self.stream_retrying;
         let mut steps = 0usize;
+        let mut post_edit_reminder_added = false;
+        let mut programmer_md_edited = false;
+        let mut association_grace_used = false;
+        // Start association beside the first model request instead of putting
+        // it on the first-token path. A result can join a later step after a
+        // tool round; a one-response turn never waits for it.
+        let mut association = self.memory_model.as_ref().and_then(|memory_model| {
+            association_context(conversation).map(|(context, query)| {
+                spawn_memory_association(memory_model.clone(), context, query)
+            })
+        });
         loop {
             if cancel.is_cancelled() {
                 ensure_tool_output_pairing(conversation);
                 return Err(RunnerError::Cancelled);
+            }
+            if let Some(task) = &mut association {
+                let should_wait = steps > 0 && !association_grace_used && !task.is_finished();
+                let grace = if should_wait {
+                    association_grace_used = true;
+                    surface.on_event(RunnerEvent::Phase(RunnerPhase::Associating));
+                    std::time::Duration::from_millis(crate::consts::MEMORY_ASSOCIATION_GRACE_MS)
+                } else {
+                    std::time::Duration::ZERO
+                };
+                match poll_memory_association(task, grace).await {
+                    AssociationPoll::Pending => {}
+                    AssociationPoll::Finished(Ok(entries)) => {
+                        conversation.lock().unwrap().recalled_memories = Some(entries.len());
+                        append_associated_memories(conversation, &entries);
+                        association = None;
+                    }
+                    AssociationPoll::Finished(Err(error)) => {
+                        // Continuing without memories is the right call, but
+                        // doing it silently makes a failed lookup
+                        // indistinguishable from finding nothing relevant.
+                        let notice = association_failure_notice(&error);
+                        surface.on_event(RunnerEvent::Notice(&notice));
+                        association = None;
+                    }
+                }
             }
             if let Some(limit) = self.max_steps
                 && steps >= limit
@@ -357,22 +483,21 @@ impl TurnRunner {
             // any are attached, so a hook-free headless run does no extra work. We need
             // the edit call-ids to tell afterwards whether a file was actually
             // written; the tool names go into the summary handed to each hook.
-            let hook_meta: Option<(Vec<String>, HashSet<String>)> =
-                (!self.hooks.is_empty()).then(|| {
-                    let tool_names = calls.iter().map(|c| c.name.clone()).collect();
-                    let edit_call_ids = calls
-                        .iter()
-                        .filter(|c| {
-                            c.name == crate::tools::write_file::NAME
-                                || c.name == crate::tools::edit_file::NAME
-                        })
-                        .map(|c| c.call_id.clone())
-                        .collect();
-                    (tool_names, edit_call_ids)
-                });
+            let tool_names = calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+            let edit_call_ids = calls
+                .iter()
+                .filter(|c| is_file_edit_tool(&c.name))
+                .map(|c| c.call_id.clone())
+                .collect::<HashSet<_>>();
+            let programmer_md_call_ids = calls
+                .iter()
+                .filter(|c| is_file_edit_tool(&c.name) && edit_targets_programmer_md(&c.arguments))
+                .map(|c| c.call_id.clone())
+                .collect::<HashSet<_>>();
+            let hook_meta = (!self.hooks.is_empty()).then_some(tool_names);
 
             // Before-batch hooks (tools have not run, so `edited` is false).
-            if let Some((tool_names, _)) = &hook_meta {
+            if let Some(tool_names) = &hook_meta {
                 let summary = hooks::BatchSummary {
                     tool_names: tool_names.clone(),
                     edited: false,
@@ -390,12 +515,12 @@ impl TurnRunner {
             let outputs = self.run_calls(conversation, calls, cancel, surface).await;
             match outputs {
                 Some(outputs) => {
-                    let edited = match &hook_meta {
-                        Some((_, edit_call_ids)) => outputs
-                            .iter()
-                            .any(|o| !o.failed && edit_call_ids.contains(&o.param.call_id)),
-                        None => false,
-                    };
+                    let edited = outputs
+                        .iter()
+                        .any(|o| !o.failed && edit_call_ids.contains(&o.param.call_id));
+                    let edited_programmer_md = outputs
+                        .iter()
+                        .any(|o| !o.failed && programmer_md_call_ids.contains(&o.param.call_id));
                     {
                         let mut conv = conversation.lock().unwrap();
                         for out in outputs {
@@ -405,7 +530,7 @@ impl TurnRunner {
                     // After-batch hooks. Each self-gates on the summary, so we run
                     // them after every batch and let e.g. the diagnostics hook
                     // bow out when nothing was edited.
-                    if let Some((tool_names, _)) = hook_meta {
+                    if let Some(tool_names) = hook_meta {
                         let summary = hooks::BatchSummary { tool_names, edited };
                         self.run_hooks(
                             hooks::HookPhase::After,
@@ -415,6 +540,20 @@ impl TurnRunner {
                             cancel,
                         )
                         .await;
+                    }
+                    if edited_programmer_md {
+                        programmer_md_edited = true;
+                        if post_edit_reminder_added {
+                            conversation
+                                .lock()
+                                .unwrap()
+                                .remove_last_developer_message(crate::prompts::POST_EDIT_REMINDER);
+                            post_edit_reminder_added = false;
+                        }
+                    }
+                    if edited && !programmer_md_edited && !post_edit_reminder_added {
+                        append_post_edit_reminder(conversation);
+                        post_edit_reminder_added = true;
                     }
                     if let Some((input_tokens, _, _)) = usage {
                         surface.usage_safe_point(input_tokens).await;
@@ -515,7 +654,15 @@ impl TurnRunner {
         }
         denied.extend(outcome.denied);
 
-        surface.on_event(RunnerEvent::Phase(RunnerPhase::RunningTools));
+        let phase = if allowed.iter().any(|call| {
+            call.name == crate::tools::memory::NAME
+                && crate::tools::memory::action_is_recall(&call.arguments)
+        }) {
+            RunnerPhase::Associating
+        } else {
+            RunnerPhase::RunningTools
+        };
+        surface.on_event(RunnerEvent::Phase(phase));
         // Use the front-end's tool channel when it has one (so ask_user and live
         // task updates reach the UI); otherwise a throwaway channel with a
         // dropped receiver — safe because ask_user is already pre-denied there.
@@ -635,6 +782,159 @@ fn last_edit_output_call_id(conversation: &Conversation) -> Option<String> {
         .last()
 }
 
+fn is_file_edit_tool(name: &str) -> bool {
+    name == crate::tools::write_file::NAME || name == crate::tools::edit_file::NAME
+}
+
+fn edit_targets_programmer_md(arguments: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| value.get("path")?.as_str().map(str::to_owned))
+        .and_then(|path| {
+            std::path::PathBuf::from(path)
+                .file_name()
+                .map(|name| name.to_owned())
+        })
+        .is_some_and(|name| name == "PROGRAMMER.md")
+}
+
+/// Everything the memory model needs for one association pass: the latest user
+/// request, plus a bounded digest of the surrounding conversation so elliptical
+/// follow-ups can still match a stored memory.
+///
+/// The digest deliberately carries only user and assistant prose. Tool traffic
+/// is noisy and the associated-memory block we inject ourselves is a developer
+/// message, so neither can feed back into the next association pass.
+fn association_context(conversation: &Mutex<Conversation>) -> Option<(String, String)> {
+    const MAX_CONTEXT_CHARS: usize = 4000;
+    const MAX_TURNS: usize = 12;
+    let conv = conversation.lock().unwrap();
+    let items: Vec<_> = conv.items().collect();
+    let mut query = None;
+    let mut lines: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            MessageItem::Input(async_openai::types::responses::InputItem::Item(
+                async_openai::types::responses::Item::Message(ApiMessageItem::Input(message)),
+            )) if message.role == InputRole::User => {
+                for content in &message.content {
+                    if let InputContent::InputText(text) = content {
+                        query = Some(text.text.clone());
+                        lines.push(format!("User: {}", text.text));
+                    }
+                }
+            }
+            MessageItem::Output(OutputItem::Message(message)) => {
+                for content in &message.content {
+                    if let OutputMessageContent::OutputText(text) = content {
+                        lines.push(format!("Assistant: {}", text.text));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let query = query?;
+    let context = bounded_digest(&lines, MAX_TURNS, MAX_CONTEXT_CHARS);
+    Some((context, query))
+}
+
+/// Keep the most recent turns and the tail of the transcript, trimming each
+/// line so a single huge paste cannot crowd out the rest of the digest.
+fn bounded_digest(lines: &[String], max_turns: usize, max_chars: usize) -> String {
+    const MAX_LINE_CHARS: usize = 600;
+    let start = lines.len().saturating_sub(max_turns);
+    let mut digest = lines[start..]
+        .iter()
+        .map(|line| {
+            if line.chars().count() > MAX_LINE_CHARS {
+                let head: String = line.chars().take(MAX_LINE_CHARS).collect();
+                format!("{head}…")
+            } else {
+                line.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if digest.chars().count() > max_chars {
+        digest = digest
+            .chars()
+            .skip(digest.chars().count() - max_chars)
+            .collect();
+    }
+    digest
+}
+
+/// What to tell the user when the memory model could not be consulted or
+/// answered with something unusable.
+fn association_failure_notice(error: &str) -> String {
+    format!("Memory association failed ({error}); continuing without recalled memories.")
+}
+
+fn append_associated_memories(
+    conversation: &Mutex<Conversation>,
+    entries: &[crate::memory::MemoryEntry],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut conv = conversation.lock().unwrap();
+    let existing = conv.items().any(|item| match item {
+        MessageItem::Input(async_openai::types::responses::InputItem::Item(
+            async_openai::types::responses::Item::Message(ApiMessageItem::Input(message)),
+        )) if message.role == InputRole::Developer => message.content.iter().any(|content| {
+            let InputContent::InputText(text) = content else {
+                return false;
+            };
+            text.text.starts_with("<!-- programmer-associated-memory:")
+        }),
+        _ => false,
+    });
+    if existing {
+        return;
+    }
+    let mut text = String::from(
+        "<!-- programmer-associated-memory: persistent recalled context -->\nRelevant memories from previous sessions:\n",
+    );
+    for entry in entries {
+        // Claude Code style: fresh memories get a short age prefix, older ones
+        // get the staleness caveat instead, so the two never repeat each other.
+        // Injection only appends to the end of the conversation, so this never
+        // invalidates the cached prompt prefix.
+        let header = crate::memory::freshness_caveat(entry, crate::memory::now_secs())
+            .unwrap_or_else(|| {
+                format!(
+                    "saved {}",
+                    crate::memory::age_label(entry, crate::memory::now_secs())
+                )
+            });
+        text.push_str(&format!(
+            "- [{:?}] ({header}) {}\n",
+            entry.kind, entry.content
+        ));
+    }
+    conv.add_input_message(ApiMessageItem::Input(InputMessage {
+        content: vec![InputContent::InputText(
+            async_openai::types::responses::InputTextContent { text },
+        )],
+        role: InputRole::Developer,
+        status: Some(OutputStatus::Completed),
+    }));
+}
+
+fn append_post_edit_reminder(conversation: &Mutex<Conversation>) {
+    conversation
+        .lock()
+        .unwrap()
+        .add_input_message(ApiMessageItem::Input(InputMessage {
+            content: vec![InputContent::InputText(
+                crate::prompts::POST_EDIT_REMINDER.into(),
+            )],
+            role: InputRole::Developer,
+            status: Some(OutputStatus::Completed),
+        }));
+}
+
 /// Concatenate the text of every assistant message in `items` (skipping
 /// reasoning, refusals, and tool calls).
 fn message_text(items: &[OutputItem]) -> String {
@@ -664,6 +964,44 @@ mod tests {
         OutputTextContent,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn only_file_edit_tools_trigger_the_post_edit_reminder() {
+        assert!(is_file_edit_tool(crate::tools::write_file::NAME));
+        assert!(is_file_edit_tool(crate::tools::edit_file::NAME));
+        assert!(!is_file_edit_tool(crate::tools::command::NAME));
+        assert!(!is_file_edit_tool(crate::tools::read_file::NAME));
+    }
+
+    #[test]
+    fn programmer_md_edit_arguments_are_detected_by_file_name() {
+        assert!(edit_targets_programmer_md(r#"{"path":"PROGRAMMER.md"}"#));
+        assert!(edit_targets_programmer_md(
+            r#"{"path":"/workspace/PROGRAMMER.md"}"#
+        ));
+        assert!(!edit_targets_programmer_md(r#"{"path":"README.md"}"#));
+        assert!(!edit_targets_programmer_md("not json"));
+    }
+
+    #[test]
+    fn post_edit_reminder_is_a_separate_developer_message() {
+        let conversation = Mutex::new(Conversation::new());
+        append_post_edit_reminder(&conversation);
+        let conv = conversation.lock().unwrap();
+        let Some(MessageItem::Input(async_openai::types::responses::InputItem::Item(
+            async_openai::types::responses::Item::Message(ApiMessageItem::Input(message)),
+        ))) = conv.items().next()
+        else {
+            panic!("expected a standalone input message");
+        };
+        assert_eq!(message.role, InputRole::Developer);
+        let InputContent::InputText(text) = &message.content[0] else {
+            panic!("expected text reminder");
+        };
+        assert!(text.text.contains("PROGRAMMER.md"));
+        assert!(text.text.contains("documentation"));
+        assert!(text.text.contains("tests"));
+    }
 
     /// One `data: <json>\n\n` SSE frame.
     fn frame(value: serde_json::Value) -> String {
@@ -770,6 +1108,7 @@ mod tests {
             coauthor: None,
             vision_enabled: true,
             thinking_level: crate::thinking::ThinkingLevel::Auto,
+            memory_model: None,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
             max_steps: None,
@@ -807,6 +1146,207 @@ mod tests {
             role: InputRole::User,
             status: Some(OutputStatus::Completed),
         })
+    }
+
+    #[test]
+    fn association_context_carries_the_whole_recent_conversation() {
+        let conversation = Mutex::new(Conversation::new());
+        {
+            let mut conv = conversation.lock().unwrap();
+            conv.add_input_message(user("add dark mode to the theme"));
+            conv.add_output(message_item("I picked the slate palette."));
+            conv.add_input_message(user("now make the toggle match it"));
+        }
+        let (context, query) = association_context(&conversation).expect("context");
+        assert_eq!(query, "now make the toggle match it");
+        // The earlier turn is what lets an elliptical follow-up match a memory.
+        assert!(context.contains("User: add dark mode to the theme"));
+        assert!(context.contains("Assistant: I picked the slate palette."));
+        assert!(context.contains("User: now make the toggle match it"));
+    }
+
+    #[test]
+    fn association_context_ignores_injected_memories_and_tool_output() {
+        let conversation = Mutex::new(Conversation::new());
+        {
+            let mut conv = conversation.lock().unwrap();
+            conv.add_input_message(user("carry on"));
+        }
+        append_associated_memories(
+            &conversation,
+            &[crate::memory::MemoryEntry {
+                id: "mem_1".into(),
+                scope: crate::memory::MemoryScope::Global,
+                kind: crate::memory::MemoryKind::Preference,
+                content: "prefers tabs".into(),
+                tags: Vec::new(),
+                created_at: 0,
+                updated_at: 0,
+                last_used_at: None,
+                use_count: 0,
+                source: crate::memory::MemorySource::AgentTool,
+                confidence: crate::memory::MemoryConfidence::Explicit,
+                status: crate::memory::MemoryStatus::Active,
+                supersedes: None,
+            }],
+        );
+        let (context, _) = association_context(&conversation).expect("context");
+        assert!(!context.contains("prefers tabs"));
+    }
+
+    fn pending_association(
+        receiver: tokio::sync::oneshot::Receiver<Result<Vec<crate::memory::MemoryEntry>, String>>,
+    ) -> MemoryAssociationTask {
+        MemoryAssociationTask {
+            handle: Some(tokio::spawn(async move {
+                receiver
+                    .await
+                    .unwrap_or_else(|_| Err("sender dropped".into()))
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_step_never_waits_for_memory_association() {
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let mut task = pending_association(receiver);
+
+        let poll = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            poll_memory_association(&mut task, std::time::Duration::ZERO),
+        )
+        .await
+        .expect("a zero-grace poll must return immediately");
+
+        assert!(matches!(poll, AssociationPoll::Pending));
+        assert!(task.handle.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_later_step_can_collect_memory_during_its_grace_period() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut task = pending_association(receiver);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let _ = sender.send(Ok(Vec::new()));
+        });
+
+        let poll = poll_memory_association(&mut task, std::time::Duration::from_millis(100)).await;
+
+        assert!(matches!(poll, AssociationPoll::Finished(Ok(entries)) if entries.is_empty()));
+        assert!(task.handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_expired_grace_keeps_the_prefetch_running() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut task = pending_association(receiver);
+
+        let poll = poll_memory_association(&mut task, std::time::Duration::from_millis(5)).await;
+        assert!(matches!(poll, AssociationPoll::Pending));
+        assert!(task.handle.is_some());
+
+        sender.send(Ok(Vec::new())).unwrap();
+        let poll = poll_memory_association(&mut task, std::time::Duration::from_millis(100)).await;
+        assert!(matches!(poll, AssociationPoll::Finished(Ok(entries)) if entries.is_empty()));
+    }
+
+    #[test]
+    fn association_failure_note_keeps_the_models_reason() {
+        let notice = association_failure_notice("timed out after 30s");
+
+        // The reason matters: "timed out" and "no relevant memories" both show
+        // up as `Memories recalled: 0`, so the text has to tell them apart.
+        assert!(notice.contains("timed out after 30s"));
+        assert!(notice.contains("continuing without recalled memories"));
+    }
+
+    #[test]
+    fn association_context_requires_a_user_message() {
+        let conversation = Mutex::new(Conversation::new());
+        assert!(association_context(&conversation).is_none());
+    }
+
+    fn memory_entry(updated_at: u64, content: &str) -> crate::memory::MemoryEntry {
+        crate::memory::MemoryEntry {
+            id: format!("mem_{updated_at}"),
+            scope: crate::memory::MemoryScope::Project,
+            kind: crate::memory::MemoryKind::ProjectFact,
+            content: content.into(),
+            tags: Vec::new(),
+            created_at: updated_at,
+            updated_at,
+            last_used_at: None,
+            use_count: 0,
+            source: crate::memory::MemorySource::AgentTool,
+            confidence: crate::memory::MemoryConfidence::Explicit,
+            status: crate::memory::MemoryStatus::Active,
+            supersedes: None,
+        }
+    }
+
+    /// Text of every developer input message, which is where associations land.
+    fn developer_text(conversation: &Mutex<Conversation>) -> String {
+        conversation
+            .lock()
+            .unwrap()
+            .items()
+            .filter_map(|item| match item {
+                MessageItem::Input(async_openai::types::responses::InputItem::Item(
+                    async_openai::types::responses::Item::Message(ApiMessageItem::Input(message)),
+                )) if message.role == InputRole::Developer => Some(
+                    message
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            InputContent::InputText(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn associated_memories_carry_an_age_or_a_staleness_caveat() {
+        let now = crate::memory::now_secs();
+        let conversation = Mutex::new(Conversation::new());
+        append_associated_memories(
+            &conversation,
+            &[
+                memory_entry(now, "prefers tabs"),
+                memory_entry(
+                    now - 47 * 86_400,
+                    "the retry helper lives at src/net/retry.rs:88",
+                ),
+            ],
+        );
+
+        let text = developer_text(&conversation);
+        assert!(text.contains("(saved today) prefers tabs"));
+        // Stale entries replace the age prefix with the caveat, never both.
+        assert!(text.contains("This memory is 47 days old"));
+        assert!(text.contains("Verify against current code before asserting as fact"));
+        assert!(text.contains("the retry helper lives at src/net/retry.rs:88"));
+    }
+
+    #[test]
+    fn bounded_digest_keeps_recent_turns_and_shortens_long_lines() {
+        let lines = vec![
+            "old".to_string(),
+            format!("User: {}", "x".repeat(900)),
+            "Assistant: newest".to_string(),
+        ];
+        let digest = bounded_digest(&lines, 2, 4000);
+        assert!(!digest.contains("old"));
+        assert!(digest.contains("Assistant: newest"));
+        assert!(digest.contains('…'));
+
+        let digest = bounded_digest(&lines[1..], 2, 50);
+        assert_eq!(digest.chars().count(), 50);
     }
 
     #[tokio::test]
@@ -999,6 +1539,7 @@ mod tests {
             let label = match event {
                 RunnerEvent::Assistant(t) => format!("assistant:{t}"),
                 RunnerEvent::ToolCall { name } => format!("tool:{name}"),
+                RunnerEvent::Notice(text) => format!("notice:{text}"),
                 // Ephemeral progress events aren't asserted on in these tests.
                 RunnerEvent::StreamChunk(_)
                 | RunnerEvent::ResponseCommitted
@@ -1043,6 +1584,7 @@ mod tests {
             coauthor: None,
             vision_enabled: true,
             thinking_level: crate::thinking::ThinkingLevel::Auto,
+            memory_model: None,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
             max_steps: None,

@@ -96,6 +96,10 @@ fn persist_session(app: &mut App<'_>) -> Result<bool, String> {
     session.input_suggestion = app.input_panel.suggestion().map(str::to_owned);
     session.work_mode = Some(app.work_mode);
     session.current_model = Some(app.current_model.clone());
+    session.last_request_input_tokens = app
+        .conversation_panel
+        .usage_summary()
+        .last_request_input_tokens;
     session.vision_enabled = app.vision_enabled;
     session.thinking_level = app.thinking_level;
     session.classifier_model_override = app.session.classifier_model_override.clone();

@@ -32,7 +32,8 @@ TUI built with [Ratatui](https://ratatui.rs).
   project-local skills.
 - **Tasks and sub-agents** — stream command output, promote long-running commands
   to background tasks, drive interactive PTYs from the TUI, and delegate bounded
-  work to independent in-process agents.
+  work to independent in-process agents whose live phase (including the memory
+  model's association pass) shows on their own sidebar row.
 - **Multimodal terminal UI** — paste or reference images, render supported images
   with terminal graphics protocols, group related tool calls and reasoning, and
   keep providers, MCP servers, skills, todos, tasks, diagnostics, and agents in a
@@ -92,10 +93,14 @@ Use `--version v0.2.4` with `install.sh`, or `-Version v0.2.4` with
    Explain this repository and run its existing tests. Do not change files yet.
    ```
 
-   Use `/init` if you want Programmer to create project guidance and configure
-   diagnostics before making changes. If several edits are made before those
-   project artifacts exist, post-edit feedback may remind the agent to suggest
-   `/init` to you. The default Auto mode asks a classifier model to review
+   On Programmer's first interactive launch, a one-time global setup guide opens
+   provider management so you can configure providers and assign models for the
+   chat, classifier, compact, memory, title, and suggestion roles. It can also be
+   skipped. After a successful `write_file` or `edit_file` call, the next model
+   step receives a standalone developer reminder to check `PROGRAMMER.md`,
+   related documentation, and tests. The reminder is omitted if that turn
+   successfully edits `PROGRAMMER.md`; shell commands alone do not trigger it.
+   The default Auto mode asks a classifier model to review
    mutating tool calls; use a non-reasoning model for that role.
 
 If the provider works but the model list is empty, configure `models` and
@@ -176,6 +181,12 @@ classifier_top_logprobs = 20
 # current chat model when absent.
 compact_model = "openai/gpt-4o-mini"
 
+# Dedicated model that associates the current turn with stored memories. It
+# receives the recent conversation plus a manifest of local lexical candidates
+# and returns the few worth injecting. Falls back to the current chat model
+# when absent.
+memory_model = "openai/gpt-4o-mini"
+
 # Model used to generate a concise title from a session's first message. Falls
 # back to the current chat model when absent.
 title_model = "openai/gpt-4o-mini"
@@ -196,6 +207,10 @@ mandatory_compact_tokens = 150000
 # Keep this many recent complete turns verbatim after compaction.
 compact_keep_recent_turns = 2
 
+# After an automatic compaction, suppress another one for this many subsequent
+# user turns. Manual and mandatory compaction bypass this cooldown; 0 disables it.
+auto_compact_cooldown_turns = 5
+
 # Gate YOLO mode behind this flag so it can't be entered by accident.
 allow_yolo = true
 
@@ -209,9 +224,11 @@ auto_update_check = true
 git_coauthor = "programmer <noreply@programmer.local>"
 
 [memory]
-# Durable memory is local JSON outside the repository. It is recalled only
-# through the explicit memory tool or /memory command; requests are not
-# automatically modified with retrieved context.
+# Durable memory is local Markdown outside the repository. Before the first
+# request of each turn, the dedicated memory model associates the recent
+# conversation with the strongest local candidates; the few it returns are
+# appended to the end of the request so the cached prompt prefix stays valid.
+# Failures safely fall back to local relevance order.
 enabled = true
 global_enabled = true
 project_enabled = true
@@ -260,13 +277,15 @@ api_key = "sk-your-key-here"
 | `classifier_model` | (chat model) | `provider/model` for the Auto-mode classifier. Must be a **non-reasoning** model (see [Auto mode](#work-modes)). |
 | `classifier_top_logprobs` | `20` | Alternative-token count for the fast classifier probe (`0`–`20`). Lower this for providers with a smaller limit; Qwen accepts at most `5`. |
 | `compact_model` | (chat model) | `provider/model` used for manual and automatic context compaction. |
+| `memory_model` | (chat model) | Dedicated `provider/model` used to associate the current turn with relevant stored memories. |
 | `title_model` | (chat model) | `provider/model` used to generate a concise title for each new session. |
 | `suggestion_model` | (chat model) | `provider/model` used after successful turns to predict the next user message shown in the input placeholder. |
 | `auto_compact_tokens` | `100000` | Provider-reported input-token threshold for seamless background compaction. `0` disables it. Providers that do not report usage do not trigger it. |
 | `mandatory_compact_tokens` | `150000` | Hard provider-reported context limit. Programmer blocks further model requests until a proven-smaller compaction drops below it. `0` disables the gate. |
 | `compact_keep_recent_turns` | `2` | Number of recent complete turns kept verbatim when context is compacted. |
-| `memory.enabled` | `true` | Advertise the persistent-memory tool. Memory is recalled explicitly and is never injected automatically. |
-| `memory.global_enabled` / `project_enabled` | `true` | Include cross-project preferences and current-project memories in explicit recall. |
+| `auto_compact_cooldown_turns` | `5` | Suppress another automatic compaction for this many subsequent user turns; manual and mandatory compaction bypass it. `0` disables the cooldown. |
+| `memory.enabled` | `true` | Enable the persistent-memory store, automatic association, and the `memory` tool. |
+| `memory.global_enabled` / `project_enabled` | `true` | Include cross-project preferences and current-project memories when recalling. |
 | `memory.max_global_results` / `max_project_results` | `3` / `8` | Per-scope explicit recall limits. |
 | `allow_yolo` | `false` | Whether `/mode yolo` and `Ctrl+T` can reach YOLO mode. |
 | `auto_update_check` | `true` | Check GitHub Releases at startup and show a non-blocking update notice. |
@@ -282,6 +301,8 @@ api_key = "sk-your-key-here"
 | `security.sandbox.writable_paths` | `[]` | Additional paths sandboxed child processes may modify. |
 | `security.sandbox.denied_read_paths` | `[]` | Paths sandboxed child processes must not read. |
 | `security.sandbox.denied_environment` | `[]` | Environment variable name globs removed from sandboxed child processes. An empty list inherits the complete parent environment. |
+
+`request_permission` refuses filesystem access requests when the sandbox is off. Sandbox-mode requests may only relax isolation (for example, `restricted` → `network`); requests that would make the current mode stricter are rejected without prompting.
 
 Each provider is a `[providers.<name>]` section. You can add as many as you want.
 
@@ -374,7 +395,10 @@ is sent to a classifier LLM before execution. Read-only tools (`read_file`,
    (`no`, ambiguous token, or no logprobs available), the classifier
    re-evaluates with **full context** — assistant replies, tool outputs, and
    recent call history — and produces a reasoned `APPROVE` or
-   `DENY: <reason>`.
+   `DENY: <reason>`. Each complete classifier operation has a 30-second
+   deadline, including transient retries (up to three retries); cancellation
+   interrupts both the request and retry backoff. On failure it retains the
+   existing safe denial fallback.
 
 **User override — per-operation:** The classifier's instructions tell it
 to respect explicit per-operation instructions in the user's message:
@@ -480,7 +504,7 @@ programmer
 | `/mcp manage` | Open the MCP management panel |
 | `/terminal [id]` | Open a running or completed task's terminal viewer |
 | `/terminal clear` | Remove completed, failed, and killed tasks |
-| `/usage` | Show token usage for the session and latest turn |
+| `/usage` | Show cumulative token usage and the latest model request's input-token count |
 | `/new` `/n` | Start a new session (auto-saves current) |
 | `/session` `/s` | Show current session UUID and info |
 | `/title [text]` | Regenerate the current session title, or set it manually when text is provided |
@@ -491,11 +515,62 @@ programmer
 | `/quit` `/q` | Exit the application |
 | `/help` `/?` | Show all commands |
 
-Memory files are versioned JSON under the platform config directory at
-`programmer/memory/global.json` and `programmer/memory/projects/<workspace-id>.json`.
-They are not written into the repository. Credential-like content is rejected.
-Stored entries are never injected into model requests automatically; the agent
-or user must explicitly call `memory recall` or `/memory recall`.
+Memory is stored as inspectable Markdown under the platform config directory:
+global memories use `programmer/memory/global/`, and project memories use
+`programmer/memory/projects/<workspace-id>/`. Each entry has its own Markdown
+file and `MEMORY.md` is an index. Older JSON stores are migrated losslessly on
+first access and retained as a backup. They are not written into the repository.
+Credential-like content is rejected.
+
+At the start of every user turn the memory model is asked to associate the
+recent conversation with the strongest local candidates for the current
+request. Sub-agents run the same association pass against their own task
+prompt, matching Claude Code, where the recall prefetch lives in the shared
+query loop with no agent guard. What a sub-agent does *not* get is the memory
+mechanics section of the system prompt, so it receives recalled memories but is
+never told how to read or write the store; that stays a main-session
+instruction. Association is prefetched concurrently with the first model response, so even
+a slow memory model never delays first-token latency. If that response calls
+tools, a later model step collects a ready result or gives it one cancellable
+2.5-second grace period; the few selected memories are then appended as a
+developer message and remain in context for the rest of the turn. A one-response
+turn never waits and simply discards an unfinished prefetch. This preserves the
+cached prompt prefix and system prompt, and an existing associated block is
+never added again. `Associating` is shown only during the later grace period;
+for a sub-agent it appears on that agent's own sidebar row rather than the main
+turn's status. Candidates are ranked locally first, weighted by keyword
+overlap, memory kind, confidence, and freshness: memories decay with a per-kind
+half-life (durable preferences slowly, volatile workflows quickly) and are
+reinforced by each recall that returns them. Decay only ever lowers a memory's
+association weight — entries are never deleted for being old. Because a weight
+only decides what is retrieved, each injected memory also carries its own age
+(`saved today`, `saved 47 days ago`), and anything older than a day is instead
+prefixed with a caveat that it is a point-in-time observation whose claims
+about code behavior or `file:line` citations may be outdated and must be
+verified against current code before being asserted as fact. Age is measured
+from `updated_at`, the last time the memory's content changed, not from the
+recall that just reinforced it.
+
+The association request itself runs with reasoning disabled — selecting IDs
+from a short manifest is not a thinking task, and a reasoning model would spend
+the entire budget before answering — under a 30-second budget that can be
+cancelled at any point. A lookup that fails or times out never fails the turn:
+it recalls nothing and reports the reason as an informational line, because
+`Memories recalled: 0` on its own cannot distinguish "nothing was relevant"
+from "the model never answered". When the model returns nothing usable, that
+line carries what actually came back — response status, output item kinds, and
+the reasoning tokens spent — so the cause is visible without reproducing the
+call by hand.
+
+Explicit recall remains available through the `memory` tool and `/memory
+recall`; it lists each entry with its age in days and reinforces what it
+returned, so a manual recall counts toward a memory's freshness exactly like an
+automatic one. `memory list`, `update`, and `forget` behave as before, except
+that `list` also shows each entry's age.
+
+Saved sessions use an OS-backed per-session lock. If a second Programmer opens
+an in-use conversation, it reports the owning PID and asks whether to fork the
+conversation under a new UUID or exit the later process.
 
 ### Provider management panel
 
@@ -713,7 +788,7 @@ Terminal emulators generally reserve `Cmd+V` for text paste, so image paste uses
 | `/new` `/n` | Save current session and start fresh |
 | `/session` `/s` | Show current session UUID |
 | `/title [text]` | Regenerate the current session title, or set it manually |
-| `/usage` | Show session and most recent turn token usage |
+| `/usage` | Show cumulative usage and the latest request's input-token count |
 
 ## Project structure
 

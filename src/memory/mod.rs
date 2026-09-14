@@ -150,6 +150,19 @@ impl MemoryKind {
         }
     }
 
+    /// Hours after which an unreinforced memory of this kind loses half its
+    /// association weight. Durable facts decay slowly; volatile working notes
+    /// decay fast, so a stale workflow never outranks a current preference.
+    fn half_life_hours(self) -> f32 {
+        match self {
+            Self::Preference | Self::Constraint => 24.0 * 365.0,
+            Self::Decision | Self::Convention => 24.0 * 180.0,
+            Self::ProjectFact => 24.0 * 90.0,
+            Self::KnownIssue => 24.0 * 45.0,
+            Self::Workflow => 24.0 * 30.0,
+        }
+    }
+
     fn priority(self) -> f32 {
         match self {
             Self::Constraint | Self::Preference => 2.0,
@@ -250,7 +263,9 @@ impl MemoryManager {
         Ok(Self::new(config_dir.join("programmer"), cwd))
     }
 
-    fn new(config_root: PathBuf, working_dir: PathBuf) -> Self {
+    /// Build a store at explicit roots. Split from [`Self::for_current_dir`]
+    /// so tests can point at a temporary directory.
+    pub(crate) fn new(config_root: PathBuf, working_dir: PathBuf) -> Self {
         let workspace_root = workspace_root(&working_dir);
         let identity = workspace_root.to_string_lossy().replace('\\', "/");
         let workspace_id = blake3::hash(identity.as_bytes()).to_hex().to_string();
@@ -348,6 +363,31 @@ impl MemoryManager {
         Err(format!("memory '{id}' was not found"))
     }
 
+    /// Record that a recall actually returned `ids`, so their freshness is
+    /// reinforced. Failures are ignored by callers: recall must never break a
+    /// turn because a memory file could not be rewritten.
+    pub(crate) fn touch(&self, ids: &[String]) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = now_secs();
+        for scope in [MemoryScope::Global, MemoryScope::Project] {
+            let mut file = self.load(scope)?;
+            let mut changed = false;
+            for entry in &mut file.entries {
+                if ids.iter().any(|id| id == &entry.id) {
+                    entry.last_used_at = Some(now);
+                    entry.use_count = entry.use_count.saturating_add(1);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.save(scope, &file)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn forget(&self, id: &str) -> Result<(), String> {
         for scope in [MemoryScope::Global, MemoryScope::Project] {
             let mut file = self.load(scope)?;
@@ -407,14 +447,16 @@ impl MemoryManager {
         if entries.is_empty() {
             return "No active memories.".to_string();
         }
+        let now = now_secs();
         entries
             .iter()
             .map(|entry| {
                 format!(
-                    "{}  {:7}  {:12}  {}",
+                    "{}  {:7}  {:12}  saved {:12}  {}",
                     entry.id,
                     entry.scope.label(),
                     entry.kind.label(),
+                    age_label(entry, now),
                     entry.content
                 )
             })
@@ -429,38 +471,82 @@ impl MemoryManager {
         }
     }
 
+    fn directory(&self, scope: MemoryScope) -> PathBuf {
+        self.path(scope).with_extension("")
+    }
+
     fn load(&self, scope: MemoryScope) -> Result<MemoryFile, String> {
-        let path = self.path(scope);
-        if !path.exists() {
-            return Ok(MemoryFile::empty(self.workspace_path(scope)));
+        let dir = self.directory(scope);
+        let index = dir.join("MEMORY.md");
+        if index.exists() {
+            let mut entries = Vec::new();
+            for line in std::fs::read_to_string(&index)
+                .map_err(|e| format!("read {}: {e}", index.display()))?
+                .lines()
+            {
+                if let Some(name) = line
+                    .strip_prefix("- ")
+                    .and_then(|s| s.split_whitespace().next())
+                {
+                    let p = dir.join(name);
+                    if p.extension().and_then(|x| x.to_str()) == Some("md") && p.exists() {
+                        let text = std::fs::read_to_string(&p)
+                            .map_err(|e| format!("read {}: {e}", p.display()))?;
+                        if let Some(metadata) = text
+                            .strip_prefix("<!-- ")
+                            .and_then(|s| s.split_once(" -->\n"))
+                            .map(|x| x.0)
+                        {
+                            entries.push(
+                                serde_json::from_str(metadata)
+                                    .map_err(|e| format!("parse {}: {e}", p.display()))?,
+                            );
+                        }
+                    }
+                }
+            }
+            return Ok(MemoryFile {
+                schema_version: SCHEMA_VERSION,
+                workspace_path: self.workspace_path(scope),
+                entries,
+            });
         }
-        let bytes =
-            std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-        let file: MemoryFile = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("parse {}: {error}", path.display()))?;
-        if file.schema_version > SCHEMA_VERSION {
-            return Err(format!(
-                "memory schema {} is newer than supported schema {SCHEMA_VERSION}",
-                file.schema_version
-            ));
+        // One-time, lossless migration from the legacy JSON store.
+        let old = self.path(scope);
+        if old.exists() {
+            let file: MemoryFile = serde_json::from_slice(
+                &std::fs::read(old).map_err(|e| format!("read {}: {e}", old.display()))?,
+            )
+            .map_err(|e| format!("parse {}: {e}", old.display()))?;
+            self.save(scope, &file)?;
+            return Ok(file);
         }
-        Ok(file)
+        Ok(MemoryFile::empty(self.workspace_path(scope)))
     }
 
     fn save(&self, scope: MemoryScope, file: &MemoryFile) -> Result<(), String> {
-        let path = self.path(scope);
-        let parent = path
-            .parent()
-            .ok_or_else(|| format!("memory path has no parent: {}", path.display()))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("create {}: {error}", parent.display()))?;
-        let json = serde_json::to_string_pretty(file)
-            .map_err(|error| format!("serialize memory: {error}"))?;
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, json)
-            .map_err(|error| format!("write {}: {error}", temporary.display()))?;
-        std::fs::rename(&temporary, path)
-            .map_err(|error| format!("rename to {}: {error}", path.display()))
+        let dir = self.directory(scope);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let mut index = String::from("# Memory\n\n");
+        for entry in &file.entries {
+            let name = format!("{}.md", entry.id);
+            let json =
+                serde_json::to_string(entry).map_err(|e| format!("serialize memory: {e}"))?;
+            std::fs::write(
+                dir.join(&name),
+                format!(
+                    "<!-- {json} -->\n# {}\n\n{}\n",
+                    entry.kind.label(),
+                    entry.content
+                ),
+            )
+            .map_err(|e| format!("write memory: {e}"))?;
+            index.push_str(&format!(
+                "- {name} {}\n",
+                entry.content.lines().next().unwrap_or("")
+            ));
+        }
+        std::fs::write(dir.join("MEMORY.md"), index).map_err(|e| format!("write index: {e}"))
     }
 
     fn workspace_path(&self, scope: MemoryScope) -> Option<String> {
@@ -550,6 +636,19 @@ fn tokens(text: &str) -> HashSet<String> {
     tokens
 }
 
+/// How strongly a memory still counts, as a Claude Code style freshness
+/// weight: exponential decay since the memory was last reinforced, damped by
+/// per-kind half-lives and lifted a little every time a recall actually used
+/// it. Recalled memories therefore stay warm, while never-recalled ones fade
+/// without ever being deleted.
+fn freshness(entry: &MemoryEntry, now: u64) -> f32 {
+    let reinforced_at = entry.last_used_at.unwrap_or(0).max(entry.updated_at);
+    let age_hours = now.saturating_sub(reinforced_at) as f32 / 3600.0;
+    let decay = 0.5_f32.powf(age_hours / entry.kind.half_life_hours());
+    let reinforcement = 1.0 + (entry.use_count as f32).min(20.0) * 0.05;
+    (decay * reinforcement).min(1.0)
+}
+
 fn relevance(entry: &MemoryEntry, query_tokens: &HashSet<String>) -> f32 {
     let content_tokens = tokens(&entry.content);
     let tag_tokens = entry
@@ -562,10 +661,50 @@ fn relevance(entry: &MemoryEntry, query_tokens: &HashSet<String>) -> f32 {
     if content_overlap == 0.0 && tag_overlap == 0.0 {
         return 0.0;
     }
-    content_overlap * 2.0 + tag_overlap * 4.0 + entry.kind.priority() + entry.confidence.score()
+    let keyword = content_overlap * 2.0
+        + tag_overlap * 4.0
+        + entry.kind.priority()
+        + entry.confidence.score();
+    keyword * freshness(entry, now_secs())
 }
 
-fn now_secs() -> u64 {
+/// Whole days since a memory was last written. Age is measured from
+/// `updated_at`, the last time its content changed, not from `last_used_at`
+/// — being recalled says nothing about whether the claim is still true.
+pub(crate) fn age_days(entry: &MemoryEntry, now: u64) -> u64 {
+    now.saturating_sub(entry.updated_at) / 86_400
+}
+
+/// Human-readable age. Models are poor at date arithmetic, and a raw
+/// timestamp does not trigger staleness reasoning the way "47 days ago" does.
+pub(crate) fn age_label(entry: &MemoryEntry, now: u64) -> String {
+    match age_days(entry, now) {
+        0 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        days => format!("{days} days ago"),
+    }
+}
+
+/// Claude Code style staleness caveat for memories older than a day, and
+/// `None` for fresh ones — warning about today's memory is just noise.
+///
+/// Stale memories are dropped in weight but never deleted, so this is the
+/// only thing standing between a model and an old claim: it addresses the
+/// case where a `file:line` citation makes a stale statement sound *more*
+/// authoritative rather than less.
+pub(crate) fn freshness_caveat(entry: &MemoryEntry, now: u64) -> Option<String> {
+    let days = age_days(entry, now);
+    if days <= 1 {
+        return None;
+    }
+    Some(format!(
+        "This memory is {days} days old. Memories are point-in-time observations, not live state — \
+         claims about code behavior or file:line citations may be outdated. \
+         Verify against current code before asserting as fact."
+    ))
+}
+
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -693,6 +832,112 @@ mod tests {
         assert_eq!(manager.list(None).unwrap()[0].content, "New fact");
         manager.forget(&entry.id).unwrap();
         assert!(manager.list(None).unwrap().is_empty());
+    }
+
+    fn entry_with_age(kind: MemoryKind, age_hours: u64, use_count: u32) -> MemoryEntry {
+        let now = now_secs();
+        let created_at = now.saturating_sub(age_hours * 3600);
+        MemoryEntry {
+            id: "mem_test".into(),
+            scope: MemoryScope::Project,
+            kind,
+            content: "Store sessions as JSON".into(),
+            tags: Vec::new(),
+            created_at,
+            updated_at: created_at,
+            last_used_at: None,
+            use_count,
+            source: MemorySource::AgentTool,
+            confidence: MemoryConfidence::Explicit,
+            status: MemoryStatus::Active,
+            supersedes: None,
+        }
+    }
+
+    #[test]
+    fn freshness_decays_with_age_and_never_reaches_zero() {
+        let now = now_secs();
+        let fresh = entry_with_age(MemoryKind::ProjectFact, 0, 0);
+        let stale = entry_with_age(MemoryKind::ProjectFact, 24 * 90, 0);
+        let ancient = entry_with_age(MemoryKind::ProjectFact, 24 * 360, 0);
+
+        assert!(freshness(&fresh, now) > 0.99);
+        assert!(freshness(&stale, now) < freshness(&fresh, now));
+        // Half-life decay, not expiry: old memories stay recalled, just weaker.
+        assert!(freshness(&ancient, now) > 0.0);
+    }
+
+    #[test]
+    fn durable_kinds_decay_slower_than_volatile_ones() {
+        let now = now_secs();
+        let preference = entry_with_age(MemoryKind::Preference, 24 * 90, 0);
+        let workflow = entry_with_age(MemoryKind::Workflow, 24 * 90, 0);
+
+        assert!(freshness(&preference, now) > freshness(&workflow, now));
+    }
+
+    #[test]
+    fn recall_reinforces_freshness() {
+        let now = now_secs();
+        let unused = entry_with_age(MemoryKind::Workflow, 24 * 60, 0);
+        let mut reused = entry_with_age(MemoryKind::Workflow, 24 * 60, 0);
+        reused.last_used_at = Some(now);
+
+        assert!(freshness(&reused, now) > freshness(&unused, now));
+        assert!(freshness(&reused, now) > 0.99);
+    }
+
+    #[test]
+    fn freshness_caveat_is_silent_for_fresh_memories_and_names_the_age_for_old_ones() {
+        let now = now_secs();
+        let today = entry_with_age(MemoryKind::ProjectFact, 2, 0);
+        let yesterday = entry_with_age(MemoryKind::ProjectFact, 30, 0);
+        let old = entry_with_age(MemoryKind::ProjectFact, 24 * 47, 0);
+
+        assert_eq!(age_label(&today, now), "today");
+        assert_eq!(age_label(&yesterday, now), "yesterday");
+        assert_eq!(age_label(&old, now), "47 days ago");
+        assert!(freshness_caveat(&today, now).is_none());
+        // A day-old memory is still fresh: warning there would only be noise.
+        assert!(freshness_caveat(&yesterday, now).is_none());
+
+        let caveat = freshness_caveat(&old, now).expect("caveat for a 47 day old memory");
+        assert!(caveat.contains("This memory is 47 days old"));
+        assert!(caveat.contains("point-in-time observations, not live state"));
+    }
+
+    #[test]
+    fn memory_age_is_measured_from_the_last_edit_not_from_recall() {
+        let now = now_secs();
+        let mut entry = entry_with_age(MemoryKind::Preference, 24 * 30, 0);
+        entry.last_used_at = Some(now);
+
+        // Being recalled today does not make a month-old claim fresh.
+        assert_eq!(age_days(&entry, now), 30);
+        assert!(freshness_caveat(&entry, now).is_some());
+    }
+
+    #[test]
+    fn touch_records_recall_usage_and_persists_it() {
+        let manager = manager();
+        let entry = manager
+            .remember(
+                MemoryScope::Project,
+                MemoryKind::ProjectFact,
+                "Store sessions as JSON".into(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(entry.use_count, 0);
+        assert_eq!(entry.last_used_at, None);
+
+        manager.touch(std::slice::from_ref(&entry.id)).unwrap();
+
+        let stored = manager.list(Some(MemoryScope::Project)).unwrap();
+        assert_eq!(stored[0].use_count, 1);
+        assert!(stored[0].last_used_at.is_some());
+        // Unknown ids are ignored rather than failing the recall.
+        manager.touch(&["mem_missing".into()]).unwrap();
     }
 
     #[test]

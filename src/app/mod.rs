@@ -22,6 +22,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod events;
 pub(crate) mod helpers;
 pub(crate) mod session;
+mod setup;
 pub(crate) mod surface;
 
 use crate::cancel::CancellationToken;
@@ -174,6 +175,9 @@ pub(crate) struct AutoCompactState {
     pub(crate) history_epoch: u64,
     pub(crate) last_cutoff: Option<usize>,
     pub(crate) last_input_tokens: Option<u32>,
+    /// Conversation length immediately after the latest successful automatic
+    /// compaction, used to count subsequent user turns for cooldown.
+    pub(crate) last_completed_item_count: Option<usize>,
     /// A user/runtime request is queued behind a mandatory compaction.
     pub(crate) mandatory_waiting: bool,
     pub(crate) mandatory_resume: Option<tokio::sync::oneshot::Sender<()>>,
@@ -293,6 +297,7 @@ pub struct App<'a> {
     pub footer: Footer,
     /// Full-screen provider management panel, when open.
     pub provider_panel: Option<ProviderPanel>,
+    pub(crate) setup_guide: Option<setup::SetupGuide>,
     /// Full-screen skills management panel, when open.
     pub skills_panel: Option<SkillsPanel>,
     /// Full-screen MCP server management panel, when open.
@@ -414,6 +419,7 @@ impl App<'_> {
         project_name: String,
     ) -> Self {
         config.normalize_security_profiles();
+        let setup_guide = setup::SetupGuide::first_launch();
         let provider_manager = ProviderManager::from_config(&config);
         let mut current_model = provider_manager.default_model();
         let mut work_mode = WorkMode::default();
@@ -425,6 +431,7 @@ impl App<'_> {
         let mut compact_keep_recent_turns_override = None;
         let mut session_title = String::new();
         let mut saved_input_suggestion = None;
+        let mut saved_last_request_input_tokens = None;
 
         let mut saved_activated_skills: Option<Vec<String>> = None;
         let mut saved_file_snapshots: Vec<crate::security::policy::PersistedFileSnapshot> =
@@ -442,6 +449,7 @@ impl App<'_> {
             }
             session_title = saved.title;
             saved_input_suggestion = saved.input_suggestion;
+            saved_last_request_input_tokens = saved.last_request_input_tokens;
             saved_file_snapshots = saved.file_snapshots;
             vision_enabled = saved.vision_enabled;
             thinking_level = saved.thinking_level;
@@ -455,6 +463,9 @@ impl App<'_> {
         }
         let mut conversation_panel = ConversationPanel::new();
         conversation_panel.restore_items(saved_items);
+        if let Ok(mut conversation) = conversation_panel.conversation.lock() {
+            conversation.last_request_input_tokens = saved_last_request_input_tokens;
+        }
         events::remove_quit_confirmation_warning(&mut conversation_panel);
         for msg in startup_messages {
             conversation_panel.add_info_string(msg);
@@ -503,6 +514,7 @@ impl App<'_> {
             conversation_panel,
             footer: Footer::new(),
             provider_panel: open_provider_panel.then(ProviderPanel::new),
+            setup_guide,
             skills_panel: None,
             mcp_panel: None,
             diagnostics_panel: None,
@@ -714,6 +726,23 @@ impl App<'_> {
 
         let (client, model_name) = self.provider_manager.resolve(&self.current_model)?;
         let model_str = self.current_model.clone();
+        let memory_model_target = self
+            .config
+            .memory_model
+            .as_deref()
+            .unwrap_or(&self.current_model);
+        // A disabled memory store disables automatic recall, matching the
+        // memory tool being unadvertised.
+        let memory_model = if self.config.memory.enabled {
+            self.provider_manager
+                .resolve(memory_model_target)
+                .map(|(client, model)| crate::tools::memory::MemoryModel {
+                    client: client.clone(),
+                    model,
+                })
+        } else {
+            None
+        };
         // Unify every tool source behind the registry: the local built-ins are
         // one provider, all connected MCP servers another.
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
@@ -721,6 +750,7 @@ impl App<'_> {
                 LocalToolProvider::new(self.todo_store.clone(), self.security.clone())
                     .with_checkpoint(self.checkpoint_recorder())
                     .with_memory_enabled(self.config.memory.enabled)
+                    .with_memory_model(memory_model.clone())
                     .with_conversation_history(Some(self.conversation_panel.shared_conversation())),
             ),
             Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
@@ -769,6 +799,7 @@ impl App<'_> {
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,
             memory_config: self.config.memory.clone(),
+            memory_model: self.config.memory_model.clone(),
             skill_registry: self.skill_registry.clone(),
             skill_prompt: self.skill_registry.catalog_prompt(),
             approval_label: format!(
@@ -795,6 +826,7 @@ impl App<'_> {
             coauthor: self.config.git_coauthor.clone(),
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,
+            memory_model,
             hooks: crate::runner::hooks::standard_hooks(self.diagnostics_state.clone()),
             stream_retrying: self.cancel.stream_retrying.clone(),
             max_steps: None,

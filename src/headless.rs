@@ -177,10 +177,26 @@ impl HeadlessAgent {
             .ok_or_else(|| {
                 color_eyre::eyre::eyre!("built-in initialize-project skill is unavailable")
             })?;
+        let memory_model_target = config.memory_model.as_deref().unwrap_or(&model);
+        // A disabled memory store disables automatic recall, matching the
+        // memory tool being unadvertised.
+        let memory_model = if config.memory.enabled {
+            provider_manager
+                .resolve(memory_model_target)
+                .map(
+                    |(memory_client, memory_name)| crate::tools::memory::MemoryModel {
+                        client: memory_client.clone(),
+                        model: memory_name,
+                    },
+                )
+        } else {
+            None
+        };
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
             Arc::new(
                 LocalToolProvider::new(todo_store.clone(), security.clone())
-                    .with_memory_enabled(config.memory.enabled),
+                    .with_memory_enabled(config.memory.enabled)
+                    .with_memory_model(memory_model.clone()),
             ),
             Arc::new(SkillToolProvider::new(skill_registry.clone())),
         ];
@@ -243,6 +259,7 @@ impl HeadlessAgent {
             vision_enabled: false,
             thinking_level: args.thinking,
             memory_config: config.memory.clone(),
+            memory_model: config.memory_model.clone(),
             skill_registry,
             skill_prompt: skill_prompt.clone(),
             approval_label: format!(
@@ -276,6 +293,7 @@ impl HeadlessAgent {
             coauthor: config.git_coauthor,
             vision_enabled: false,
             thinking_level: args.thinking,
+            memory_model,
             hooks,
             stream_retrying: Arc::new(AtomicBool::new(false)),
             max_steps: args.max_steps,
@@ -370,6 +388,11 @@ impl AgentSurface for CliSurface {
                 "type": "phase",
                 "phase": phase_label(phase),
             }),
+            RunnerEvent::Notice(text) => json!({
+                "schema_version": OUTPUT_SCHEMA_VERSION,
+                "type": "notice",
+                "text": text,
+            }),
             RunnerEvent::UsageSafePoint { .. } | RunnerEvent::WaitingSubagents(_) => return,
         };
         println!("{event}");
@@ -403,6 +426,7 @@ fn phase_label(phase: RunnerPhase) -> &'static str {
     match phase {
         RunnerPhase::Streaming => "streaming",
         RunnerPhase::Classifying => "classifying",
+        RunnerPhase::Associating => "associating_memories",
         RunnerPhase::RunningTools => "running_tools",
         RunnerPhase::Checking => "checking",
     }

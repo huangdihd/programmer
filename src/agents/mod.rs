@@ -24,7 +24,7 @@ use crate::cancel::CancellationToken;
 use crate::classifier::WorkMode;
 use crate::conversation::Conversation;
 use crate::runner::{
-    AgentSurface, LlmPolicy, ReviewDecision, RunnerEvent, RunnerPolicy, TurnRunner,
+    AgentSurface, LlmPolicy, ReviewDecision, RunnerEvent, RunnerPhase, RunnerPolicy, TurnRunner,
 };
 use crate::ui::event::{AppEvent, Event, ReplyTx};
 use async_openai::Client;
@@ -75,6 +75,8 @@ pub(crate) struct AgentSnapshot {
     pub(crate) status: AgentStatus,
     pub(crate) elapsed: Duration,
     pub(crate) result: Option<String>,
+    /// What the sub-agent is doing right now, while it is still running.
+    pub(crate) phase: Option<RunnerPhase>,
 }
 
 struct AgentEntry {
@@ -85,6 +87,7 @@ struct AgentEntry {
     started: Instant,
     finished: Option<Instant>,
     result: Option<String>,
+    phase: Option<RunnerPhase>,
     conversation: Arc<Mutex<Conversation>>,
     cancel: CancellationToken,
     changed: Arc<Notify>,
@@ -100,6 +103,13 @@ impl AgentEntry {
             status: self.status,
             elapsed: self.finished.unwrap_or_else(Instant::now) - self.started,
             result: self.result.clone(),
+            // A finished sub-agent has no current phase, whatever it was doing
+            // when it stopped.
+            phase: if self.status == AgentStatus::Running {
+                self.phase
+            } else {
+                None
+            },
         }
     }
 }
@@ -197,6 +207,7 @@ impl AgentManager {
                 started: Instant::now(),
                 finished: None,
                 result: None,
+                phase: None,
                 conversation: conversation.clone(),
                 cancel: cancel.clone(),
                 changed: Arc::new(Notify::new()),
@@ -221,6 +232,7 @@ impl AgentManager {
             return;
         };
         entry.finished = Some(Instant::now());
+        entry.phase = None;
         match result {
             Ok(result) => {
                 entry.status = AgentStatus::Completed;
@@ -249,6 +261,19 @@ impl AgentManager {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Record what a running sub-agent is doing, for the sidebar. Phase
+    /// updates for finished or unknown agents are dropped rather than
+    /// resurrecting a stale row.
+    pub(crate) fn set_phase(&self, id: u64, phase: RunnerPhase) {
+        let mut state = self.state.lock().unwrap();
+        let Some(entry) = state.entries.get_mut(&id) else {
+            return;
+        };
+        if entry.status == AgentStatus::Running {
+            entry.phase = Some(phase);
+        }
     }
 
     pub(crate) fn snapshot_all(&self) -> Vec<AgentSnapshot> {
@@ -371,6 +396,11 @@ pub(crate) struct AgentRuntime {
     pub(crate) vision_enabled: bool,
     pub(crate) thinking_level: crate::thinking::ThinkingLevel,
     pub(crate) memory_config: crate::config::programmer_config::MemoryConfig,
+    /// `provider/model` used for memory association inside sub-agents. `None`
+    /// falls back to the sub-agent's own model. Stored as a target rather than
+    /// a resolved client so a model override on the sub-agent still picks a
+    /// memory model from the same provider set.
+    pub(crate) memory_model: Option<String>,
     pub(crate) skill_registry: crate::skills::SkillRegistry,
     pub(crate) skill_prompt: Option<String>,
     pub(crate) approval_label: String,
@@ -411,6 +441,21 @@ impl AgentRuntime {
             LocalToolProvider, McpToolProvider, SkillToolProvider, ToolProvider, ToolRegistry,
         };
 
+        // Sub-agents recall memory exactly like the main session does: Claude
+        // Code starts its relevance prefetch inside the shared query loop with
+        // no agent guard, so a child that hits a stored gotcha sees it too.
+        // The memory model is independent of the sub-agent's own model, and a
+        // disabled memory store disables recall as well as the tool.
+        let memory_model = if self.memory_config.enabled {
+            self.provider_manager
+                .resolve(self.memory_model.as_deref().unwrap_or(&self.model_str))
+                .map(|(client, model)| crate::tools::memory::MemoryModel {
+                    client: client.clone(),
+                    model,
+                })
+        } else {
+            None
+        };
         let mut providers: Vec<Arc<dyn ToolProvider>> = vec![
             Arc::new(
                 LocalToolProvider::new_scoped(
@@ -420,6 +465,7 @@ impl AgentRuntime {
                 )
                 .with_checkpoint(self.checkpoint.clone())
                 .with_memory_enabled(self.memory_config.enabled)
+                .with_memory_model(memory_model.clone())
                 .with_conversation_history(self.conversation_history.clone()),
             ),
             Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
@@ -437,6 +483,7 @@ impl AgentRuntime {
             coauthor: self.coauthor.clone(),
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,
+            memory_model,
             hooks: crate::runner::hooks::standard_hooks(Arc::new(Mutex::new(
                 crate::runner::DiagnosticsState::default(),
             ))),
@@ -457,7 +504,20 @@ struct SubagentSurface {
 
 #[async_trait::async_trait]
 impl AgentSurface for SubagentSurface {
-    fn on_event(&self, _event: RunnerEvent<'_>) {}
+    fn on_event(&self, event: RunnerEvent<'_>) {
+        // Sub-agents run the same turn loop as the main session, so they pass
+        // through the same phases — including `Associating`. Forward them, but
+        // tagged with this agent's id so the sidebar can show them per child
+        // instead of overwriting the main turn's status.
+        let RunnerEvent::Phase(phase) = event else {
+            return;
+        };
+        let _ = self.tx.send(Event::App(AppEvent::AgentPhase {
+            generation: self.generation,
+            id: self.id,
+            phase,
+        }));
+    }
 
     async fn review(
         &self,
@@ -525,6 +585,118 @@ fn default_name(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runtime with one resolvable provider, so memory-model resolution can
+    /// be exercised without a network or a real config file.
+    fn memory_runtime(enabled: bool) -> AgentRuntime {
+        let mut config = crate::ProgrammerConfig::default();
+        config.memory.enabled = enabled;
+        config.memory_model = Some("openai/memory-model".to_string());
+        if let Some(provider) = config.providers.get_mut("openai") {
+            provider.default_model = Some("memory-model".to_string());
+        }
+        let security = crate::security::SecurityManager::standalone().unwrap();
+        AgentRuntime {
+            provider_manager: Arc::new(crate::providers::ProviderManager::from_config(&config)),
+            client: Client::with_config(OpenAIConfig::default()),
+            model_name: "memory-model".to_string(),
+            model_str: "openai/memory-model".to_string(),
+            todos: Arc::new(Mutex::new(crate::todos::TodoList::default())),
+            security: Arc::new(crate::security::SecurityHandle::new(Arc::new(security))),
+            mcp_manager: None,
+            policy: AgentPolicyFactory::Yolo,
+            soul: None,
+            coauthor: None,
+            vision_enabled: false,
+            thinking_level: crate::thinking::ThinkingLevel::Auto,
+            memory_config: config.memory.clone(),
+            memory_model: config.memory_model.clone(),
+            skill_registry: crate::skills::SkillRegistry::default(),
+            skill_prompt: None,
+            approval_label: "test".to_string(),
+            checkpoint: None,
+            conversation_history: None,
+        }
+    }
+
+    #[test]
+    fn sub_agents_recall_memories_like_the_main_session() {
+        let runner = memory_runtime(true).build_runner(0);
+        assert!(
+            runner.memory_model.is_some(),
+            "a sub-agent runner should associate memories"
+        );
+
+        // Disabling the store disables recall, not just the tool.
+        let disabled = memory_runtime(false).build_runner(0);
+        assert!(disabled.memory_model.is_none());
+    }
+
+    #[test]
+    fn sub_agent_model_overrides_keep_the_memory_model() {
+        let runtime = memory_runtime(true);
+        let overridden = runtime
+            .with_overrides(Some("openai/other-model"), None)
+            .unwrap();
+
+        assert_eq!(overridden.model_str, "openai/other-model");
+        // The memory model is an independent target, so it survives the swap.
+        assert_eq!(
+            overridden.memory_model.as_deref(),
+            Some("openai/memory-model")
+        );
+        assert!(overridden.build_runner(0).memory_model.is_some());
+    }
+
+    #[test]
+    fn running_sub_agents_report_their_phase_and_clear_it_when_finished() {
+        let manager = AgentManager::default();
+        let start = manager.reserve("inspect".into(), None).unwrap();
+        assert_eq!(manager.snapshot(start.id).unwrap().phase, None);
+
+        manager.set_phase(start.id, RunnerPhase::Associating);
+        assert_eq!(
+            manager.snapshot(start.id).unwrap().phase,
+            Some(RunnerPhase::Associating)
+        );
+
+        // Phase updates after the child stopped must not resurrect a row.
+        manager.finish(start.id, Err(crate::runner::RunnerError::Cancelled));
+        manager.set_phase(start.id, RunnerPhase::Streaming);
+        assert_eq!(manager.snapshot(start.id).unwrap().phase, None);
+        // Unknown ids are ignored rather than panicking.
+        manager.set_phase(9_999, RunnerPhase::Streaming);
+    }
+
+    #[test]
+    fn the_sub_agent_surface_forwards_phases_tagged_with_its_own_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let surface = SubagentSurface {
+            id: 7,
+            generation: 3,
+            tx,
+            skill_prompt: None,
+            approval_label: "auto".to_string(),
+            cancel: CancellationToken::new(),
+        };
+
+        surface.on_event(RunnerEvent::Phase(RunnerPhase::Associating));
+        // Phases are tagged so they land on the child's row, never on the main
+        // turn's status bar.
+        let event = rx.try_recv().expect("a forwarded phase");
+        assert!(matches!(
+            event,
+            Event::App(AppEvent::AgentPhase {
+                generation: 3,
+                id: 7,
+                phase: RunnerPhase::Associating,
+            })
+        ));
+
+        // Everything else stays private to the sub-agent.
+        surface.on_event(RunnerEvent::Assistant("hi"));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn registry_enforces_concurrency_and_tracks_terminal_result() {

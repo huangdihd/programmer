@@ -245,7 +245,7 @@ pub(crate) async fn run_local_tool(name: &str, arguments: &str) -> Result<String
         fetch::NAME => fetch::run(arguments).await,
         configure_diagnostics::NAME => configure_diagnostics::run(arguments).await,
         diagnostics::NAME => diagnostics::run(arguments).await,
-        memory::NAME => memory::run(arguments).await,
+        memory::NAME => memory::run(arguments, None).await,
         todo::NAME => Err(
             "error: the todo tool requires a session and is unavailable in standalone MCP mode"
                 .to_string(),

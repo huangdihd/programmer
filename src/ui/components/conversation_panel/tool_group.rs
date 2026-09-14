@@ -32,7 +32,8 @@
 //! scan as ordinary calls.
 
 use async_openai::types::responses::{
-    FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, OutputItem,
+    FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, InputContent, InputItem,
+    InputRole, Item, MessageItem as ApiMessageItem, OutputItem,
 };
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -188,6 +189,20 @@ fn group_is_tool_output(item: &GroupItem<'_>) -> bool {
     matches!(item, GroupItem::Message(MessageItem::ToolOutput { .. }))
 }
 
+/// The runner may insert this internal developer reminder between model steps
+/// in one user turn. It is protocol-visible but not a user interaction, so it
+/// must not split the visual tool run.
+fn group_is_post_edit_reminder(item: &GroupItem<'_>) -> bool {
+    matches!(
+        item,
+        GroupItem::Message(MessageItem::Input(InputItem::Item(Item::Message(
+            ApiMessageItem::Input(message)
+        )))) if message.role == InputRole::Developer
+            && matches!(message.content.as_slice(), [InputContent::InputText(text)]
+                if text.text == crate::prompts::POST_EDIT_REMINDER)
+    )
+}
+
 fn discover_group_items(items: &[GroupItem<'_>]) -> Vec<ToolGroup> {
     let mut groups = Vec::new();
     let mut run = Vec::new();
@@ -225,7 +240,7 @@ fn discover_group_items(items: &[GroupItem<'_>]) -> Vec<ToolGroup> {
             Some(call) if is_hidden_runtime_tool(call) => {}
             Some(call) if !is_interactive(call) => run.push(index),
             None if group_is_reasoning(item) => absorbed.push(index),
-            None if group_is_tool_output(item) => {}
+            None if group_is_tool_output(item) || group_is_post_edit_reminder(item) => {}
             _ => flush(&mut run, &mut absorbed, false, &mut groups),
         }
     }
@@ -287,10 +302,12 @@ fn continues_tool_run(item: &MessageItem) -> bool {
     match function_call(item) {
         Some(call) if is_hidden_runtime_tool(call) => true,
         Some(call) => !is_interactive(call),
-        None => matches!(
-            item,
-            MessageItem::Output(OutputItem::Reasoning(_)) | MessageItem::ToolOutput { .. }
-        ),
+        None => {
+            matches!(
+                item,
+                MessageItem::Output(OutputItem::Reasoning(_)) | MessageItem::ToolOutput { .. }
+            ) || group_is_post_edit_reminder(&GroupItem::Message(item))
+        }
     }
 }
 
@@ -759,7 +776,7 @@ fn display_tool_name(name: &str) -> String {
 mod tests {
     use super::*;
     use async_openai::types::responses::{
-        FunctionCallOutput, ReasoningItem, SummaryPart, SummaryTextContent,
+        FunctionCallOutput, InputMessage, ReasoningItem, SummaryPart, SummaryTextContent,
     };
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
@@ -858,6 +875,32 @@ mod tests {
         assert_eq!(groups[0].key, "call-0");
         assert_eq!(groups[0].member_indices, [0, 1, 2]);
         assert_eq!(groups[0].title(3, 0), "Explored");
+    }
+
+    #[test]
+    fn post_edit_reminder_does_not_split_one_turns_tool_group() {
+        let reminder = MessageItem::Input(InputItem::Item(Item::Message(ApiMessageItem::Input(
+            InputMessage {
+                content: vec![InputContent::InputText(
+                    crate::prompts::POST_EDIT_REMINDER.into(),
+                )],
+                role: InputRole::Developer,
+                status: None,
+            },
+        ))));
+        let items = vec![
+            call(0, "grep"),
+            call(1, "read_file"),
+            call(2, "edit_file"),
+            reminder,
+            call(3, "command"),
+            call(4, "command"),
+        ];
+
+        let groups = discover_tool_groups(&items);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_indices, [0, 1, 2, 4, 5]);
     }
 
     #[test]

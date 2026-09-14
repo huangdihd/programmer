@@ -17,6 +17,7 @@ use crate::config::programmer_config::ProgrammerConfig;
 use crate::session::SessionManager;
 use ::config::{Config, Environment, File};
 use app::App;
+use std::io::{self, Write};
 use std::path::Path;
 
 mod agents;
@@ -76,13 +77,14 @@ struct SessionBootstrap {
     todos: Vec<crate::todos::Todo>,
     mgr: Option<SessionManager>,
     messages: Vec<String>,
+    _lock: Option<crate::session::SessionLock>,
 }
 
-fn resolve_session(resume: Option<Option<String>>) -> SessionBootstrap {
+fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
     let session_mgr = SessionManager::new();
     let mut startup_messages: Vec<String> = Vec::new();
 
-    let (session_uuid, saved_items, saved_history, saved_todos) = match (resume, &session_mgr) {
+    let (mut session_uuid, saved_items, saved_history, saved_todos) = match (resume, &session_mgr) {
         (Some(Some(uuid)), Some(mgr)) => match mgr.load(&uuid) {
             Some(session) => {
                 let history = session.history.clone();
@@ -151,13 +153,74 @@ fn resolve_session(resume: Option<Option<String>>) -> SessionBootstrap {
         }
     };
 
-    SessionBootstrap {
+    let session_lock = if let Some(mgr) = &session_mgr {
+        match mgr.try_lock(&session_uuid) {
+            Ok(lock) => Some(lock),
+            Err(crate::session::SessionLockError::InUse { pid }) => {
+                if !prompt_session_fork(pid) {
+                    return None;
+                }
+                let Some(source) = mgr.load(&session_uuid) else {
+                    eprintln!("Session {session_uuid} could not be loaded for forking.");
+                    return None;
+                };
+                let forked = match mgr.fork(&source) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        eprintln!("Failed to fork session: {error}");
+                        return None;
+                    }
+                };
+                session_uuid = forked.uuid;
+                startup_messages.push(format!(
+                    "Forked the in-use conversation into session {session_uuid}."
+                ));
+                match mgr.try_lock(&session_uuid) {
+                    Ok(lock) => Some(lock),
+                    Err(error) => {
+                        eprintln!("Failed to lock forked session: {error:?}");
+                        return None;
+                    }
+                }
+            }
+            Err(crate::session::SessionLockError::Io(error)) => {
+                eprintln!("Failed to lock session: {error}");
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
+    Some(SessionBootstrap {
         uuid: session_uuid,
         items: saved_items,
         history: saved_history,
         todos: saved_todos,
         mgr: session_mgr,
         messages: startup_messages,
+        _lock: session_lock,
+    })
+}
+
+fn prompt_session_fork(pid: Option<u32>) -> bool {
+    let owner = pid.map_or_else(
+        || "another Programmer process".to_string(),
+        |pid| format!("Programmer process {pid}"),
+    );
+    eprintln!("{owner} is currently using this conversation.");
+    loop {
+        eprint!("[f] Fork this conversation  [q] Exit this Programmer: ");
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer).is_err() {
+            return false;
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "f" | "fork" => return true,
+            "q" | "quit" | "exit" => return false,
+            _ => eprintln!("Please enter 'f' to fork or 'q' to exit."),
+        }
     }
 }
 
@@ -224,7 +287,9 @@ async fn async_main(mut args: cli::Args) -> color_eyre::Result<()> {
         None => None,
     };
 
-    let bootstrap = resolve_session(resume);
+    let Some(bootstrap) = resolve_session(resume) else {
+        return Ok(());
+    };
     let (programmer_config, _config_path) = load_config()?;
     crate::security::SecurityManager::for_current_dir(programmer_config.security.clone())
         .map_err(|error| color_eyre::eyre::eyre!(error))?;

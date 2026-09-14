@@ -34,6 +34,8 @@ pub enum StatusState {
     ToolRunning,
     /// The Auto-mode LLM classifier is deciding whether to approve tool calls.
     Classifying,
+    /// The memory model is selecting relevant memories.
+    Associating,
     /// Diagnostics checkers are running after an edit.
     Checking,
     /// `/compact` is summarizing the conversation.
@@ -60,6 +62,7 @@ impl StatusState {
                 | StatusState::CreatingToolCall
                 | StatusState::ToolRunning
                 | StatusState::Classifying
+                | StatusState::Associating
                 | StatusState::Compacting
                 | StatusState::Cancelling
                 | StatusState::WaitingSubagents
@@ -77,6 +80,7 @@ impl StatusState {
             StatusState::CreatingToolCall => "\u{2692} Creating tool call",
             StatusState::ToolRunning => "\u{26a1} Running tools",
             StatusState::Classifying => "\u{25cd} Evaluating",
+            StatusState::Associating => "\u{223f} Associating memories",
             StatusState::Checking => "\u{25c7} Checking diagnostics",
             StatusState::Compacting => "\u{29c9} Compacting",
             StatusState::Cancelling => "\u{2716} Cancelling",

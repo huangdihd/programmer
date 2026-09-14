@@ -274,6 +274,13 @@ impl ProviderPanel {
                     config.compact_model = None;
                 }
                 if config
+                    .memory_model
+                    .as_deref()
+                    .is_some_and(|model| model.starts_with(&format!("{name}/")))
+                {
+                    config.memory_model = None;
+                }
+                if config
                     .title_model
                     .as_deref()
                     .is_some_and(|model| model.starts_with(&format!("{name}/")))
@@ -454,6 +461,7 @@ impl ProviderPanel {
                     }
                     rename_global_model_provider(&mut config.classifier_model, original, &name);
                     rename_global_model_provider(&mut config.compact_model, original, &name);
+                    rename_global_model_provider(&mut config.memory_model, original, &name);
                     rename_global_model_provider(&mut config.title_model, original, &name);
                     rename_global_model_provider(&mut config.suggestion_model, original, &name);
                 }
@@ -595,25 +603,28 @@ impl ProviderPanel {
                 PanelAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                *selected = (*selected + 1).min(8);
+                *selected = (*selected + 1).min(10);
                 PanelAction::None
             }
             KeyCode::Enter => {
                 let qualified = format!("{provider}/{model}");
                 match *selected {
                     0 => {
+                        config.default_provider = provider.clone();
                         if let Some(provider_config) = config.providers.get_mut(provider) {
                             provider_config.default_model = Some(model.clone());
                         }
                     }
                     1 => config.classifier_model = Some(qualified),
                     2 => config.compact_model = Some(qualified),
-                    3 => config.title_model = Some(qualified),
-                    4 => config.suggestion_model = Some(qualified),
-                    5 => config.classifier_model = None,
-                    6 => config.compact_model = None,
-                    7 => config.title_model = None,
-                    8 => config.suggestion_model = None,
+                    3 => config.memory_model = Some(qualified),
+                    4 => config.title_model = Some(qualified),
+                    5 => config.suggestion_model = Some(qualified),
+                    6 => config.classifier_model = None,
+                    7 => config.compact_model = None,
+                    8 => config.memory_model = None,
+                    9 => config.title_model = None,
+                    10 => config.suggestion_model = None,
                     _ => unreachable!(),
                 }
                 self.mode = Mode::List;
@@ -966,6 +977,7 @@ impl ProviderPanel {
                             config.classifier_model.as_deref() == Some(qualified.as_str());
                         let is_compact =
                             config.compact_model.as_deref() == Some(qualified.as_str());
+                        let is_memory = config.memory_model.as_deref() == Some(qualified.as_str());
                         let is_title = config.title_model.as_deref() == Some(qualified.as_str());
                         let is_suggestion =
                             config.suggestion_model.as_deref() == Some(qualified.as_str());
@@ -1007,6 +1019,12 @@ impl ProviderPanel {
                             spans.push(Span::styled(
                                 "  compact",
                                 Style::default().fg(palette::CYAN),
+                            ));
+                        }
+                        if is_memory {
+                            spans.push(Span::styled(
+                                "  memory",
+                                Style::default().fg(palette::PURPLE),
                             ));
                         }
                         if is_title {
@@ -1087,13 +1105,15 @@ impl ProviderPanel {
                 Clear.render(chunks[1], buf);
                 Clear.render(chunks[2], buf);
                 let choices = [
-                    "Set as provider chat default",
+                    "Set as global chat model",
                     "Set as global classifier model",
                     "Set as global compact model",
+                    "Set as global memory model",
                     "Set as global title model",
                     "Set as global suggestion model",
                     "Clear global classifier model",
                     "Clear global compact model",
+                    "Clear global memory model",
                     "Clear global title model",
                     "Clear global suggestion model",
                 ];
@@ -1202,11 +1222,13 @@ mod tests {
             classifier_model: None,
             classifier_top_logprobs: crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS,
             compact_model: None,
+            memory_model: None,
             title_model: None,
             suggestion_model: None,
             auto_compact_tokens: 100_000,
             mandatory_compact_tokens: 150_000,
             compact_keep_recent_turns: 2,
+            auto_compact_cooldown_turns: 5,
             memory: Default::default(),
             allow_yolo: false,
             security: Default::default(),
@@ -1346,6 +1368,38 @@ mod tests {
     }
 
     #[test]
+    fn model_role_menu_sets_global_chat_and_memory_models() {
+        let mut config = config_with(&["alpha", "beta"]);
+        let pm = pm_stub();
+        let mut panel = ProviderPanel::new();
+        panel.mode = Mode::RoleMenu {
+            provider: "beta".to_string(),
+            model: "fast".to_string(),
+            selected: 0,
+        };
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config, &pm),
+            PanelAction::Saved
+        );
+        assert_eq!(config.default_provider, "beta");
+        assert_eq!(
+            config.providers["beta"].default_model.as_deref(),
+            Some("fast")
+        );
+
+        panel.mode = Mode::RoleMenu {
+            provider: "beta".to_string(),
+            model: "fast".to_string(),
+            selected: 3,
+        };
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter), &mut config, &pm),
+            PanelAction::Saved
+        );
+        assert_eq!(config.memory_model.as_deref(), Some("beta/fast"));
+    }
+
+    #[test]
     fn model_role_menu_sets_and_clears_suggestion_model() {
         let mut config = config_with(&["alpha"]);
         let pm = pm_stub();
@@ -1353,7 +1407,7 @@ mod tests {
         panel.mode = Mode::RoleMenu {
             provider: "alpha".to_string(),
             model: "fast".to_string(),
-            selected: 4,
+            selected: 5,
         };
 
         assert_eq!(
@@ -1365,7 +1419,7 @@ mod tests {
         panel.mode = Mode::RoleMenu {
             provider: "alpha".to_string(),
             model: "fast".to_string(),
-            selected: 8,
+            selected: 10,
         };
         assert_eq!(
             panel.handle_key(key(KeyCode::Enter), &mut config, &pm),

@@ -38,6 +38,8 @@ const APPROVE_MARGIN: f64 = 0.7;
 /// nothing extra there; a reasoning model gets enough room to finish thinking
 /// before it emits the answer token whose logprobs we read.
 const CLASSIFIER_MAX_TOKENS: u32 = 2048;
+/// Hard deadline for the complete classifier request, including retries.
+const CLASSIFIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Number of retries after the initial classifier request for transient
 /// transport, rate-limit, and server failures.
@@ -223,20 +225,24 @@ async fn create_with_retries(
     client: &Client<OpenAIConfig>,
     request: &CreateResponse,
 ) -> Result<async_openai::types::responses::Response, OpenAIError> {
-    let mut attempt = 0;
-    loop {
-        match client.responses().create(request.clone()).await {
-            Ok(response) => return Ok(response),
-            Err(error)
-                if crate::runner::stream::is_retryable(&error)
-                    && attempt < CLASSIFIER_MAX_RETRIES =>
-            {
-                attempt += 1;
-                tokio::time::sleep(crate::runner::stream::backoff_delay(attempt)).await;
+    tokio::time::timeout(CLASSIFIER_TIMEOUT, async {
+        let mut attempt = 0;
+        loop {
+            match client.responses().create(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if crate::runner::stream::is_retryable(&error)
+                        && attempt < CLASSIFIER_MAX_RETRIES =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(crate::runner::stream::backoff_delay(attempt)).await;
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
-    }
+    })
+    .await
+    .map_err(|_| OpenAIError::InvalidArgument("classifier request timed out".to_string()))?
 }
 
 /// Fast path: make the model answer yes/no, then compare `P(yes)` vs `P(no)` in

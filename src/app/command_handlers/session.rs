@@ -125,25 +125,24 @@ fn cache_percent(cached_tokens: u64, input_tokens: u64) -> u64 {
 
 fn format_usage(summary: crate::conversation::UsageSummary) -> String {
     match summary.last_turn {
-        Some((last_input, last_output, last_cached)) => format!(
+        Some(_) => format!(
             "Token usage for this session:\n\
-             \u{20} input: {} tokens\n\
+             \u{20} total input: {} tokens\n\
              \u{20} cached input: {} tokens ({}%)\n\
              \u{20} output: {} tokens\n\
              \u{20} total: {} tokens\n\
              \u{20} recorded turns: {}\n\
-             Last turn: {} input ({} cached, {}%) + {} output = {} tokens",
+             Last request input: {}",
             summary.input_tokens,
             summary.cached_input_tokens,
             cache_percent(summary.cached_input_tokens, summary.input_tokens),
             summary.output_tokens,
             summary.total_tokens(),
             summary.turns,
-            last_input,
-            last_cached,
-            cache_percent(u64::from(last_cached), u64::from(last_input)),
-            last_output,
-            u64::from(last_input) + u64::from(last_output),
+            summary.last_request_input_tokens.map_or_else(
+                || "unavailable".to_string(),
+                |tokens| format!("{tokens} tokens")
+            ),
         ),
         None => "No token usage recorded for this session.".to_string(),
     }
@@ -242,21 +241,22 @@ mod tests {
     }
 
     #[test]
-    fn usage_message_reports_session_and_last_turn_totals() {
+    fn usage_message_reports_total_and_last_request_input() {
         let message = format_usage(UsageSummary {
             input_tokens: 13,
             output_tokens: 7,
             cached_input_tokens: 5,
             turns: 2,
             last_turn: Some((3, 2, 2)),
+            last_request_input_tokens: Some(11),
         });
 
-        assert!(message.contains("input: 13 tokens"));
+        assert!(message.contains("total input: 13 tokens"));
         assert!(message.contains("cached input: 5 tokens (38%)"));
         assert!(message.contains("output: 7 tokens"));
         assert!(message.contains("total: 20 tokens"));
         assert!(message.contains("recorded turns: 2"));
-        assert!(message.contains("Last turn: 3 input (2 cached, 66%) + 2 output = 5 tokens"));
+        assert!(message.contains("Last request input: 11 tokens"));
     }
 
     #[test]

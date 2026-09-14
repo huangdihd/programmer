@@ -757,11 +757,21 @@ impl Sidebar {
                 ),
             ];
             let prefix_width = spans_width(&prefix_spans);
+            // While a sub-agent runs, its current phase (including the memory
+            // model's association pass) is shown next to the elapsed time.
+            let phase = agent
+                .phase
+                .map(|phase| format!(" · {}", phase.label()))
+                .unwrap_or_default();
             let before = lines.len();
             wrapped_item(
                 lines,
                 prefix_spans,
-                &format!("{} ({})", agent.name, format_duration_secs(agent.elapsed)),
+                &format!(
+                    "{} ({}){phase}",
+                    agent.name,
+                    format_duration_secs(agent.elapsed)
+                ),
                 width,
                 prefix_width,
                 CONT_INDENT,
@@ -1179,7 +1189,9 @@ mod tests {
     #[test]
     fn agents_section_shows_live_status_and_label() {
         let mut sidebar = Sidebar::new();
-        let area = Rect::new(0, 0, 40, 20);
+        // Wide enough that the agent row stays on one line, so the phase
+        // suffix can be asserted verbatim.
+        let area = Rect::new(0, 0, 60, 20);
         let mut buf = Buffer::empty(area);
         let agents = vec![crate::agents::AgentSnapshot {
             id: 2,
@@ -1188,6 +1200,7 @@ mod tests {
             status: crate::agents::AgentStatus::Running,
             elapsed: Duration::from_secs(3),
             result: None,
+            phase: Some(crate::runner::RunnerPhase::Associating),
         }];
 
         sidebar.render(
@@ -1207,5 +1220,8 @@ mod tests {
         let text = buffer_text(&buf);
         assert!(text.contains("Agents (1 running, 1 total)"), "got:\n{text}");
         assert!(text.contains("#2 Review diagnostics"), "got:\n{text}");
+        // The child's live phase rides along with its row, so a sub-agent
+        // associating memories is visible without opening its panel.
+        assert!(text.contains("· associating"), "got:\n{text}");
     }
 }

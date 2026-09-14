@@ -46,6 +46,12 @@ pub struct Conversation {
     /// responses in the current turn (a turn may span multiple responses when
     /// tool calls are involved). Flushed to a [`MessageItem::Usage`] at turn end.
     pub accumulated_usage: (u32, u32, u32),
+    /// Top-K results returned by automatic association for this turn.
+    pub recalled_memories: Option<usize>,
+    /// Provider-reported input tokens for the most recent individual model
+    /// request. This is the best available proxy for the next context size;
+    /// provider tokenization and pending input make exact prediction impossible.
+    pub last_request_input_tokens: Option<u32>,
     /// Bumped whenever an *existing* item is mutated in place (or the list is
     /// replaced wholesale), as opposed to appended to. The renderer's cache is
     /// keyed by item index, so appends are naturally cache-coherent — this
@@ -62,6 +68,7 @@ pub struct UsageSummary {
     pub cached_input_tokens: u64,
     pub turns: usize,
     pub last_turn: Option<(u32, u32, u32)>,
+    pub last_request_input_tokens: Option<u32>,
 }
 
 impl UsageSummary {
@@ -179,6 +186,25 @@ impl Conversation {
         self.items.push(MessageItem::Warning(message.into()));
     }
 
+    /// Remove the most recent developer input message whose sole text part
+    /// exactly matches `target`.
+    pub fn remove_last_developer_message(&mut self, target: &str) -> bool {
+        let Some(index) = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                MessageItem::Input(InputItem::Item(Item::Message(
+                    ApiMessageItem::Input(message)
+                ))) if message.role == InputRole::Developer
+                    && matches!(message.content.as_slice(), [InputContent::InputText(text)] if text.text == target)
+            )
+        }) else {
+            return false;
+        };
+        self.items.remove(index);
+        self.mutation_version = self.mutation_version.wrapping_add(1);
+        true
+    }
+
     /// Remove every warning with the given text.
     pub fn remove_warning_string(&mut self, message: &str) -> bool {
         let original_len = self.items.len();
@@ -287,6 +313,22 @@ impl Conversation {
         turns
     }
 
+    /// Count user turns appended at or after a previously snapshotted item
+    /// position. Developer maintenance messages do not count as user turns.
+    pub fn user_turns_after(&self, start: usize) -> usize {
+        self.items[start.min(self.items.len())..]
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    MessageItem::Input(InputItem::Item(Item::Message(
+                        ApiMessageItem::Input(message)
+                    ))) if message.role == InputRole::User
+                )
+            })
+            .count()
+    }
+
     /// Build the model input for the stable prefix ending at `cutoff`.
     pub fn input_param_for_prefix(
         &self,
@@ -298,6 +340,8 @@ impl Conversation {
         let prefix = Conversation {
             items: self.items[..cutoff.min(self.items.len())].to_vec(),
             accumulated_usage: (0, 0, 0),
+            recalled_memories: None,
+            last_request_input_tokens: None,
             mutation_version: 0,
         };
         prefix.to_input_param_with_soul(current_model, soul, None, None, None, vision_enabled)
@@ -316,6 +360,7 @@ impl Conversation {
     }
 
     pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32, cached_input_tokens: u32) {
+        self.last_request_input_tokens = Some(input_tokens);
         self.accumulated_usage.0 += input_tokens;
         self.accumulated_usage.1 += output_tokens;
         self.accumulated_usage.2 += cached_input_tokens;
@@ -324,7 +369,7 @@ impl Conversation {
     pub fn usage_summary(&self) -> UsageSummary {
         let mut summary = UsageSummary::default();
         for item in &self.items {
-            if let MessageItem::Usage(input, output, cached) = item {
+            if let MessageItem::Usage(input, output, cached, _) = item {
                 summary.input_tokens += u64::from(*input);
                 summary.output_tokens += u64::from(*output);
                 summary.cached_input_tokens += u64::from(*cached);
@@ -341,6 +386,7 @@ impl Conversation {
             summary.turns += 1;
             summary.last_turn = Some((input, output, cached));
         }
+        summary.last_request_input_tokens = self.last_request_input_tokens;
         summary
     }
 
@@ -350,8 +396,14 @@ impl Conversation {
     pub fn flush_usage(&mut self) -> bool {
         let (input, output, cached) = self.accumulated_usage;
         if input > 0 || output > 0 {
-            self.items.push(MessageItem::Usage(input, output, cached));
+            self.items.push(MessageItem::Usage(
+                input,
+                output,
+                cached,
+                self.recalled_memories.take(),
+            ));
             self.accumulated_usage = (0, 0, 0);
+            self.recalled_memories = None;
             true
         } else {
             false
@@ -361,12 +413,15 @@ impl Conversation {
     /// Reset the accumulated usage counter (on /clear, new session, etc.).
     pub fn reset_accumulated_usage(&mut self) {
         self.accumulated_usage = (0, 0, 0);
+        self.recalled_memories = None;
     }
 
     /// Clear all conversation history and usage.
     pub fn clear(&mut self) {
         self.items.clear();
         self.accumulated_usage = (0, 0, 0);
+        self.recalled_memories = None;
+        self.last_request_input_tokens = None;
         self.mutation_version += 1;
     }
 
@@ -379,6 +434,7 @@ impl Conversation {
     pub fn truncate(&mut self, cutoff: usize) {
         self.items.truncate(cutoff);
         self.accumulated_usage = (0, 0, 0);
+        self.recalled_memories = None;
         self.mutation_version = self.mutation_version.wrapping_add(1);
     }
 
@@ -782,7 +838,7 @@ mod tests {
             .expect("old prefix");
         assert!(matches!(
             conv.items[cutoff - 1],
-            MessageItem::Usage(_, _, _)
+            MessageItem::Usage(_, _, _, _)
         ));
         assert!(
             conv.items[cutoff..]
@@ -1062,7 +1118,7 @@ mod tests {
         assert_eq!(conv.accumulated_usage, (0, 0, 0));
         assert!(matches!(
             conv.items.last(),
-            Some(MessageItem::Usage(13, 7, 6))
+            Some(MessageItem::Usage(13, 7, 6, None))
         ));
         // A second flush with nothing accumulated pushes nothing.
         assert!(!conv.flush_usage());
@@ -1083,8 +1139,24 @@ mod tests {
                 cached_input_tokens: 6,
                 turns: 2,
                 last_turn: Some((3, 2, 2)),
+                last_request_input_tokens: Some(3),
             }
         );
         assert_eq!(conv.usage_summary().total_tokens(), 20);
+    }
+
+    #[test]
+    fn cooldown_turn_count_ignores_developer_messages() {
+        let mut conv = Conversation::new();
+        conv.add_input_message(user_message("old"));
+        let start = conv.items.len();
+        conv.add_input_message(ApiMessageItem::Input(InputMessage {
+            content: vec![InputContent::InputText("maintenance".into())],
+            role: InputRole::Developer,
+            status: Some(OutputStatus::Completed),
+        }));
+        conv.add_input_message(user_message("first"));
+        conv.add_input_message(user_message("second"));
+        assert_eq!(conv.user_turns_after(start), 2);
     }
 }

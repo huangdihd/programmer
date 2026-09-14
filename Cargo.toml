@@ -32,6 +32,7 @@ uuid = { version = "1", features = ["v4"] }
 unicode-width = "0.2"
 ratatui-markdown = { git = "https://github.com/huangdihd/ratatui-markdown", version = "0.3.6", features = ["highlight-lang-all"] }
 which = "8.0.5"
+fs2 = "0.4"
 html2text = "0.17.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 # Interactive PTY tasks: portable-pty (WezTerm) spawns children in a real

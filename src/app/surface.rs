@@ -55,6 +55,7 @@ impl AgentSurface for TuiSurface {
             RunnerEvent::WaitingSubagents(waiting) => {
                 AppEvent::WaitingSubagents(self.operation_id, waiting)
             }
+            RunnerEvent::Notice(text) => AppEvent::Notice(self.operation_id, text.to_string()),
             // These are read from the shared conversation directly.
             RunnerEvent::Assistant(_) | RunnerEvent::ToolCall { .. } => return,
         };

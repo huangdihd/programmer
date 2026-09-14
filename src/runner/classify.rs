@@ -134,8 +134,8 @@ pub(crate) async fn classify_llm(
                 &call.name,
                 &call.arguments,
                 try_logprobs,
-            )
-            .await;
+            );
+            let outcome = cancel.wait_or(outcome).await?;
             if outcome.logprobs_missing {
                 no_logprobs.lock().unwrap().insert(ctx.model.to_string());
             }
@@ -347,7 +347,7 @@ pub(crate) fn build_classifier_context(items: &[&MessageItem]) -> (String, Strin
             MessageItem::Meta { label, text } => {
                 full_ctx.push(format!("\n[{label}]\n{text}"));
             }
-            MessageItem::Usage(_, _, _) => {
+            MessageItem::Usage(_, _, _, _) => {
                 // Token usage counters — not useful for classification.
             }
             MessageItem::Compacted { summary } => {

@@ -24,14 +24,21 @@ pub struct UsageMessage {
     input_tokens: u32,
     output_tokens: u32,
     cached_input_tokens: u32,
+    recalled_memories: Option<usize>,
 }
 
 impl UsageMessage {
-    pub fn new(input_tokens: u32, output_tokens: u32, cached_input_tokens: u32) -> Self {
+    pub fn new(
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_input_tokens: u32,
+        recalled_memories: Option<usize>,
+    ) -> Self {
         Self {
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            recalled_memories,
         }
     }
 
@@ -67,6 +74,14 @@ impl UsageMessage {
             Span::styled("  ·  ", Style::new().fg(palette::FAINT)),
             Span::styled(total.to_string(), Style::new().fg(palette::TEXT)),
             Span::styled(" total tokens", Style::new().fg(palette::MUTED)),
+            Span::styled(
+                format!(
+                    "  ·  Memories recalled: {}",
+                    self.recalled_memories
+                        .map_or_else(|| "n/a".to_string(), |n| n.to_string())
+                ),
+                Style::new().fg(palette::MUTED),
+            ),
         ]))
         .wrap(Wrap { trim: false })
     }
@@ -81,9 +96,9 @@ mod tests {
 
     #[test]
     fn usage_is_a_compact_borderless_summary() {
-        let area = Rect::new(0, 0, 80, 1);
+        let area = Rect::new(0, 0, 120, 1);
         let mut buffer = Buffer::empty(area);
-        UsageMessage::new(13, 7, 5)
+        UsageMessage::new(13, 7, 5, Some(2))
             .into_paragraph()
             .render(area, &mut buffer);
 
@@ -95,6 +110,7 @@ mod tests {
         assert!(
             rendered.starts_with("↳  13 input  ·  5 cached (38%)  ·  7 output  ·  20 total tokens")
         );
+        assert!(rendered.contains("Memories recalled: 2"));
         assert!(!rendered.contains('│'));
     }
 }

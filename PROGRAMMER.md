@@ -12,18 +12,22 @@ The binary is a single crate at the repo root.
 
 Key features beyond the chat loop:
 - **Multi-provider**: add/edit/delete/switch API backends at runtime.
-- **Multi-session**: UUID-keyed JSON persistence in `~/.config/programmer/sessions/`.
+- **Multi-session**: UUID-keyed JSON persistence in `~/.config/programmer/sessions/`, with per-session OS locks and an interactive fork-or-exit conflict flow.
 - **Input suggestions**: after successful turns, a configurable model predicts the next user message as an accept-with-Right placeholder.
 - **Rewind checkpoints**: prompt-level conversation checkpoints plus content-addressed snapshots for built-in file edits.
-- **Context compaction**: manual and provider-usage-triggered background summaries with session overrides, immediate safe-boundary persistence for generated summaries, a parsed structured working-state snapshot, and read-only search/paging over exact pre-compaction items.
-- **Persistent memory**: explicit-only bounded lexical recall over inspectable global/project JSON stores, with no automatic request injection, explicit memory management, and credential rejection.
+- **Context compaction**: manual and provider-usage-triggered background summaries with session overrides, a configurable post-auto-compaction turn cooldown (mandatory/manual compaction bypass it), immediate safe-boundary persistence for generated summaries, a parsed structured working-state snapshot, and read-only search/paging over exact pre-compaction items.
+- **Persistent memory**: inspectable global/project Markdown indexes and per-entry files, explicit management, automatic per-turn association where the dedicated memory model sees the recent conversation and the top lexical candidates, Claude Code style time decay with per-kind half-lives and recall reinforcement, per-memory age plus a staleness caveat on injected memories older than a day, a non-blocking first-step prefetch with one cancellable later-step grace period, reasoning-disabled association requests with a named timeout budget and an informational line when association fails, reinforcing explicit recalls and age-tagged list/recall output, the same association for sub-agents (which get recalled memories but not the memory-mechanics system prompt), legacy JSON migration, and credential rejection.
 - **Auto-mode classifier**: per-mode LLM classifier that approves/denies/defers tool calls.
 - **MCP (Model Context Protocol)**: connect to external MCP servers (stdio + HTTP);
   their tools are advertised to the model as `mcp__<server>__<tool>`.
 - **Skills**: user-authored `SKILL.md` files that inject prompt segments (Vercel Labs compatible).
 - **Background tasks**: shell commands that run detached; shown in the sidebar.
 - **Multi-agent**: up to three in-process child runners with independent conversations,
-  parent-forwarded approvals, completion delivery, and live sidebar inspection.
+  parent-forwarded approvals, completion delivery, live sidebar inspection, a per-child
+  sidebar row showing the running phase (tagged with the agent id so it never touches the
+  main turn's status bar), and the same automatic memory association as the main session
+  (child runners resolve the configured `memory_model` target rather than inheriting a
+  resolved client, so a per-agent model override does not disable recall).
 - **Todo list**: per-session task tracking with a `todo` tool and a sidebar panel.
 - **Diagnostics pipeline**: IDE-style error/warning feedback after edits (command + LSP backends).
 - **Slash-commands**: `/init`, `/model`, `/mode`, `/skill`, `/mcp`, `/todo`, etc. with tab-completion.
@@ -115,7 +119,7 @@ src/
 │   ├── runner.rs             #   Run checkers, collect diagnostics
 │   └── lsp.rs                #   LSP-based checker (spawn + query over stdio)
 │
-├── memory/                   # Layered persistent memory store, retrieval, and L1 session state
+├── memory/                   # Layered persistent memory store, freshness-weighted retrieval, and L1 session state
 │   └── mod.rs
 │
 ├── mcp/                      # Model Context Protocol integration
@@ -231,6 +235,6 @@ src/
 - **No `unwrap()` in production code:** Prefer `?`, `.unwrap_or_default()`, or explicit `match`.
 - **The diagnostics system** is language-agnostic: it reads `.programmer/diagnostics.toml` for checker definitions. Each checker can be a one-shot command (parsed via `rustc-json`, `tsc`, `gnu`, or regex) or an LSP server (`kind = "lsp"`). The `configure_diagnostics` tool writes this file.
 - **Constants** live in `src/consts.rs` — tunable values like output length limits, concurrency caps, tick rate, and classifier budgets.
-- **Prompts** are centralised in `src/prompts.rs`: system prompt, classifier instructions, plan-mode injection, and post-edit reminders. Project initialization state is kept out of the system prompt for cache stability; periodic runner hooks surface `/init` guidance after edits when its artifacts are missing.
+- **Prompts** are centralised in `src/prompts.rs`: system prompt, classifier instructions, plan-mode injection, and post-edit reminders. Successful `write_file`/`edit_file` calls append the reminder once per turn unless that turn successfully edits `PROGRAMMER.md`; shell commands do not trigger it. `src/app/setup.rs` owns the skippable, one-time global first-launch guide for configuring providers and assigning chat/classifier/compact/memory/title/suggestion model roles.
 - **MCP integration** supports both stdio and HTTP transports. Tools are prefixed `mcp__<server>__<tool>` and merged into the advertised tool list.
 - **Skills** are compiled from `src/skills/builtin/<name>/SKILL.md` or discovered from `~/.agents/skills/<name>/SKILL.md` (shared), the platform config directory's `programmer/skills/<name>/SKILL.md` (global), and `.programmer/skills/<name>/SKILL.md` (project). Precedence is project > global > shared > built-in.

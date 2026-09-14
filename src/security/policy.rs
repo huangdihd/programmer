@@ -123,6 +123,20 @@ impl SandboxMode {
             Self::Off => "off",
         }
     }
+
+    /// Whether changing from `self` to `target` relaxes isolation. Permission
+    /// requests may only broaden access; tightening policy belongs in explicit
+    /// user configuration rather than an agent-initiated access request.
+    pub(crate) fn can_request(self, target: Self) -> bool {
+        fn access_level(mode: SandboxMode) -> u8 {
+            match mode {
+                SandboxMode::Restricted => 0,
+                SandboxMode::Network => 1,
+                SandboxMode::Off => 2,
+            }
+        }
+        access_level(target) > access_level(self)
+    }
 }
 
 impl Default for SandboxConfig {
