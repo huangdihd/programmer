@@ -35,6 +35,33 @@ static PASTED_IMAGE_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[Pasted image #\d+ \d+x\d+\]").expect("valid pasted-image placeholder regex")
 });
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum KeepRetryMode {
+    Exponential,
+    Fixed(std::time::Duration),
+}
+
+impl KeepRetryMode {
+    fn delay(self, attempt: u32) -> std::time::Duration {
+        match self {
+            Self::Exponential => crate::runner::stream::backoff_delay(attempt),
+            Self::Fixed(delay) => delay,
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Exponential => {
+                "exponential backoff (up to 30s between attempts; retries never stop)".to_string()
+            }
+            Self::Fixed(delay) if delay.subsec_millis() == 0 => {
+                format!("a fixed {}s delay", delay.as_secs())
+            }
+            Self::Fixed(delay) => format!("a fixed {}ms delay", delay.as_millis()),
+        }
+    }
+}
+
 /// Build an optional plan-mode system prompt snippet.
 fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
     if app.work_mode != WorkMode::Plan {
@@ -217,6 +244,91 @@ fn format_agent_updates(agents: &[crate::agents::AgentSnapshot]) -> String {
     }
     text.push_str("</sub_agent_updates>");
     text
+}
+
+pub(in crate::app) fn start_keep_retry(app: &mut App<'_>, mode: KeepRetryMode) {
+    use std::sync::atomic::Ordering;
+
+    if app.cancel.active_id.is_some() {
+        app.conversation_panel
+            .add_warning_string("cannot retry while another request is active");
+        return;
+    }
+    if !app
+        .conversation_panel
+        .items_snapshot()
+        .iter()
+        .any(|item| matches!(item, crate::response::message_item::MessageItem::Input(_)))
+    {
+        app.conversation_panel
+            .add_warning_string("nothing to retry yet — send a message first");
+        return;
+    }
+    let Some(mut runner) = app.build_runner() else {
+        app.conversation_panel
+            .add_error_string(format!("unknown provider/model: {}", app.current_model));
+        return;
+    };
+    // `/keepretry` owns the retry loop so its selected delay is applied after
+    // every failed model attempt rather than after the runner's normal batch.
+    runner.stream_retry_limit = 0;
+
+    app.input_panel.clear_suggestion();
+    app.conversation_panel.reset_accumulated_usage();
+    app.conversation_panel.add_info_string(format!(
+        "Retrying the previous model request with {} until it succeeds. Press Esc to stop.",
+        mode.label()
+    ));
+    app.cancel.active = crate::cancel::CancellationToken::new();
+    app.cancel.next_id = app.cancel.next_id.wrapping_add(1);
+    let operation_id = app.cancel.next_id;
+    app.cancel.active_id = Some(operation_id);
+    app.cancel.turn_conversation_cutoff = Some(app.conversation_panel.items_snapshot().len());
+    app.cancel.response_started = false;
+    app.cancel.active_user_request = None;
+
+    let surface = TuiSurface {
+        tx: app.events.sender.clone(),
+        skill_prompt: app.skill_registry.catalog_prompt(),
+        plan_prompt: plan_system_prompt(app),
+        approval_label: format!(
+            "{} approved by {} mode",
+            app.work_mode.icon(),
+            app.work_mode.label()
+        ),
+        operation_id,
+        cancel: app.cancel.active.clone(),
+    };
+    let shared = app.conversation_panel.shared_conversation();
+    let cancel = app.cancel.active.clone();
+    let retrying = app.cancel.stream_retrying.clone();
+    let tx = app.events.sender.clone();
+    tokio::spawn(async move {
+        let mut attempt = 1u32;
+        let result = loop {
+            match runner.run_turn(&shared, &cancel, &surface).await {
+                Ok(result) => break Ok(result),
+                Err(crate::runner::RunnerError::Cancelled) => {
+                    break Err(crate::runner::RunnerError::Cancelled);
+                }
+                Err(_) => {
+                    let _ = tx.send(Event::App(AppEvent::KeepRetryAttempt(operation_id)));
+                    retrying.store(true, Ordering::Relaxed);
+                    if cancel
+                        .wait_or(tokio::time::sleep(mode.delay(attempt)))
+                        .await
+                        .is_none()
+                    {
+                        break Err(crate::runner::RunnerError::Cancelled);
+                    }
+                    retrying.store(false, Ordering::Relaxed);
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        };
+        retrying.store(false, Ordering::Relaxed);
+        let _ = tx.send(Event::App(AppEvent::TurnFinished(operation_id, result)));
+    });
 }
 
 async fn start_ready_request(
@@ -727,12 +839,17 @@ async fn stream_compact_response(
     let mut stream_error = None;
     let retrying = std::sync::atomic::AtomicBool::new(false);
 
-    crate::runner::stream::stream_with_retries(client, &request, &cancel, &retrying, |event| {
-        match event {
+    crate::runner::stream::stream_with_retries(
+        client,
+        &request,
+        &cancel,
+        &retrying,
+        crate::consts::MAX_STREAM_RETRIES,
+        |event| match event {
             Ok(event) => partial.handle_response_stream_event(event),
             Err(error) => stream_error = Some(error),
-        }
-    })
+        },
+    )
     .await;
 
     if cancel.is_cancelled() {
@@ -1106,6 +1223,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         | Command::Mode(_)
         | Command::Classifier(_)
         | Command::Thinking(_)
+        | Command::KeepRetry(_)
         | Command::Permission(_)) => command_handlers::settings::execute(app, command),
         command @ (Command::Providers(_)
         | Command::Skill(_)
@@ -1220,6 +1338,11 @@ mod tests {
             (
                 "thinking",
                 "/thinking",
+                ExpectedCommandEffect::AppendedMessage,
+            ),
+            (
+                "keepretry",
+                "/keepretry",
                 ExpectedCommandEffect::AppendedMessage,
             ),
             ("vision", "/vision", ExpectedCommandEffect::AppendedMessage),

@@ -101,6 +101,8 @@ pub(crate) struct TurnRunner {
     /// Set while the stream layer is retrying a dropped connection; shared so
     /// a front-end can show a "retrying" indicator.
     pub stream_retrying: Arc<AtomicBool>,
+    /// Maximum retries performed inside one model request before returning an error.
+    pub stream_retry_limit: u32,
     /// Maximum number of model responses in one turn. A tool-call response
     /// consumes one step; `None` leaves the agent loop unbounded.
     pub max_steps: Option<usize>,
@@ -402,17 +404,24 @@ impl TurnRunner {
             surface.on_event(RunnerEvent::Phase(RunnerPhase::Streaming));
             let mut partial = PartialResponse::new(cancel.child());
             let mut stream_err: Option<OpenAIError> = None;
-            stream::stream_with_retries(&self.client, &req, cancel, retrying, |result| {
-                match result {
-                    Ok(ev) => {
-                        // Forward each chunk for live rendering, then fold it
-                        // into our own partial to extract the committed items.
-                        surface.on_event(RunnerEvent::StreamChunk(Box::new(ev.clone())));
-                        partial.handle_response_stream_event(ev);
+            stream::stream_with_retries(
+                &self.client,
+                &req,
+                cancel,
+                retrying,
+                self.stream_retry_limit,
+                |result| {
+                    match result {
+                        Ok(ev) => {
+                            // Forward each chunk for live rendering, then fold it
+                            // into our own partial to extract the committed items.
+                            surface.on_event(RunnerEvent::StreamChunk(Box::new(ev.clone())));
+                            partial.handle_response_stream_event(ev);
+                        }
+                        Err(e) => stream_err = Some(e),
                     }
-                    Err(e) => stream_err = Some(e),
-                }
-            })
+                },
+            )
             .await;
 
             if cancel.is_cancelled() {
@@ -1111,6 +1120,7 @@ mod tests {
             memory_model: None,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
+            stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: None,
         }
     }
@@ -1587,6 +1597,7 @@ mod tests {
             memory_model: None,
             hooks: Vec::new(),
             stream_retrying: Arc::new(AtomicBool::new(false)),
+            stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: None,
         }
     }

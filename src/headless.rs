@@ -296,6 +296,7 @@ impl HeadlessAgent {
             memory_model,
             hooks,
             stream_retrying: Arc::new(AtomicBool::new(false)),
+            stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: args.max_steps,
         };
 

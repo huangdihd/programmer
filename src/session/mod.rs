@@ -407,7 +407,12 @@ impl SessionManager {
             let mut owner = String::new();
             let _ = file.rewind();
             let _ = file.read_to_string(&mut owner);
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            // Rust does not consistently map Windows ERROR_LOCK_VIOLATION
+            // (33) to WouldBlock, but it still means another handle owns the
+            // requested range and should be reported as a session conflict.
+            let contended = error.kind() == std::io::ErrorKind::WouldBlock
+                || cfg!(windows) && error.raw_os_error() == Some(33);
+            if contended {
                 return Err(SessionLockError::InUse {
                     pid: owner.trim().parse().ok(),
                 });
@@ -1072,10 +1077,17 @@ mod tests {
         };
         let session = mgr.create();
         let lock = mgr.try_lock(&session.uuid).unwrap();
+        let second_lock = mgr.try_lock(&session.uuid);
+        #[cfg(not(windows))]
         assert!(matches!(
-            mgr.try_lock(&session.uuid),
+            second_lock,
             Err(SessionLockError::InUse { pid: Some(pid) }) if pid == std::process::id()
         ));
+        // Windows range locks prevent the competing handle from reading the PID
+        // stored in the locked file. The OS lock remains authoritative, so the
+        // conflict must still be reported even when owner metadata is unavailable.
+        #[cfg(windows)]
+        assert!(matches!(second_lock, Err(SessionLockError::InUse { .. })));
         drop(lock);
         let reacquired = mgr.try_lock(&session.uuid).unwrap();
         drop(reacquired);

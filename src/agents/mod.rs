@@ -488,6 +488,7 @@ impl AgentRuntime {
                 crate::runner::DiagnosticsState::default(),
             ))),
             stream_retrying: Arc::new(AtomicBool::new(false)),
+            stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: Some(DEFAULT_MAX_STEPS),
         }
     }

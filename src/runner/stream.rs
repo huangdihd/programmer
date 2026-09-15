@@ -67,9 +67,9 @@ where
 
 /// Open `request` as a streaming response and pump every event into `sink`.
 ///
-/// Retries the initial connection on transient failures (up to
-/// [`crate::consts::MAX_STREAM_RETRIES`]) with exponential backoff, flipping
-/// `retrying` true only while a backoff is pending. Both a terminal connection
+/// Retries the initial connection on transient failures up to `max_retries`
+/// times with exponential backoff, flipping `retrying` true only while a backoff
+/// is pending. Both a terminal connection
 /// error and any per-event error are delivered to `sink` as `Err`; successful
 /// events arrive as `Ok`. Once `cancel` is cancelled the function stops
 /// silently — no further sink calls, no error surfaced — so a cancelled turn
@@ -79,6 +79,7 @@ pub(crate) async fn stream_with_retries(
     request: &CreateResponse,
     cancel: &CancellationToken,
     retrying: &AtomicBool,
+    max_retries: u32,
     mut sink: impl FnMut(Result<ResponseStreamEvent, OpenAIError>),
 ) {
     retrying.store(false, Ordering::Relaxed);
@@ -93,7 +94,7 @@ pub(crate) async fn stream_with_retries(
         };
         match opened {
             Ok(stream) => break Ok(stream),
-            Err(e) if is_retryable(&e) && attempt < crate::consts::MAX_STREAM_RETRIES => {
+            Err(e) if is_retryable(&e) && attempt < max_retries => {
                 if cancel.is_cancelled() {
                     retrying.store(false, Ordering::Relaxed);
                     return;
