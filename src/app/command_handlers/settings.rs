@@ -6,7 +6,7 @@
 // (at your option) any later version.
 
 use super::CommandOutcome;
-use crate::app::{App, session};
+use crate::app::{App, commands, session};
 use crate::classifier::WorkMode;
 use crate::commands::{Command, PERMISSION_BOOLEAN_SETTINGS, PERMISSION_COLLECTION_KINDS};
 use crate::config::programmer_config::validate_security_profile_name;
@@ -25,9 +25,54 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::Mode(arg) => mode(app, &arg),
         Command::Classifier(arg) => classifier(app, &arg),
         Command::Thinking(arg) => thinking(app, &arg),
+        Command::KeepRetry(arg) => keep_retry(app, &arg),
         Command::Permission(arg) => permission(app, &arg),
         _ => unreachable!("settings handler received a command from another domain"),
     }
+}
+
+fn keep_retry(app: &mut App<'_>, arg: &str) -> CommandOutcome {
+    match parse_keep_retry_mode(arg) {
+        Ok(mode) => commands::start_keep_retry(app, mode),
+        Err(error) => app.conversation_panel.add_error_string(error),
+    }
+    CommandOutcome::handled(false)
+}
+
+fn parse_keep_retry_mode(arg: &str) -> Result<commands::KeepRetryMode, String> {
+    let normalized = arg.to_ascii_lowercase();
+    let parts = normalized.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [] | ["exponential"] | ["exp"] => Ok(commands::KeepRetryMode::Exponential),
+        ["fixed", duration] => parse_retry_duration(duration).map(commands::KeepRetryMode::Fixed),
+        _ => Err(
+            "usage: /keepretry [exponential | fixed <duration>] — durations accept ms, s, or m (for example: 5s)"
+                .to_string(),
+        ),
+    }
+}
+
+fn parse_retry_duration(value: &str) -> Result<std::time::Duration, String> {
+    let value = value.to_ascii_lowercase();
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else {
+        (value.as_str(), 1_000)
+    };
+    let amount = number.parse::<u64>().map_err(|_| {
+        format!("invalid retry duration '{value}' — use a value such as 500ms, 5s, or 1m")
+    })?;
+    let millis = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("retry duration '{value}' is too large"))?;
+    if millis == 0 {
+        return Err("retry duration must be greater than zero".to_string());
+    }
+    Ok(std::time::Duration::from_millis(millis))
 }
 
 fn select(app: &mut App<'_>, arg: &str) -> CommandOutcome {
@@ -610,6 +655,33 @@ mod tests {
         assert_eq!(parse_classifier_top_logprobs("20"), Ok(20));
         assert!(parse_classifier_top_logprobs("21").is_err());
         assert!(parse_classifier_top_logprobs("five").is_err());
+    }
+
+    #[test]
+    fn keep_retry_parser_supports_exponential_and_fixed_delays() {
+        assert_eq!(
+            parse_keep_retry_mode(""),
+            Ok(commands::KeepRetryMode::Exponential)
+        );
+        assert_eq!(
+            parse_keep_retry_mode("EXPONENTIAL"),
+            Ok(commands::KeepRetryMode::Exponential)
+        );
+        assert_eq!(
+            parse_keep_retry_mode("fixed 500ms"),
+            Ok(commands::KeepRetryMode::Fixed(
+                std::time::Duration::from_millis(500)
+            ))
+        );
+        assert_eq!(
+            parse_keep_retry_mode("fixed 2m"),
+            Ok(commands::KeepRetryMode::Fixed(
+                std::time::Duration::from_secs(120)
+            ))
+        );
+        assert!(parse_keep_retry_mode("off").is_err());
+        assert!(parse_keep_retry_mode("fixed 0s").is_err());
+        assert!(parse_keep_retry_mode("fixed soon").is_err());
     }
 
     #[test]

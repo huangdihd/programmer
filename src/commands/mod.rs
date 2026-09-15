@@ -67,6 +67,9 @@ pub enum Command {
     /// `/thinking [level]` — set or show the reasoning effort used by the main
     /// conversation and `/compact`.
     Thinking(String),
+    /// `/keepretry [exponential|fixed <duration>]` — immediately retry the
+    /// previous model request until success or Escape.
+    KeepRetry(String),
     /// `/vision <on|off>` — enable or disable image attachments for this session.
     Vision(String),
     /// `/select [on|off]` — toggle native terminal text selection and copying.
@@ -100,6 +103,7 @@ enum CommandKind {
     Terminal,
     Compact,
     Thinking,
+    KeepRetry,
     Vision,
     Select,
     Permission,
@@ -177,6 +181,7 @@ impl CommandKind {
             Self::Terminal => Command::Terminal(args),
             Self::Compact => Command::Compact(args),
             Self::Thinking => Command::Thinking(args),
+            Self::KeepRetry => Command::KeepRetry(args),
             Self::Vision => Command::Vision(args),
             Self::Select => Command::Select(args),
             Self::Permission => Command::Permission(args),
@@ -208,7 +213,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["n"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 22,
+            order: 23,
             usage: "/new | /n",
             description: "Start a new session (saves current)",
         }],
@@ -220,17 +225,17 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Providers,
         help: &[
             HelpEntry {
-                order: 23,
+                order: 24,
                 usage: "/providers show",
                 description: "List all configured providers and models",
             },
             HelpEntry {
-                order: 24,
+                order: 25,
                 usage: "/providers manage",
                 description: "Open the provider management panel",
             },
             HelpEntry {
-                order: 25,
+                order: 26,
                 usage: "/providers refresh [provider]",
                 description: "Refetch auto-discovered provider models",
             },
@@ -242,7 +247,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["s"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 26,
+            order: 27,
             usage: "/session | /s",
             description: "Show current session info",
         }],
@@ -253,7 +258,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 27,
+            order: 28,
             usage: "/title [text]",
             description: "Regenerate the session title, or set it manually",
         }],
@@ -264,7 +269,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 28,
+            order: 29,
             usage: "/usage",
             description: "Show token usage for the current session",
         }],
@@ -275,7 +280,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 29,
+            order: 30,
             usage: "/rewind",
             description: "Restore conversation and built-in file edits to a user prompt",
         }],
@@ -319,7 +324,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["t"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 21,
+            order: 22,
             usage: "/todo | /t",
             description: "Open the todo list panel",
         }],
@@ -332,7 +337,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
             "list", "recall", "remember", "update", "forget", "on", "off",
         ]),
         help: &[HelpEntry {
-            order: 33,
+            order: 34,
             usage: "/memory <list|recall|remember|update|forget|on|off>",
             description: "Inspect or manage persistent memory",
         }],
@@ -450,12 +455,23 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         }],
     },
     CommandSpec {
+        kind: CommandKind::KeepRetry,
+        name: "keepretry",
+        aliases: &[],
+        completion: CompletionKind::Fixed(&["exponential", "fixed"]),
+        help: &[HelpEntry {
+            order: 16,
+            usage: "/keepretry [exponential | fixed <duration>]",
+            description: "Retry the previous model request until success; Esc cancels",
+        }],
+    },
+    CommandSpec {
         kind: CommandKind::Vision,
         name: "vision",
         aliases: &[],
         completion: CompletionKind::Fixed(&["on", "off"]),
         help: &[HelpEntry {
-            order: 16,
+            order: 17,
             usage: "/vision <on|off>",
             description: "Enable or disable image attachments for this session",
         }],
@@ -466,7 +482,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         completion: CompletionKind::Fixed(&["on", "off"]),
         help: &[HelpEntry {
-            order: 17,
+            order: 18,
             usage: "/select [on|off]",
             description: "Toggle native terminal text selection and copying",
         }],
@@ -478,17 +494,17 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         completion: CompletionKind::Permission,
         help: &[
             HelpEntry {
-                order: 18,
+                order: 19,
                 usage: "/permission show | manage",
                 description: "Show security status or open the profile management panel",
             },
             HelpEntry {
-                order: 19,
+                order: 20,
                 usage: "/permission profile <list|use|create|rename|delete>",
                 description: "List, switch, or manage named security profiles",
             },
             HelpEntry {
-                order: 20,
+                order: 21,
                 usage: "/permission mode <restricted|network|off> | <setting> <on|off>",
                 description: "Configure the active profile mode, settings, paths, and environment",
             },
@@ -500,7 +516,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["c"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 30,
+            order: 31,
             usage: "/clear | /c",
             description: "Delete this session; reset chat, todos, images, and diagnostics",
         }],
@@ -511,7 +527,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["q", "exit"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 31,
+            order: 32,
             usage: "/quit | /q",
             description: "Exit the application",
         }],
@@ -522,7 +538,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["?"],
         completion: CompletionKind::None,
         help: &[HelpEntry {
-            order: 32,
+            order: 33,
             usage: "/help | /?",
             description: "Show this help",
         }],
@@ -1649,6 +1665,15 @@ mod tests {
     }
 
     #[test]
+    fn keep_retry_command_parses_its_mode() {
+        assert_eq!(
+            Command::parse("/keepretry fixed 5s"),
+            Some(Command::KeepRetry("fixed 5s".to_string()))
+        );
+        assert!(Command::all_commands().any(|name| name == "keepretry"));
+    }
+
+    #[test]
     fn select_command_parses_and_completes_explicit_states() {
         assert_eq!(
             Command::parse("/select on"),
@@ -1689,6 +1714,7 @@ mod tests {
             "terminal",
             "compact",
             "thinking",
+            "keepretry",
             "vision",
             "select",
             "permission",
@@ -1769,6 +1795,10 @@ mod tests {
             (
                 "/thinking [auto|none|minimal|low|medium|high|xhigh]",
                 "Set/show reasoning effort for chat and compaction",
+            ),
+            (
+                "/keepretry [exponential | fixed <duration>]",
+                "Retry the previous model request until success; Esc cancels",
             ),
             (
                 "/vision <on|off>",

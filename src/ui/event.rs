@@ -63,6 +63,9 @@ pub enum AppEvent {
     /// conversation: drop the live in-progress view (the committed copy renders
     /// from the conversation now). Tagged with the operation id.
     ResponseCommitted(u64),
+    /// A `/keepretry` attempt failed and a fresh attempt will start after its delay.
+    /// The front-end drops any uncommitted partial response from the failed attempt.
+    KeepRetryAttempt(u64),
     /// The runner's turn moved to a new phase (classifying, running tools, …).
     /// Tagged with the operation id.
     RunnerPhase(u64, crate::runner::RunnerPhase),
@@ -235,6 +238,7 @@ impl std::fmt::Debug for AppEvent {
                 .field(&"..")
                 .finish(),
             Self::ResponseCommitted(id) => f.debug_tuple("ResponseCommitted").field(id).finish(),
+            Self::KeepRetryAttempt(id) => f.debug_tuple("KeepRetryAttempt").field(id).finish(),
             Self::RunnerPhase(id, _) => f.debug_tuple("RunnerPhase").field(id).finish(),
             Self::UsageSafePoint(id, tokens, _) => f
                 .debug_tuple("UsageSafePoint")

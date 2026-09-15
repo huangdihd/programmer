@@ -303,6 +303,7 @@ pub struct App<'a> {
     pub(crate) native_selection_mode: bool,
     /// Reasoning effort for main chat and compaction requests.
     pub(crate) thinking_level: crate::thinking::ThinkingLevel,
+    /// Retry policy selected by `/keepretry` for main model turns.
     /// Images belonging to the queued follow-up message while a turn is busy.
     pub(crate) pending_images: Vec<async_openai::types::responses::InputImageContent>,
     /// Event handler.
@@ -843,6 +844,7 @@ impl App<'_> {
             memory_model,
             hooks: crate::runner::hooks::standard_hooks(self.diagnostics_state.clone()),
             stream_retrying: self.cancel.stream_retrying.clone(),
+            stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: None,
         })
     }

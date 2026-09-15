@@ -142,6 +142,13 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             app.cancel.response_started = true;
             app.sync_todos_from_store();
         }
+        AppEvent::KeepRetryAttempt(op_id) => {
+            if !is_live_turn(app, op_id) {
+                return;
+            }
+            app.conversation_panel.abort_receiving();
+            app.conversation_panel.phase = ActivePhase::None;
+        }
         AppEvent::RunnerPhase(op_id, p) => {
             if !is_live_turn(app, op_id) {
                 return;

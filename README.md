@@ -482,6 +482,7 @@ programmer
 | `/diagnostics manage` | Open the project diagnostics checker management panel |
 | `/diagnostics update` | Re-run configured checkers and refresh the sidebar diagnostics |
 | `/thinking [level]` | Set/show reasoning effort for chat and compaction |
+| `/keepretry [exponential\|fixed <duration>]` | Retry the previous model request forever until success or `Esc`; exponential retries continue indefinitely with a maximum 30s interval, and fixed durations accept `ms`, `s`, or `m` |
 | `/compact` | Manually compact older complete turns with the effective compact model |
 | `/compact show` | Show compact model, threshold, latest reported usage, and background status |
 | `/compact set model <provider/model\|current\|default>` | Set the compact model for this session |
