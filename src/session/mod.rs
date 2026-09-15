@@ -1072,10 +1072,17 @@ mod tests {
         };
         let session = mgr.create();
         let lock = mgr.try_lock(&session.uuid).unwrap();
+        let second_lock = mgr.try_lock(&session.uuid);
+        #[cfg(not(windows))]
         assert!(matches!(
-            mgr.try_lock(&session.uuid),
+            second_lock,
             Err(SessionLockError::InUse { pid: Some(pid) }) if pid == std::process::id()
         ));
+        // Windows range locks prevent the competing handle from reading the PID
+        // stored in the locked file. The OS lock remains authoritative, so the
+        // conflict must still be reported even when owner metadata is unavailable.
+        #[cfg(windows)]
+        assert!(matches!(second_lock, Err(SessionLockError::InUse { .. })));
         drop(lock);
         let reacquired = mgr.try_lock(&session.uuid).unwrap();
         drop(reacquired);
