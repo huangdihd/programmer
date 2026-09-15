@@ -407,7 +407,12 @@ impl SessionManager {
             let mut owner = String::new();
             let _ = file.rewind();
             let _ = file.read_to_string(&mut owner);
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            // Rust does not consistently map Windows ERROR_LOCK_VIOLATION
+            // (33) to WouldBlock, but it still means another handle owns the
+            // requested range and should be reported as a session conflict.
+            let contended = error.kind() == std::io::ErrorKind::WouldBlock
+                || cfg!(windows) && error.raw_os_error() == Some(33);
+            if contended {
                 return Err(SessionLockError::InUse {
                     pid: owner.trim().parse().ok(),
                 });
