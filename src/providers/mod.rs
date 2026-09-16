@@ -140,7 +140,12 @@ impl ProviderManager {
             if pc.models.is_some() {
                 return None; // manual list already present
             }
-            let client = clients.get(name).unwrap().clone();
+            let Some(client) = clients.get(name).cloned() else {
+                startup_errors.push(format!(
+                    "cannot fetch models for provider '{name}': provider client is unavailable"
+                ));
+                return None;
+            };
             let name = name.clone();
             Some(tokio::spawn(async move {
                 match tokio::time::timeout(MODEL_FETCH_TIMEOUT, client.models().list()).await {
@@ -289,6 +294,29 @@ mod tests {
         assert!(message.contains("provider 'llmhub'"));
         assert!(message.contains("/providers refresh"));
         assert!(!message.contains("check your network"));
+    }
+
+    #[tokio::test]
+    async fn model_discovery_reports_a_missing_client() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "missing".to_string(),
+            ProviderConfig {
+                base_url: "https://example.invalid".to_string(),
+                api_key: String::new(),
+                models: None,
+                default_model: None,
+            },
+        );
+
+        let (models, errors) = ProviderManager::discover_models(&providers, &HashMap::new()).await;
+
+        assert!(models.is_empty());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("client is unavailable"))
+        );
     }
 
     #[test]

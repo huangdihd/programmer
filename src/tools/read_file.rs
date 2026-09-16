@@ -100,7 +100,7 @@ fn slice_lines(contents: String, offset: Option<usize>, limit: Option<usize>) ->
     }
 
     let end = match limit {
-        Some(lim) => (start + lim).min(lines.len()),
+        Some(lim) => start.saturating_add(lim).min(lines.len()),
         None => lines.len(),
     };
 
@@ -139,5 +139,11 @@ mod tests {
     fn slice_lines_offset_past_end() {
         let out = slice_lines("a\nb\n".to_string(), Some(10), None);
         assert!(out.contains("offset 10 exceeds file length (2 lines)"));
+    }
+
+    #[test]
+    fn slice_lines_saturates_an_oversized_limit() {
+        let out = slice_lines("a\nb\n".to_string(), Some(2), Some(usize::MAX));
+        assert_eq!(out, "b");
     }
 }

@@ -198,7 +198,7 @@ impl WorkMode {
 
     /// Return the synchronous classifier for this mode. Auto has no sync
     /// classifier (it uses [`classify_tool_call`]); it falls back to asking so
-    /// callers that ignore [`uses_llm_classifier`] stay safe. The classifiers no
+    /// callers that ignore [`Self::uses_llm_classifier`] stay safe. The classifiers no
     /// longer take a policy map — the read-only/MCP-trust front gate now lives in
     /// [`crate::tools::provider`], so only calls that genuinely need review reach
     /// them.

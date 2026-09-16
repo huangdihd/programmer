@@ -255,6 +255,10 @@ pub(crate) struct Session {
     /// are restored as killed — their processes died with the old instance.
     #[serde(default)]
     pub(crate) tasks: Vec<crate::tasks::PersistedTask>,
+    /// Sub-agent records carried with the session. Running agents are restored
+    /// as cancelled because their processes do not survive a fork or restart.
+    #[serde(default)]
+    pub(crate) agents: Vec<crate::agents::PersistedAgent>,
     /// File content fingerprints read in this session, used by file protection after resume.
     #[serde(default)]
     pub(crate) file_snapshots: Vec<crate::security::policy::PersistedFileSnapshot>,
@@ -347,6 +351,7 @@ impl SessionManager {
             activated_skills: Vec::new(),
             skill_selection_saved: false,
             tasks: Vec::new(),
+            agents: Vec::new(),
             file_snapshots: Vec::new(),
         }
     }
@@ -437,6 +442,7 @@ impl SessionManager {
         let now = now_secs();
         forked.created_at = now;
         forked.updated_at = now;
+        crate::checkpoint::CheckpointStore::fork_session(&source.uuid, &forked.uuid)?;
         if !forked.title.is_empty() {
             forked.title.push_str(" (fork)");
         }
@@ -609,7 +615,7 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                             "(empty)".to_string()
                         };
                         let time_str = unix_to_local(s.updated_at);
-                        let short_uuid = &s.uuid[..8.min(s.uuid.len())];
+                        let short_uuid = &s.uuid[..s.uuid.floor_char_boundary(8)];
 
                         ListItem::new(vec![
                             Line::from(vec![Span::styled(
@@ -653,7 +659,7 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                     );
                     f.render_widget(Paragraph::new(warning), chunks[2]);
                 } else if let Some(ref uuid) = confirm_uuid {
-                    let short = &uuid[..8.min(uuid.len())];
+                    let short = &uuid[..uuid.floor_char_boundary(8)];
                     let confirm = Line::from(vec![
                         Span::styled(
                             format!(" Delete session {}?  ", short),

@@ -136,7 +136,7 @@ pub(crate) struct CancelState {
     /// always get distinct ids in practice.
     pub(crate) next_id: u64,
     /// The current turn's operation id, or `None` when idle. Set synchronously
-    /// before the turn spawns and cleared when [`AppEvent::TurnFinished`]
+    /// before the turn spawns and cleared when `AppEvent::TurnFinished`
     /// arrives, so the UI never races between "start" and "what is my id?" and
     /// stale events from an earlier turn are always dropped.
     pub(crate) active_id: Option<u64>,
@@ -429,6 +429,7 @@ impl App<'_> {
         saved_items: Vec<MessageItem>,
         saved_history: Vec<String>,
         saved_todos: Vec<crate::todos::Todo>,
+        saved_agents: Vec<crate::agents::PersistedAgent>,
         session_uuid: String,
         session_mgr: Option<SessionManager>,
         startup_messages: Vec<String>,
@@ -512,6 +513,8 @@ impl App<'_> {
             .map(|server| McpServerStatus::connecting(server.name.clone()))
             .collect();
         let provider_model_statuses = ProviderModelStatus::from_config(&config);
+        let agents = crate::agents::AgentManager::default();
+        agents.restore(&saved_agents);
         let checkpoint_store = crate::checkpoint::CheckpointStore::for_session(&session_uuid)
             .map(|store| Arc::new(Mutex::new(store)));
         let mut app = Self {
@@ -541,7 +544,7 @@ impl App<'_> {
             agent_panel: None,
             task_notifications: TaskNotificationState::new(),
             agent_notifications: AgentNotificationState::new(),
-            agents: crate::agents::AgentManager::default(),
+            agents,
             sidebar: Some(Sidebar::new()),
             sidebar_area: None,
             todo_list,
@@ -878,7 +881,7 @@ impl App<'_> {
                     );
                     let current_scroll_direction = scroll_direction(&current);
                     let current_is_left_drag = is_left_drag(&current);
-                    redraw |= matches!(&current, Event::Tick)
+                    redraw |= matches!(&current, Event::Tick | Event::Redraw)
                         || event_requests_immediate_redraw(&current);
                     self.handle_event(current).await?;
                     if chunk_received {
@@ -886,10 +889,16 @@ impl App<'_> {
                     } else {
                         regular_events += 1;
                     }
-                    // Busy status labels contain a live elapsed timer. Keep
-                    // that timer moving only while a busy phase is active;
-                    // idle sessions still produce no synthetic Tick events.
+                    // Status timing remains at 10 FPS. Edge-drag selection has
+                    // a separate, smoother timer so it can advance one row per
+                    // step without making background housekeeping run faster.
                     if self.footer.status.status.is_busy() {
+                        self.events.schedule_status_tick();
+                    }
+                    if self.conversation_panel.selection_auto_scroll_active() {
+                        self.events.schedule_selection_scroll();
+                    }
+                    if chunk_received {
                         self.events.schedule_redraw();
                     }
                     // Drag reports can arrive much faster than a full terminal
@@ -906,6 +915,9 @@ impl App<'_> {
                         }
                         if let Some(latest_drag) = latest_drag {
                             self.handle_event(latest_drag).await?;
+                            if self.conversation_panel.selection_auto_scroll_active() {
+                                self.events.schedule_selection_scroll();
+                            }
                         }
                     }
                     // Mouse wheel events are often delivered in a burst. Consume
@@ -1068,6 +1080,7 @@ mod tests {
             Duration::from_secs(2),
             super::App::new(
                 config,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),

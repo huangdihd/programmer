@@ -229,7 +229,7 @@ src/
 - **Configuration:** `ProgrammerConfig` deserializes from TOML via the `config` crate. Environment variables prefixed with `Programmer` override file values. Config lives at `~/.config/programmer/config.toml`. The optional top-level `soul` value replaces only the identity/mindset section of the developer prompt.
 - **Sessions:** Stored as JSON at `~/.config/programmer/sessions/<uuid>.json`. Each session contains message items, history, the latest input suggestion, todos, and persisted task state.
 - **Module visibility:** `pub(crate)` for internal visibility; `pub` only where needed externally. UI internals are `mod` (private). Tool modules are `pub` within `tools/`.
-- **Tests:** Inline `#[cfg(test)]` modules at the bottom of source files. No separate `tests/` directory.
+- **Tests:** Primarily inline `#[cfg(test)]` modules at the bottom of source files, plus CLI integration tests under `tests/`.
 - **Copyright header:** GPL-3.0-or-later header block on every `.rs` file.
 - **Naming:** snake_case for modules/functions, CamelCase for types.
 - **No `unwrap()` in production code:** Prefer `?`, `.unwrap_or_default()`, or explicit `match`.

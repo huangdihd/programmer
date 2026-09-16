@@ -46,6 +46,8 @@ use crossterm::event::KeyEventKind;
 pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre::Result<()> {
     match event {
         Event::Tick => app.tick(),
+        Event::Redraw => {}
+        Event::SelectionScroll => app.conversation_panel.selection_auto_scroll_tick(),
         Event::Crossterm(event) => handle_crossterm(app, event).await?,
         Event::App(app_event) => handle_app_event(app, app_event).await,
     }
@@ -1116,11 +1118,10 @@ fn handle_mcp_reloaded(app: &mut App<'_>, generation: u64, manager: crate::mcp::
 
 /// Handles the tick event of the terminal.
 ///
-/// Ticks fire at [`crate::consts::TICK_FPS`] to drive animation redraws; we
-/// piggy-back on them to flush a dirty session once the current turn has gone
-/// idle, debouncing saves to turn boundaries, and to watch interactive tasks
-/// for exit (auto-closing the terminal panel, handing `!` results to the
-/// agent).
+/// Ticks fire at 10 FPS while a busy status is active; we use them to refresh
+/// the elapsed timer, flush a dirty session once the current turn has gone
+/// idle, debounce saves to turn boundaries, and watch interactive tasks for
+/// exit (auto-closing the terminal panel, handing `!` results to the agent).
 pub(crate) fn tick(app: &mut App<'_>) {
     expire_quit_confirmation(app, std::time::Instant::now());
     session::flush_if_dirty(app);
@@ -1157,8 +1158,8 @@ pub(crate) fn tick(app: &mut App<'_>) {
 }
 
 /// Consecutive ticks a task must be seen finished before acting on it. At
-/// [`crate::consts::TICK_FPS`] (30) this is ~100 ms — enough for the PTY
-/// reader thread to flush the tail of the output after the child exits.
+/// 3 ticks at 10 FPS gives ~300 ms — enough for the PTY reader thread to
+/// flush the tail of the output after the child exits.
 const TASK_EXIT_GRACE_TICKS: u8 = 3;
 
 /// Watch interactive tasks for exit and close their terminal panel after the
@@ -1400,6 +1401,7 @@ mod tests {
         config.providers.clear();
         let mut app = crate::app::App::new(
             config,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

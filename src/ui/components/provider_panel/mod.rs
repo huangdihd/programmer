@@ -981,31 +981,7 @@ impl ProviderPanel {
                         let is_title = config.title_model.as_deref() == Some(qualified.as_str());
                         let is_suggestion =
                             config.suggestion_model.as_deref() == Some(qualified.as_str());
-                        let mut spans = if f.is_empty() {
-                            vec![Span::styled((*m).to_string(), style)]
-                        } else {
-                            let lower = m.to_lowercase();
-                            let mut spans = Vec::new();
-                            let mut pos = 0;
-                            while let Some(idx) = lower[pos..].find(&f) {
-                                let start = pos + idx;
-                                let end = start + f.len();
-                                if start > pos {
-                                    spans.push(Span::styled(m[pos..start].to_string(), style));
-                                }
-                                spans.push(Span::styled(
-                                    m[start..end].to_string(),
-                                    Style::default()
-                                        .fg(palette::BLUE)
-                                        .add_modifier(Modifier::BOLD),
-                                ));
-                                pos = end;
-                            }
-                            if pos < m.len() {
-                                spans.push(Span::styled(m[pos..].to_string(), style));
-                            }
-                            spans
-                        };
+                        let mut spans = highlight_model_matches(m, &f, style);
                         if is_chat {
                             spans.push(Span::styled("  chat", Style::default().fg(palette::GREEN)));
                         }
@@ -1188,6 +1164,37 @@ impl ProviderPanel {
     }
 }
 
+fn highlight_model_matches(model: &str, folded_filter: &str, style: Style) -> Vec<Span<'static>> {
+    // Lowercasing Unicode may change its byte length (for example, `İ` becomes
+    // `i` plus a combining dot), so offsets from the folded string cannot
+    // safely slice the original. Keep Unicode model names unhighlighted.
+    if folded_filter.is_empty() || !model.is_ascii() || !folded_filter.is_ascii() {
+        return vec![Span::styled(model.to_string(), style)];
+    }
+
+    let lower = model.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    let mut position = 0;
+    while let Some(index) = lower[position..].find(folded_filter) {
+        let start = position + index;
+        let end = start + folded_filter.len();
+        if start > position {
+            spans.push(Span::styled(model[position..start].to_string(), style));
+        }
+        spans.push(Span::styled(
+            model[start..end].to_string(),
+            Style::default()
+                .fg(palette::BLUE)
+                .add_modifier(Modifier::BOLD),
+        ));
+        position = end;
+    }
+    if position < model.len() {
+        spans.push(Span::styled(model[position..].to_string(), style));
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,6 +1203,19 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn model_filter_highlight_handles_unicode_case_expansion() {
+        let model = "İMODEL";
+        let spans = highlight_model_matches(model, &"İM".to_lowercase(), Style::default());
+        let rendered = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(rendered, model);
+        assert_eq!(spans.len(), 1);
     }
 
     fn pm_stub() -> ProviderManager {

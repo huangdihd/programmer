@@ -1277,6 +1277,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             "test-session".to_string(),
             None,
             Vec::new(),

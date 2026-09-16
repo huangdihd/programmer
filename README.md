@@ -65,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 Both installers select the release asset for the current OS and architecture.
-Use `--version v0.2.4` with `install.sh`, or `-Version v0.2.4` with
+Use `--version v0.2.15` with `install.sh`, or `-Version v0.2.15` with
 `install.ps1`, to install a specific release.
 
 ## Quick start
@@ -114,7 +114,7 @@ Once installed, Programmer can update or remove its own executable:
 ```sh
 programmer upgrade --check
 programmer upgrade
-programmer upgrade --tag v0.2.4
+programmer upgrade --tag v0.2.15
 programmer uninstall
 programmer uninstall --purge
 ```
