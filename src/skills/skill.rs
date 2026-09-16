@@ -101,7 +101,7 @@ impl Skill {
         );
         // 80 KiB safety cap — skills shouldn't be enormous, but avoid token bombs.
         if prompt.len() > 81920 {
-            let truncate_at = 81920 - 128;
+            let truncate_at = prompt.floor_char_boundary(81920 - 128);
             prompt.truncate(truncate_at);
             prompt.push_str("\n\n[... skill truncated — too large ...]");
         }
@@ -240,5 +240,24 @@ mod tests {
         let prompt = skill.to_prompt();
         assert!(prompt.contains("## Skill: test"));
         assert!(prompt.contains("Do the thing."));
+    }
+
+    #[test]
+    fn oversized_unicode_prompt_truncates_at_a_char_boundary() {
+        let header =
+            "## Skill: test\n\n*a test. If this skill is active, follow its instructions.*\n\n";
+        let truncate_at = 81920 - 128;
+        let ascii_prefix = "a".repeat(truncate_at - header.len() - 1);
+        let skill = Skill {
+            name: "test".into(),
+            description: "a test".into(),
+            body: format!("{ascii_prefix}值{}", "b".repeat(256)),
+            source: SkillSource::Project,
+        };
+
+        let prompt = skill.to_prompt();
+
+        assert!(prompt.ends_with("[... skill truncated — too large ...]"));
+        assert!(!prompt.contains('值'));
     }
 }

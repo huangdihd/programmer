@@ -103,7 +103,7 @@ pub async fn run_checker(
     Ok(apply_lint(checker, parse_output(&parser, &combined)))
 }
 
-/// Downgrade a lint checker's non-error findings to the [`Severity::Lint`] tier.
+/// Downgrade a lint checker's non-error findings to the [`crate::diagnostics::Severity::Lint`] tier.
 fn apply_lint(checker: &Checker, mut diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
     if checker.lint {
         for diag in &mut diags {

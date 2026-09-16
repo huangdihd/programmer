@@ -516,6 +516,10 @@ pub struct ConversationPanel {
     pub(crate) live_expanded_groups: HashSet<String>,
     /// The current mouse text selection, if any.
     pub(crate) selection: Option<Selection>,
+    /// Latest screen cell reported while the left button is held. Keeping it
+    /// after the pointer reaches an edge lets timer ticks continue auto-scroll
+    /// even though terminals only emit another drag event when the mouse moves.
+    selection_drag_position: Option<(u16, u16)>,
     /// The streaming items' paragraphs from the last render (paragraph, height,
     /// copy buttons). Exploring-group entries are moved forward unchanged on a
     /// cache hit; all entries are also kept for selection and copy-button clicks.
@@ -609,6 +613,7 @@ impl ConversationPanel {
             live_expanded_items: HashSet::new(),
             live_expanded_groups: HashSet::new(),
             selection: None,
+            selection_drag_position: None,
             live_paragraphs: Vec::new(),
             live_group_headers: Vec::new(),
             live_render_cache: None,
@@ -808,6 +813,7 @@ impl ConversationPanel {
 
     /// Left button pressed: start a potential selection at this point.
     pub fn selection_begin(&mut self, column: u16, row: u16) {
+        self.selection_drag_position = None;
         self.selection = self.to_buffer_pos(column, row, false).map(|pos| Selection {
             anchor: pos,
             head: pos,
@@ -818,6 +824,7 @@ impl ConversationPanel {
 
     /// Mouse dragged with the left button held: extend the selection.
     pub fn selection_drag(&mut self, column: u16, row: u16) {
+        self.selection_drag_position = self.selection.as_ref().map(|_| (column, row));
         // Auto-scroll when dragging against the top/bottom edge so the
         // selection can extend past the visible window. The terminal clamps the
         // mouse row to its bounds, so a drag beyond the edge keeps arriving at
@@ -827,9 +834,9 @@ impl ConversationPanel {
         let area = self.view_area;
         if self.selection.is_some() && area.height > 0 {
             if row >= area.bottom().saturating_sub(1) {
-                self.scroll_down();
+                self.scroll_down_by(1);
             } else if row <= area.y {
-                self.scroll_up();
+                self.scroll_up_by(1);
             }
         }
         let Some(pos) = self.to_buffer_pos(column, row, true) else {
@@ -840,6 +847,27 @@ impl ConversationPanel {
                 sel.dragging = true;
             }
             sel.head = pos;
+        }
+    }
+
+    /// Whether a held selection is resting against a vertical viewport edge.
+    pub(crate) fn selection_auto_scroll_active(&self) -> bool {
+        let Some((_, row)) = self.selection_drag_position else {
+            return false;
+        };
+        let area = self.view_area;
+        self.selection.is_some()
+            && area.height > 0
+            && (row <= area.y || row >= area.bottom().saturating_sub(1))
+    }
+
+    /// Continue an edge drag from a timer tick without requiring mouse motion.
+    pub(crate) fn selection_auto_scroll_tick(&mut self) {
+        if !self.selection_auto_scroll_active() {
+            return;
+        }
+        if let Some((column, row)) = self.selection_drag_position {
+            self.selection_drag(column, row);
         }
     }
 
@@ -854,12 +882,14 @@ impl ConversationPanel {
             .filter(|sel| !sel.dragging && sel.screen_anchor == (column, row))
         {
             self.selection = None;
+            self.selection_drag_position = None;
             return SelectionEnd::Click {
                 column: sel.anchor.0,
                 row: sel.anchor.1,
             };
         }
         self.selection_drag(column, row);
+        self.selection_drag_position = None;
         match self.selection {
             None => SelectionEnd::Ignored,
             Some(sel) if !sel.dragging || sel.anchor == sel.head => {
@@ -964,7 +994,7 @@ impl ConversationPanel {
     }
 
     /// Appends a tool result so it is both rendered and sent back to the model
-    /// on the next request. Delegates to [`Conversation::add_tool_output`].
+    /// on the next request. Delegates to [`crate::conversation::Conversation::add_tool_output`].
     pub fn add_tool_output(&mut self, output: crate::tools::ToolOutput) {
         self.conversation.lock().unwrap().add_tool_output(output);
     }
@@ -1038,7 +1068,7 @@ impl ConversationPanel {
 
     /// Record a finished `/compact`: push the boundary carrying `summary`.
     /// History before it stays visible in the UI but stops being sent to the
-    /// API (see [`Conversation::to_input_param`]).
+    /// API (see [`crate::conversation::Conversation::to_input_param`]).
     pub fn apply_compaction(&mut self, summary: String) {
         self.conversation.lock().unwrap().apply_compaction(summary);
         self.stick_to_bottom = true;
@@ -1743,7 +1773,7 @@ impl ConversationPanel {
     }
 
     /// Build the API request input from the conversation history. Delegates to
-    /// [`Conversation::to_input_param`] — the history-shaping logic lives on the
+    /// [`crate::conversation::Conversation::to_input_param`] — the history-shaping logic lives on the
     /// model so the headless runner produces byte-identical requests.
     pub fn get_input_param(
         &self,
@@ -1898,6 +1928,29 @@ mod tests {
         panel.selection_drag(8, 4);
 
         assert!(matches!(panel.selection_end(8, 4), SelectionEnd::Copied(_)));
+    }
+
+    #[test]
+    fn selection_at_top_edge_keeps_scrolling_without_mouse_motion() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(0, 0, 40, 10);
+        panel.scroll_view_state.update(100, 10);
+        panel.scroll_view_state.scroll_to_bottom();
+        panel.view_offset = panel.scroll_view_state.offset().y;
+
+        panel.selection_begin(3, 5);
+        panel.selection_drag(3, 0);
+        assert!(panel.selection_auto_scroll_active());
+
+        let offset_after_drag = panel.scroll_view_state.offset().y;
+        panel.view_offset = offset_after_drag;
+        panel.selection_auto_scroll_tick();
+
+        assert_eq!(panel.scroll_view_state.offset().y, offset_after_drag - 1);
+        assert_eq!(panel.selection.unwrap().head, (3, offset_after_drag));
+
+        panel.selection_end(3, 0);
+        assert!(!panel.selection_auto_scroll_active());
     }
 
     #[test]

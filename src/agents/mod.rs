@@ -33,6 +33,7 @@ use async_openai::types::responses::{
     FunctionToolCall, InputContent, InputMessage, InputRole, MessageItem as ApiMessageItem,
     OutputStatus,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -65,6 +66,16 @@ impl AgentStatus {
     pub(crate) fn is_terminal(self) -> bool {
         self != Self::Running
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PersistedAgent {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) prompt: String,
+    pub(crate) status: String,
+    pub(crate) elapsed_secs: u64,
+    pub(crate) result: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +295,59 @@ impl AgentManager {
             .values()
             .map(AgentEntry::snapshot)
             .collect()
+    }
+
+    pub(crate) fn persist_all(&self) -> Vec<PersistedAgent> {
+        self.snapshot_all()
+            .into_iter()
+            .map(|agent| PersistedAgent {
+                id: agent.id,
+                name: agent.name,
+                prompt: agent.prompt,
+                status: agent.status.label().to_string(),
+                elapsed_secs: agent.elapsed.as_secs(),
+                result: agent.result,
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore(&self, saved: &[PersistedAgent]) {
+        let mut state = self.state.lock().unwrap();
+        for agent in saved {
+            if state.entries.contains_key(&agent.id) {
+                continue;
+            }
+            let status = match agent.status.as_str() {
+                "completed" => AgentStatus::Completed,
+                "failed" => AgentStatus::Failed,
+                "cancelled" => AgentStatus::Cancelled,
+                _ => AgentStatus::Cancelled,
+            };
+            let now = Instant::now();
+            let started = now
+                .checked_sub(Duration::from_secs(agent.elapsed_secs))
+                .unwrap_or(now);
+            state.entries.insert(
+                agent.id,
+                AgentEntry {
+                    id: agent.id,
+                    name: agent.name.clone(),
+                    prompt: agent.prompt.clone(),
+                    status,
+                    started,
+                    finished: Some(now),
+                    result: agent.result.clone(),
+                    phase: None,
+                    conversation: Arc::new(Mutex::new(Conversation::new())),
+                    cancel: CancellationToken::new(),
+                    changed: Arc::new(Notify::new()),
+                    notify_parent: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        if let Some(max_id) = state.entries.keys().max().copied() {
+            state.next_id = state.next_id.max(max_id);
+        }
     }
 
     pub(crate) fn conversation(&self, id: u64) -> Option<Arc<Mutex<Conversation>>> {

@@ -166,7 +166,7 @@ impl TodoList {
         lines.push("-".repeat(120));
 
         for t in &self.todos {
-            let short_id = &t.id[..t.id.len().min(10)];
+            let short_id = &t.id[..t.id.floor_char_boundary(10)];
             let desc = t
                 .description
                 .as_deref()
@@ -241,6 +241,22 @@ mod tests {
         assert_eq!(TodoStatus::parse("done"), Some(TodoStatus::Completed));
         assert_eq!(TodoStatus::parse("cancel"), Some(TodoStatus::Cancelled));
         assert_eq!(TodoStatus::parse("bogus"), None);
+    }
+
+    #[test]
+    fn render_table_handles_unicode_id_prefix() {
+        let list = TodoList {
+            todos: vec![Todo {
+                id: "abcdefghi值-rest".into(),
+                title: "test".into(),
+                description: None,
+                status: TodoStatus::Pending,
+                created_at: 0,
+                updated_at: 0,
+            }],
+        };
+
+        assert!(list.render_table().contains("abcdefghi"));
     }
 
     #[test]

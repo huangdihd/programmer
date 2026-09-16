@@ -101,6 +101,7 @@ struct IncrementalMarkdownState {
     generation: u64,
     width: u16,
     source_len: usize,
+    source_hash: Option<blake3::Hash>,
     scan_offset: usize,
     in_fence: bool,
     stable_end: usize,
@@ -275,16 +276,32 @@ fn find_chunk_button(
 
 impl IncrementalMarkdownState {
     fn render(&mut self, source: &str, generation: u64, width: u16) -> IncrementalMarkdownRender {
-        let append_only =
-            self.generation == generation && self.width == width && source.len() >= self.source_len;
+        let mut source_hasher = blake3::Hasher::new();
+        let append_only = self.generation == generation
+            && self.width == width
+            && source.len() >= self.source_len
+            && self.source_hash.is_some_and(|previous_hash| {
+                source
+                    .as_bytes()
+                    .get(..self.source_len)
+                    .is_some_and(|prefix| {
+                        source_hasher.update(prefix);
+                        source_hasher.finalize() == previous_hash
+                    })
+            });
         if !append_only {
             self.generation = generation;
             self.width = width;
             self.source_len = 0;
+            self.source_hash = None;
             self.scan_offset = 0;
             self.in_fence = false;
             self.stable_end = 0;
             self.stable = None;
+            source_hasher = blake3::Hasher::new();
+            source_hasher.update(source.as_bytes());
+        } else {
+            source_hasher.update(&source.as_bytes()[self.source_len..]);
         }
 
         self.scan_appended_lines(source);
@@ -315,6 +332,7 @@ impl IncrementalMarkdownState {
         let stable_lines = self.stable.as_ref().map_or(0, |chunk| chunk.total_lines);
         let line_count = stable_lines.saturating_add(tail_lines.len() as u16);
         self.source_len = source.len();
+        self.source_hash = Some(source_hasher.finalize());
 
         IncrementalMarkdownRender {
             stable: self.stable.clone(),
@@ -798,6 +816,24 @@ mod tests {
                 .iter()
                 .any(|line| line.to_string().contains("Stable heading"))
         );
+    }
+
+    #[test]
+    fn rewritten_source_resets_incremental_byte_offsets() {
+        let mut state = IncrementalMarkdownState::default();
+        let original = "abcdef\n\nstreaming tail";
+        state.render(original, 1, 40);
+        assert_eq!(state.scan_offset, "abcdef\n\n".len());
+
+        // The new source is longer but is not an append. Its multi-byte character
+        // straddles the old scan offset, which used to make byte slicing panic.
+        let rewritten = "abcdefg值\n\na longer replacement tail";
+        let incremental = state.render(rewritten, 1, 40);
+        let (full_lines, full_codes) = render_markdown(rewritten, 40);
+
+        assert_eq!(incremental.lines(), full_lines);
+        assert_eq!(incremental.codes(), full_codes);
+        assert!(rewritten.is_char_boundary(state.scan_offset));
     }
 
     #[test]

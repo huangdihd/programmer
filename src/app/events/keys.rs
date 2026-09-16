@@ -1029,6 +1029,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             "mcp-escape-routing-test".to_string(),
             None,
             Vec::new(),

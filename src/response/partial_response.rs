@@ -84,6 +84,14 @@ pub struct PartialResponse {
     item_render_revision: u64,
 }
 
+const MAX_OUTPUT_ITEMS: usize = 4096;
+const MAX_ITEM_PARTS: usize = 4096;
+
+fn bounded_item_part_index(index: u32) -> Option<usize> {
+    let index = index as usize;
+    (index < MAX_ITEM_PARTS).then_some(index)
+}
+
 impl PartialResponse {
     pub fn new(cancelled: CancellationToken) -> Self {
         PartialResponse {
@@ -99,16 +107,23 @@ impl PartialResponse {
     }
 
     fn set_item(&mut self, item: OutputItem, output_index: u32) {
-        if self.items.len() <= output_index as usize {
-            self.items.resize((output_index + 1) as usize, None);
-            self.finished_items
-                .resize((output_index + 1) as usize, false);
-            self.item_revisions.resize((output_index + 1) as usize, 0);
+        let output_index = output_index as usize;
+        if output_index >= MAX_OUTPUT_ITEMS {
+            return;
         }
-        self.items[output_index as usize] = Some(item);
+        if self.items.len() <= output_index {
+            let new_len = output_index + 1;
+            self.items.resize(new_len, None);
+            self.finished_items.resize(new_len, false);
+            self.item_revisions.resize(new_len, 0);
+        }
+        self.items[output_index] = Some(item);
     }
 
     fn bump_item_revision(&mut self, output_index: usize) {
+        if output_index >= MAX_OUTPUT_ITEMS {
+            return;
+        }
         if self.item_revisions.len() <= output_index {
             self.item_revisions.resize(output_index + 1, 0);
         }
@@ -241,10 +256,13 @@ impl PartialResponse {
             }
 
             ResponseContentPartAdded(part_added_event) => {
+                let Some(content_index) = bounded_item_part_index(part_added_event.content_index)
+                else {
+                    return;
+                };
                 if let Some(Some(output_item)) =
                     self.items.get_mut(part_added_event.output_index as usize)
                 {
-                    let content_index = part_added_event.content_index as usize;
                     match output_item {
                         OutputItem::Message(output_message) => {
                             if output_message.content.len() <= content_index {
@@ -385,8 +403,12 @@ impl PartialResponse {
                     return;
                 };
 
+                let Some(content_index) =
+                    bounded_item_part_index(reasoning_text_delta_event.content_index)
+                else {
+                    return;
+                };
                 let contents = reasoning_item.content.get_or_insert_with(Vec::new);
-                let content_index = reasoning_text_delta_event.content_index as usize;
                 while contents.len() <= content_index {
                     contents.push(ReasoningItemContent::ReasoningText(ReasoningTextContent {
                         text: String::new(),
@@ -423,7 +445,11 @@ impl PartialResponse {
                 else {
                     return;
                 };
-                let summary_index = summary_part_added_event.summary_index as usize;
+                let Some(summary_index) =
+                    bounded_item_part_index(summary_part_added_event.summary_index)
+                else {
+                    return;
+                };
                 if reasoning_item.summary.len() <= summary_index {
                     reasoning_item.summary.push(summary_part_added_event.part);
                 }
@@ -450,7 +476,11 @@ impl PartialResponse {
                     return;
                 };
 
-                let summary_index = summary_text_delta_event.summary_index as usize;
+                let Some(summary_index) =
+                    bounded_item_part_index(summary_text_delta_event.summary_index)
+                else {
+                    return;
+                };
                 while reasoning_item.summary.len() <= summary_index {
                     reasoning_item
                         .summary
@@ -828,6 +858,27 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].0, 0, "live UI indices skip protocol gaps");
         assert_eq!(items[0].3, 0);
+    }
+
+    #[test]
+    fn oversized_output_index_is_ignored() {
+        let mut p = fresh();
+
+        p.set_item(msg_item(), u32::MAX);
+        p.bump_item_revision(usize::MAX);
+
+        assert!(p.items.is_empty());
+        assert!(p.item_revisions.is_empty());
+    }
+
+    #[test]
+    fn oversized_item_part_indices_are_rejected() {
+        assert_eq!(
+            bounded_item_part_index((MAX_ITEM_PARTS - 1) as u32),
+            Some(MAX_ITEM_PARTS - 1)
+        );
+        assert_eq!(bounded_item_part_index(MAX_ITEM_PARTS as u32), None);
+        assert_eq!(bounded_item_part_index(u32::MAX), None);
     }
 
     #[test]

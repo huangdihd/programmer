@@ -27,12 +27,12 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
-    /// An event that is emitted on a regular schedule.
-    ///
-    /// Use this event to run any code which has to run outside of being a direct response to a user
-    /// event. e.g. polling exernal systems, updating animations, or rendering the ui based on a
-    /// fixed frame rate.
+    /// A 10 FPS tick used for busy-status timing and background housekeeping.
     Tick,
+    /// A coalesced high-rate redraw used while streaming output.
+    Redraw,
+    /// A timer step for mouse-selection edge auto-scroll.
+    SelectionScroll,
     /// Crossterm events.
     ///
     /// These events are emitted by the terminal.
@@ -379,9 +379,12 @@ pub struct EventHandler {
     pub sender: mpsc::UnboundedSender<Event>,
     /// Event receiver channel.
     receiver: mpsc::UnboundedReceiver<Event>,
-    /// At most one tick may wait in the FIFO, so a slow render cannot bury
-    /// keyboard and mouse events under stale animation work.
-    tick_queued: Arc<AtomicBool>,
+    /// At most one streaming redraw may wait in the FIFO.
+    redraw_queued: Arc<AtomicBool>,
+    /// At most one busy-status tick may wait in the FIFO.
+    status_tick_queued: Arc<AtomicBool>,
+    /// At most one selection auto-scroll step may wait in the FIFO.
+    selection_scroll_queued: Arc<AtomicBool>,
     /// The task that reads crossterm events and emits ticks.
     _task: tokio::task::JoinHandle<()>,
 }
@@ -391,7 +394,9 @@ impl EventHandler {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         let _sender = sender.clone();
-        let tick_queued = Arc::new(AtomicBool::new(false));
+        let redraw_queued = Arc::new(AtomicBool::new(false));
+        let status_tick_queued = Arc::new(AtomicBool::new(false));
+        let selection_scroll_queued = Arc::new(AtomicBool::new(false));
         let _task = tokio::spawn(async move {
             let mut reader = crossterm::event::EventStream::new();
             loop {
@@ -410,7 +415,9 @@ impl EventHandler {
         Self {
             sender,
             receiver,
-            tick_queued,
+            redraw_queued,
+            status_tick_queued,
+            selection_scroll_queued,
             _task,
         }
     }
@@ -446,29 +453,72 @@ impl EventHandler {
         let _ = self.sender.send(Event::App(app_event));
     }
 
-    /// Schedule one coalesced redraw at the maximum refresh rate. Unlike a
-    /// periodic ticker this creates no events while the UI is idle.
+    /// Schedule one coalesced streaming redraw at up to 60 FPS. This does
+    /// not affect direct input redraws or the separate status timer.
     pub fn schedule_redraw(&self) {
         if self
-            .tick_queued
+            .redraw_queued
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
         let sender = self.sender.clone();
-        let queued = self.tick_queued.clone();
+        let queued = self.redraw_queued.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+            if sender.send(Event::Redraw).is_err() {
+                queued.store(false, Ordering::Release);
+            }
+        });
+    }
+
+    /// Schedule the elapsed-status timer at 10 FPS. The resulting tick also
+    /// performs the existing periodic housekeeping work.
+    pub fn schedule_status_tick(&self) {
+        if self
+            .status_tick_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let sender = self.sender.clone();
+        let queued = self.status_tick_queued.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if sender.send(Event::Tick).is_err() {
                 queued.store(false, Ordering::Release);
             }
         });
     }
 
+    /// Schedule one selection edge-scroll step at roughly 30 FPS. This is
+    /// separate from the 10 FPS status timer so each step can remain one line.
+    pub fn schedule_selection_scroll(&self) {
+        if self
+            .selection_scroll_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let sender = self.sender.clone();
+        let queued = self.selection_scroll_queued.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(32)).await;
+            if sender.send(Event::SelectionScroll).is_err() {
+                queued.store(false, Ordering::Release);
+            }
+        });
+    }
+
     fn mark_received(&self, event: &Event) {
-        if matches!(event, Event::Tick) {
-            self.tick_queued.store(false, Ordering::Release);
+        match event {
+            Event::Redraw => self.redraw_queued.store(false, Ordering::Release),
+            Event::Tick => self.status_tick_queued.store(false, Ordering::Release),
+            Event::SelectionScroll => self.selection_scroll_queued.store(false, Ordering::Release),
+            _ => {}
         }
     }
 }

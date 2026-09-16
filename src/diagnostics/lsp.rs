@@ -178,12 +178,14 @@ pub fn diagnostic_from_lsp(value: &Value, file: &str) -> Diagnostic {
     let line = start
         .and_then(|s| s.get("line"))
         .and_then(Value::as_u64)
-        .map(|l| l as u32 + 1)
+        .and_then(|line| u32::try_from(line).ok())
+        .map(|line| line.saturating_add(1))
         .unwrap_or(0);
     let col = start
         .and_then(|s| s.get("character"))
         .and_then(Value::as_u64)
-        .map(|c| c as u32 + 1);
+        .and_then(|column| u32::try_from(column).ok())
+        .map(|column| column.saturating_add(1));
     let severity = severity_from_lsp(value.get("severity").and_then(Value::as_u64));
     let code = value.get("code").and_then(|c| match c {
         Value::String(s) => Some(s.clone()),
@@ -723,6 +725,18 @@ mod tests {
             diagnostic_from_lsp(&v, "a.ts").code.as_deref(),
             Some("2322")
         );
+    }
+
+    #[test]
+    fn malformed_lsp_positions_do_not_overflow() {
+        let v = json!({
+            "range": { "start": { "line": u64::MAX, "character": u32::MAX } },
+            "message": "x"
+        });
+        let diagnostic = diagnostic_from_lsp(&v, "a.ts");
+
+        assert_eq!(diagnostic.line, 0);
+        assert_eq!(diagnostic.col, Some(u32::MAX));
     }
 
     fn which(bin: &str) -> Option<String> {

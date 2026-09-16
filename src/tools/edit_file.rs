@@ -141,7 +141,7 @@ pub(crate) async fn run_with_security_scope(
             format!(
                 "error: old_string not found in {} lines {offset}-{}",
                 args.path,
-                offset + limit - 1
+                offset.saturating_add(limit.saturating_sub(1))
             )
         } else {
             format!("error: old_string not found in {}", args.path)

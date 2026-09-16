@@ -23,7 +23,7 @@ use crate::ui::text::truncate_to_width;
 
 use super::muted_style;
 
-/// Combined horizontal padding of the parent [`AssistantMessage`] block
+/// Combined horizontal padding of the parent `AssistantMessage` block
 /// (`PAD_LEFT` + `PAD_RIGHT`).
 const BLOCK_PAD: u16 = 2;
 /// Extra left indent applied to expanded reasoning lines, keeping a visual

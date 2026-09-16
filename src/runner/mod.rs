@@ -112,7 +112,7 @@ pub(crate) struct TurnRunner {
 /// (the UI renders the baseline; both survive the per-turn runners because the
 /// front-end holds this behind an `Arc<Mutex<_>>` and hands each turn's runner a
 /// clone). The [`hooks::DiagnosticsHook`] owns `baseline`; the
-/// [`hooks::OverviewReminderHook`] owns `mutating_turns`.
+/// the overview-reminder hook owns `mutating_turns`.
 #[derive(Default)]
 pub(crate) struct DiagnosticsState {
     /// The last diagnostics snapshot to diff against; `None` until the first run

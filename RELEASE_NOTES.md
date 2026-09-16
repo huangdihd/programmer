@@ -1,3 +1,31 @@
+# programmer v0.2.15
+
+v0.2.15 improves session continuity, streaming responsiveness, and robustness
+against malformed provider data.
+
+## Highlights
+
+- Persist completed sub-agent entries across session resumes and preserve
+  rewind checkpoints when a conversation is forked.
+- Separate high-rate streaming redraws from lower-rate status housekeeping for
+  smoother output without unnecessary idle refreshes.
+- Improve provider startup and model-management error handling, Unicode-safe UI
+  truncation and highlighting, and live Markdown rendering behavior.
+
+## Fixes
+
+- Bound provider-controlled output and reasoning-part indices to prevent
+  malformed streaming events from causing excessive memory allocation.
+- Saturate oversized file offsets and limits instead of overflowing.
+- Continue auto-scrolling a mouse text selection while the pointer rests at
+  the top or bottom edge, without requiring horizontal movement.
+- Normalize malformed LSP positions and harden several session and UI edge
+  cases.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.14...v0.2.15
+
+---
+
 # programmer v0.2.4
 
 v0.2.4 focuses on streaming rendering performance and dependency updates.

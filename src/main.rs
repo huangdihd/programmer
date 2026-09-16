@@ -75,6 +75,7 @@ struct SessionBootstrap {
     items: Vec<crate::response::message_item::MessageItem>,
     history: Vec<String>,
     todos: Vec<crate::todos::Todo>,
+    agents: Vec<crate::agents::PersistedAgent>,
     mgr: Option<SessionManager>,
     messages: Vec<String>,
     _lock: Option<crate::session::SessionLock>,
@@ -84,74 +85,90 @@ fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
     let session_mgr = SessionManager::new();
     let mut startup_messages: Vec<String> = Vec::new();
 
-    let (mut session_uuid, saved_items, saved_history, saved_todos) = match (resume, &session_mgr) {
-        (Some(Some(uuid)), Some(mgr)) => match mgr.load(&uuid) {
-            Some(session) => {
-                let history = session.history.clone();
-                let todos = session.todos.clone();
-                tasks::restore(&session.tasks);
-                let items = SessionManager::into_items(session);
-                (uuid, items, history, todos)
-            }
-            None => {
-                startup_messages.push(format!("Session {uuid} not found, creating a new session."));
-                let session = mgr.create();
-                (session.uuid, Vec::new(), Vec::new(), Vec::new())
-            }
-        },
-        (Some(None), Some(mgr)) => match mgr.list_all() {
-            Ok(sessions) => {
-                let was_empty = sessions.is_empty();
-                match session::pick_session(&sessions, mgr) {
-                    Some(uuid) => match mgr.load(&uuid) {
-                        Some(session) => {
-                            let history = session.history.clone();
-                            let todos = session.todos.clone();
-                            tasks::restore(&session.tasks);
-                            let items = SessionManager::into_items(session);
-                            (uuid, items, history, todos)
-                        }
+    let (mut session_uuid, saved_items, saved_history, saved_todos, saved_agents) =
+        match (resume, &session_mgr) {
+            (Some(Some(uuid)), Some(mgr)) => match mgr.load(&uuid) {
+                Some(session) => {
+                    let history = session.history.clone();
+                    let todos = session.todos.clone();
+                    let agents = session.agents.clone();
+                    tasks::restore(&session.tasks);
+                    let items = SessionManager::into_items(session);
+                    (uuid, items, history, todos, agents)
+                }
+                None => {
+                    startup_messages
+                        .push(format!("Session {uuid} not found, creating a new session."));
+                    let session = mgr.create();
+                    (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                }
+            },
+            (Some(None), Some(mgr)) => match mgr.list_all() {
+                Ok(sessions) => {
+                    let was_empty = sessions.is_empty();
+                    match session::pick_session(&sessions, mgr) {
+                        Some(uuid) => match mgr.load(&uuid) {
+                            Some(session) => {
+                                let history = session.history.clone();
+                                let todos = session.todos.clone();
+                                let agents = session.agents.clone();
+                                tasks::restore(&session.tasks);
+                                let items = SessionManager::into_items(session);
+                                (uuid, items, history, todos, agents)
+                            }
+                            None => {
+                                startup_messages.push(format!(
+                                    "Session {uuid} not found on disk, starting a new session."
+                                ));
+                                let session = mgr.create();
+                                (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                            }
+                        },
                         None => {
-                            startup_messages.push(format!(
-                                "Session {uuid} not found on disk, starting a new session."
-                            ));
+                            if was_empty {
+                                startup_messages.push(
+                                    "No existing sessions found, creating a new one.".to_string(),
+                                );
+                            }
                             let session = mgr.create();
-                            (session.uuid, Vec::new(), Vec::new(), Vec::new())
+                            (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
                         }
-                    },
-                    None => {
-                        if was_empty {
-                            startup_messages.push(
-                                "No existing sessions found, creating a new one.".to_string(),
-                            );
-                        }
-                        let session = mgr.create();
-                        (session.uuid, Vec::new(), Vec::new(), Vec::new())
                     }
                 }
-            }
-            Err(e) => {
-                startup_messages.push(format!(
-                    "Failed to list sessions: {e}, creating new session."
-                ));
-                if let Some(mgr) = session_mgr.as_ref() {
+                Err(e) => {
+                    startup_messages.push(format!(
+                        "Failed to list sessions: {e}, creating new session."
+                    ));
+                    if let Some(mgr) = session_mgr.as_ref() {
+                        let session = mgr.create();
+                        (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    } else {
+                        (
+                            String::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    }
+                }
+            },
+            _ => {
+                if let Some(mgr) = &session_mgr {
                     let session = mgr.create();
-                    (session.uuid, Vec::new(), Vec::new(), Vec::new())
+                    (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
                 } else {
-                    (String::new(), Vec::new(), Vec::new(), Vec::new())
+                    startup_messages.push("Session persistence unavailable.".to_string());
+                    (
+                        String::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
                 }
             }
-        },
-        _ => {
-            if let Some(mgr) = &session_mgr {
-                let session = mgr.create();
-                (session.uuid, Vec::new(), Vec::new(), Vec::new())
-            } else {
-                startup_messages.push("Session persistence unavailable.".to_string());
-                (String::new(), Vec::new(), Vec::new(), Vec::new())
-            }
-        }
-    };
+        };
 
     let session_lock = if let Some(mgr) = &session_mgr {
         match mgr.try_lock(&session_uuid) {
@@ -197,6 +214,7 @@ fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
         items: saved_items,
         history: saved_history,
         todos: saved_todos,
+        agents: saved_agents,
         mgr: session_mgr,
         messages: startup_messages,
         _lock: session_lock,
@@ -230,7 +248,7 @@ fn load_config() -> color_eyre::Result<(ProgrammerConfig, std::path::PathBuf)> {
         .unwrap_or_else(|| Path::new("config.toml").to_path_buf());
 
     let mut programmer_config: ProgrammerConfig = Config::builder()
-        .add_source(File::with_name(config_path.to_str().unwrap()).required(false))
+        .add_source(File::from(config_path.clone()).required(false))
         .add_source(Environment::with_prefix("Programmer"))
         .build()
         .unwrap_or_default()
@@ -310,6 +328,7 @@ async fn async_main(mut args: cli::Args) -> color_eyre::Result<()> {
             bootstrap.items,
             bootstrap.history,
             bootstrap.todos,
+            bootstrap.agents,
             bootstrap.uuid,
             bootstrap.mgr,
             bootstrap.messages,

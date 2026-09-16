@@ -12,6 +12,30 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target)
+        .map_err(|error| format!("create checkpoint directory {}: {error}", target.display()))?;
+    for entry in std::fs::read_dir(source)
+        .map_err(|error| format!("read checkpoint directory {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read checkpoint entry: {error}"))?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_directory(&source_path, &target_path)?;
+        } else {
+            std::fs::copy(&source_path, &target_path).map_err(|error| {
+                format!(
+                    "copy checkpoint file {} to {}: {error}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FileChange {
     #[serde(default)]
@@ -62,6 +86,24 @@ impl CheckpointStore {
             .join("checkpoints")
             .join(uuid);
         Some(Self::at(root))
+    }
+
+    pub(crate) fn fork_session(source_uuid: &str, target_uuid: &str) -> Result<(), String> {
+        let Some(config_dir) = dirs::config_dir() else {
+            return Ok(());
+        };
+        let source = config_dir
+            .join("programmer")
+            .join("checkpoints")
+            .join(source_uuid);
+        if !source.exists() {
+            return Ok(());
+        }
+        let target = config_dir
+            .join("programmer")
+            .join("checkpoints")
+            .join(target_uuid);
+        copy_directory(&source, &target)
     }
 
     fn at(root: PathBuf) -> Self {

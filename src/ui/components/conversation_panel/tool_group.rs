@@ -155,7 +155,7 @@ pub(crate) fn discover_tool_groups(items: &[MessageItem]) -> Vec<ToolGroup> {
     discover_group_items(&refs)
 }
 
-/// The streaming response is owned by [`PartialResponse`], so the renderer
+/// The streaming response is owned by [`crate::response::partial_response::PartialResponse`], so the renderer
 /// must not clone every output item merely to discover tool groups. This is
 /// the same grouping rule as [`discover_tool_groups`], specialized to borrowed
 /// protocol output items. The returned indices are relative to `items`.

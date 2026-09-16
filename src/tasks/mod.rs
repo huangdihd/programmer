@@ -1602,7 +1602,7 @@ pub fn restore(saved: &[PersistedTask]) {
         });
     }
     let max_id = reg.iter().map(|e| e.id).max().unwrap_or(0);
-    NEXT_ID.fetch_max(max_id + 1, Ordering::Relaxed);
+    NEXT_ID.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
 }
 
 fn append_output(id: u64, chunk: &str) {

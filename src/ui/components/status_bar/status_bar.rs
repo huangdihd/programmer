@@ -111,7 +111,7 @@ impl StatusBar {
     }
 
     /// Set the current status, starting the elapsed timer when entering a busy
-    /// phase and clearing it otherwise. The caller ([`App::resolve_status`])
+    /// phase and clearing it otherwise. The caller (`App::resolve_status`)
     /// owns the precedence logic; this just tracks timing.
     pub fn set(&mut self, new_state: StatusState) {
         if new_state != self.status {
