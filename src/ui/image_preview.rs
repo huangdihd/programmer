@@ -21,7 +21,8 @@ use ratatui::layout::{Rect, Size};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui_image::Resize;
-use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::picker::cap_parser::QueryStdioOptions;
+use ratatui_image::picker::{Capability, Picker, ProtocolType};
 use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -59,7 +60,22 @@ struct StoredImage {
 /// intentionally called by terminal setup before crossterm starts consuming
 /// input; tests and non-interactive users retain the deterministic fallback.
 pub(crate) fn detect_terminal_protocol() {
-    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // Reuse the existing pre-event-loop query rather than racing a second
+    // stdin reader against crossterm. OSC 11 adds no separate round trip.
+    let mut picker = Picker::from_query_stdio_with_options(QueryStdioOptions {
+        terminal_background_color_osc: true,
+        timeout: std::time::Duration::from_millis(500),
+        ..QueryStdioOptions::default()
+    })
+    .unwrap_or_else(|_| Picker::halfblocks());
+    let background = picker
+        .capabilities()
+        .iter()
+        .find_map(|capability| match capability {
+            Capability::Background(r, g, b) => Some((*r, *g, *b)),
+            _ => None,
+        });
+    crate::ui::theme::set_terminal_background(background);
 
     let running_in_iterm = std::env::var("TERM_PROGRAM").is_ok_and(|value| value.contains("iTerm"))
         || std::env::var("LC_TERMINAL").is_ok_and(|value| value.contains("iTerm"))

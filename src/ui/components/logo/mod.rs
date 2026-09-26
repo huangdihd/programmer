@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::prelude::Widget;
@@ -51,7 +52,7 @@ impl Widget for Logo<'_> {
         let title = Line::styled(
             self.title,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(role::TITLE)
                 .add_modifier(Modifier::BOLD),
         );
         let separator = Line::styled(

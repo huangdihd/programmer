@@ -65,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 Both installers select the release asset for the current OS and architecture.
-Use `--version v0.2.16` with `install.sh`, or `-Version v0.2.16` with
+Use `--version v0.2.17` with `install.sh`, or `-Version v0.2.17` with
 `install.ps1`, to install a specific release.
 
 ## Quick start
@@ -114,7 +114,7 @@ Once installed, Programmer can update or remove its own executable:
 ```sh
 programmer upgrade --check
 programmer upgrade
-programmer upgrade --tag v0.2.16
+programmer upgrade --tag v0.2.17
 programmer uninstall
 programmer uninstall --purge
 ```
@@ -214,6 +214,9 @@ auto_compact_cooldown_turns = 5
 # Enable image input for new interactive and headless sessions. Resumed sessions
 # restore their own saved state; `/vision on|off global` updates this value.
 vision_enabled = true
+
+# UI color mode: auto (default), light, or dark. /theme persists this setting.
+theme = "auto"
 
 # Gate YOLO mode behind this flag so it can't be entered by accident.
 allow_yolo = true
@@ -482,6 +485,48 @@ programmer
 | Mouse scroll | Scroll conversation history |
 | `!<command>` + `Enter` | Run a command interactively in a terminal panel (Ctrl+O releases input) |
 
+### Markdown links
+
+Click a rendered inline HTTP(S) Markdown link in an assistant message to open
+it in your default browser. The underlined project GitHub URL in the welcome
+card is also clickable. Dragging still selects text and never opens a link.
+This works with wrapped/scrolled text and either theme. With `/select on`, mouse
+handling belongs to the terminal instead. Reference links, bare URLs, reasoning
+and tool detail panes are not currently clickable; ambiguous duplicate labels
+are deliberately ignored rather than opening the wrong destination.
+
+### Batch file edits
+
+The `edit_file` tool accepts `replace_all: true` to replace every non-overlapping
+match within the optional `offset`/`limit` range (at least one match is required).
+The default remains a single, unique match. For several changes to one file:
+
+```json
+{
+  "path": "src/example.rs",
+  "edits": [
+    {"old_string": "old_name", "new_string": "new_name", "replace_all": true},
+    {"old_string": "const LIMIT: usize = 10;", "new_string": "const LIMIT: usize = 20;"}
+  ]
+}
+```
+
+Batch entries are applied sequentially in memory, including their line ranges;
+the file is written only after every entry validates. Do not combine `edits`
+with top-level replacement/range fields. Existing read-before-write and
+permission checks still apply.
+
+### Appearance
+
+`/theme light` and `/theme dark` apply immediately, including already-rendered
+Markdown and management panels. `/theme auto` (the default) uses the terminal
+background detected at startup via OSC 11; unsupported queries fall back to dark.
+Detection shares the existing graphics-protocol query with a 500 ms inactivity
+timeout, before the event reader starts. `/theme` reports the setting, effective
+mode; manual overrides are explicitly labeled and only auto reports the detected background. Auto uses the startup result, not live terminal
+appearance notifications; restart after changing your terminal's theme.
+Embedded task terminals retain their own ANSI colors.
+
 ### Slash commands
 
 | Command | Action |
@@ -509,6 +554,7 @@ programmer
 | `/vision <on\|off> [session]` | Enable/disable image input for this session (the default scope) |
 | `/vision <on\|off> global` | Enable/disable image input now and persist the default for new sessions |
 | `/select [on\|off]` | Toggle native terminal text selection and copying |
+| `/theme [auto\|light\|dark]` | Show the effective theme or persist a theme override |
 | `/permission` `/sandbox` | Show sandbox, file protection, and permission status |
 | `/todo` `/t` | Open this session's todo list |
 | `/memory list [global\|project]` | List active persistent memories |

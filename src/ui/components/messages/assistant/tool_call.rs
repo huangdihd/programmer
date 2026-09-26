@@ -87,8 +87,8 @@ impl<'a> ToolCallMessage<'a> {
 
         let status_color = match (failed, output.is_some()) {
             (true, _) => palette::RED,
-            (false, true) => palette::GREEN,
-            (false, false) => palette::YELLOW,
+            (false, true) => crate::ui::theme::role::TOOL_SUCCESS,
+            (false, false) => crate::ui::theme::role::TOOL_PENDING,
         };
         let status_char = if failed { "\u{2717}" } else { "\u{2713}" };
         let accent = Style::new().fg(status_color).add_modifier(Modifier::BOLD);
@@ -530,7 +530,7 @@ mod tests {
 
         assert_eq!(
             color(ToolCallMessage::new(&call, 80).into_text()),
-            Some(palette::YELLOW)
+            Some(crate::ui::theme::role::TOOL_PENDING)
         );
         assert_eq!(
             color(
@@ -538,7 +538,7 @@ mod tests {
                     .output(Some(&output))
                     .into_text()
             ),
-            Some(palette::GREEN)
+            Some(crate::ui::theme::role::TOOL_SUCCESS)
         );
         assert_eq!(
             color(ToolCallMessage::new(&call, 80).failed(true).into_text()),

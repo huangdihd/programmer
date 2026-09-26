@@ -98,6 +98,13 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
                 SelectionEnd::Click { column, row } => {
                     app.conversation_panel.handle_buffer_click(column, row)
                 }
+                SelectionEnd::Link(url) => {
+                    if let Err(error) = crate::ui::components::conversation_panel::links::open(&url)
+                    {
+                        app.conversation_panel
+                            .add_error_string(format!("failed to open link: {error}"));
+                    }
+                }
                 SelectionEnd::Copied(text) => {
                     if !crate::clipboard::copy(&text) {
                         app.conversation_panel

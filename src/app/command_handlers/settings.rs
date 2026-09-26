@@ -22,6 +22,7 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::Model(name) => model(app, name),
         Command::Vision(arg) => vision(app, &arg),
         Command::Select(arg) => select(app, &arg),
+        Command::Theme(arg) => theme(app, &arg),
         Command::Mode(arg) => mode(app, &arg),
         Command::Classifier(arg) => classifier(app, &arg),
         Command::Thinking(arg) => thinking(app, &arg),
@@ -29,6 +30,21 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::Permission(arg) => permission(app, &arg),
         _ => unreachable!("settings handler received a command from another domain"),
     }
+}
+
+fn theme(app: &mut App<'_>, arg: &str) -> CommandOutcome {
+    if !arg.trim().is_empty() {
+        let Some(theme) = crate::ui::theme::Theme::parse(arg) else {
+            app.conversation_panel
+                .add_error_string("usage: /theme [auto|light|dark]");
+            return CommandOutcome::handled(false);
+        };
+        app.config.theme = theme;
+        session::persist_config(app);
+    }
+    app.conversation_panel
+        .add_info_string(app.config.theme.status());
+    CommandOutcome::handled(false)
 }
 
 fn keep_retry(app: &mut App<'_>, arg: &str) -> CommandOutcome {

@@ -1298,6 +1298,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         command @ (Command::Model(_)
         | Command::Vision(_)
         | Command::Select(_)
+        | Command::Theme(_)
         | Command::Mode(_)
         | Command::Classifier(_)
         | Command::Thinking(_)
@@ -1425,6 +1426,7 @@ mod tests {
                 ExpectedCommandEffect::AppendedMessage,
             ),
             ("vision", "/vision", ExpectedCommandEffect::AppendedMessage),
+            ("theme", "/theme", ExpectedCommandEffect::AppendedMessage),
             (
                 "select",
                 "/select invalid",

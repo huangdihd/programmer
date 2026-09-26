@@ -21,6 +21,7 @@ use crate::providers::{ProviderModelState, ProviderModelStatus};
 use crate::tasks::{SidebarTaskSnapshot, TaskStatus};
 use crate::todos::{TodoList, TodoStatus};
 use crate::ui::text::{format_duration_secs, truncate_to_width, wrap_to_width};
+use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -67,7 +68,7 @@ impl Sidebar {
     ) {
         let block = Block::default()
             .borders(Borders::LEFT)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(role::DIVIDER));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -176,7 +177,7 @@ impl Sidebar {
             if rendered_any {
                 lines.push(Line::from(Span::styled(
                     "─".repeat(width as usize),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(role::DIVIDER),
                 )));
                 targets.push(ClickTarget::None);
             }
@@ -409,13 +410,13 @@ impl Sidebar {
         let text = format!(" {arrow} {title}");
 
         let color = match section {
-            SidebarSection::Diagnostics => Color::Red,
-            SidebarSection::Mcp => Color::Magenta,
-            SidebarSection::Providers => Color::Green,
-            SidebarSection::Skills => Color::LightMagenta,
-            SidebarSection::Todos => Color::Yellow,
-            SidebarSection::Tasks => Color::Cyan,
-            SidebarSection::Agents => Color::Blue,
+            SidebarSection::Diagnostics => role::SECTION_DIAGNOSTICS,
+            SidebarSection::Mcp => role::SECTION_MCP,
+            SidebarSection::Providers => role::SECTION_PROVIDERS,
+            SidebarSection::Skills => role::SECTION_SKILLS,
+            SidebarSection::Todos => role::SECTION_TODOS,
+            SidebarSection::Tasks => role::SECTION_TASKS,
+            SidebarSection::Agents => role::SECTION_AGENTS,
         };
 
         let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
@@ -472,7 +473,7 @@ impl Sidebar {
         for name in active_skills {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("●", Style::default().fg(Color::LightMagenta)),
+                Span::styled("●", Style::default().fg(role::SECTION_SKILLS)),
                 Span::raw(" "),
                 Span::styled(name.clone(), Style::default().fg(Color::White)),
             ]));

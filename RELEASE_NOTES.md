@@ -1,3 +1,21 @@
+### programmer v0.2.17
+
+- Add persistent `/theme auto|light|dark` with startup terminal background detection,
+  a complete light palette, matching welcome border, and light completion selection.
+- Open inline HTTP(S) Markdown links and the welcome card's project GitHub link
+  in the default browser; dragging text never activates a link.
+- Add `edit_file` `replace_all` and sequential `edits` batches. Validate the entire
+  batch before writing, preserving the file when any edit fails.
+- Include the reviewed light-theme preview and update usage documentation.
+
+Auto theme detection falls back to dark when unavailable and uses the startup
+result, not live terminal theme notifications. Markdown link activation is
+conservative: unsupported or ambiguous destinations remain inert.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.16...v0.2.17
+
+---
+
 # programmer v0.2.16
 
 v0.2.16 adds background memory consolidation, session-level vision controls,

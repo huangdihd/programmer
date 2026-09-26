@@ -14,12 +14,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::ui::components::input_panel::input_panel::InputPanel;
+use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
-const ACCENT: Color = Color::LightBlue;
 const PASTE_ACCENT: Color = Color::LightMagenta;
 /// Accent while the input is a `!command` (shell mode) — the green of the
 /// terminal panel's grabbed state.
@@ -41,7 +41,7 @@ impl Widget for &InputPanel<'_> {
                 || " Input ".to_string(),
                 |details| format!(" Input — next turn uses compacted context · {details} "),
             );
-            (title, ACCENT, "❯ ")
+            (title, role::FOCUS, "❯ ")
         };
 
         let block = Block::default()

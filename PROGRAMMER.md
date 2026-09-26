@@ -158,7 +158,7 @@ src/
 │   ├── command.rs            #   Shell command execution
 │   ├── read_file.rs          #   Read file with offset/limit
 │   ├── write_file.rs         #   Write/create file (whole-file replacement)
-│   ├── edit_file.rs          #   Substring replacement in file
+│   ├── edit_file.rs          #   Unique/replace-all and validated sequential batch edits
 │   ├── grep.rs               #   Regex search across files
 │   ├── blob.rs               #   File glob (find by name pattern)
 │   ├── ask_user.rs           #   Prompt user for input (yes/no, multi-choice, text)
@@ -178,7 +178,8 @@ src/
     ├── event.rs              #   Event + EventHandler enums
     ├── text.rs               #   Text styling helpers
     ├── markdown_code_block.rs    # Syntax-highlighted code block widget
-    ├── markdown_theme.rs         # Markdown colour palette
+    ├── markdown_theme.rs         # Original dark Markdown colour palette
+    ├── theme.rs                  # auto/light/dark config, detection and final-frame conversion
     ├── tool_details.rs       #   Tool-call detail popup (arguments + output)
     └── components/
         ├── mod.rs
@@ -229,6 +230,8 @@ src/
 - **Error handling:** `color_eyre::Result<T>` throughout; `.wrap_err()` for context; `?` propagation. `thiserror` for library-style error types.
 - **Async:** `#[tokio::main]` on `main()`, `tokio::spawn` for concurrent tasks. All tool execution is async.
 - **Configuration:** `ProgrammerConfig` deserializes from TOML via the `config` crate. Environment variables prefixed with `Programmer` override file values. Config lives at `~/.config/programmer/config.toml`. The optional top-level `soul` value replaces only the identity/mindset section of the developer prompt.
+- **Markdown links:** Assistant inline HTTP(S) links are resolved from original cached paragraph styles by `conversation_panel/links.rs`; stationary clicks launch the browser without a shell. Drags cancel activation; ambiguous labels and unsupported link forms are inert.
+- **UI themes:** `/theme [auto|light|dark]` persists the top-level `theme` setting (default `auto`). Startup OSC 11 background detection shares the ratatui-image query; missing results fall back to dark. `ui/theme.rs` resolves paired semantic UI-role tokens (decorative headings, borders, tool summaries, and status colors are distinct) at frame presentation, leaving cached Markdown styles intact and child terminal colors untouched.
 - **Sessions:** Stored as JSON at `~/.config/programmer/sessions/<uuid>.json`. Each session contains message items, history, the latest input suggestion, todos, and persisted task state.
 - **Module visibility:** `pub(crate)` for internal visibility; `pub` only where needed externally. UI internals are `mod` (private). Tool modules are `pub` within `tools/`.
 - **Tests:** Primarily inline `#[cfg(test)]` modules at the bottom of source files, plus CLI integration tests under `tests/`.
