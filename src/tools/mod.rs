@@ -170,9 +170,7 @@ pub(crate) async fn run_tool_call(
     // successful text or multimodal result, `Err` is a failure. This is the
     // single source of truth for the `failed` flag below.
     let result: Result<FunctionCallOutput, String> = if call.name.starts_with("mcp__") {
-        mcp_bridge::run_mcp_call(call, mcp)
-            .await
-            .map(FunctionCallOutput::Text)
+        mcp_bridge::run_mcp_call(call, mcp).await
     } else if call.name == ask_user::NAME {
         // ask_user needs the UI channel, so it isn't part of run_local_tool.
         ask_user::run(
@@ -410,8 +408,41 @@ fn safe_filename_part(value: &str) -> String {
     }
 }
 
-/// A `Tool::Function` definition with a strict JSON-schema object for parameters.
-/// `required` should list every property name for strict mode to validate.
+/// Generate the object schema accepted by OpenAI-compatible function tools.
+///
+/// `schemars` describes the Rust argument type, while this small compatibility
+/// layer removes metadata that some OpenAI-compatible gateways reject and makes
+/// the closed-object behavior explicit.
+pub(crate) fn parameters_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    let mut schema = serde_json::to_value(schemars::schema_for!(T))
+        .expect("JsonSchema output should always serialize");
+    let object = schema
+        .as_object_mut()
+        .expect("tool argument schemas must be JSON objects");
+    object.remove("$schema");
+    object.insert(
+        "additionalProperties".to_string(),
+        serde_json::Value::Bool(false),
+    );
+    schema
+}
+
+pub(crate) fn function_tool_schema(
+    name: &str,
+    description: &str,
+    parameters: serde_json::Value,
+) -> Tool {
+    use async_openai::types::responses::FunctionTool;
+
+    Tool::Function(FunctionTool {
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        parameters: Some(parameters),
+        strict: Some(false),
+        defer_loading: None,
+    })
+}
+
 fn function_tool(
     name: &str,
     description: &str,
@@ -430,7 +461,7 @@ fn function_tool(
             "required": required,
             "additionalProperties": false,
         })),
-        strict: Some(true),
+        strict: Some(false),
         defer_loading: None,
     })
 }

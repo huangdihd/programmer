@@ -1125,9 +1125,16 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
 
     if matches!(action, "on" | "off") {
         app.config.memory.enabled = action == "on";
+        // The worker reads this on its next wake, so turning memory off also
+        // stops background consolidation rather than only recall.
+        app.refresh_dream_runtime();
         app.conversation_panel
             .add_info_string(format!("Persistent memory {} for this run.", action));
         return command_handlers::CommandOutcome::handled(false);
+    }
+
+    if action == "dream" {
+        return dream_command(app, parts).await;
     }
 
     let arguments = match action {
@@ -1156,35 +1163,21 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
         }),
         _ => {
             app.conversation_panel.add_warning_string(
-                "usage: /memory [list [global|project] | recall <query> | remember <global|project> <kind> <content> | update <id> <content> | forget <id> | on | off]",
+                "usage: /memory [list [global|project] | recall <query> | remember <global|project> <kind> <content> | update <id> <content> | forget <id> | dream [status|preview|apply] [global|project] | on | off]",
             );
             return command_handlers::CommandOutcome::handled(false);
         }
     };
 
     let is_recall = crate::tools::memory::action_is_recall(&arguments.to_string());
-    let memory_model = is_recall.then(|| {
-        let target = app
-            .config
-            .memory_model
-            .as_deref()
-            .unwrap_or(&app.current_model);
-        app.provider_manager.resolve(target).map(|(client, model)| {
-            crate::tools::memory::MemoryModel {
-                client: client.clone(),
-                model,
-            }
-        })
-    });
+    // One resolver for recall, association, and Dream, so all three agree on
+    // which provider/model does memory work.
+    let memory_model = is_recall.then(|| app.effective_memory_model()).flatten();
     if is_recall {
         app.conversation_panel.phase =
             crate::ui::components::conversation_panel::conversation_panel::ActivePhase::Associating;
     }
-    let result = crate::tools::memory::run(
-        &arguments.to_string(),
-        memory_model.as_ref().and_then(Option::as_ref),
-    )
-    .await;
+    let result = crate::tools::memory::run(&arguments.to_string(), memory_model.as_ref()).await;
     if is_recall {
         app.conversation_panel.phase =
             crate::ui::components::conversation_panel::conversation_panel::ActivePhase::None;
@@ -1194,6 +1187,91 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
         Err(error) => app.conversation_panel.add_warning_string(error),
     }
     command_handlers::CommandOutcome::handled(false)
+}
+
+/// `/memory dream [status|preview|apply] [global|project]`.
+///
+/// Kept out of the `memory` tool on purpose: consolidating long-term memory is
+/// a user decision, so the agent can neither see nor invoke it.
+async fn dream_command(
+    app: &mut App<'_>,
+    mut parts: impl Iterator<Item = &str>,
+) -> command_handlers::CommandOutcome {
+    use crate::memory::dream;
+
+    let mode = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or("status");
+    let scope = match parts.next().filter(|part| !part.is_empty()) {
+        Some("global") => Some(crate::memory::MemoryScope::Global),
+        Some("project") => Some(crate::memory::MemoryScope::Project),
+        Some(other) => {
+            app.conversation_panel.add_warning_string(format!(
+                "unknown Dream scope '{other}' — use global or project"
+            ));
+            return command_handlers::CommandOutcome::handled(false);
+        }
+        None => None,
+    };
+    let Ok(manager) = crate::memory::MemoryManager::for_current_dir() else {
+        app.conversation_panel
+            .add_warning_string("error: memory store is unavailable");
+        return command_handlers::CommandOutcome::handled(false);
+    };
+
+    let config = dream::DreamConfig::from(&app.config.memory);
+    let result: Result<String, String> = match mode {
+        "status" => manager.dream_status().map(|(state, queued, preview)| {
+            let mut line = dream::render_status(&state, queued, preview);
+            if !config.enabled {
+                line.push_str(" · automatic Dream is disabled");
+            }
+            line
+        }),
+        "preview" => {
+            // Planning is a real request, so show the phase the same way recall
+            // does and let it be cancelled with Esc.
+            let Some(model) = app.effective_memory_model() else {
+                app.conversation_panel
+                    .add_warning_string("error: Dream preview requires a configured memory model");
+                return command_handlers::CommandOutcome::handled(false);
+            };
+            let model = dream::DreamModel {
+                client: model.client,
+                model: model.model,
+            };
+            app.conversation_panel.phase =
+                crate::ui::components::conversation_panel::conversation_panel::ActivePhase::Associating;
+            let result = model.preview(&manager, &config, scope).await;
+            app.conversation_panel.phase =
+                crate::ui::components::conversation_panel::conversation_panel::ActivePhase::None;
+            result.map(dream_report_line)
+        }
+        "apply" => dream::apply_saved_preview(&manager, scope).map(dream_report_line),
+        other => {
+            app.conversation_panel.add_warning_string(format!(
+                "usage: /memory dream [status|preview|apply] [global|project] \
+                 — '{other}' is not a Dream mode"
+            ));
+            return command_handlers::CommandOutcome::handled(false);
+        }
+    };
+
+    match result {
+        Ok(line) => app.conversation_panel.add_info_string(line),
+        Err(error) => app
+            .conversation_panel
+            .add_warning_string(format!("error: {error}")),
+    }
+    command_handlers::CommandOutcome::handled(false)
+}
+
+fn dream_report_line(report: crate::memory::dream::DreamReport) -> String {
+    format!(
+        "{} (queued={}, operations={}, applied={})",
+        report.message, report.pending, report.operations, report.applied
+    )
 }
 
 /// Parse and execute a slash command. If the command is unknown, fall back

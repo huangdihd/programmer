@@ -459,38 +459,84 @@ fn model(app: &mut App<'_>, model: String) -> CommandOutcome {
     CommandOutcome::handled(true)
 }
 
+const VISION_USAGE: &str = "usage: /vision <on|off> [global|session]";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisionScope {
+    Session,
+    Global,
+}
+
+fn parse_vision_args(arg: &str) -> Result<Option<(bool, VisionScope)>, String> {
+    let normalized = arg.trim().to_ascii_lowercase();
+    let mut parts = normalized.split_whitespace();
+    let Some(state) = parts.next() else {
+        return Ok(None);
+    };
+
+    let enabled = match state {
+        "on" => true,
+        "off" => false,
+        _ => return Err(VISION_USAGE.to_string()),
+    };
+    let scope = match parts.next() {
+        None | Some("session") => VisionScope::Session,
+        Some("global") => VisionScope::Global,
+        Some(_) => return Err(VISION_USAGE.to_string()),
+    };
+    if parts.next().is_some() {
+        return Err(VISION_USAGE.to_string());
+    }
+    Ok(Some((enabled, scope)))
+}
+
 fn vision(app: &mut App<'_>, arg: &str) -> CommandOutcome {
-    match arg.trim().to_ascii_lowercase().as_str() {
-        "on" => {
-            app.vision_enabled = true;
-            app.conversation_panel.add_info_string(
-                "Vision enabled for this session. Reference images with @path.".to_string(),
-            );
+    let Some((enabled, scope)) = (match parse_vision_args(arg) {
+        Ok(setting) => setting,
+        Err(error) => {
+            app.conversation_panel.add_error_string(error);
+            return CommandOutcome::handled(true);
         }
-        "off" => {
-            let count = app.conversation_panel.image_count();
-            app.vision_enabled = false;
-            let suffix = if count == 0 {
-                String::new()
-            } else {
-                format!(
-                    " {count} stored image(s) will be omitted from future requests until vision is enabled again."
-                )
-            };
-            app.conversation_panel
-                .add_info_string(format!("Vision disabled for this session.{suffix}"));
-        }
-        "" => {
-            let state = if app.vision_enabled { "on" } else { "off" };
-            app.conversation_panel.add_info_string(format!(
-                "Vision is {state} for this session. Usage: /vision <on|off>"
-            ));
-        }
-        other => {
-            app.conversation_panel.add_error_string(format!(
-                "unknown vision setting '{other}' — use /vision on or /vision off"
-            ));
-        }
+    }) else {
+        let session_state = if app.vision_enabled { "on" } else { "off" };
+        let global_state = if app.config.vision_enabled {
+            "on"
+        } else {
+            "off"
+        };
+        app.conversation_panel.add_info_string(format!(
+            "Vision is {session_state} for this session; global default is {global_state}. \
+             Usage: /vision <on|off> [global|session]"
+        ));
+        return CommandOutcome::handled(true);
+    };
+
+    app.vision_enabled = enabled;
+    session::mark_dirty(app);
+    if scope == VisionScope::Global {
+        app.config.vision_enabled = enabled;
+        session::persist_config(app);
+    }
+
+    let scope_description = match scope {
+        VisionScope::Session => "for this session",
+        VisionScope::Global => "for this session and by default for new sessions",
+    };
+    if enabled {
+        app.conversation_panel.add_info_string(format!(
+            "Vision enabled {scope_description}. Reference images with @path."
+        ));
+    } else {
+        let count = app.conversation_panel.image_count();
+        let suffix = if count == 0 {
+            String::new()
+        } else {
+            format!(
+                " {count} stored image(s) will be omitted from future requests until vision is enabled again."
+            )
+        };
+        app.conversation_panel
+            .add_info_string(format!("Vision disabled {scope_description}.{suffix}"));
     }
     CommandOutcome::handled(true)
 }
@@ -647,6 +693,25 @@ fn thinking(app: &mut App<'_>, arg: &str) -> CommandOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_parser_defaults_to_session_and_accepts_global_scope() {
+        assert_eq!(parse_vision_args(""), Ok(None));
+        assert_eq!(
+            parse_vision_args("on"),
+            Ok(Some((true, VisionScope::Session)))
+        );
+        assert_eq!(
+            parse_vision_args("off session"),
+            Ok(Some((false, VisionScope::Session)))
+        );
+        assert_eq!(
+            parse_vision_args("ON GLOBAL"),
+            Ok(Some((true, VisionScope::Global)))
+        );
+        assert!(parse_vision_args("on project").is_err());
+        assert!(parse_vision_args("on global extra").is_err());
+    }
 
     #[test]
     fn classifier_top_logprobs_parser_enforces_api_range() {

@@ -67,6 +67,13 @@ Important TUI commands include:
 - `/skill <name>`, `/skill list`, `/skill manage`, and `/skill off` for skills.
 - `/mcp show|manage` for external MCP servers.
 - `/init` and diagnostics tooling for project understanding and checks.
+- `/memory` for inspecting, consolidating, or managing long-term memory:
+  `list`, `recall`, `remember`, `update`, `forget`, `dream`, and `on|off`.
+  `/memory dream` reports the background-consolidation queue, `dream preview`
+  writes a reviewable plan, and `dream apply` commits that plan. `dream` exists
+  only here: the model's `memory` tool does not offer it. While a background
+  consolidation pass runs, the title row shows a `💭` indicator at its right
+  edge.
 - `/todo`, `/terminal`, `/compact`, `/vision`, `/select`, `/session`, `/usage`,
   `/new`, `/clear`, `/help`, and `/quit` for session and UI workflows. `/select`
   temporarily gives mouse drags to the terminal for native text selection and
@@ -84,6 +91,11 @@ completion for the exact controls in the installed version.
 - Project skills: `.programmer/skills/<name>/SKILL.md`.
 - Cross-agent shared skills: `~/.agents/skills/<name>/SKILL.md`.
 - Long tool-output archives: `.programmer/outputs/`.
+- Long-term memory: Markdown entries and their `MEMORY.md` index under
+  `programmer/memory/global/` and `programmer/memory/projects/<workspace-id>/`,
+  next to the Dream queue (`pending/`, `processed/`), its `.dream-state.json`
+  scheduler state, and the cross-process `.dream.lock`. These stay outside the
+  repository.
 - Global configuration, sessions, todos, and skills live below the platform's
   standard application config directory under `programmer/`. On macOS this is
   normally `~/Library/Application Support/programmer/`; on Linux it is normally

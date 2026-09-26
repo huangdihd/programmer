@@ -65,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 Both installers select the release asset for the current OS and architecture.
-Use `--version v0.2.15` with `install.sh`, or `-Version v0.2.15` with
+Use `--version v0.2.16` with `install.sh`, or `-Version v0.2.16` with
 `install.ps1`, to install a specific release.
 
 ## Quick start
@@ -114,7 +114,7 @@ Once installed, Programmer can update or remove its own executable:
 ```sh
 programmer upgrade --check
 programmer upgrade
-programmer upgrade --tag v0.2.15
+programmer upgrade --tag v0.2.16
 programmer uninstall
 programmer uninstall --purge
 ```
@@ -211,6 +211,10 @@ compact_keep_recent_turns = 2
 # user turns. Manual and mandatory compaction bypass this cooldown; 0 disables it.
 auto_compact_cooldown_turns = 5
 
+# Enable image input for new interactive and headless sessions. Resumed sessions
+# restore their own saved state; `/vision on|off global` updates this value.
+vision_enabled = true
+
 # Gate YOLO mode behind this flag so it can't be entered by accident.
 allow_yolo = true
 
@@ -234,6 +238,14 @@ global_enabled = true
 project_enabled = true
 max_global_results = 3
 max_project_results = 8
+# Background consolidation ("Dream"). Completed sessions are queued on exit and
+# consolidated by an in-process worker: after at least this many queued sessions
+# and this many hours since the last pass, a dedicated model proposes memory
+# operations and only high-confidence additions are applied automatically.
+dream_enabled = true
+dream_min_sessions = 5
+dream_min_interval_hours = 24
+dream_timeout_secs = 60
 
 [security]
 enabled = true
@@ -287,6 +299,11 @@ api_key = "sk-your-key-here"
 | `memory.enabled` | `true` | Enable the persistent-memory store, automatic association, and the `memory` tool. |
 | `memory.global_enabled` / `project_enabled` | `true` | Include cross-project preferences and current-project memories when recalling. |
 | `memory.max_global_results` / `max_project_results` | `3` / `8` | Per-scope explicit recall limits. |
+| `memory.dream_enabled` | `true` | Queue completed sessions for background consolidation and run the Dream worker. |
+| `memory.dream_min_sessions` | `5` | Queued sessions required before an automatic Dream pass runs. |
+| `memory.dream_min_interval_hours` | `24` | Minimum hours between automatic Dream passes. |
+| `memory.dream_timeout_secs` | `60` | Timeout for one Dream planning request. |
+| `vision_enabled` | `true` | Enable image input for new interactive and headless sessions. Resumed sessions restore their saved state. |
 | `allow_yolo` | `false` | Whether `/mode yolo` and `Ctrl+T` can reach YOLO mode. |
 | `auto_update_check` | `true` | Check GitHub Releases at startup and show a non-blocking update notice. |
 | `git_coauthor` | `programmer <noreply@programmer.local>` | `Co-Authored-By:` trailer added to the agent's git commits. Use a GitHub-linked email for an avatar; `""` disables. |
@@ -489,7 +506,8 @@ programmer
 | `/compact set tokens <number\|off\|default>` | Set, disable, or inherit automatic compaction for this session |
 | `/compact set keep <number\|default>` | Set or inherit recent-turn retention for this session |
 | `/rewind` | Restore conversation and/or built-in `write_file`/`edit_file` changes to a previous user prompt |
-| `/vision <on\|off>` | Enable/disable `@image` attachments for this session |
+| `/vision <on\|off> [session]` | Enable/disable image input for this session (the default scope) |
+| `/vision <on\|off> global` | Enable/disable image input now and persist the default for new sessions |
 | `/select [on\|off]` | Toggle native terminal text selection and copying |
 | `/permission` `/sandbox` | Show sandbox, file protection, and permission status |
 | `/todo` `/t` | Open this session's todo list |
@@ -498,6 +516,7 @@ programmer
 | `/memory remember <global\|project> <kind> <content>` | Store an explicit stable preference, fact, or decision |
 | `/memory update <id> <content>` | Correct an existing memory |
 | `/memory forget <id>` | Permanently remove a memory |
+| `/memory dream [status\|preview\|apply] [global\|project]` | Show, plan, or apply background consolidation |
 | `/memory <on\|off>` | Enable or disable memory for this run |
 | `/skill <name\|list\|off>` | Activate, list, or clear skills |
 | `/skill manage` | Open the skills management panel |
@@ -569,6 +588,58 @@ returned, so a manual recall counts toward a memory's freshness exactly like an
 automatic one. `memory list`, `update`, and `forget` behave as before, except
 that `list` also shows each entry's age.
 
+### Background consolidation (Dream)
+
+Dream is the part of memory that works while you are not looking at it: it reads
+finished sessions and turns them into durable entries, rather than only storing
+what a single turn or an explicit `remember` happened to capture.
+
+When a session ends — quitting the TUI, `/new`, or a finished `programmer run`
+— its user/assistant transcript, never tool output, images, or Programmer's own
+injected messages, is written to a pending queue kept beside the project's
+memory entries (`programmer/memory/projects/<workspace-id>/pending/`, with
+consumed sessions moved to `processed/`; a very long session is truncated to its
+most recent 12,000 characters, and a transcript that looks like it contains a
+credential is refused outright). An in-process
+worker, started with the TUI and stopped with it, then consolidates that queue
+once both `dream_min_sessions` queued sessions and `dream_min_interval_hours`
+since the last pass have elapsed. There is no cron job, launchd agent, or Task
+Scheduler entry: persistence lives in the queue and in `.dream-state.json`, so
+nothing needs installing and interrupted work simply resumes on the next launch
+(a one-shot `programmer run` only enqueues; the next interactive launch
+consolidates it).
+
+Each pass gives the model the pending transcripts plus the current memory
+manifest and asks for a JSON list of `create`, `update`, `supersede`, and
+`archive` operations. An unattended pass is deliberately conservative: it only
+adds or extends entries the model marked as directly stated or demonstrated in
+the session, and it never merges, supersedes, or archives anything on the
+model's judgement alone. Those changes are proposed as a preview you can read
+and apply:
+
+```
+/memory dream            # status: pending sessions, preview availability, last error
+/memory dream preview    # write an auditable plan without touching memory
+/memory dream apply      # apply that plan, then retire the consumed sessions
+```
+
+`preview` writes `.dream-preview.json` in the project memory directory and
+consumes nothing; `apply` performs no model call at all, so reviewing a plan
+costs one request. Both are slash commands only: `dream` is deliberately absent
+from the `memory` tool the model can call, so an agent can neither inspect the
+queue nor trigger consolidation — and a hand-written tool call naming it is
+refused. A pass that is
+cancelled, times out, or loses its provider keeps its pending sessions for the
+next attempt and records the reason in the status line. All passes take one
+cross-process lock over the memory root, so two Programmer instances, or an
+explicit `apply` racing the background worker, can never interleave their writes;
+memory files and their `MEMORY.md` index are still replaced atomically through a
+temporary file and rename.
+
+While the background worker is consolidating, its title row shows a `💭`
+indicator at the far right, so a pass is never invisible; it disappears as soon
+as the pass finishes.
+
 Saved sessions use an OS-backed per-session lock. If a second Programmer opens
 an in-use conversation, it reports the owning PID and asks whether to fork the
 conversation under a new UUID or exit the later process.
@@ -610,9 +681,14 @@ response. For tool-using responses it waits until all call outputs are recorded,
 then summarizes a stable prefix in the background. Input stays usable and new
 messages remain outside that prefix. Once the summary is installed, the session
 is saved immediately when idle (or at the next safe turn boundary), so reopening
-the conversation reuses the generated summary. The input title announces that
-the next turn will use compacted context; when that turn starts, a marker is
-inserted immediately before its messages. The read-only `conversation_history` tool is
+the conversation reuses the generated summary. When the summary lands while no
+turn is running, the input title announces that the next turn will use compacted
+context, and a marker is inserted immediately before that turn's messages when it
+starts. When it lands inside a running turn — a compaction forced by the
+mandatory limit at a tool boundary — the turn's own next request is already the
+first to use it, so no title is raised and the change is recorded by the
+`context compacted` divider alone; nothing is left above the input to go stale.
+The read-only `conversation_history` tool is
 then exposed to the main agent and its sub-agents, allowing them to search the
 exact pre-compaction items and page through a matching message or tool result
 when the summary omits a needed detail. A stale summary is discarded after
@@ -764,11 +840,16 @@ message; the resume picker and `/session` show that title. Once available, the
 generated title also replaces the project directory name in the terminal window
 title; untitled sessions continue to show the directory name.
 
-With `/vision on`, referencing a local PNG, JPEG, WEBP, or non-animated GIF as
-`@path` attaches it as an image input. `/vision off` stops sending both new and
-historical images without deleting them from the session; turning it back on
-restores them. Other local files are referenced by path only; their contents are
-not copied into the request context.
+Vision defaults to `vision_enabled` from `config.toml` (`true` by default) for
+new interactive and headless sessions. Resumed sessions restore their saved
+state. `/vision on|off` and `/vision on|off session` change only the current
+session; adding `global` also persists the default used by future sessions.
+
+With vision enabled, referencing a local PNG, JPEG, WEBP, or non-animated GIF
+as `@path` attaches it as an image input. Disabling vision stops sending both
+new and historical images without deleting them from the session; turning it
+back on restores them. Other local files are referenced by path only; their
+contents are not copied into the request context.
 
 The agent can inspect a local image itself with the read-only `read_image` tool.
 Its result is sent back to vision-capable models as image content, and expanding

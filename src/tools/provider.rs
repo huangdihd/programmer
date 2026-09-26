@@ -475,9 +475,7 @@ impl ToolProvider for McpToolProvider {
         call: &FunctionToolCall,
         _ctx: &ToolCtx<'_>,
     ) -> Result<FunctionCallOutput, String> {
-        mcp_bridge::run_mcp_call(call, Some(self.manager.as_ref()))
-            .await
-            .map(FunctionCallOutput::Text)
+        mcp_bridge::run_mcp_call(call, Some(self.manager.as_ref())).await
     }
 }
 

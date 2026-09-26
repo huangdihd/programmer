@@ -15,11 +15,10 @@
 
 use std::time::Duration;
 
+use super::{function_tool_schema, parameters_schema};
 use async_openai::types::responses::Tool;
+use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::json;
-
-use super::function_tool;
 
 pub const NAME: &str = "command";
 
@@ -32,7 +31,7 @@ pub fn live_output(call_id: &str) -> Option<String> {
 }
 
 pub fn tool() -> Tool {
-    function_tool(
+    function_tool_schema(
         NAME,
         "Execute a shell command in the user's project directory and return its \
          combined stdout/stderr and exit code. The command runs through the host \
@@ -40,30 +39,11 @@ pub fn tool() -> Tool {
          security policy blocks required work, use request_permission to ask for \
          the exact filesystem access or least-permissive sandbox mode, then retry \
          after approval.",
-        json!({
-            "command": {
-                "type": "string",
-                "description": "The shell command to execute."
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Optional timeout in seconds. Default: 120."
-            },
-            "timeout_action": {
-                "type": "string",
-                "enum": ["kill", "background"],
-                "description": "What to do when timeout elapses: kill the command (default), or keep it running as a background task."
-            },
-            "dir": {
-                "type": "string",
-                "description": "Optional working directory for the command. Default: the project directory."
-            }
-        }),
-        &["command"],
+        parameters_schema::<Args>(),
     )
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct Args {
     command: String,
     #[serde(default)]
@@ -74,7 +54,7 @@ struct Args {
     dir: Option<String>,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum TimeoutAction {
     #[default]
@@ -420,6 +400,7 @@ mod clean_tests {
 #[cfg(test)]
 mod live_tests {
     use super::*;
+    use serde_json::json;
 
     fn long_command() -> &'static str {
         if cfg!(windows) {

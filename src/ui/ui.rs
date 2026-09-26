@@ -441,7 +441,9 @@ impl Widget for &mut App<'_> {
         } else {
             &self.session.title
         };
-        Logo::new(title).render(vert[0], buf);
+        Logo::new(title)
+            .with_dream(self.dream_active.load(std::sync::atomic::Ordering::Relaxed))
+            .render(vert[0], buf);
         let content_area = vert[1];
 
         // ---- sidebar: conditionally split the content area horizontally ----

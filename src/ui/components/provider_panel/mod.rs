@@ -1256,6 +1256,7 @@ mod tests {
             active_security_profile: crate::config::programmer_config::DEFAULT_SECURITY_PROFILE
                 .to_string(),
             git_coauthor: None,
+            vision_enabled: true,
             auto_update_check: true,
             mcp_servers: Vec::new(),
             model: None,

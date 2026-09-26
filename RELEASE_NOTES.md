@@ -1,3 +1,33 @@
+# programmer v0.2.16
+
+v0.2.16 adds background memory consolidation, session-level vision controls,
+and richer, more compatible tool integrations.
+
+## Highlights
+
+- Add Dream background consolidation for completed interactive and headless
+  sessions, with conservative automatic additions and auditable preview/apply
+  workflows for broader memory changes.
+- Add `/vision on|off [session|global]` and a persisted default for controlling
+  image input without discarding stored images.
+- Preserve image content returned by MCP tools as multimodal model input instead
+  of flattening it to text.
+- Generate built-in tool parameter schemas from their Rust argument types and
+  centralize slash-command metadata to keep parsing, help, and completion in
+  sync.
+
+## Safety and reliability
+
+- Keep Dream unavailable to model-invoked memory tools, reject transcripts that
+  appear to contain credentials, serialize cross-process consolidation, and
+  retain queued work after cancellation or provider failures.
+- Respect MCP read-only annotations when deciding whether a tool needs approval,
+  while conservatively classifying tools without an explicit hint.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.15...v0.2.16
+
+---
+
 # programmer v0.2.15
 
 v0.2.15 improves session continuity, streaming responsiveness, and robustness

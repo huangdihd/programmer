@@ -70,7 +70,8 @@ pub enum Command {
     /// `/keepretry [exponential|fixed <duration>]` — immediately retry the
     /// previous model request until success or Escape.
     KeepRetry(String),
-    /// `/vision <on|off>` — enable or disable image attachments for this session.
+    /// `/vision <on|off> [global|session]` — control image attachments for this
+    /// session and optionally persist the default for new sessions.
     Vision(String),
     /// `/select [on|off]` — toggle native terminal text selection and copying.
     Select(String),
@@ -334,12 +335,12 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         name: "memory",
         aliases: &[],
         completion: CompletionKind::Fixed(&[
-            "list", "recall", "remember", "update", "forget", "on", "off",
+            "list", "recall", "remember", "update", "forget", "dream", "on", "off",
         ]),
         help: &[HelpEntry {
             order: 34,
-            usage: "/memory <list|recall|remember|update|forget|on|off>",
-            description: "Inspect or manage persistent memory",
+            usage: "/memory <list|recall|remember|update|forget|dream|on|off>",
+            description: "Inspect, consolidate, or manage persistent memory",
         }],
     },
     CommandSpec {
@@ -469,11 +470,11 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         kind: CommandKind::Vision,
         name: "vision",
         aliases: &[],
-        completion: CompletionKind::Fixed(&["on", "off"]),
+        completion: CompletionKind::Fixed(&["on", "off", "global", "session"]),
         help: &[HelpEntry {
             order: 17,
-            usage: "/vision <on|off>",
-            description: "Enable or disable image attachments for this session",
+            usage: "/vision <on|off> [global|session]",
+            description: "Control image attachments for this session or globally",
         }],
     },
     CommandSpec {
@@ -1801,8 +1802,8 @@ mod tests {
                 "Retry the previous model request until success; Esc cancels",
             ),
             (
-                "/vision <on|off>",
-                "Enable or disable image attachments for this session",
+                "/vision <on|off> [global|session]",
+                "Control image attachments for this session or globally",
             ),
             (
                 "/select [on|off]",
@@ -1848,8 +1849,8 @@ mod tests {
             ("/quit | /q", "Exit the application"),
             ("/help | /?", "Show this help"),
             (
-                "/memory <list|recall|remember|update|forget|on|off>",
-                "Inspect or manage persistent memory",
+                "/memory <list|recall|remember|update|forget|dream|on|off>",
+                "Inspect, consolidate, or manage persistent memory",
             ),
         ];
         assert_eq!(Command::descriptions(), expected);
