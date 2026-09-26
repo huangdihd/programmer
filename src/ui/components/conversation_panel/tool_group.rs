@@ -577,9 +577,9 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
     let color = if failed > 0 {
         palette::RED
     } else if completed == members.len() {
-        palette::GREEN
+        crate::ui::theme::role::TOOL_SUCCESS
     } else {
-        palette::YELLOW
+        crate::ui::theme::role::TOOL_PENDING
     };
     let arrow = if expanded { "\u{25BE}" } else { "\u{25B8}" };
     let muted = Style::new().fg(palette::MUTED);

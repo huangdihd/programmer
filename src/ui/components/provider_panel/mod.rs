@@ -1237,6 +1237,7 @@ mod tests {
         }
         ProgrammerConfig {
             soul: None,
+            theme: Default::default(),
             default_provider: names.first().unwrap_or(&"").to_string(),
             providers,
             classifier_model: None,

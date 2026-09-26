@@ -369,6 +369,8 @@ pub enum SelectionEnd {
     Click { column: u16, row: u16 },
     /// A drag selection finished; contains the selected text.
     Copied(String),
+    /// A safe Markdown destination captured at button-down.
+    Link(String),
 }
 
 #[derive(Debug, Default)]
@@ -520,6 +522,7 @@ pub struct ConversationPanel {
     /// after the pointer reaches an edge lets timer ticks continue auto-scroll
     /// even though terminals only emit another drag event when the mouse moves.
     selection_drag_position: Option<(u16, u16)>,
+    pressed_link: Option<String>,
     /// The streaming items' paragraphs from the last render (paragraph, height,
     /// copy buttons). Exploring-group entries are moved forward unchanged on a
     /// cache hit; all entries are also kept for selection and copy-button clicks.
@@ -614,6 +617,7 @@ impl ConversationPanel {
             live_expanded_groups: HashSet::new(),
             selection: None,
             selection_drag_position: None,
+            pressed_link: None,
             live_paragraphs: Vec::new(),
             live_group_headers: Vec::new(),
             live_render_cache: None,
@@ -811,9 +815,82 @@ impl ConversationPanel {
         ))
     }
 
+    /// Resolve against the cached, unthemed paragraph, not the screen buffer.
+    /// This preserves wrap geometry even when the first link row is scrolled off
+    /// screen. Supports the welcome project URL and assistant Markdown messages.
+    fn link_at(&self, x: u16, y: u16) -> Option<String> {
+        let welcome = WelcomeMessage;
+        if y < welcome.line_count(self.render_cache.width) {
+            return welcome
+                .link_at(self.render_cache.width, x, y)
+                .map(str::to_owned);
+        }
+        let history = self
+            .item_layout
+            .iter()
+            .find(|(_, top, bottom)| y >= *top && y < *bottom);
+        let (paragraph, height, top, source) = if let Some(&(index, top, bottom)) = history {
+            let entry = self.render_cache.entries.get(index)?;
+            if entry.lazy || entry.hidden || entry.tool_group.is_some() {
+                return None;
+            }
+            let conversation = self.conversation.lock().ok()?;
+            let MessageItem::Output(OutputItem::Message(message)) =
+                conversation.items.get(index)?
+            else {
+                return None;
+            };
+            (
+                &entry.paragraph,
+                bottom - top,
+                top,
+                crate::ui::components::messages::assistant::text::markdown_source(message),
+            )
+        } else {
+            let &(index, top, bottom) = self
+                .live_item_layout
+                .iter()
+                .find(|(_, top, bottom)| y >= *top && y < *bottom)?;
+            if self.live_group_headers.get(index)?.is_some() {
+                return None;
+            }
+            let items = self.receiving_response.as_ref()?.message_item_refs();
+            let (OutputItem::Message(message), _) = items.get(index)? else {
+                return None;
+            };
+            (
+                &self.live_paragraphs.get(index)?.0,
+                bottom - top,
+                top,
+                crate::ui::components::messages::assistant::text::markdown_source(message),
+            )
+        };
+        if !source.contains("](") {
+            return None;
+        }
+        let width = self.render_cache.width;
+        // Bound click-time allocation; enormous messages remain selectable.
+        if usize::from(width) * usize::from(height) > 1_000_000 {
+            return None;
+        }
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        match paragraph {
+            LiveParagraphContent::Paragraph(paragraph) => {
+                paragraph.as_ref().render(buffer.area, &mut buffer)
+            }
+            LiveParagraphContent::Incremental(paragraph) => {
+                paragraph.render(buffer.area, &mut buffer, 0)
+            }
+        }
+        super::links::hit(&source, &buffer, x, y - top)
+    }
+
     /// Left button pressed: start a potential selection at this point.
     pub fn selection_begin(&mut self, column: u16, row: u16) {
         self.selection_drag_position = None;
+        self.pressed_link = self
+            .to_buffer_pos(column, row, false)
+            .and_then(|(x, y)| self.link_at(x, y));
         self.selection = self.to_buffer_pos(column, row, false).map(|pos| Selection {
             anchor: pos,
             head: pos,
@@ -824,6 +901,10 @@ impl ConversationPanel {
 
     /// Mouse dragged with the left button held: extend the selection.
     pub fn selection_drag(&mut self, column: u16, row: u16) {
+        self.pressed_link = None;
+        if let Some(selection) = self.selection.as_mut() {
+            selection.dragging = true;
+        }
         self.selection_drag_position = self.selection.as_ref().map(|_| (column, row));
         // Auto-scroll when dragging against the top/bottom edge so the
         // selection can extend past the visible window. The terminal clamps the
@@ -883,6 +964,9 @@ impl ConversationPanel {
         {
             self.selection = None;
             self.selection_drag_position = None;
+            if let Some(url) = self.pressed_link.take() {
+                return SelectionEnd::Link(url);
+            }
             return SelectionEnd::Click {
                 column: sel.anchor.0,
                 row: sel.anchor.1,
@@ -892,7 +976,7 @@ impl ConversationPanel {
         self.selection_drag_position = None;
         match self.selection {
             None => SelectionEnd::Ignored,
-            Some(sel) if !sel.dragging || sel.anchor == sel.head => {
+            Some(sel) if !sel.dragging => {
                 self.selection = None;
                 SelectionEnd::Click {
                     column: sel.anchor.0,
@@ -1917,6 +2001,28 @@ mod tests {
         panel.handle_buffer_click(column, row);
         assert!(panel.expanded_items.contains(&7));
         assert!(!panel.expanded_items.contains(&9));
+    }
+
+    #[test]
+    fn drag_back_to_anchor_never_opens_a_link_or_clicks() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(0, 0, 40, 10);
+        panel.selection_begin(3, 4);
+        panel.pressed_link = Some("https://example.test/".into());
+        panel.selection_drag(8, 4);
+        assert!(matches!(panel.selection_end(3, 4), SelectionEnd::Copied(_)));
+    }
+
+    #[test]
+    fn stationary_link_keeps_the_pressed_destination_during_streaming() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(0, 0, 40, 10);
+        panel.selection_begin(3, 4);
+        panel.pressed_link = Some("https://example.test/".into());
+        panel.view_offset = 20;
+        assert!(
+            matches!(panel.selection_end(3, 4), SelectionEnd::Link(url) if url == "https://example.test/")
+        );
     }
 
     #[test]

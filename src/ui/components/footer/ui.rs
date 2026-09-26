@@ -16,6 +16,7 @@
 use super::footer::Footer;
 use crate::classifier::WorkMode;
 use crate::security::SandboxMode;
+use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -23,7 +24,6 @@ use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
 const DIM: Color = Color::DarkGray;
-const ACCENT: Color = Color::LightBlue;
 
 impl Widget for &Footer {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -102,7 +102,7 @@ impl Widget for &Footer {
         // Model name and thinking level
         if !model_text.is_empty() {
             ratatui::widgets::Paragraph::new(model_text)
-                .style(Style::default().fg(ACCENT))
+                .style(Style::default().fg(role::SUBTLE))
                 .render(chunks[3], buf);
         }
 

@@ -328,6 +328,18 @@ impl App<'_> {
 
 impl Widget for &mut App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let theme = self.config.theme;
+        let terminal_pane = self.terminal_pane.is_some();
+        self.render_content(area, buf);
+        // A child terminal owns its ANSI colors, not the application's theme.
+        if !terminal_pane {
+            crate::ui::theme::apply(theme, area, buf);
+        }
+    }
+}
+
+impl App<'_> {
+    fn render_content(&mut self, area: Rect, buf: &mut Buffer) {
         if let Some(panel) = &self.provider_panel {
             panel.render(&self.config, &self.provider_manager, area, buf);
             return;

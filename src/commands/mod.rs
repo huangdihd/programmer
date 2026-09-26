@@ -75,6 +75,8 @@ pub enum Command {
     Vision(String),
     /// `/select [on|off]` — toggle native terminal text selection and copying.
     Select(String),
+    /// `/theme [auto|light|dark]` — show or persist the UI theme.
+    Theme(String),
     /// `/permission` (or `/sandbox`) — inspect or configure mandatory
     /// filesystem and process isolation.
     Permission(String),
@@ -107,6 +109,7 @@ enum CommandKind {
     KeepRetry,
     Vision,
     Select,
+    Theme,
     Permission,
 }
 
@@ -185,6 +188,7 @@ impl CommandKind {
             Self::KeepRetry => Command::KeepRetry(args),
             Self::Vision => Command::Vision(args),
             Self::Select => Command::Select(args),
+            Self::Theme => Command::Theme(args),
             Self::Permission => Command::Permission(args),
         }
     }
@@ -197,6 +201,17 @@ impl CommandSpec {
 }
 
 const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        kind: CommandKind::Theme,
+        name: "theme",
+        aliases: &[],
+        completion: CompletionKind::Fixed(&["auto", "light", "dark"]),
+        help: &[HelpEntry {
+            order: 35,
+            usage: "/theme [auto|light|dark]",
+            description: "Show or persist the UI theme (auto follows terminal background)",
+        }],
+    },
     CommandSpec {
         kind: CommandKind::Model,
         name: "model",
@@ -1675,6 +1690,25 @@ mod tests {
     }
 
     #[test]
+    fn theme_command_parses_and_completes() {
+        assert_eq!(
+            Command::parse("/theme light"),
+            Some(Command::Theme("light".into()))
+        );
+        assert_eq!(
+            Command::parse("/theme"),
+            Some(Command::Theme(String::new()))
+        );
+        let spec = COMMAND_SPECS.iter().find(|s| s.name == "theme").unwrap();
+        let CompletionKind::Fixed(values) = spec.completion else {
+            panic!("fixed completion")
+        };
+        assert_eq!(values, &["auto", "light", "dark"]);
+        let state = CompletionEngine::complete_subcommand("theme l", "theme", values).unwrap();
+        assert_eq!(state.candidates[0].value, "light");
+    }
+
+    #[test]
     fn select_command_parses_and_completes_explicit_states() {
         assert_eq!(
             Command::parse("/select on"),
@@ -1696,6 +1730,7 @@ mod tests {
     #[test]
     fn command_catalog_preserves_names_aliases_and_argument_parsing() {
         let expected_names = [
+            "theme",
             "model",
             "new",
             "providers",
@@ -1851,6 +1886,10 @@ mod tests {
             (
                 "/memory <list|recall|remember|update|forget|dream|on|off>",
                 "Inspect, consolidate, or manage persistent memory",
+            ),
+            (
+                "/theme [auto|light|dark]",
+                "Show or persist the UI theme (auto follows terminal background)",
             ),
         ];
         assert_eq!(Command::descriptions(), expected);

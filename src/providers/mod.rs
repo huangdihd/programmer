@@ -353,6 +353,7 @@ mod tests {
         );
         let config = ProgrammerConfig {
             soul: None,
+            theme: Default::default(),
             default_provider: "offline".to_string(),
             providers,
             classifier_model: None,

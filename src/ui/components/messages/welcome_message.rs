@@ -13,17 +13,18 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 
-const ACCENT: Color = Color::LightBlue;
 const DIM: Color = Color::Gray;
 const TEXT: Color = Color::White;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const PROJECT_URL: &str = "https://github.com/huangdihd/programmer";
 
 #[derive(Debug, Clone, Default)]
 pub struct WelcomeMessage;
@@ -42,6 +43,21 @@ impl Widget for &WelcomeMessage {
 }
 
 impl WelcomeMessage {
+    /// Hit-test the actually rendered URL, including centering and clipping.
+    pub(crate) fn link_at(&self, width: u16, x: u16, y: u16) -> Option<&'static str> {
+        let height = self.line_count(width);
+        if x >= width || y >= height || usize::from(width) * usize::from(height) > 1_000_000 {
+            return None;
+        }
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        self.render(buffer.area, &mut buffer);
+        let cell = &buffer[(x, y)];
+        (cell.fg == role::FOCUS
+            && cell.modifier.contains(Modifier::UNDERLINED)
+            && !cell.symbol().trim().is_empty())
+        .then_some(PROJECT_URL)
+    }
+
     pub fn line_count(&self, total_width: u16) -> u16 {
         let dummy = Rect::new(0, 0, total_width, u16::MAX);
         let inner = self.block().inner(dummy);
@@ -60,10 +76,14 @@ impl WelcomeMessage {
     fn block(&self) -> Block<'static> {
         Block::default()
             .title(format!(" programmer v{} ", VERSION))
-            .title_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+            .title_style(
+                Style::default()
+                    .fg(role::HEADING)
+                    .add_modifier(Modifier::BOLD),
+            )
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT))
+            .border_style(Style::default().fg(role::BORDER))
     }
 
     fn split_columns(inner: Rect) -> std::rc::Rc<[Rect]> {
@@ -88,9 +108,9 @@ impl WelcomeMessage {
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(Span::styled(" ▄▄▄▄▄▄ ", Style::default().fg(ACCENT))),
-            Line::from(Span::styled(" █ ▀▀ █ ", Style::default().fg(ACCENT))),
-            Line::from(Span::styled(" ▀▄▄▄▄▀ ", Style::default().fg(ACCENT))),
+            Line::from(Span::styled(" ▄▄▄▄▄▄ ", Style::default().fg(role::LOGO))),
+            Line::from(Span::styled(" █ ▀▀ █ ", Style::default().fg(role::LOGO))),
+            Line::from(Span::styled(" ▀▄▄▄▄▀ ", Style::default().fg(role::LOGO))),
             Line::from(""),
             Line::from(Span::styled(
                 "A coding agent written in rust",
@@ -98,8 +118,10 @@ impl WelcomeMessage {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "https://github.com/huangdihd/programmer",
-                Style::default().fg(ACCENT),
+                PROJECT_URL,
+                Style::default()
+                    .fg(role::FOCUS)
+                    .add_modifier(Modifier::UNDERLINED),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -114,36 +136,40 @@ impl WelcomeMessage {
             Line::from(""),
             Line::from(Span::styled(
                 "Keyboard shortcuts",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(role::HEADING)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(vec![
-                Span::styled("  Enter", Style::default().fg(ACCENT)),
+                Span::styled("  Enter", Style::default().fg(role::HEADING)),
                 Span::styled("          Send message", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  Alt+Enter", Style::default().fg(ACCENT)),
+                Span::styled("  Alt+Enter", Style::default().fg(role::HEADING)),
                 Span::styled("      Insert newline", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  Ctrl+T", Style::default().fg(ACCENT)),
+                Span::styled("  Ctrl+T", Style::default().fg(role::HEADING)),
                 Span::styled("         Cycle work mode", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  Ctrl+B", Style::default().fg(ACCENT)),
+                Span::styled("  Ctrl+B", Style::default().fg(role::HEADING)),
                 Span::styled("         Toggle sidebar", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  Ctrl+C", Style::default().fg(ACCENT)),
+                Span::styled("  Ctrl+C", Style::default().fg(role::HEADING)),
                 Span::styled("         Quit", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  Scroll", Style::default().fg(ACCENT)),
+                Span::styled("  Scroll", Style::default().fg(role::HEADING)),
                 Span::styled("         Scroll conversation", Style::default().fg(TEXT)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
                 "Quote",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(role::HEADING)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "Initially, computer means a person who computes.",
@@ -167,11 +193,42 @@ impl WelcomeMessage {
 
         Block::default()
             .borders(Borders::LEFT)
-            .border_style(Style::default().fg(DIM))
+            .border_style(Style::default().fg(role::WELCOME_DIVIDER))
             .render(chunks[0], buf);
 
         Paragraph::new(self.right_content())
             .wrap(Wrap { trim: true })
             .render(chunks[1], buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_url_hit_test_matches_visible_cells_at_different_widths() {
+        for width in [40, 100, 200] {
+            let welcome = WelcomeMessage;
+            let height = welcome.line_count(width);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+            (&welcome).render(buffer.area, &mut buffer);
+            let mut hits = 0;
+            for y in 0..height {
+                for x in 0..width {
+                    let cell = &buffer[(x, y)];
+                    let expected = cell.modifier.contains(Modifier::UNDERLINED)
+                        && !cell.symbol().trim().is_empty();
+                    assert_eq!(welcome.link_at(width, x, y).is_some(), expected);
+                    if expected {
+                        assert_eq!(welcome.link_at(width, x, y), Some(PROJECT_URL));
+                        hits += 1;
+                    }
+                }
+            }
+            assert!(hits > 0);
+            assert_eq!(welcome.link_at(width, width, 0), None);
+            assert_eq!(welcome.link_at(width, 0, height), None);
+        }
     }
 }

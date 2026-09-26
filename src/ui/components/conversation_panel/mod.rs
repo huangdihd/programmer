@@ -15,6 +15,7 @@
 
 #[allow(clippy::module_inception)]
 pub mod conversation_panel;
+pub(crate) mod links;
 pub(crate) mod live_markdown;
 pub(crate) mod tool_group;
 pub mod ui;

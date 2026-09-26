@@ -78,6 +78,8 @@ pub struct ProgrammerConfig {
     /// developer prompt. When absent, the built-in identity is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soul: Option<String>,
+    /// UI color mode; auto detects the terminal background at startup.
+    pub theme: crate::ui::theme::Theme,
     /// The provider to use when none is specified in the model string.
     pub default_provider: String,
     /// All configured providers, keyed by name.
@@ -254,6 +256,7 @@ impl Default for ProgrammerConfig {
         let security = crate::security::SecurityConfig::default();
         ProgrammerConfig {
             soul: None,
+            theme: crate::ui::theme::Theme::Auto,
             default_provider: "openai".to_string(),
             providers,
             classifier_model: None,
@@ -385,6 +388,20 @@ impl ProgrammerConfig {
 mod tests {
     use super::*;
     use crate::mcp::types::McpServerConfig;
+
+    #[test]
+    fn theme_defaults_to_auto_and_round_trips() {
+        let defaults: ProgrammerConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.theme, crate::ui::theme::Theme::Auto);
+        for name in ["auto", "light", "dark"] {
+            let config: ProgrammerConfig = toml::from_str(&format!("theme = \"{name}\"")).unwrap();
+            assert_eq!(config.theme.label(), name);
+            let parsed: ProgrammerConfig =
+                toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(parsed.theme, config.theme);
+        }
+        assert!(toml::from_str::<ProgrammerConfig>("theme = \"invalid\"").is_err());
+    }
 
     #[test]
     fn vision_defaults_to_enabled_and_round_trips() {

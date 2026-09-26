@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::CompletionPopup;
+use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -21,7 +22,6 @@ use ratatui::widgets::{Clear, List, ListItem, Widget};
 
 const BG: Color = Color::Rgb(30, 30, 40);
 const FG: Color = Color::White;
-const ACCENT: Color = Color::LightBlue;
 
 impl<T> Widget for &CompletionPopup<'_, T> {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -53,7 +53,9 @@ impl<T> Widget for &CompletionPopup<'_, T> {
             .take(visible_height)
             .map(|(i, candidate)| {
                 let style = if i == self.selected {
-                    Style::default().fg(Color::Black).bg(ACCENT)
+                    Style::default()
+                        .fg(role::SELECTION_TEXT)
+                        .bg(role::SELECTION_BG)
                 } else {
                     Style::default().fg(FG).bg(BG)
                 };
@@ -62,5 +64,37 @@ impl<T> Widget for &CompletionPopup<'_, T> {
             .collect();
 
         List::new(items).render(inner, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::theme::{self, Theme};
+
+    #[test]
+    fn selected_row_is_filled_edge_to_edge_in_both_themes() {
+        let candidates = ["auto", "light", "dark"];
+        let popup = CompletionPopup {
+            candidates: &candidates,
+            label: |value| *value,
+            selected: 0,
+            scroll_offset: 0,
+        };
+        let area = Rect::new(2, 1, 12, 3);
+        for mode in [Theme::Light, Theme::Dark] {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 18, 5));
+            (&popup).render(area, &mut buffer);
+            theme::apply(mode, buffer.area, &mut buffer);
+            let (fg, bg) = if mode == Theme::Light {
+                (Color::Rgb(56, 58, 66), Color::Rgb(225, 235, 253))
+            } else {
+                (Color::Black, Color::LightBlue)
+            };
+            for x in area.x..area.right() {
+                assert_eq!(buffer[(x, area.y)].bg, bg);
+                assert_eq!(buffer[(x, area.y)].fg, fg);
+            }
+        }
     }
 }
