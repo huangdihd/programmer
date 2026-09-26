@@ -26,6 +26,8 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod dream;
+
 const SCHEMA_VERSION: u32 = 1;
 
 /// Structured L1 working state persisted alongside a compacted conversation.
@@ -178,6 +180,7 @@ impl MemoryKind {
 pub(crate) enum MemorySource {
     ExplicitUser,
     AgentTool,
+    Dream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,9 +215,18 @@ pub(crate) struct MemoryEntry {
     pub(crate) id: String,
     pub(crate) scope: MemoryScope,
     pub(crate) kind: MemoryKind,
+    /// Stable, model-generated retrieval name. Older entries derive this from
+    /// their kind until Dream next updates them.
+    #[serde(default)]
+    pub(crate) name: String,
+    /// Short manifest text shown to the association model.
+    #[serde(default)]
+    pub(crate) description: String,
     pub(crate) content: String,
     #[serde(default)]
     pub(crate) tags: Vec<String>,
+    #[serde(default)]
+    pub(crate) related_memories: Vec<String>,
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
     #[serde(default)]
@@ -314,8 +326,11 @@ impl MemoryManager {
             id: format!("mem_{}", uuid::Uuid::new_v4().simple()),
             scope,
             kind,
+            name: fallback_name(kind, &content),
+            description: fallback_description(&content),
             content,
             tags: normalize_tags(tags),
+            related_memories: Vec::new(),
             created_at: now,
             updated_at: now,
             last_used_at: None,
@@ -497,10 +512,10 @@ impl MemoryManager {
                             .and_then(|s| s.split_once(" -->\n"))
                             .map(|x| x.0)
                         {
-                            entries.push(
-                                serde_json::from_str(metadata)
-                                    .map_err(|e| format!("parse {}: {e}", p.display()))?,
-                            );
+                            let mut entry: MemoryEntry = serde_json::from_str(metadata)
+                                .map_err(|e| format!("parse {}: {e}", p.display()))?;
+                            normalize_legacy_entry(&mut entry);
+                            entries.push(entry);
                         }
                     }
                 }
@@ -514,10 +529,13 @@ impl MemoryManager {
         // One-time, lossless migration from the legacy JSON store.
         let old = self.path(scope);
         if old.exists() {
-            let file: MemoryFile = serde_json::from_slice(
+            let mut file: MemoryFile = serde_json::from_slice(
                 &std::fs::read(old).map_err(|e| format!("read {}: {e}", old.display()))?,
             )
             .map_err(|e| format!("parse {}: {e}", old.display()))?;
+            for entry in &mut file.entries {
+                normalize_legacy_entry(entry);
+            }
             self.save(scope, &file)?;
             return Ok(file);
         }
@@ -532,21 +550,19 @@ impl MemoryManager {
             let name = format!("{}.md", entry.id);
             let json =
                 serde_json::to_string(entry).map_err(|e| format!("serialize memory: {e}"))?;
-            std::fs::write(
-                dir.join(&name),
-                format!(
-                    "<!-- {json} -->\n# {}\n\n{}\n",
-                    entry.kind.label(),
-                    entry.content
+            atomic_write_text(
+                &dir.join(&name),
+                &format!(
+                    "<!-- {json} -->\n# {}\n\n{}\n\n{}\n",
+                    entry.name, entry.description, entry.content
                 ),
-            )
-            .map_err(|e| format!("write memory: {e}"))?;
+            )?;
             index.push_str(&format!(
-                "- {name} {}\n",
-                entry.content.lines().next().unwrap_or("")
+                "- {name} {} — {}\n",
+                entry.name, entry.description
             ));
         }
-        std::fs::write(dir.join("MEMORY.md"), index).map_err(|e| format!("write index: {e}"))
+        atomic_write_text(&dir.join("MEMORY.md"), &index)
     }
 
     fn workspace_path(&self, scope: MemoryScope) -> Option<String> {
@@ -563,6 +579,69 @@ fn workspace_root(working_dir: &Path) -> PathBuf {
         .find(|ancestor| ancestor.join(".git").exists())
         .unwrap_or(&canonical)
         .to_path_buf()
+}
+
+fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("memory"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)
+            .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+        file.write_all(content.as_bytes())
+            .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+        std::fs::rename(&temporary, path).map_err(|error| {
+            format!(
+                "replace {} with {}: {error}",
+                path.display(),
+                temporary.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn normalize_legacy_entry(entry: &mut MemoryEntry) {
+    if entry.name.trim().is_empty() {
+        entry.name = fallback_name(entry.kind, &entry.content);
+    }
+    if entry.description.trim().is_empty() {
+        entry.description = fallback_description(&entry.content);
+    }
+}
+
+fn fallback_name(kind: MemoryKind, content: &str) -> String {
+    let slug = content
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_ascii_lowercase();
+    if slug.is_empty() {
+        kind.label().to_string()
+    } else {
+        format!("{}-{slug}", kind.label().replace('_', "-"))
+    }
+}
+
+fn fallback_description(content: &str) -> String {
+    let first_line = content.lines().next().unwrap_or(content).trim();
+    first_line.chars().take(240).collect()
 }
 
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
@@ -582,7 +661,14 @@ fn validate_content(content: &str) -> Result<(), String> {
     if trimmed.chars().count() > 2_000 {
         return Err("memory content exceeds the 2000 character limit".to_string());
     }
-    let lower = trimmed.to_ascii_lowercase();
+    if content_looks_sensitive(trimmed) {
+        return Err("memory content appears to contain a credential or secret".to_string());
+    }
+    Ok(())
+}
+
+fn content_looks_sensitive(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
     let sensitive_markers = [
         "-----begin private key-----",
         "-----begin rsa private key-----",
@@ -592,14 +678,10 @@ fn validate_content(content: &str) -> Result<(), String> {
         "password=",
         "secret_access_key",
     ];
-    if sensitive_markers
+    sensitive_markers
         .iter()
         .any(|marker| lower.contains(marker))
         || lower.split_whitespace().any(looks_like_secret_token)
-    {
-        return Err("memory content appears to contain a credential or secret".to_string());
-    }
-    Ok(())
 }
 
 fn looks_like_secret_token(token: &str) -> bool {
@@ -841,8 +923,11 @@ mod tests {
             id: "mem_test".into(),
             scope: MemoryScope::Project,
             kind,
+            name: "session-storage".into(),
+            description: "How sessions are stored".into(),
             content: "Store sessions as JSON".into(),
             tags: Vec::new(),
+            related_memories: Vec::new(),
             created_at,
             updated_at: created_at,
             last_used_at: None,

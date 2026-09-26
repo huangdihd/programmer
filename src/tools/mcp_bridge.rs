@@ -21,9 +21,12 @@
 //! tools. Execution side: [`run_mcp_call`] routes a call with an `mcp__`
 //! prefix to the right server and operation.
 
-use async_openai::types::responses::{FunctionToolCall, Tool};
+use async_openai::types::responses::{
+    FunctionCallOutput, FunctionToolCall, InputContent, InputTextContent, Tool,
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-use crate::mcp::McpManager;
+use crate::mcp::{McpManager, types::ToolContent};
 
 // ---------------------------------------------------------------------------
 // Discovery: MCP → tool definitions
@@ -165,18 +168,22 @@ fn tool_name(tool: &Tool) -> Option<&str> {
 pub(crate) async fn run_mcp_call(
     call: &FunctionToolCall,
     mcp: Option<&McpManager>,
-) -> Result<String, String> {
+) -> Result<FunctionCallOutput, String> {
     let Some(mgr) = mcp else {
         return Err("error: MCP not available (no servers connected)".to_string());
     };
     if let Some(server) = suffixed_server(&call.name, "__resources_list") {
-        resources_list(mgr, server)
+        resources_list(mgr, server).map(FunctionCallOutput::Text)
     } else if let Some(server) = suffixed_server(&call.name, "__resources_read") {
-        resources_read(mgr, server, &call.arguments).await
+        resources_read(mgr, server, &call.arguments)
+            .await
+            .map(FunctionCallOutput::Text)
     } else if let Some(server) = suffixed_server(&call.name, "__prompts_list") {
-        prompts_list(mgr, server)
+        prompts_list(mgr, server).map(FunctionCallOutput::Text)
     } else if let Some(server) = suffixed_server(&call.name, "__prompts_get") {
-        prompts_get(mgr, server, &call.arguments).await
+        prompts_get(mgr, server, &call.arguments)
+            .await
+            .map(FunctionCallOutput::Text)
     } else {
         call_tool(mgr, &call.name, &call.arguments).await
     }
@@ -328,7 +335,11 @@ async fn prompts_get(mgr: &McpManager, server: &str, arguments: &str) -> Result<
     }
 }
 
-async fn call_tool(mgr: &McpManager, fqn: &str, arguments: &str) -> Result<String, String> {
+async fn call_tool(
+    mgr: &McpManager,
+    fqn: &str,
+    arguments: &str,
+) -> Result<FunctionCallOutput, String> {
     match mgr
         .call_tool(
             fqn,
@@ -336,17 +347,52 @@ async fn call_tool(mgr: &McpManager, fqn: &str, arguments: &str) -> Result<Strin
         )
         .await
     {
-        Ok(result) => Ok(result
-            .content
-            .iter()
-            .map(|c| match c {
-                crate::mcp::types::ToolContent::Text { text } => text.clone(),
-                _ => "[non-text MCP content]".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")),
+        Ok(result) => tool_content_output(&result.content),
         Err(e) => Err(format!("error: MCP tool call failed: {e}")),
     }
+}
+
+fn tool_content_output(content: &[ToolContent]) -> Result<FunctionCallOutput, String> {
+    if !content
+        .iter()
+        .any(|part| matches!(part, ToolContent::Image { .. }))
+    {
+        return Ok(FunctionCallOutput::Text(
+            content
+                .iter()
+                .map(|part| match part {
+                    ToolContent::Text { text } => text.clone(),
+                    _ => "[non-text MCP content]".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    let mut output = Vec::with_capacity(content.len());
+    for part in content {
+        match part {
+            ToolContent::Text { text } => {
+                output.push(InputContent::InputText(InputTextContent {
+                    text: text.clone(),
+                }));
+            }
+            ToolContent::Image { data, mime_type } => {
+                let bytes = STANDARD
+                    .decode(data)
+                    .map_err(|error| format!("error: invalid MCP {mime_type} image: {error}"))?;
+                let image = crate::commands::image_content_from_bytes(&bytes)
+                    .map_err(|error| format!("error: invalid MCP {mime_type} image: {error}"))?;
+                output.push(InputContent::InputImage(image));
+            }
+            ToolContent::Resource { .. } => {
+                output.push(InputContent::InputText(InputTextContent {
+                    text: "[non-text MCP content]".to_string(),
+                }));
+            }
+        }
+    }
+    Ok(FunctionCallOutput::Content(output))
 }
 
 #[cfg(test)]
@@ -392,6 +438,45 @@ mod tests {
         };
         assert_eq!(f.parameters.as_ref().unwrap()["type"], "object");
         assert!(f.description.as_deref().unwrap().contains("mcp__x__y"));
+    }
+
+    #[test]
+    fn mcp_text_content_remains_a_text_output() {
+        let content = vec![
+            crate::mcp::types::ToolContent::Text { text: "one".into() },
+            crate::mcp::types::ToolContent::Text { text: "two".into() },
+        ];
+
+        assert_eq!(
+            tool_content_output(&content),
+            Ok(FunctionCallOutput::Text("one\ntwo".into()))
+        );
+    }
+
+    #[test]
+    fn mcp_image_content_becomes_visual_input() {
+        let content = vec![
+            crate::mcp::types::ToolContent::Text {
+                text: "screenshot".into(),
+            },
+            crate::mcp::types::ToolContent::Image {
+                data: STANDARD.encode(b"\x89PNG\r\n\x1a\nfake"),
+                mime_type: "image/png".into(),
+            },
+        ];
+
+        let FunctionCallOutput::Content(output) = tool_content_output(&content).unwrap() else {
+            panic!("expected multimodal MCP output");
+        };
+        assert!(matches!(
+            &output[0],
+            InputContent::InputText(text) if text.text == "screenshot"
+        ));
+        assert!(matches!(
+            &output[1],
+            InputContent::InputImage(image)
+                if image.image_url.as_deref().is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        ));
     }
 
     #[test]

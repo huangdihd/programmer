@@ -388,7 +388,22 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                     "could not update rewind checkpoints after compaction: {error}"
                 ));
             }
-            app.input_panel.show_next_turn_compaction(details);
+            // Announce the compaction only where the announcement is still
+            // true. A pass that finishes inside a live turn — the mandatory
+            // safe-point pass — resumes that turn, so the compaction is already
+            // in effect for the turn's very next request: a "next turn" banner
+            // would be stale the moment it was drawn, and nothing would consume
+            // it until the user sent another message, leaving it above the input
+            // box long after the compacted context had been used. Only a pass
+            // that lands before its turn starts is genuinely about the next
+            // turn, so only that case raises the banner. Anything still pending
+            // is dropped, so a banner can never outlive the context it
+            // described.
+            if app.cancel.active_id.is_some() {
+                app.input_panel.clear_next_turn_compaction();
+            } else {
+                app.input_panel.show_next_turn_compaction(details);
+            }
             session::mark_dirty(app);
             session::flush_if_dirty(app);
 
@@ -1226,11 +1241,12 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
 mod tests {
     use super::{
         ConversationPanel, QUIT_CONFIRM_TIMEOUT, QUIT_CONFIRM_WARNING,
-        estimated_tokens_after_compaction, handle_cancel, is_current_turn_id, is_live_turn_id,
-        quit_confirmation_expired, quit_is_confirmed, reducing_compaction_usage,
+        estimated_tokens_after_compaction, handle_cancel, handle_event, is_current_turn_id,
+        is_live_turn_id, quit_confirmation_expired, quit_is_confirmed, reducing_compaction_usage,
         remove_quit_confirmation_warning, take_pending_request,
     };
     use crate::response::message_item::MessageItem;
+    use crate::ui::event::{AppEvent, Event};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1389,6 +1405,186 @@ mod tests {
         assert_eq!(taken_images.len(), 1);
         assert!(images.is_empty());
         assert!(take_pending_request(&mut panel, &mut images).is_none());
+    }
+
+    /// An `App` with no providers: enough for tests that drive UI state
+    /// transitions without any network or session persistence.
+    async fn headless_test_app(session: &str) -> crate::app::App<'static> {
+        let mut config = crate::config::programmer_config::ProgrammerConfig::default();
+        config.providers.clear();
+        crate::app::App::new(
+            config,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            session.to_string(),
+            None,
+            Vec::new(),
+            false,
+            "test".to_string(),
+        )
+        .await
+    }
+
+    /// A proven-smaller compaction result whose usage numbers are enough to
+    /// pass every validity check the event handler applies.
+    fn compaction_result() -> crate::ui::event::CompactionResult {
+        crate::ui::event::CompactionResult {
+            summary: "earlier turns summarized".to_string(),
+            input_tokens: Some(200_000),
+            output_tokens: Some(3_000),
+        }
+    }
+
+    async fn finish_auto_compaction(app: &mut crate::app::App<'_>, cutoff: usize) {
+        handle_event(
+            app,
+            Event::App(AppEvent::AutoCompactFinished {
+                job_id: 1,
+                history_epoch: 0,
+                cutoff,
+                result: Ok(compaction_result()),
+            }),
+        )
+        .await
+        .expect("dispatching the compaction result must not fail");
+    }
+
+    #[tokio::test]
+    async fn a_compaction_before_a_queued_turn_announces_itself_above_the_input() {
+        use async_openai::types::responses::{InputContent, InputMessage, InputRole, OutputStatus};
+
+        let mut app = headless_test_app("compaction-banner-queued").await;
+        for turn in 0..2 {
+            app.conversation_panel.add_input_message(
+                async_openai::types::responses::MessageItem::Input(InputMessage {
+                    content: vec![InputContent::InputText(format!("turn {turn}").into())],
+                    role: InputRole::User,
+                    status: Some(OutputStatus::Completed),
+                }),
+            );
+            // Separate the two requests, so they are not grouped into one turn.
+            app.conversation_panel
+                .add_info_string(format!("reply {turn}"));
+        }
+        app.auto_compact.active_id = Some(1);
+        app.auto_compact.mandatory_waiting = true;
+        // No turn is live: the queued request has not started yet, so the next
+        // model turn really is the first to use the compacted context.
+        app.cancel.active_id = None;
+
+        finish_auto_compaction(&mut app, 4).await;
+
+        assert_eq!(
+            app.input_panel.next_turn_compaction.as_deref(),
+            Some("2 turns, 200000→3000 tokens"),
+            "the next turn must be told what it is about to run on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compaction_inside_a_live_turn_leaves_no_banner_behind() {
+        let mut app = headless_test_app("compaction-banner-live").await;
+        app.conversation_panel
+            .add_info_string("older history".to_string());
+        app.auto_compact.active_id = Some(1);
+        app.auto_compact.mandatory_waiting = true;
+        // The mandatory safe-point pass suspends a live turn and resumes it, so
+        // the compaction is in effect for that turn's next request.
+        app.cancel.active_id = Some(7);
+        app.input_panel
+            .show_next_turn_compaction("left over from an earlier pass".to_string());
+
+        finish_auto_compaction(&mut app, 0).await;
+
+        assert!(
+            app.input_panel.next_turn_compaction.is_none(),
+            "a compaction the live turn already uses must not promise anything about the next turn"
+        );
+        // The context change itself is still recorded in the conversation.
+        assert!(
+            app.conversation_panel
+                .items_snapshot()
+                .iter()
+                .any(|item| matches!(item, MessageItem::Compacted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_thresholds_distinguish_soft_and_hard_limits() {
+        use async_openai::types::responses::{InputContent, InputMessage, InputRole, OutputStatus};
+
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "offline".to_string(),
+            crate::config::programmer_config::ProviderConfig {
+                base_url: "http://192.0.2.1:9".to_string(),
+                api_key: "unused".to_string(),
+                models: None,
+                default_model: None,
+            },
+        );
+        let config = crate::config::programmer_config::ProgrammerConfig {
+            providers,
+            default_provider: "offline".to_string(),
+            auto_compact_tokens: 100_000,
+            mandatory_compact_tokens: 150_000,
+            auto_compact_cooldown_turns: 0,
+            ..Default::default()
+        };
+        let mut app = crate::app::App::new(
+            config,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "automatic-compaction-thresholds".to_string(),
+            None,
+            Vec::new(),
+            false,
+            "test".to_string(),
+        )
+        .await;
+        for turn in 0..6 {
+            app.conversation_panel.add_input_message(
+                async_openai::types::responses::MessageItem::Input(InputMessage {
+                    content: vec![InputContent::InputText(format!("turn {turn}").into())],
+                    role: InputRole::User,
+                    status: Some(OutputStatus::Completed),
+                }),
+            );
+            app.conversation_panel
+                .add_info_string(format!("reply {turn}"));
+        }
+        app.cancel.active_id = Some(9);
+        app.cancel.turn_conversation_cutoff = Some(app.conversation_panel.items_snapshot().len());
+
+        let (resume, _rx) = tokio::sync::oneshot::channel();
+        handle_event(
+            &mut app,
+            Event::App(AppEvent::UsageSafePoint(9, 110_000, resume)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.auto_compact.active_id, None,
+            "the soft threshold is not checked from this safe-point path"
+        );
+
+        // The hard threshold is checked at the same safe point and starts the
+        // mandatory background compaction.
+        let (resume, _rx) = tokio::sync::oneshot::channel();
+        handle_event(
+            &mut app,
+            Event::App(AppEvent::UsageSafePoint(9, 160_000, resume)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.auto_compact.active_id.is_some(),
+            "the hard threshold must start automatic compaction"
+        );
     }
 
     #[tokio::test]

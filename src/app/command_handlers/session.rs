@@ -167,6 +167,9 @@ fn new(app: &mut App<'_>) -> CommandOutcome {
     }
     app.input_panel.clear_suggestion();
     session::save_session(app);
+    // The session that is ending is queued for consolidation before its
+    // conversation is cleared, exactly as it would be on quit.
+    app.queue_current_session_for_dream();
     app.conversation_panel.clear_messages();
     diagnostics::reset_diagnostics_state(app);
     app.pending_images.clear();
@@ -187,7 +190,7 @@ fn new(app: &mut App<'_>) -> CommandOutcome {
     app.session.title_generation_id = app.session.title_generation_id.wrapping_add(1);
     app.todo_list = crate::todos::TodoList::default();
     app.sync_todos_to_store();
-    app.vision_enabled = false;
+    app.vision_enabled = app.config.vision_enabled;
     app.session.classifier_model_override = crate::session::ModelOverride::Inherit;
     app.session.compact_model_override = crate::session::ModelOverride::Inherit;
     app.session.auto_compact_override = crate::session::AutoCompactOverride::Inherit;

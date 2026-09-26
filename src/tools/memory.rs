@@ -85,7 +85,8 @@ impl MemoryModel {
                 json!({
                     "id": entry.id,
                     "kind": entry.kind,
-                    "description": entry.content.lines().next().unwrap_or(""),
+                    "name": entry.name,
+                    "description": entry.description,
                     "age_days": now.saturating_sub(entry.updated_at) / 86_400,
                     "recalled_before": entry.use_count,
                 })
@@ -367,6 +368,13 @@ pub async fn run(arguments: &str, model: Option<&MemoryModel>) -> Result<String,
                 .map_err(|error| format!("error: {error}"))?;
             Ok(format!("Forgot memory {id}"))
         }
+        "dream" => {
+            // Dream stays a user-facing control: consolidating long-term memory
+            // is not something an agent may trigger on its own, so this action
+            // is deliberately absent from the advertised tool schema and is only
+            // reachable through `/memory dream`.
+            Err("error: Dream is only available through the `/memory dream` command".to_string())
+        }
         other => Err(format!(
             "error: unknown action '{other}' — use remember, recall, list, update, or forget"
         )),
@@ -436,6 +444,34 @@ mod tests {
         assert!(!action_is_mutating(r#"{"action":"recall","query":"rust"}"#));
         assert!(action_is_mutating(r#"{"action":"remember"}"#));
         assert!(action_is_mutating("not json"));
+    }
+
+    #[test]
+    fn the_tool_schema_does_not_offer_dream() {
+        let Tool::Function(function) = tool() else {
+            panic!("the memory tool must stay a function tool");
+        };
+        let parameters = function.parameters.expect("parameters are declared");
+        let action = &parameters["properties"]["action"];
+        assert_eq!(
+            action["enum"],
+            serde_json::json!(["remember", "recall", "list", "update", "forget"]),
+            "consolidating long-term memory must stay a user-only decision"
+        );
+        assert!(
+            parameters["properties"].get("dream_mode").is_none(),
+            "no Dream parameter may leak into the schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dream_action_is_refused_even_when_called_directly() {
+        // Not advertising the action is not enough: an agent, or an MCP client,
+        // could still send it by hand.
+        let error = run(r#"{"action":"dream","dream_mode":"apply"}"#, None)
+            .await
+            .expect_err("the tool must never consolidate memory");
+        assert!(error.contains("`/memory dream`"), "{error}");
     }
 
     fn temp_manager() -> MemoryManager {

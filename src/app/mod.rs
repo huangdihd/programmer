@@ -392,6 +392,14 @@ pub struct App<'a> {
     pub(crate) input_suggestion_cancel: Option<crate::cancel::CancellationToken>,
     pub(crate) checkpoint_store: Option<Arc<Mutex<crate::checkpoint::CheckpointStore>>>,
     pub(crate) current_checkpoint_id: Option<u64>,
+    /// Live Dream inputs (settings + resolved memory model) read by the worker.
+    pub(crate) dream_runtime: Arc<std::sync::Mutex<crate::memory::dream::DreamRuntime>>,
+    /// Background consolidation worker, stopped when the application exits.
+    pub(crate) dream_worker: Option<crate::memory::dream::DreamWorker>,
+    /// Raised by the worker while a consolidation pass is running, so the title
+    /// bar can show a Dream indicator. Purely presentational: nothing else reads
+    /// it, and it stays false whenever memory or Dream is off.
+    pub(crate) dream_active: Arc<std::sync::atomic::AtomicBool>,
     /// Project directory name for the terminal title.
     pub(crate) project_name: String,
     /// Plan mode sub-phase. Only meaningful when `work_mode == WorkMode::Plan`.
@@ -440,7 +448,7 @@ impl App<'_> {
         let provider_manager = ProviderManager::from_config(&config);
         let mut current_model = provider_manager.default_model();
         let mut work_mode = WorkMode::default();
-        let mut vision_enabled = false;
+        let mut vision_enabled = config.vision_enabled;
         let mut thinking_level = crate::thinking::ThinkingLevel::default();
         let mut classifier_model_override = ModelOverride::Inherit;
         let mut compact_model_override = ModelOverride::Inherit;
@@ -592,6 +600,11 @@ impl App<'_> {
             input_suggestion_cancel: None,
             checkpoint_store,
             current_checkpoint_id: None,
+            dream_runtime: Arc::new(std::sync::Mutex::new(
+                crate::memory::dream::DreamRuntime::default(),
+            )),
+            dream_worker: None,
+            dream_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             skill_registry: crate::skills::SkillRegistry::load(),
             mcp_manager: None,
             mcp_server_statuses,
@@ -636,6 +649,8 @@ impl App<'_> {
                 }
             }
         });
+
+        app.start_auto_dream();
 
         if app.config.auto_update_check {
             let app_event_tx = app.events.sender.clone();
@@ -744,23 +759,11 @@ impl App<'_> {
 
         let (client, model_name) = self.provider_manager.resolve(&self.current_model)?;
         let model_str = self.current_model.clone();
-        let memory_model_target = self
-            .config
-            .memory_model
-            .as_deref()
-            .unwrap_or(&self.current_model);
-        // A disabled memory store disables automatic recall, matching the
-        // memory tool being unadvertised.
-        let memory_model = if self.config.memory.enabled {
-            self.provider_manager
-                .resolve(memory_model_target)
-                .map(|(client, model)| crate::tools::memory::MemoryModel {
-                    client: client.clone(),
-                    model,
-                })
-        } else {
-            None
-        };
+        // Keep the Dream worker's view of the memory model current: this runs at
+        // the start of every turn, which is exactly when `/model`, provider
+        // changes, and `/memory off` have already been applied to `self.config`.
+        self.refresh_dream_runtime();
+        let memory_model = self.effective_memory_model();
         // Unify every tool source behind the registry: the local built-ins are
         // one provider, all connected MCP servers another.
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
@@ -975,16 +978,120 @@ impl App<'_> {
         events::tick(self)
     }
 
+    /// Refresh the worker's view of the memory model and Dream settings. Called
+    /// before each turn so `/model`, provider edits, and `/memory off` are picked
+    /// up without restarting the application.
+    fn refresh_dream_runtime(&self) {
+        let runtime = crate::memory::dream::DreamRuntime {
+            config: crate::memory::dream::DreamConfig::from(&self.config.memory),
+            model: self
+                .effective_memory_model()
+                .map(|model| crate::memory::dream::DreamModel {
+                    client: model.client,
+                    model: model.model,
+                }),
+        };
+        if let Ok(mut slot) = self.dream_runtime.lock() {
+            *slot = runtime;
+        }
+    }
+
+    /// The dedicated memory model, or the current chat model when none is
+    /// configured. Shared by recall, association, and Dream so all three agree
+    /// on which model memory work uses.
+    pub(crate) fn effective_memory_model(&self) -> Option<crate::tools::memory::MemoryModel> {
+        if !self.config.memory.enabled {
+            return None;
+        }
+        let target = self
+            .config
+            .memory_model
+            .as_deref()
+            .unwrap_or(&self.current_model);
+        self.provider_manager
+            .resolve(target)
+            .map(|(client, model)| crate::tools::memory::MemoryModel {
+                client: client.clone(),
+                model,
+            })
+    }
+
+    fn start_auto_dream(&mut self) {
+        let Ok(manager) = crate::memory::MemoryManager::for_current_dir() else {
+            return;
+        };
+        self.refresh_dream_runtime();
+        self.dream_worker = Some(crate::memory::dream::DreamWorker::start(
+            manager,
+            self.dream_runtime.clone(),
+            self.dream_active.clone(),
+        ));
+    }
+
+    /// Queue the current session's user/assistant prose for background
+    /// consolidation. Called when a session ends (quit or `/new`), while its
+    /// transcript is still in the conversation.
+    pub(crate) fn queue_current_session_for_dream(&self) {
+        if !self.config.memory.enabled || !self.config.memory.dream_enabled {
+            return;
+        }
+        let transcript = dream_transcript(&self.conversation_panel.items_snapshot());
+        if transcript.trim().is_empty() {
+            return;
+        }
+        if let Ok(manager) = crate::memory::MemoryManager::for_current_dir() {
+            let _ = manager.enqueue_dream(&self.session.uuid.to_string(), &transcript);
+        }
+    }
+
     pub fn quit(&mut self) {
         self.agents.cancel_all();
         session::save_session(self);
+        self.queue_current_session_for_dream();
+        // Stop consolidation after the queue is durable. A pass cut off here has
+        // already written memory synchronously and leaves its queue files, so it
+        // converges on the next launch.
+        crate::memory::dream::shutdown(&mut self.dream_worker);
         self.running = false;
     }
 }
 
+pub(crate) fn dream_transcript(items: &[crate::response::message_item::MessageItem]) -> String {
+    use async_openai::types::responses::{
+        InputContent, InputItem, InputRole, Item, MessageItem as ApiMessageItem, OutputItem,
+        OutputMessageContent,
+    };
+
+    let mut lines = Vec::new();
+    for item in items {
+        match item {
+            crate::response::message_item::MessageItem::Input(InputItem::Item(Item::Message(
+                ApiMessageItem::Input(message),
+            ))) if message.role == InputRole::User => {
+                for content in &message.content {
+                    if let InputContent::InputText(text) = content {
+                        lines.push(format!("User: {}", text.text));
+                    }
+                }
+            }
+            crate::response::message_item::MessageItem::Output(OutputItem::Message(message)) => {
+                for content in &message.content {
+                    if let OutputMessageContent::OutputText(text) = content {
+                        lines.push(format!("Assistant: {}", text.text));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TaskNotificationState, event_requests_immediate_redraw, is_left_drag};
+    use super::{
+        TaskNotificationState, dream_transcript, event_requests_immediate_redraw, is_left_drag,
+    };
     use crate::ui::event::{AppEvent, Event};
     use crossterm::event::{
         Event as CrosstermEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -992,6 +1099,77 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn dream_transcript_keeps_only_user_and_assistant_prose() {
+        use async_openai::types::responses::AssistantRole;
+        use async_openai::types::responses::{
+            FunctionCallOutput, FunctionCallOutputItemParam, InputContent, InputItem, InputMessage,
+            InputRole, InputTextContent, Item, MessageItem as ApiMessageItem, OutputItem,
+            OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent,
+        };
+        let user = |text: &str| {
+            crate::response::message_item::MessageItem::Input(InputItem::Item(Item::Message(
+                ApiMessageItem::Input(InputMessage {
+                    role: InputRole::User,
+                    content: vec![InputContent::InputText(InputTextContent {
+                        text: text.to_string(),
+                    })],
+                    ..Default::default()
+                }),
+            )))
+        };
+        let developer = |text: &str| {
+            crate::response::message_item::MessageItem::Input(InputItem::Item(Item::Message(
+                ApiMessageItem::Input(InputMessage {
+                    role: InputRole::Developer,
+                    content: vec![InputContent::InputText(InputTextContent {
+                        text: text.to_string(),
+                    })],
+                    ..Default::default()
+                }),
+            )))
+        };
+        let assistant = |text: &str| {
+            crate::response::message_item::MessageItem::Output(OutputItem::Message(OutputMessage {
+                content: vec![OutputMessageContent::OutputText(OutputTextContent {
+                    text: text.to_string(),
+                    annotations: Vec::new(),
+                    logprobs: None,
+                })],
+                id: "msg_1".to_string(),
+                role: AssistantRole::Assistant,
+                phase: None,
+                status: OutputStatus::Completed,
+            }))
+        };
+
+        let items = vec![
+            user("add a dream worker"),
+            assistant("done"),
+            // Tool traffic and Programmer's own injected memory block are noisy
+            // and must never be consolidated into long-term memory.
+            developer("<!-- programmer-associated-memory: ... -->"),
+            crate::response::message_item::MessageItem::ToolOutput {
+                output: FunctionCallOutputItemParam {
+                    call_id: "call_1".to_string(),
+                    id: None,
+                    status: None,
+                    output: FunctionCallOutput::Text("exit code 1".to_string()),
+                },
+                failed: true,
+                approval_label: None,
+            },
+            crate::response::message_item::MessageItem::Info("startup".to_string()),
+            user("now run the tests"),
+        ];
+
+        assert_eq!(
+            dream_transcript(&items),
+            "User: add a dream worker\nAssistant: done\nUser: now run the tests"
+        );
+        assert_eq!(dream_transcript(&[]), "");
+    }
 
     #[test]
     fn redraw_policy_keeps_ticks_and_interaction_immediate_but_throttles_chunks() {

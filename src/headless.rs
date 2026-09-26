@@ -73,6 +73,7 @@ pub(crate) async fn run(args: RunArgs) -> color_eyre::Result<bool> {
         }
 
         let result = agent.run_turn(prompt, InputRole::User, format).await?;
+        agent.queue_for_dream();
         let diagnostics = if check {
             Some(collect_report(threshold, &cancel).await)
         } else {
@@ -145,6 +146,8 @@ struct HeadlessAgent {
     skill_prompt: Option<String>,
     initialization_prompt: String,
     agents: crate::agents::AgentManager,
+    /// Identity used when queueing this run for background consolidation.
+    dream_session_id: String,
 }
 
 impl Drop for HeadlessAgent {
@@ -256,7 +259,7 @@ impl HeadlessAgent {
             policy: child_policy,
             soul: config.soul.clone(),
             coauthor: config.git_coauthor.clone(),
-            vision_enabled: false,
+            vision_enabled: config.vision_enabled,
             thinking_level: args.thinking,
             memory_config: config.memory.clone(),
             memory_model: config.memory_model.clone(),
@@ -291,7 +294,7 @@ impl HeadlessAgent {
             policy,
             soul: config.soul,
             coauthor: config.git_coauthor,
-            vision_enabled: false,
+            vision_enabled: config.vision_enabled,
             thinking_level: args.thinking,
             memory_model,
             hooks,
@@ -302,6 +305,7 @@ impl HeadlessAgent {
 
         Ok(Self {
             runner,
+            dream_session_id: format!("headless-{}", uuid::Uuid::new_v4().simple()),
             conversation: Mutex::new(Conversation::new()),
             diagnostics_state,
             cancel,
@@ -337,6 +341,27 @@ impl HeadlessAgent {
             .run_turn(&self.conversation, &self.cancel, &surface)
             .await
             .map_err(Into::into)
+    }
+
+    /// Queue this headless run's user/assistant prose for background
+    /// consolidation. A run is a complete session, so it is queued exactly like
+    /// an interactive one; the same content-hash dedup makes a repeated
+    /// identical run a no-op.
+    fn queue_for_dream(&self) {
+        let items = self
+            .conversation
+            .lock()
+            .unwrap()
+            .items()
+            .cloned()
+            .collect::<Vec<_>>();
+        let transcript = crate::app::dream_transcript(&items);
+        if transcript.trim().is_empty() {
+            return;
+        }
+        if let Ok(manager) = crate::memory::MemoryManager::for_current_dir() {
+            let _ = manager.enqueue_dream(&self.dream_session_id, &transcript);
+        }
     }
 
     async fn seed_diagnostics_baseline(&self) {

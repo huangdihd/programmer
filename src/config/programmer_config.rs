@@ -45,6 +45,14 @@ pub struct MemoryConfig {
     pub max_global_results: usize,
     /// Maximum number of project memories returned by one recall.
     pub max_project_results: usize,
+    /// Enable background extraction and consolidation of completed sessions.
+    pub dream_enabled: bool,
+    /// Minimum queued completed sessions before automatic Dream runs.
+    pub dream_min_sessions: usize,
+    /// Minimum hours between automatic Dream passes.
+    pub dream_min_interval_hours: u64,
+    /// Maximum duration of one Dream model request.
+    pub dream_timeout_secs: u64,
 }
 
 impl Default for MemoryConfig {
@@ -55,6 +63,10 @@ impl Default for MemoryConfig {
             project_enabled: true,
             max_global_results: 3,
             max_project_results: 8,
+            dream_enabled: true,
+            dream_min_sessions: 5,
+            dream_min_interval_hours: 24,
+            dream_timeout_secs: 60,
         }
     }
 }
@@ -142,6 +154,10 @@ pub struct ProgrammerConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub git_coauthor: Option<String>,
+    /// Whether vision is enabled when starting a new interactive or headless
+    /// session. Resumed sessions restore their own saved vision state.
+    #[serde(default = "default_true")]
+    pub vision_enabled: bool,
     /// Check GitHub for a newer release at startup and show a one-line notice
     /// when one exists. Set to false to disable the network call.
     #[serde(default = "default_true")]
@@ -258,6 +274,7 @@ impl Default for ProgrammerConfig {
             security_profiles: BTreeMap::new(),
             active_security_profile: default_security_profile_name(),
             git_coauthor: default_git_coauthor(),
+            vision_enabled: true,
             auto_update_check: true,
             mcp_servers: Vec::new(),
             model: None,
@@ -368,6 +385,20 @@ impl ProgrammerConfig {
 mod tests {
     use super::*;
     use crate::mcp::types::McpServerConfig;
+
+    #[test]
+    fn vision_defaults_to_enabled_and_round_trips() {
+        let defaulted: ProgrammerConfig = toml::from_str("").expect("deserialize defaults");
+        assert!(defaulted.vision_enabled);
+
+        let disabled: ProgrammerConfig =
+            toml::from_str("vision_enabled = false").expect("deserialize configured value");
+        assert!(!disabled.vision_enabled);
+
+        let serialized = toml::to_string(&disabled).expect("serialize");
+        let parsed: ProgrammerConfig = toml::from_str(&serialized).expect("deserialize");
+        assert!(!parsed.vision_enabled);
+    }
 
     #[test]
     fn mandatory_compact_limit_defaults_to_150000_and_round_trips() {
