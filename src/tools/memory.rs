@@ -42,10 +42,11 @@ impl MemoryModel {
         &self,
         context: &str,
         query: &str,
+        excluded: &std::collections::HashSet<String>,
     ) -> Result<Vec<MemoryEntry>, String> {
         let manager = MemoryManager::for_current_dir()?;
         let config = crate::config::programmer_config::MemoryConfig::default();
-        let mut entries = manager.retrieve(query, &config)?;
+        let mut entries = manager.retrieve_excluding(query, &config, excluded)?;
         let ids = self.select(context, query, &entries).await?;
         entries.sort_by_key(|entry| {
             ids.iter()
@@ -302,6 +303,14 @@ pub(crate) fn action_is_mutating(arguments: &str) -> bool {
 }
 
 pub async fn run(arguments: &str, model: Option<&MemoryModel>) -> Result<String, String> {
+    run_excluding(arguments, model, &std::collections::HashSet::new()).await
+}
+
+pub(crate) async fn run_excluding(
+    arguments: &str,
+    model: Option<&MemoryModel>,
+    excluded: &std::collections::HashSet<String>,
+) -> Result<String, String> {
     let args: Args = serde_json::from_str(arguments)
         .map_err(|error| format!("error: invalid arguments: {error}"))?;
     let manager = MemoryManager::for_current_dir().map_err(|error| format!("error: {error}"))?;
@@ -329,7 +338,7 @@ pub async fn run(arguments: &str, model: Option<&MemoryModel>) -> Result<String,
                 config.project_enabled = scope == MemoryScope::Project;
             }
             let mut entries = manager
-                .retrieve(&query, &config)
+                .retrieve_excluding(&query, &config, excluded)
                 .map_err(|error| format!("error: {error}"))?;
             if let Some(model) = model
                 && let Ok(ids) = model.select(&query, &query, &entries).await

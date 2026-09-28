@@ -1177,7 +1177,18 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
         app.conversation_panel.phase =
             crate::ui::components::conversation_panel::conversation_panel::ActivePhase::Associating;
     }
-    let result = crate::tools::memory::run(&arguments.to_string(), memory_model.as_ref()).await;
+    let excluded = app
+        .conversation_panel
+        .shared_conversation()
+        .lock()
+        .unwrap()
+        .context_memory_ids();
+    let result = crate::tools::memory::run_excluding(
+        &arguments.to_string(),
+        memory_model.as_ref(),
+        &excluded,
+    )
+    .await;
     if is_recall {
         app.conversation_panel.phase =
             crate::ui::components::conversation_panel::conversation_panel::ActivePhase::None;

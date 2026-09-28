@@ -138,7 +138,7 @@ pub(crate) async fn diagnostics(args: DiagnosticsArgs) -> color_eyre::Result<boo
 
 struct HeadlessAgent {
     runner: TurnRunner,
-    conversation: Mutex<Conversation>,
+    conversation: Arc<Mutex<Conversation>>,
     diagnostics_state: Arc<Mutex<DiagnosticsState>>,
     cancel: CancellationToken,
     model: String,
@@ -195,11 +195,13 @@ impl HeadlessAgent {
         } else {
             None
         };
+        let conversation = Arc::new(Mutex::new(Conversation::new()));
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
             Arc::new(
                 LocalToolProvider::new(todo_store.clone(), security.clone())
                     .with_memory_enabled(config.memory.enabled)
-                    .with_memory_model(memory_model.clone()),
+                    .with_memory_model(memory_model.clone())
+                    .with_memory_context(Some(conversation.clone())),
             ),
             Arc::new(SkillToolProvider::new(skill_registry.clone())),
         ];
@@ -306,7 +308,7 @@ impl HeadlessAgent {
         Ok(Self {
             runner,
             dream_session_id: format!("headless-{}", uuid::Uuid::new_v4().simple()),
-            conversation: Mutex::new(Conversation::new()),
+            conversation,
             diagnostics_state,
             cancel,
             model,

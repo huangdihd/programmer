@@ -34,7 +34,7 @@ use async_openai::types::responses::{
     EasyInputContent, FunctionCallOutput, FunctionCallOutputItemParam, InputContent, InputItem,
     InputMessage, InputParam, InputRole, InputTextContent, Item, OutputItem, OutputStatus,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The conversation history and turn-usage counter, free of any UI state.
 #[derive(Debug, Default)]
@@ -46,6 +46,8 @@ pub struct Conversation {
     /// responses in the current turn (a turn may span multiple responses when
     /// tool calls are involved). Flushed to a [`MessageItem::Usage`] at turn end.
     pub accumulated_usage: (u32, u32, u32),
+    /// Responses without usable accounting: (missing usage, all-zero usage).
+    unavailable_usage: (usize, usize),
     /// Top-K results returned by automatic association for this turn.
     pub recalled_memories: Option<usize>,
     /// Provider-reported input tokens for the most recent individual model
@@ -217,6 +219,115 @@ impl Conversation {
         removed
     }
 
+    /// Memory IDs explicitly present in live context, excluding compacted summaries.
+    pub fn context_memory_ids(&self) -> HashSet<String> {
+        // MemoryManager creates IDs with UUID::simple(), using lowercase hex.
+        fn valid_id(id: &str) -> bool {
+            id.strip_prefix("mem_").is_some_and(|suffix| {
+                suffix.len() == 32
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        }
+
+        fn output_ids(text: &str, action: &str, ids: &mut HashSet<String>) {
+            match action {
+                "remember" | "update" => {
+                    let entry = if action == "remember" {
+                        text.strip_prefix("Remembered global memory ")
+                            .or_else(|| text.strip_prefix("Remembered project memory "))
+                    } else {
+                        text.strip_prefix("Updated memory ")
+                    };
+                    if let Some((id, _)) = entry.and_then(|entry| entry.split_once(": "))
+                        && valid_id(id)
+                    {
+                        ids.insert(id.to_string());
+                    }
+                }
+                "recall" => {
+                    for line in text.lines() {
+                        let Some((id, rest)) = line.split_once("  ") else {
+                            continue;
+                        };
+                        if valid_id(id)
+                            && matches!(rest.split_whitespace().next(), Some("global" | "project"))
+                        {
+                            ids.insert(id.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let start = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, MessageItem::Compacted { .. }))
+            .map_or(0, |index| index + 1);
+        let live_items = &self.items[start..];
+        let calls: HashMap<_, _> = live_items
+            .iter()
+            .filter_map(|item| {
+                let MessageItem::Output(OutputItem::FunctionCall(call)) = item else {
+                    return None;
+                };
+                if call.name != "memory" {
+                    return None;
+                }
+                let args: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+                let action = args.get("action")?.as_str()?;
+                matches!(action, "remember" | "recall" | "update")
+                    .then(|| (call.call_id.as_str(), action.to_string()))
+            })
+            .collect();
+        let mut ids = HashSet::new();
+        for item in live_items {
+            match item {
+                MessageItem::ToolOutput {
+                    output,
+                    failed: false,
+                    ..
+                } => {
+                    let Some(action) = calls.get(output.call_id.as_str()) else {
+                        continue;
+                    };
+                    match &output.output {
+                        FunctionCallOutput::Text(text) => output_ids(text, action, &mut ids),
+                        FunctionCallOutput::Content(content) => {
+                            for part in content {
+                                if let InputContent::InputText(text) = part {
+                                    output_ids(&text.text, action, &mut ids);
+                                }
+                            }
+                        }
+                    }
+                }
+                MessageItem::Input(InputItem::Item(Item::Message(ApiMessageItem::Input(
+                    message,
+                )))) if message.role == InputRole::Developer => {
+                    let Some(InputContent::InputText(text)) = message.content.first() else {
+                        continue;
+                    };
+                    let header = text.text.lines().next().unwrap_or_default();
+                    let Some(json) = header
+                        .strip_prefix("<!-- programmer-associated-memory-ids: ")
+                        .and_then(|header| header.strip_suffix(" -->"))
+                    else {
+                        continue;
+                    };
+                    if let Ok(associated) = serde_json::from_str::<Vec<String>>(json) {
+                        ids.extend(associated.into_iter().filter(|id| valid_id(id)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        ids
+    }
+
     /// Whether there is API-visible history worth compacting: any input/output
     /// item after the last `/compact` boundary.
     pub fn has_compactable_history(&self) -> bool {
@@ -340,6 +451,7 @@ impl Conversation {
         let prefix = Conversation {
             items: self.items[..cutoff.min(self.items.len())].to_vec(),
             accumulated_usage: (0, 0, 0),
+            unavailable_usage: (0, 0),
             recalled_memories: None,
             last_request_input_tokens: None,
             mutation_version: 0,
@@ -359,8 +471,22 @@ impl Conversation {
         true
     }
 
+    /// Record accounting for every committed model response, including omissions.
+    pub fn record_response_usage(&mut self, usage: Option<(u32, u32, u32)>) {
+        match usage {
+            Some((input, output, cached)) => self.add_usage(input, output, cached),
+            None => self.unavailable_usage.0 += 1,
+        }
+    }
+
     pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32, cached_input_tokens: u32) {
-        self.last_request_input_tokens = Some(input_tokens);
+        if input_tokens == 0 && output_tokens == 0 && cached_input_tokens == 0 {
+            self.unavailable_usage.1 += 1;
+            return;
+        }
+        if input_tokens > 0 {
+            self.last_request_input_tokens = Some(input_tokens);
+        }
         self.accumulated_usage.0 += input_tokens;
         self.accumulated_usage.1 += output_tokens;
         self.accumulated_usage.2 += cached_input_tokens;
@@ -395,24 +521,36 @@ impl Conversation {
     /// own view state).
     pub fn flush_usage(&mut self) -> bool {
         let (input, output, cached) = self.accumulated_usage;
-        if input > 0 || output > 0 {
+        let has_usage = input > 0 || output > 0 || cached > 0;
+        let (missing, zero) = std::mem::take(&mut self.unavailable_usage);
+        if has_usage {
             self.items.push(MessageItem::Usage(
                 input,
                 output,
                 cached,
                 self.recalled_memories.take(),
             ));
-            self.accumulated_usage = (0, 0, 0);
-            self.recalled_memories = None;
-            true
-        } else {
-            false
         }
+        if missing > 0 || zero > 0 {
+            let label = if has_usage {
+                "Usage incomplete"
+            } else {
+                "Usage unavailable"
+            };
+            self.add_info_string(format!(
+                "{label}: {missing} response(s) omitted usage; {zero} response(s) reported all-zero token counts. No token estimate substituted."
+            ));
+        }
+        self.accumulated_usage = (0, 0, 0);
+        self.unavailable_usage = (0, 0);
+        self.recalled_memories = None;
+        has_usage || missing > 0 || zero > 0
     }
 
     /// Reset the accumulated usage counter (on /clear, new session, etc.).
     pub fn reset_accumulated_usage(&mut self) {
         self.accumulated_usage = (0, 0, 0);
+        self.unavailable_usage = (0, 0);
         self.recalled_memories = None;
     }
 
@@ -420,6 +558,7 @@ impl Conversation {
     pub fn clear(&mut self) {
         self.items.clear();
         self.accumulated_usage = (0, 0, 0);
+        self.unavailable_usage = (0, 0);
         self.recalled_memories = None;
         self.last_request_input_tokens = None;
         self.mutation_version += 1;
@@ -434,6 +573,7 @@ impl Conversation {
     pub fn truncate(&mut self, cutoff: usize) {
         self.items.truncate(cutoff);
         self.accumulated_usage = (0, 0, 0);
+        self.unavailable_usage = (0, 0);
         self.recalled_memories = None;
         self.mutation_version = self.mutation_version.wrapping_add(1);
     }
@@ -784,6 +924,176 @@ mod tests {
         })
     }
 
+    fn memory_result(
+        conv: &mut Conversation,
+        call_id: &str,
+        action: &str,
+        text: &str,
+        failed: bool,
+    ) {
+        let OutputItem::FunctionCall(mut memory_call) = call(call_id) else {
+            unreachable!();
+        };
+        memory_call.name = "memory".into();
+        memory_call.arguments = serde_json::json!({"action": action}).to_string();
+        conv.add_output(OutputItem::FunctionCall(memory_call));
+        let mut result = output(call_id);
+        result.param.output = FunctionCallOutput::Text(text.into());
+        result.failed = failed;
+        conv.add_tool_output(result);
+    }
+
+    fn associated_message(role: InputRole, text: String) -> ApiMessageItem {
+        ApiMessageItem::Input(InputMessage {
+            content: vec![InputContent::InputText(text.into())],
+            role,
+            status: Some(OutputStatus::Completed),
+        })
+    }
+
+    const MEMORY_A: &str = "mem_0123456789abcdef0123456789abcdef";
+    const MEMORY_B: &str = "mem_fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn context_memory_ids_reads_remember_recall_and_update() {
+        let mut conv = Conversation::new();
+        for scope in ["global", "project"] {
+            memory_result(
+                &mut conv,
+                scope,
+                "remember",
+                &format!("Remembered {scope} memory {MEMORY_A}: content mentions {MEMORY_B}"),
+                false,
+            );
+        }
+        assert_eq!(conv.context_memory_ids(), HashSet::from([MEMORY_A.into()]));
+        memory_result(
+            &mut conv,
+            "recall",
+            "recall",
+            &format!(
+                "{MEMORY_A}  global   preference    saved today         one\n{MEMORY_B}  project  project_fact  saved today         two\nmem_bad  global  invalid\n{MEMORY_A}extra  project  invalid"
+            ),
+            false,
+        );
+        assert_eq!(
+            conv.context_memory_ids(),
+            HashSet::from([MEMORY_A.into(), MEMORY_B.into()])
+        );
+        let mut updated = Conversation::new();
+        memory_result(
+            &mut updated,
+            "update",
+            "update",
+            &format!("Updated memory {MEMORY_B}: updated content"),
+            false,
+        );
+        assert_eq!(
+            updated.context_memory_ids(),
+            HashSet::from([MEMORY_B.into()])
+        );
+    }
+
+    #[test]
+    fn context_memory_ids_ignores_failed_unmatched_and_unrelated_outputs() {
+        let mut conv = Conversation::new();
+        let text = format!("Remembered global memory {MEMORY_A}: content");
+        memory_result(&mut conv, "failed", "remember", &text, true);
+        memory_result(
+            &mut conv,
+            "list",
+            "list",
+            &format!("{MEMORY_A}  global  content"),
+            false,
+        );
+        memory_result(&mut conv, "wrong_format", "recall", &text, false);
+        memory_result(
+            &mut conv,
+            "invalid_id",
+            "remember",
+            "Remembered global memory mem_bad: content",
+            false,
+        );
+        memory_result(
+            &mut conv,
+            "wrong_scope",
+            "recall",
+            &format!("{MEMORY_A}  other  content"),
+            false,
+        );
+        conv.add_output(call("command"));
+        for call_id in ["command", "orphan"] {
+            let mut result = output(call_id);
+            result.param.output = FunctionCallOutput::Text(text.clone());
+            conv.add_tool_output(result);
+        }
+        conv.add_input_message(user_message(&text));
+        conv.add_output(assistant_text(&text));
+        assert!(conv.context_memory_ids().is_empty());
+    }
+
+    #[test]
+    fn context_memory_ids_only_reads_developer_first_line_header() {
+        let mut conv = Conversation::new();
+        let old_marker = "<!-- programmer-associated-memory: persistent recalled context -->";
+        let header =
+            format!("<!-- programmer-associated-memory-ids: [\"{MEMORY_A}\",\"mem_bad\"] -->");
+        conv.add_input_message(associated_message(InputRole::User, header.clone()));
+        for text in [
+            format!("{old_marker}\n{MEMORY_B}  global  old memory"),
+            format!("preface\n{header}"),
+            "<!-- programmer-associated-memory-ids: not-json -->".into(),
+            format!("<!-- programmer-associated-memory-ids: [\"{MEMORY_A}\",42] -->"),
+        ] {
+            conv.add_input_message(associated_message(InputRole::Developer, text));
+        }
+        assert!(conv.context_memory_ids().is_empty());
+        conv.add_input_message(associated_message(
+            InputRole::Developer,
+            format!("{header}\n{old_marker}\ncontent mentions {MEMORY_B}"),
+        ));
+        assert_eq!(conv.context_memory_ids(), HashSet::from([MEMORY_A.into()]));
+    }
+
+    #[test]
+    fn context_memory_ids_compaction_excludes_summary_and_preserves_retained_tail() {
+        let mut conv = Conversation::new();
+        memory_result(
+            &mut conv,
+            "old",
+            "remember",
+            &format!("Remembered global memory {MEMORY_A}: old"),
+            false,
+        );
+        conv.add_input_message(associated_message(
+            InputRole::Developer,
+            format!("<!-- programmer-associated-memory-ids: [\"{MEMORY_A}\"] -->"),
+        ));
+        let cutoff = conv.items.len();
+        memory_result(
+            &mut conv,
+            "retained",
+            "recall",
+            &format!("{MEMORY_B}  project  project_fact  retained"),
+            false,
+        );
+        assert!(conv.apply_compaction_at(cutoff, format!("<!-- programmer-associated-memory-ids: [\"{MEMORY_A}\"] -->\nRemembered global memory {MEMORY_A}: summary")));
+        assert_eq!(conv.context_memory_ids(), HashSet::from([MEMORY_B.into()]));
+        conv.apply_compaction(format!("{MEMORY_B}  project  summary"));
+        assert!(conv.context_memory_ids().is_empty());
+        // A retained result cannot match a call hidden behind the boundary.
+        let mut result = output("old");
+        result.param.output =
+            FunctionCallOutput::Text(format!("Remembered global memory {MEMORY_A}: old"));
+        conv.add_tool_output(result);
+        assert!(conv.context_memory_ids().is_empty());
+        conv.add_input_message(associated_message(
+            InputRole::Developer,
+            format!("<!-- programmer-associated-memory-ids: [\"{MEMORY_B}\"] -->"),
+        ));
+        assert_eq!(conv.context_memory_ids(), HashSet::from([MEMORY_B.into()]));
+    }
+
     #[test]
     fn remove_warning_string_removes_only_matching_warnings() {
         let mut conv = Conversation::new();
@@ -1106,6 +1416,39 @@ mod tests {
                 .iter()
                 .any(|part| matches!(part, InputContent::InputImage(_)))
         );
+    }
+
+    #[test]
+    fn unavailable_usage_is_visible_and_does_not_erase_context_size() {
+        let mut conv = Conversation::new();
+        conv.add_usage(100, 5, 20);
+        conv.flush_usage();
+        conv.record_response_usage(Some((0, 0, 0)));
+        conv.record_response_usage(None);
+        assert_eq!(conv.last_request_input_tokens, Some(100));
+        assert!(conv.flush_usage());
+        let Some(MessageItem::Info(message)) = conv.items.last() else {
+            panic!("usage notice")
+        };
+        assert!(message.starts_with("Usage unavailable:"));
+        assert!(message.contains("1 response(s) omitted"));
+        assert!(message.contains("1 response(s) reported all-zero"));
+        assert!(!conv.flush_usage());
+    }
+
+    #[test]
+    fn mixed_usage_is_marked_incomplete_and_reset_clears_notices() {
+        let mut conv = Conversation::new();
+        conv.record_response_usage(None);
+        conv.add_usage(10, 5, 0);
+        assert!(conv.flush_usage());
+        assert!(matches!(&conv.items[0], MessageItem::Usage(10, 5, 0, _)));
+        assert!(
+            matches!(&conv.items[1], MessageItem::Info(s) if s.starts_with("Usage incomplete:"))
+        );
+        conv.record_response_usage(None);
+        conv.reset_accumulated_usage();
+        assert!(!conv.flush_usage());
     }
 
     #[test]

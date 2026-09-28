@@ -1590,6 +1590,40 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn unavailable_usage_renders_after_reply_in_the_conversation() {
+        let mut panel = ConversationPanel::new();
+        panel.add_info_string("Finished reply marker");
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .record_response_usage(Some((0, 0, 0)));
+        panel.flush_usage();
+        let area = Rect::new(0, 0, 180, 35);
+        for theme in [
+            crate::ui::theme::Theme::Dark,
+            crate::ui::theme::Theme::Light,
+        ] {
+            let mut buffer = Buffer::empty(area);
+            (&mut panel).render(area, &mut buffer);
+            crate::ui::theme::apply(theme, area, &mut buffer);
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let reply = rows
+                .iter()
+                .position(|r| r.contains("Finished reply marker"))
+                .unwrap();
+            let usage = rows
+                .iter()
+                .position(|r| r.contains("Usage unavailable:"))
+                .unwrap();
+            assert!(usage > reply);
+            assert!(rows[usage].contains("ℹ  Usage unavailable: 0 response(s) omitted usage; 1 response(s) reported all-zero token counts. No token estimate substituted."));
+        }
+    }
+
+    #[test]
     fn streaming_output_growth_keeps_a_previous_bottom_view_at_the_bottom() {
         let mut panel = ConversationPanel::new();
         panel.stick_to_bottom = false;

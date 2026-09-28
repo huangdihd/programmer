@@ -65,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 Both installers select the release asset for the current OS and architecture.
-Use `--version v0.2.17` with `install.sh`, or `-Version v0.2.17` with
+Use `--version v0.2.18` with `install.sh`, or `-Version v0.2.18` with
 `install.ps1`, to install a specific release.
 
 ## Quick start
@@ -114,7 +114,7 @@ Once installed, Programmer can update or remove its own executable:
 ```sh
 programmer upgrade --check
 programmer upgrade
-programmer upgrade --tag v0.2.17
+programmer upgrade --tag v0.2.18
 programmer uninstall
 programmer uninstall --purge
 ```
@@ -231,15 +231,16 @@ auto_update_check = true
 git_coauthor = "programmer <noreply@programmer.local>"
 
 [memory]
-# Durable memory is local Markdown outside the repository. Before the first
-# request of each turn, the dedicated memory model associates the recent
-# conversation with the strongest local candidates; the few it returns are
-# appended to the end of the request so the cached prompt prefix stays valid.
-# Failures safely fall back to local relevance order.
+# Durable memory is local Markdown outside the repository. Automatic association
+# runs alongside the first request and can supply memories to later tool steps.
+# Candidates do not require keyword overlap; the memory model selects relevance.
+# Memories added or recalled in the live context are excluded before candidate
+# limits. Compacted-away records no longer exclude them; retained turns still do.
+# Explicit recall falls back to local candidate order if model selection fails.
 enabled = true
 global_enabled = true
 project_enabled = true
-max_global_results = 3
+max_global_results = 30
 max_project_results = 8
 # Background consolidation ("Dream"). Completed sessions are queued on exit and
 # consolidated by an in-process worker: after at least this many queued sessions
@@ -301,7 +302,7 @@ api_key = "sk-your-key-here"
 | `auto_compact_cooldown_turns` | `5` | Suppress another automatic compaction for this many subsequent user turns; manual and mandatory compaction bypass it. `0` disables the cooldown. |
 | `memory.enabled` | `true` | Enable the persistent-memory store, automatic association, and the `memory` tool. |
 | `memory.global_enabled` / `project_enabled` | `true` | Include cross-project preferences and current-project memories when recalling. |
-| `memory.max_global_results` / `max_project_results` | `3` / `8` | Per-scope explicit recall limits. |
+| `memory.max_global_results` / `max_project_results` | `30` / `8` | Default per-scope memory candidate limits. |
 | `memory.dream_enabled` | `true` | Queue completed sessions for background consolidation and run the Dream worker. |
 | `memory.dream_min_sessions` | `5` | Queued sessions required before an automatic Dream pass runs. |
 | `memory.dream_min_interval_hours` | `24` | Minimum hours between automatic Dream passes. |
@@ -470,6 +471,14 @@ non-reasoning model to fix.
 ```sh
 programmer
 ```
+
+### Token usage
+
+Completed responses retain a visible usage status even when the provider omits
+accounting or reports all-zero token counts. These cases are distinguished as
+`Usage unavailable`; mixed turns show the reported totals plus an
+`Usage incomplete` notice. Missing values are never replaced with estimates.
+Zero input-token reports do not erase the last known positive context-size count.
 
 ### Keyboard shortcuts
 
