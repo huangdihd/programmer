@@ -1,3 +1,21 @@
+### programmer v0.2.18
+
+- Remove keyword filtering from memory candidates and increase the default global
+  candidate limit from 3 to 30. The memory model selects up to five relevant entries.
+- Exclude memories already added or recalled in live context before applying
+  candidate limits. Compacted-away records become eligible again; retained turns
+  still count. Apply context tracking to interactive, headless, and child agents.
+- Show unavailable or incomplete token accounting when responses omit usage or
+  report all-zero counts, preserving the last positive context count.
+- Allow exact filesystem permission requests while the process sandbox is off,
+  including on Windows. Filesystem restrictions and user approval still apply.
+- Render sequential `edit_file` batches as individual multiline diffs instead of
+  displaying escaped JSON.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.17...v0.2.18
+
+---
+
 ### programmer v0.2.17
 
 - Add persistent `/theme auto|light|dark` with startup terminal background detection,

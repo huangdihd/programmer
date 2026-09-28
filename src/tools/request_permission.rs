@@ -158,12 +158,6 @@ async fn request_filesystem(
     if operation == AccessKind::Network {
         return Err("error: filesystem permission does not support network access".to_string());
     }
-    if context.security.sandbox_mode() == SandboxMode::Off {
-        return Err(
-            "error: filesystem permission request rejected because the sandbox is off; there is no active sandbox policy to grant additional access through"
-                .to_string(),
-        );
-    }
     let path = path.trim();
     if path.is_empty() {
         return Err("error: filesystem permission requires a non-empty path".to_string());
@@ -252,23 +246,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn off_sandbox_rejects_filesystem_permission_without_prompt() {
-        let manager = SecurityManager::standalone().expect("standalone security");
-        let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
-        assert_eq!(security.sandbox_mode(), SandboxMode::Off);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
-        let args = r#"{"kind":"filesystem","mode":null,"operation":"read","path":"/tmp/outside","reason":"inspect a file"}"#;
-        let output = run(args, &tx, &cancel, 6, &security).await;
-        assert!(
-            output
-                .expect_err("off sandbox must reject")
-                .contains("sandbox is off")
-        );
-        assert!(rx.try_recv().is_err(), "must not prompt for approval");
-    }
-
-    #[tokio::test]
     async fn stricter_sandbox_request_is_rejected_without_prompt() {
         let manager = SecurityManager::standalone().expect("standalone security");
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
@@ -319,7 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_permission_grants_exact_path_after_approval() {
+    async fn filesystem_permission_grants_exact_path_with_sandbox_off_after_approval() {
         let root =
             std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
         let external =
@@ -331,7 +308,7 @@ mod tests {
             SecurityManager::new(crate::security::SecurityConfig::default(), root.clone())
                 .expect("security manager");
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
-        security.set_sandbox_mode(SandboxMode::Restricted).unwrap();
+        security.set_sandbox_mode(SandboxMode::Off).unwrap();
         assert!(
             security
                 .snapshot()
@@ -377,6 +354,13 @@ mod tests {
                 .is_ok()
         );
 
+        assert!(
+            security
+                .snapshot()
+                .authorize_path(AccessKind::Write, external.join("other.txt"))
+                .is_err()
+        );
+        assert_eq!(security.sandbox_mode(), SandboxMode::Off);
         security.set_sandbox_mode(SandboxMode::Network).unwrap();
         assert!(
             security
@@ -403,7 +387,7 @@ mod tests {
             SecurityManager::new(crate::security::SecurityConfig::default(), root.clone())
                 .expect("security manager");
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
-        security.set_sandbox_mode(SandboxMode::Restricted).unwrap();
+        security.set_sandbox_mode(SandboxMode::Off).unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();

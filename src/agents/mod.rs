@@ -175,7 +175,7 @@ impl AgentManager {
                 cancel: start.cancel.clone(),
             };
             let result = runtime
-                .build_runner(start.file_scope)
+                .build_runner(start.file_scope, start.conversation.clone())
                 .run_turn(&start.conversation, &start.cancel, &surface)
                 .await;
             runtime
@@ -500,7 +500,7 @@ impl AgentRuntime {
         Ok(runtime)
     }
 
-    fn build_runner(&self, file_scope: u64) -> TurnRunner {
+    fn build_runner(&self, file_scope: u64, conversation: Arc<Mutex<Conversation>>) -> TurnRunner {
         use crate::tools::provider::{
             LocalToolProvider, McpToolProvider, SkillToolProvider, ToolProvider, ToolRegistry,
         };
@@ -530,6 +530,7 @@ impl AgentRuntime {
                 .with_checkpoint(self.checkpoint.clone())
                 .with_memory_enabled(self.memory_config.enabled)
                 .with_memory_model(memory_model.clone())
+                .with_memory_context(Some(conversation))
                 .with_conversation_history(self.conversation_history.clone()),
             ),
             Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
@@ -686,14 +687,16 @@ mod tests {
 
     #[test]
     fn sub_agents_recall_memories_like_the_main_session() {
-        let runner = memory_runtime(true).build_runner(0);
+        let runner =
+            memory_runtime(true).build_runner(0, Arc::new(Mutex::new(Conversation::new())));
         assert!(
             runner.memory_model.is_some(),
             "a sub-agent runner should associate memories"
         );
 
         // Disabling the store disables recall, not just the tool.
-        let disabled = memory_runtime(false).build_runner(0);
+        let disabled =
+            memory_runtime(false).build_runner(0, Arc::new(Mutex::new(Conversation::new())));
         assert!(disabled.memory_model.is_none());
     }
 
@@ -710,7 +713,12 @@ mod tests {
             overridden.memory_model.as_deref(),
             Some("openai/memory-model")
         );
-        assert!(overridden.build_runner(0).memory_model.is_some());
+        assert!(
+            overridden
+                .build_runner(0, Arc::new(Mutex::new(Conversation::new())))
+                .memory_model
+                .is_some()
+        );
     }
 
     #[test]

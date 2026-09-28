@@ -184,6 +184,7 @@ pub(crate) struct LocalToolProvider {
     memory_enabled: bool,
     memory_model: Option<memory::MemoryModel>,
     conversation_history: Option<Arc<Mutex<crate::conversation::Conversation>>>,
+    memory_context: Option<Arc<Mutex<crate::conversation::Conversation>>>,
 }
 
 impl LocalToolProvider {
@@ -199,6 +200,7 @@ impl LocalToolProvider {
             memory_enabled: true,
             memory_model: None,
             conversation_history: None,
+            memory_context: None,
         }
     }
 
@@ -215,6 +217,7 @@ impl LocalToolProvider {
             memory_enabled: true,
             memory_model: None,
             conversation_history: None,
+            memory_context: None,
         }
     }
 
@@ -233,6 +236,14 @@ impl LocalToolProvider {
 
     pub(crate) fn with_memory_model(mut self, model: Option<memory::MemoryModel>) -> Self {
         self.memory_model = model;
+        self
+    }
+
+    pub(crate) fn with_memory_context(
+        mut self,
+        conversation: Option<Arc<Mutex<crate::conversation::Conversation>>>,
+    ) -> Self {
+        self.memory_context = conversation;
         self
     }
 
@@ -348,7 +359,13 @@ impl ToolProvider for LocalToolProvider {
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == memory::NAME {
-            memory::run(&call.arguments, self.memory_model.as_ref())
+            let excluded = self
+                .memory_context
+                .as_ref()
+                .or(self.conversation_history.as_ref())
+                .map(|conversation| conversation.lock().unwrap().context_memory_ids())
+                .unwrap_or_default();
+            memory::run_excluding(&call.arguments, self.memory_model.as_ref(), &excluded)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == conversation_history::NAME {

@@ -22,7 +22,6 @@
 
 use crate::config::programmer_config::MemoryConfig;
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -416,19 +415,33 @@ impl MemoryManager {
         Err(format!("memory '{id}' was not found"))
     }
 
+    #[cfg(test)]
     pub(crate) fn retrieve(
         &self,
         query: &str,
         config: &MemoryConfig,
     ) -> Result<Vec<MemoryEntry>, String> {
+        self.retrieve_excluding(query, config, &HashSet::new())
+    }
+
+    /// Collect candidates without keyword filtering, excluding IDs before scope limits.
+    pub(crate) fn retrieve_excluding(
+        &self,
+        query: &str,
+        config: &MemoryConfig,
+        excluded_ids: &HashSet<String>,
+    ) -> Result<Vec<MemoryEntry>, String> {
         if !config.enabled || query.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let query_tokens = tokens(query);
-        if query_tokens.is_empty() {
-            return Ok(Vec::new());
-        }
+        let now = now_secs();
         let mut scored = Vec::new();
+        let rank = |left: &(f32, MemoryEntry), right: &(f32, MemoryEntry)| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.id.cmp(&right.1.id))
+        };
         for (scope, limit) in [
             (MemoryScope::Global, config.max_global_results),
             (MemoryScope::Project, config.max_project_results),
@@ -445,16 +458,17 @@ impl MemoryManager {
                 .entries
                 .into_iter()
                 .filter(|entry| entry.status == MemoryStatus::Active)
-                .filter_map(|entry| {
-                    let score = relevance(&entry, &query_tokens);
-                    (score > 0.0).then_some((score, entry))
+                .filter(|entry| !excluded_ids.contains(&entry.id))
+                .map(|entry| {
+                    let score =
+                        (entry.kind.priority() + entry.confidence.score()) * freshness(&entry, now);
+                    (score, entry)
                 })
                 .collect::<Vec<_>>();
-            scope_entries
-                .sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
+            scope_entries.sort_by(rank);
             scored.extend(scope_entries.into_iter().take(limit));
         }
-        scored.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
+        scored.sort_by(rank);
         Ok(scored.into_iter().map(|(_, entry)| entry).collect())
     }
 
@@ -693,31 +707,6 @@ fn looks_like_secret_token(token: &str) -> bool {
         || (token.starts_with("github_pat_") && token.len() >= 20)
 }
 
-fn tokens(text: &str) -> HashSet<String> {
-    let mut tokens = HashSet::new();
-    for word in text.split(|character: char| {
-        !character.is_alphanumeric()
-            && character != '_'
-            && character != '-'
-            && character != '/'
-            && character != '.'
-    }) {
-        let word = word.trim().to_ascii_lowercase();
-        let characters = word.chars().collect::<Vec<_>>();
-        if characters.len() >= 2 {
-            tokens.insert(word);
-        }
-        if characters.iter().any(|character| !character.is_ascii()) {
-            tokens.extend(
-                characters
-                    .windows(2)
-                    .map(|pair| pair.iter().collect::<String>()),
-            );
-        }
-    }
-    tokens
-}
-
 /// How strongly a memory still counts, as a Claude Code style freshness
 /// weight: exponential decay since the memory was last reinforced, damped by
 /// per-kind half-lives and lifted a little every time a recall actually used
@@ -729,25 +718,6 @@ fn freshness(entry: &MemoryEntry, now: u64) -> f32 {
     let decay = 0.5_f32.powf(age_hours / entry.kind.half_life_hours());
     let reinforcement = 1.0 + (entry.use_count as f32).min(20.0) * 0.05;
     (decay * reinforcement).min(1.0)
-}
-
-fn relevance(entry: &MemoryEntry, query_tokens: &HashSet<String>) -> f32 {
-    let content_tokens = tokens(&entry.content);
-    let tag_tokens = entry
-        .tags
-        .iter()
-        .flat_map(|tag| tokens(tag))
-        .collect::<HashSet<_>>();
-    let content_overlap = query_tokens.intersection(&content_tokens).count() as f32;
-    let tag_overlap = query_tokens.intersection(&tag_tokens).count() as f32;
-    if content_overlap == 0.0 && tag_overlap == 0.0 {
-        return 0.0;
-    }
-    let keyword = content_overlap * 2.0
-        + tag_overlap * 4.0
-        + entry.kind.priority()
-        + entry.confidence.score();
-    keyword * freshness(entry, now_secs())
 }
 
 /// Whole days since a memory was last written. Age is measured from
@@ -842,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_ranks_matching_memory_and_obeys_scope_limits() {
+    fn retrieval_ranks_without_keywords_and_excludes_before_scope_limits() {
         let manager = manager();
         manager
             .remember(
@@ -870,16 +840,33 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert!(entries[0].content.contains("JSON"));
+        for query in ["unrelated banana", "test", "测", "!"] {
+            let candidates = manager.retrieve(query, &config).unwrap();
+            assert_eq!(candidates[0].id, entries[0].id);
+        }
+        let excluded = HashSet::from([entries[0].id.clone()]);
+        let candidates = manager
+            .retrieve_excluding("session JSON format", &config, &excluded)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].content, "Run cargo test");
+        assert!(manager.retrieve("  ", &config).unwrap().is_empty());
         assert!(
             manager
-                .retrieve("unrelated banana", &config)
+                .retrieve(
+                    "test",
+                    &MemoryConfig {
+                        enabled: false,
+                        ..config
+                    }
+                )
                 .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
-    fn retrieval_supports_cjk_bigrams() {
+    fn retrieval_returns_cross_language_candidates() {
         let manager = manager();
         manager
             .remember(
@@ -891,10 +878,74 @@ mod tests {
             .unwrap();
 
         let entries = manager
-            .retrieve("请运行格式化", &MemoryConfig::default())
+            .retrieve("format before testing", &MemoryConfig::default())
             .unwrap();
 
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn retrieval_orders_by_quality_with_id_ties_across_scopes() {
+        let manager = manager();
+        for scope in [MemoryScope::Global, MemoryScope::Project] {
+            let mut file = manager.load(scope).unwrap();
+            let mut fresh = entry_with_age(MemoryKind::Preference, 0, 0);
+            // A fixed future timestamp makes freshness exactly equal in both scopes.
+            fresh.updated_at = u64::MAX;
+            fresh.scope = scope;
+            fresh.id = format!("{}-a", scope.label());
+            let mut tied = fresh.clone();
+            tied.id = format!("{}-b", scope.label());
+            let mut inferred = fresh.clone();
+            inferred.id = format!("{}-inferred", scope.label());
+            inferred.confidence = MemoryConfidence::Inferred;
+            let mut stale = fresh.clone();
+            stale.id = format!("{}-stale", scope.label());
+            stale.updated_at = 0;
+            let mut inactive = fresh.clone();
+            inactive.id = format!("{}-inactive", scope.label());
+            inactive.status = MemoryStatus::Superseded;
+            file.entries = vec![stale, inferred, tied, inactive, fresh];
+            manager.save(scope, &file).unwrap();
+        }
+        let config = MemoryConfig {
+            max_global_results: 1,
+            max_project_results: 2,
+            ..Default::default()
+        };
+        let excluded = HashSet::from(["global-a".to_string(), "project-a".to_string()]);
+        let entries = manager
+            .retrieve_excluding("unrelated", &config, &excluded)
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["global-b", "project-b", "project-inferred"]
+        );
+        let entries = manager
+            .retrieve(
+                "unrelated",
+                &MemoryConfig {
+                    global_enabled: false,
+                    max_project_results: 10,
+                    ..config
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "project-a",
+                "project-b",
+                "project-inferred",
+                "project-stale"
+            ]
+        );
     }
 
     #[test]

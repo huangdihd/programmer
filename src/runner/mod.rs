@@ -245,10 +245,11 @@ fn spawn_memory_association(
     model: crate::tools::memory::MemoryModel,
     context: String,
     query: String,
+    excluded: std::collections::HashSet<String>,
 ) -> MemoryAssociationTask {
     MemoryAssociationTask {
         handle: Some(tokio::spawn(async move {
-            model.associate(&context, &query).await
+            model.associate(&context, &query, &excluded).await
         })),
     }
 }
@@ -339,7 +340,12 @@ impl TurnRunner {
         // tool round; a one-response turn never waits for it.
         let mut association = self.memory_model.as_ref().and_then(|memory_model| {
             association_context(conversation).map(|(context, query)| {
-                spawn_memory_association(memory_model.clone(), context, query)
+                spawn_memory_association(
+                    memory_model.clone(),
+                    context,
+                    query,
+                    conversation.lock().unwrap().context_memory_ids(),
+                )
             })
         });
         loop {
@@ -460,9 +466,7 @@ impl TurnRunner {
                 for item in items {
                     conv.add_output(item);
                 }
-                if let Some((input, output, cached)) = usage {
-                    conv.add_usage(input, output, cached);
-                }
+                conv.record_response_usage(usage);
             }
             // Committed to the shared conversation: tell a live renderer to drop
             // its in-progress view now (after the commit, so there is no frame
@@ -888,22 +892,18 @@ fn append_associated_memories(
         return;
     }
     let mut conv = conversation.lock().unwrap();
-    let existing = conv.items().any(|item| match item {
-        MessageItem::Input(async_openai::types::responses::InputItem::Item(
-            async_openai::types::responses::Item::Message(ApiMessageItem::Input(message)),
-        )) if message.role == InputRole::Developer => message.content.iter().any(|content| {
-            let InputContent::InputText(text) = content else {
-                return false;
-            };
-            text.text.starts_with("<!-- programmer-associated-memory:")
-        }),
-        _ => false,
-    });
-    if existing {
+    let excluded = conv.context_memory_ids();
+    let entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| !excluded.contains(&entry.id))
+        .collect();
+    if entries.is_empty() {
         return;
     }
-    let mut text = String::from(
-        "<!-- programmer-associated-memory: persistent recalled context -->\nRelevant memories from previous sessions:\n",
+    let ids: Vec<_> = entries.iter().map(|entry| &entry.id).collect();
+    let mut text = format!(
+        "<!-- programmer-associated-memory-ids: {} -->\n<!-- programmer-associated-memory: persistent recalled context -->\nRelevant memories from previous sessions:\n",
+        serde_json::to_string(&ids).expect("memory IDs serialize")
     );
     for entry in entries {
         // Claude Code style: fresh memories get a short age prefix, older ones
@@ -1282,7 +1282,7 @@ mod tests {
 
     fn memory_entry(updated_at: u64, content: &str) -> crate::memory::MemoryEntry {
         crate::memory::MemoryEntry {
-            id: format!("mem_{updated_at}"),
+            id: format!("mem_{updated_at:032x}"),
             scope: crate::memory::MemoryScope::Project,
             kind: crate::memory::MemoryKind::ProjectFact,
             name: "project-fact".into(),
@@ -1324,6 +1324,28 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn association_excludes_live_ids_but_can_add_new_memories_and_recall_after_compaction() {
+        let conversation = Mutex::new(Conversation::new());
+        let first = memory_entry(1, "first preference");
+        let second = memory_entry(2, "second preference");
+        append_associated_memories(&conversation, std::slice::from_ref(&first));
+        append_associated_memories(&conversation, &[first.clone(), second.clone()]);
+        let text = developer_text(&conversation);
+        assert_eq!(text.matches("first preference").count(), 1);
+        assert_eq!(text.matches("second preference").count(), 1);
+        assert_eq!(conversation.lock().unwrap().context_memory_ids().len(), 2);
+        conversation
+            .lock()
+            .unwrap()
+            .apply_compaction("summary".into());
+        append_associated_memories(&conversation, std::slice::from_ref(&first));
+        assert_eq!(
+            conversation.lock().unwrap().context_memory_ids(),
+            std::collections::HashSet::from([first.id])
+        );
     }
 
     #[test]

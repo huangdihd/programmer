@@ -168,6 +168,42 @@ impl<'a> ToolCallMessage<'a> {
                     lines.push(line);
                 }
             }
+            Some(serde_json::Value::Object(map))
+                if self.call.name == "edit_file"
+                    && map.get("edits").and_then(|v| v.as_array()).is_some() =>
+            {
+                if let Some(path) = map.get("path").and_then(|v| v.as_str()) {
+                    push_field(&mut lines, "path", path, detail_style());
+                }
+                if let Some(edits) = map.get("edits").and_then(|v| v.as_array()) {
+                    for (index, edit) in edits.iter().enumerate() {
+                        let label = format!(
+                            "edit {}/{}{}",
+                            index + 1,
+                            edits.len(),
+                            if edit.get("replace_all").and_then(|v| v.as_bool()) == Some(true) {
+                                " · replace all"
+                            } else {
+                                ""
+                            }
+                        );
+                        lines.push(Line::from(Span::styled(label, detail_style())));
+                        if let (Some(old), Some(new)) = (
+                            edit.get("old_string").and_then(|v| v.as_str()),
+                            edit.get("new_string").and_then(|v| v.as_str()),
+                        ) {
+                            let base = edit
+                                .get("offset")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(1)
+                                .max(1) as usize;
+                            lines.extend(diff_lines(old, new, base));
+                        } else {
+                            push_field(&mut lines, "edit", &value_text(edit), detail_style());
+                        }
+                    }
+                }
+            }
             Some(serde_json::Value::Object(map)) => {
                 for (key, val) in map {
                     push_field(&mut lines, key, &value_text(val), detail_style());
@@ -543,6 +579,34 @@ mod tests {
         assert_eq!(
             color(ToolCallMessage::new(&call, 80).failed(true).into_text()),
             Some(palette::RED)
+        );
+    }
+
+    #[test]
+    fn batch_edits_render_separate_multiline_diffs() {
+        let call = FunctionToolCall {
+            arguments: serde_json::json!({"path":"file.rs", "edits":[
+                {"old_string":"old first\nkeep", "new_string":"new first\nkeep"},
+                {"old_string":"old second", "new_string":"new second", "replace_all":true}
+            ]})
+            .to_string(),
+            call_id: "batch".into(),
+            namespace: None,
+            name: "edit_file".into(),
+            id: None,
+            status: None,
+        };
+        let rendered = ToolCallMessage::new(&call, 80).expanded(true).into_text();
+        let text = plain(&rendered.lines).join("\n");
+        assert!(text.contains("edit 1/2"), "{text}");
+        assert!(text.contains("edit 2/2 · replace all"), "{text}");
+        assert!(
+            text.contains("old first") && text.contains("new second"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("old_string") && !text.contains("\\n"),
+            "{text}"
         );
     }
 

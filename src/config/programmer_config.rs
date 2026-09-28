@@ -41,9 +41,9 @@ pub struct MemoryConfig {
     pub global_enabled: bool,
     /// Include current-project memories in explicit recall results.
     pub project_enabled: bool,
-    /// Maximum number of global memories returned by one recall.
+    /// Maximum number of global memory candidates considered by one recall.
     pub max_global_results: usize,
-    /// Maximum number of project memories returned by one recall.
+    /// Maximum number of project memory candidates considered by one recall.
     pub max_project_results: usize,
     /// Enable background extraction and consolidation of completed sessions.
     pub dream_enabled: bool,
@@ -61,7 +61,7 @@ impl Default for MemoryConfig {
             enabled: true,
             global_enabled: true,
             project_enabled: true,
-            max_global_results: 3,
+            max_global_results: 30,
             max_project_results: 8,
             dream_enabled: true,
             dream_min_sessions: 5,
@@ -415,6 +415,17 @@ mod tests {
         let serialized = toml::to_string(&disabled).expect("serialize");
         let parsed: ProgrammerConfig = toml::from_str(&serialized).expect("deserialize");
         assert!(!parsed.vision_enabled);
+    }
+
+    #[test]
+    fn memory_candidate_limits_default_and_allow_overrides() {
+        assert_eq!(MemoryConfig::default().max_global_results, 30);
+        let parsed: ProgrammerConfig = toml::from_str("[memory]\n").unwrap();
+        assert_eq!(parsed.memory.max_global_results, 30);
+        assert_eq!(parsed.memory.max_project_results, 8);
+        let parsed: ProgrammerConfig =
+            toml::from_str("[memory]\nmax_global_results = 3\n").unwrap();
+        assert_eq!(parsed.memory.max_global_results, 3);
     }
 
     #[test]
