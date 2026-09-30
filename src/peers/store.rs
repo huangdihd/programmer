@@ -248,6 +248,14 @@ fn check_directories(path: &Path, create: bool) -> Result<()> {
             return Err("Parent traversal is not allowed in peer inbox paths".into());
         }
         current.push(component);
+        if matches!(component, Component::Prefix(_)) {
+            if !path.has_root() {
+                return Err("Drive-relative peer inbox paths are not allowed".into());
+            }
+            // Windows prefixes are not directories until joined to their root separator.
+            // The next iteration checks the root; every ancestor is still checked.
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(format!(
@@ -296,6 +304,42 @@ mod tests {
     impl Drop for TestStore {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0.root);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_and_verbatim_directories_are_checked() {
+        let temporary = std::env::temp_dir();
+        let canonical = temporary.canonicalize().unwrap();
+        assert!(matches!(
+            canonical.components().next(),
+            Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+        ));
+        for root in [temporary, canonical] {
+            check_directories(&root, false).unwrap();
+            let store = TestStore(Store::new(
+                root.join(format!("programmer-peer-test-{}", uuid::Uuid::new_v4())),
+            ));
+            check_directories(&store.0.root, false).unwrap();
+            assert!(!store.0.root.exists());
+            check_directories(&store.0.root, true).unwrap();
+            assert!(store.0.root.is_dir());
+            let file = store.0.root.join("not-a-directory");
+            fs::write(&file, "test").unwrap();
+            assert!(check_directories(&file.join("child"), false).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_relative_directories_are_rejected() {
+        for path in [r"C:", r"C:inbox"] {
+            assert!(
+                check_directories(Path::new(path), false)
+                    .unwrap_err()
+                    .contains("Drive-relative")
+            );
         }
     }
 
