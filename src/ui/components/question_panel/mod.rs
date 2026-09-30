@@ -20,7 +20,11 @@
 //! Pressing Enter sends the answer back to the blocked tool call via a
 //! oneshot channel, then the input panel is restored.
 
+mod delegation;
 pub mod ui;
+
+#[cfg(test)]
+mod tests;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::style::{Color, Modifier, Style};
@@ -36,6 +40,8 @@ pub enum AnswerAction {
     None,
     /// Answer with this text.
     Answer(String),
+    /// Switch the session model without answering the pending question.
+    SelectModel(String),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -50,6 +56,7 @@ pub struct QuestionPanel {
     question: Question,
     mode: Mode,
     answer_tx: Option<AnswerTx>,
+    delegation: Option<delegation::Delegation>,
 }
 
 fn make_textarea() -> TextArea<'static> {
@@ -78,16 +85,15 @@ impl QuestionPanel {
             question,
             mode,
             answer_tx: Some(answer_tx),
+            delegation: None,
         }
-    }
-
-    /// The question text the model asked.
-    pub fn question_text(&self) -> &str {
-        &self.question.text
     }
 
     /// Handle a key event. Returns the answer if the user submitted one.
     pub fn handle_key(&mut self, key: KeyEvent) -> AnswerAction {
+        if let Some(delegation) = &mut self.delegation {
+            return delegation.handle_key(key);
+        }
         match &mut self.mode {
             Mode::Choice { selected } => {
                 let QuestionKind::Choice {
@@ -147,6 +153,10 @@ impl QuestionPanel {
 
     /// Append pasted text in text-input mode.
     pub fn handle_paste(&mut self, data: &str) {
+        if let Some(delegation) = &mut self.delegation {
+            delegation.paste(data);
+            return;
+        }
         if let Mode::Text { textarea } = &mut self.mode {
             let clean: String = data.chars().filter(|c| *c != '\n' && *c != '\r').collect();
             textarea.insert_str(&clean);

@@ -189,17 +189,18 @@ fn group_is_tool_output(item: &GroupItem<'_>) -> bool {
     matches!(item, GroupItem::Message(MessageItem::ToolOutput { .. }))
 }
 
-/// The runner may insert this internal developer reminder between model steps
-/// in one user turn. It is protocol-visible but not a user interaction, so it
-/// must not split the visual tool run.
-fn group_is_post_edit_reminder(item: &GroupItem<'_>) -> bool {
+/// The runner may insert internal developer context between model steps in one
+/// user turn. These messages are hidden by the UI and are not user interaction
+/// boundaries, so they must not split the visual tool run.
+fn group_is_internal_developer_context(item: &GroupItem<'_>) -> bool {
     matches!(
         item,
         GroupItem::Message(MessageItem::Input(InputItem::Item(Item::Message(
             ApiMessageItem::Input(message)
         )))) if message.role == InputRole::Developer
             && matches!(message.content.as_slice(), [InputContent::InputText(text)]
-                if text.text == crate::prompts::POST_EDIT_REMINDER)
+                if text.text == crate::prompts::POST_EDIT_REMINDER
+                    || text.text.starts_with("<!-- programmer-associated-memory-ids: "))
     )
 }
 
@@ -240,7 +241,7 @@ fn discover_group_items(items: &[GroupItem<'_>]) -> Vec<ToolGroup> {
             Some(call) if is_hidden_runtime_tool(call) => {}
             Some(call) if !is_interactive(call) => run.push(index),
             None if group_is_reasoning(item) => absorbed.push(index),
-            None if group_is_tool_output(item) || group_is_post_edit_reminder(item) => {}
+            None if group_is_tool_output(item) || group_is_internal_developer_context(item) => {}
             _ => flush(&mut run, &mut absorbed, false, &mut groups),
         }
     }
@@ -306,7 +307,7 @@ fn continues_tool_run(item: &MessageItem) -> bool {
             matches!(
                 item,
                 MessageItem::Output(OutputItem::Reasoning(_)) | MessageItem::ToolOutput { .. }
-            ) || group_is_post_edit_reminder(&GroupItem::Message(item))
+            ) || group_is_internal_developer_context(&GroupItem::Message(item))
         }
     }
 }
@@ -602,7 +603,7 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
         )));
     }
     let mut headers = Vec::new();
-    let inner_width = width.saturating_sub(2).max(1);
+    let inner_width = width.saturating_sub(1).max(1);
     let mut rendered_rows = lines.len() as u16;
 
     if expanded {
@@ -676,7 +677,7 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
     }
 
     let block = Block::default()
-        .padding(Padding::new(1, 1, 0, 1))
+        .padding(Padding::new(0, 1, 0, 1))
         .style(if expanded {
             Style::new().bg(EXPANDED_BG)
         } else {
@@ -901,6 +902,69 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].member_indices, [0, 1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn recalled_memory_does_not_split_a_committed_live_tool_group() {
+        let memory_context = MessageItem::Input(InputItem::Item(Item::Message(
+            ApiMessageItem::Input(InputMessage {
+                content: vec![InputContent::InputText(
+                    "<!-- programmer-associated-memory-ids: [\"mem_test\"] -->\n\
+                     <!-- programmer-associated-memory: persistent recalled context -->\n\
+                     Relevant memories from previous sessions:\n- remembered fact"
+                        .into(),
+                )],
+                role: InputRole::Developer,
+                status: None,
+            }),
+        )));
+        let committed = vec![
+            call(0, "command"),
+            MessageItem::ToolOutput {
+                output: FunctionCallOutputItemParam {
+                    call_id: "call-0".into(),
+                    output: FunctionCallOutput::Text("ok".into()),
+                    id: None,
+                    status: None,
+                },
+                failed: false,
+                approval_label: Some("approved by Auto mode".into()),
+            },
+            memory_context,
+        ];
+        let reasoning = OutputItem::Reasoning(ReasoningItem {
+            id: None,
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: None,
+            status: None,
+        });
+        let live_calls: Vec<OutputItem> = [
+            "mcp__codegraph__codegraph_explore",
+            "read_file",
+            "write_file",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            OutputItem::FunctionCall(FunctionToolCall {
+                arguments: "{}".into(),
+                call_id: format!("live-call-{index}"),
+                namespace: None,
+                name: name.into(),
+                id: None,
+                status: None,
+            })
+        })
+        .collect();
+        let live: Vec<&OutputItem> = std::iter::once(&reasoning)
+            .chain(live_calls.iter())
+            .collect();
+
+        let group = discover_tool_group_bridge_outputs(&committed, &live).unwrap();
+
+        assert_eq!(group.member_indices, [0, 4, 5, 6]);
+        assert_eq!(group.absorbed, [3]);
     }
 
     #[test]

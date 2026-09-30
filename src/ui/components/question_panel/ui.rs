@@ -24,6 +24,9 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 impl QuestionPanel {
     /// The number of rows this panel needs (including the top border).
     pub fn needed_height(&self) -> u16 {
+        if let Some(delegation) = &self.delegation {
+            return delegation.height();
+        }
         let question_lines = (self.question.text.len() as u16 / 40 + 1).max(1);
         let content = match &self.question.kind {
             QuestionKind::Choice { options, .. } => {
@@ -40,6 +43,10 @@ impl QuestionPanel {
     /// Render the question panel into the given area (bottom of screen).
     /// TextArea::render handles cursor positioning via the buffer.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        if let Some(delegation) = &self.delegation {
+            delegation.render(&self.question.text, area, buf);
+            return;
+        }
         let block = Block::default()
             .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::Cyan));

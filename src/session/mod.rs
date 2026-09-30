@@ -68,6 +68,18 @@ pub(crate) enum SerializableMessageItem {
     Error(String),
     Warning(String),
     Info(String),
+    PeerExchange {
+        id: String,
+        from: String,
+        question: String,
+        answer: Option<String>,
+    },
+    PeerDelegation {
+        id: String,
+        from: String,
+        body: Option<String>,
+        state: crate::response::message_item::PeerDelegationState,
+    },
     Meta {
         label: String,
         text: String,
@@ -106,6 +118,28 @@ impl From<MessageItem> for SerializableMessageItem {
             MessageItem::Error(s) => SerializableMessageItem::Error(s),
             MessageItem::Warning(s) => SerializableMessageItem::Warning(s),
             MessageItem::Info(s) => SerializableMessageItem::Info(s),
+            MessageItem::PeerExchange {
+                id,
+                from,
+                question,
+                answer,
+            } => SerializableMessageItem::PeerExchange {
+                id,
+                from,
+                question,
+                answer,
+            },
+            MessageItem::PeerDelegation {
+                id,
+                from,
+                body,
+                state,
+            } => SerializableMessageItem::PeerDelegation {
+                id,
+                from,
+                body,
+                state,
+            },
             MessageItem::Meta { label, text } => SerializableMessageItem::Meta { label, text },
             MessageItem::Usage(i, o, cached, recalled_memories) => SerializableMessageItem::Usage {
                 input_tokens: i,
@@ -155,6 +189,28 @@ impl From<SerializableMessageItem> for MessageItem {
             SerializableMessageItem::Error(s) => MessageItem::Error(s),
             SerializableMessageItem::Warning(s) => MessageItem::Warning(s),
             SerializableMessageItem::Info(s) => MessageItem::Info(s),
+            SerializableMessageItem::PeerExchange {
+                id,
+                from,
+                question,
+                answer,
+            } => MessageItem::PeerExchange {
+                id,
+                from,
+                question,
+                answer,
+            },
+            SerializableMessageItem::PeerDelegation {
+                id,
+                from,
+                body,
+                state,
+            } => MessageItem::PeerDelegation {
+                id,
+                from,
+                body,
+                state,
+            },
             SerializableMessageItem::Meta { label, text } => MessageItem::Meta { label, text },
             SerializableMessageItem::Usage {
                 input_tokens,
@@ -851,6 +907,57 @@ pub(crate) fn truncate_first_line(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_delegation_round_trips_all_states_and_missing_task() {
+        use crate::response::message_item::PeerDelegationState::*;
+        for state in [Pending, AcceptedQueued, Started, Rejected] {
+            for body in [None, Some("任务\nfull task".to_owned())] {
+                let item = MessageItem::PeerDelegation {
+                    id: "stable-id".into(),
+                    from: "source".into(),
+                    body: body.clone(),
+                    state,
+                };
+                let json =
+                    serde_json::to_string(&SerializableMessageItem::from(item.clone())).unwrap();
+                let saved: SerializableMessageItem = serde_json::from_str(&json).unwrap();
+                let restored = MessageItem::from(saved);
+                assert!(
+                    matches!(restored, MessageItem::PeerDelegation { id, from, body: saved, state: actual }
+                    if id == "stable-id" && from == "source" && saved == body && actual == state)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn peer_exchange_round_trips_pending_and_answered() {
+        for answer in [None, Some("full answer\nsecond line".to_string())] {
+            let original = MessageItem::PeerExchange {
+                id: "exchange-id".into(),
+                from: "full-source-session".into(),
+                question: "full question\nsecond line".into(),
+                answer: answer.clone(),
+            };
+            let json =
+                serde_json::to_string(&SerializableMessageItem::from(original.clone())).unwrap();
+            let stored: SerializableMessageItem = serde_json::from_str(&json).unwrap();
+            let MessageItem::PeerExchange {
+                id,
+                from,
+                question,
+                answer: restored,
+            } = MessageItem::from(stored)
+            else {
+                panic!("exchange variant lost");
+            };
+            assert_eq!(id, "exchange-id");
+            assert_eq!(from, "full-source-session");
+            assert_eq!(question, "full question\nsecond line");
+            assert_eq!(restored, answer);
+        }
+    }
 
     #[test]
     fn truncate_short() {

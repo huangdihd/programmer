@@ -17,6 +17,16 @@ use async_openai::error::OpenAIError;
 use async_openai::types::responses::{FunctionCallOutputItemParam, InputItem, OutputItem};
 use std::sync::Arc;
 
+/// Display-only observations; never an execution authorization or completion claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerDelegationState {
+    Pending,
+    AcceptedQueued,
+    Started,
+    Rejected,
+}
+
 #[derive(Debug)]
 pub enum MessageItem {
     Input(InputItem),
@@ -37,6 +47,20 @@ pub enum MessageItem {
     Error(String),
     Warning(String),
     Info(String),
+    /// Persisted UI-only record of a lightweight cross-session exchange.
+    PeerExchange {
+        id: String,
+        from: String,
+        question: String,
+        answer: Option<String>,
+    },
+    PeerDelegation {
+        id: String,
+        from: String,
+        /// Source-side status notifications do not carry the original task.
+        body: Option<String>,
+        state: PeerDelegationState,
+    },
     Meta {
         label: String,
         text: String,
@@ -69,6 +93,28 @@ impl Clone for MessageItem {
             MessageItem::Error(s) => MessageItem::Error(s.clone()),
             MessageItem::Warning(s) => MessageItem::Warning(s.clone()),
             MessageItem::Info(s) => MessageItem::Info(s.clone()),
+            MessageItem::PeerExchange {
+                id,
+                from,
+                question,
+                answer,
+            } => MessageItem::PeerExchange {
+                id: id.clone(),
+                from: from.clone(),
+                question: question.clone(),
+                answer: answer.clone(),
+            },
+            MessageItem::PeerDelegation {
+                id,
+                from,
+                body,
+                state,
+            } => MessageItem::PeerDelegation {
+                id: id.clone(),
+                from: from.clone(),
+                body: body.clone(),
+                state: *state,
+            },
             MessageItem::Meta { label, text } => MessageItem::Meta {
                 label: label.clone(),
                 text: text.clone(),

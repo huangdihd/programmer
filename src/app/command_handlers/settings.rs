@@ -460,19 +460,26 @@ fn model(app: &mut App<'_>, model: String) -> CommandOutcome {
         return CommandOutcome::without_history(true);
     }
 
-    match app.provider_manager.resolve(&model) {
-        Some(_) => {
-            app.current_model = model;
+    match switch_model(app, &model) {
+        Ok(()) => {
             app.conversation_panel
                 .add_info_string(format!("switched to model: {}", app.current_model));
         }
-        None => {
-            app.conversation_panel.add_error_string(format!(
-                "unknown provider/model: {model} — use /providers to list available",
-            ));
-        }
+        Err(error) => app.conversation_panel.add_error_string(error),
     }
     CommandOutcome::handled(true)
+}
+
+/// Update only future turn snapshots, without clearing drafts or emitting Info.
+pub(in crate::app) fn switch_model(app: &mut App<'_>, model: &str) -> Result<(), String> {
+    if app.provider_manager.resolve(model).is_none() {
+        return Err(format!(
+            "unknown provider/model: {model} — use /providers to list available"
+        ));
+    }
+    app.current_model = model.to_string();
+    super::super::session::mark_dirty(app);
+    Ok(())
 }
 
 const VISION_USAGE: &str = "usage: /vision <on|off> [global|session]";

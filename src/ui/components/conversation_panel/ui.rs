@@ -28,6 +28,7 @@ use crate::ui::components::messages::assistant_message::AssistantMessage;
 use crate::ui::components::messages::compacting_message::CompactingMessage;
 use crate::ui::components::messages::error_message::ErrorMessage;
 use crate::ui::components::messages::info_message::InfoMessage;
+use crate::ui::components::messages::peer_exchange::PeerExchangeMessage;
 use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::tool_result::ToolResultMessage;
 use crate::ui::components::messages::usage_message::UsageMessage;
@@ -78,7 +79,8 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
         | MessageItem::Error(_)
         | MessageItem::Warning(_)
         | MessageItem::Info(_) => 1,
-        MessageItem::Meta { .. } => 1,
+        MessageItem::Meta { .. } | MessageItem::PeerExchange { .. } => 1,
+        MessageItem::PeerDelegation { .. } => 3,
         MessageItem::Usage(_, _, _, _) => 1,
         // Usually collapsed to its one-line divider (like Reasoning, the
         // estimate ignores the expanded state — the real height comes from the
@@ -148,6 +150,28 @@ fn virtual_window(
         visible_bottom.saturating_sub(visible_top),
     );
     Some((source_offset, destination))
+}
+
+/// User bubbles paint through the shared message gutter without moving text.
+fn render_user_gutter(
+    panel: Rect,
+    viewport: Rect,
+    item_top: u16,
+    item_height: u16,
+    viewport_top: u16,
+    buf: &mut Buffer,
+) {
+    let outer_left = panel.x.saturating_add(u16::from(panel.width >= 3));
+    let Some((_, visible)) = virtual_window(item_top, item_height, viewport_top, viewport) else {
+        return;
+    };
+    for x in outer_left..viewport.x {
+        for y in visible.y..visible.bottom() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(crate::ui::markdown_theme::palette::SURFACE);
+            }
+        }
+    }
 }
 
 fn render_virtual_paragraph(
@@ -487,6 +511,48 @@ fn build_live_group_slot<'a>(
     }
 }
 
+/// Recover the actual injected text from this turn, never from the mutable
+/// memory store. Older sessions without injection snapshots remain unavailable.
+fn recalled_memory_snapshots(items: &[MessageItem]) -> Vec<String> {
+    let mut snapshots = Vec::new();
+    for item in items.iter().rev() {
+        match item {
+            MessageItem::Usage(..) | MessageItem::Compacted { .. } => break,
+            MessageItem::Input(InputItem::Item(Item::Message(ApiMessageItem::Input(message)))) => {
+                if message.role == InputRole::User {
+                    break;
+                }
+                if message.role != InputRole::Developer {
+                    continue;
+                }
+                for content in &message.content {
+                    let async_openai::types::responses::InputContent::InputText(text) = content
+                    else {
+                        continue;
+                    };
+                    if text
+                        .text
+                        .starts_with("<!-- programmer-associated-memory-ids: ")
+                        && let Some((_, body)) = text
+                            .text
+                            .split_once("Relevant memories from previous sessions:\n")
+                    {
+                        snapshots.push(body.trim().to_owned());
+                    }
+                }
+            }
+            MessageItem::Input(InputItem::EasyMessage(message))
+                if message.role == async_openai::types::responses::Role::User =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    snapshots.reverse();
+    snapshots
+}
+
 /// Builds the paragraph for a finished history item. Called at most once per
 /// item (the result is cached in [`ConversationPanel::render_cache`]).
 fn build_item_paragraph(
@@ -495,6 +561,7 @@ fn build_item_paragraph(
     expanded: bool,
     tool_output: Option<(&FunctionCallOutputItemParam, bool, Option<&str>)>,
     live_output: Option<&str>,
+    memory_snapshots: Vec<String>,
 ) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
     match item {
         MessageItem::ToolOutput { output, failed, .. } => {
@@ -529,6 +596,28 @@ fn build_item_paragraph(
             InfoMessage::new(message.clone()).into_paragraph(),
             Vec::new(),
         ),
+        MessageItem::PeerExchange {
+            from,
+            question,
+            answer,
+            ..
+        } => (
+            PeerExchangeMessage::new(from, question, answer.as_deref())
+                .expanded(expanded)
+                .into_paragraph(),
+            Vec::new(),
+        ),
+        MessageItem::PeerDelegation {
+            from, body, state, ..
+        } => (
+            crate::ui::components::messages::peer_delegation::paragraph(
+                from,
+                body.as_deref(),
+                *state,
+                expanded,
+            ),
+            Vec::new(),
+        ),
         MessageItem::Meta { label, .. } => (
             InfoMessage::new(format!("\u{25B8} {}", label)).into_paragraph(),
             Vec::new(),
@@ -538,7 +627,10 @@ fn build_item_paragraph(
             Vec::new(),
         ),
         MessageItem::Usage(input, output, cached, recalled) => (
-            UsageMessage::new(*input, *output, *cached, *recalled).into_paragraph(),
+            UsageMessage::new(*input, *output, *cached, *recalled)
+                .expanded(expanded)
+                .memories(memory_snapshots)
+                .into_paragraph(),
             Vec::new(),
         ),
         MessageItem::Compacted { summary } => {
@@ -565,19 +657,28 @@ fn build_item_paragraph(
     }
 }
 
+/// Inset the transcript once: outer left margin + message gutter, with the
+/// existing right margin reserved for the overlay scrollbar. On narrow panels,
+/// retain a content column before adding either left inset.
+fn transcript_content_area(area: Rect) -> Rect {
+    let outer_left = u16::from(area.width >= 3);
+    let message_left = u16::from(area.width >= 4);
+    let left = outer_left + message_left;
+    Rect {
+        x: area.x.saturating_add(left),
+        width: area.width.saturating_sub(left + 1),
+        ..area
+    }
+}
+
 impl Widget for &mut ConversationPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.frame_count = self.frame_count.wrapping_add(1);
-        // Layout: one blank column of margin on the left and one on the right
-        // (the right column doubles as the overlay scrollbar's track), so the
-        // scrollbar never overlaps content.
-        let left_margin = u16::from(area.width >= 3);
-        let content_width = area.width.saturating_sub(left_margin + 1);
-        let content_area = Rect {
-            x: area.x + left_margin,
-            width: content_width,
-            ..area
-        };
+        // All transcript items share this viewport, including live Markdown,
+        // cached paragraphs and mouse coordinates. Keep the panel's outer
+        // margins plus one extra left column here, not in individual messages.
+        let content_area = transcript_content_area(area);
+        let content_width = content_area.width;
         // Pull a completed background Markdown result into the front buffer
         // before calculating live layout. No Markdown parser is run on this
         // render thread.
@@ -1049,6 +1150,11 @@ impl Widget for &mut ConversationPanel {
                             expanded,
                             tool_output,
                             live_output.as_deref(),
+                            if expanded && matches!(&conv.items[index], MessageItem::Usage(..)) {
+                                recalled_memory_snapshots(&conv.items[..index])
+                            } else {
+                                Vec::new()
+                            },
                         );
                         let height = paragraph.line_count(content_width) as u16;
                         CachedParagraph {
@@ -1406,6 +1512,10 @@ impl Widget for &mut ConversationPanel {
                 });
             }
             if visible(y, entry.height) {
+                if matches!(&conv.items[index], MessageItem::Input(input) if !is_hidden_developer_input(input))
+                {
+                    render_user_gutter(area, content_area, y, entry.height, visible_top, buf);
+                }
                 render_virtual_live_paragraph(
                     &entry.paragraph,
                     y,
@@ -1588,6 +1698,187 @@ mod tests {
         ActivePhase, ConversationPanel, LiveRenderCache, ViewportParagraphCache,
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn user_background_extends_into_gutter_without_changing_content_geometry() {
+        use crate::ui::markdown_theme::palette;
+        let panel = Rect::new(7, 3, 30, 8);
+        let viewport = super::transcript_content_area(panel);
+        for (top, height, scroll, rows) in [(2, 3, 0, 5..8), (2, 5, 4, 3..6)] {
+            let mut buffer = Buffer::empty(panel);
+            super::render_user_gutter(panel, viewport, top, height, scroll, &mut buffer);
+            for y in panel.y..panel.bottom() {
+                assert_eq!(
+                    buffer[(panel.x + 1, y)].bg == palette::SURFACE,
+                    rows.contains(&y)
+                );
+                assert_ne!(buffer[(panel.x, y)].bg, palette::SURFACE);
+                assert_ne!(buffer[(viewport.x, y)].bg, palette::SURFACE);
+            }
+        }
+        assert_eq!(viewport.x, panel.x + 2);
+    }
+
+    #[test]
+    fn transcript_viewport_owns_the_common_left_inset() {
+        use crate::response::message_item::MessageItem;
+        use async_openai::types::responses::InputItem;
+
+        let mut panel = ConversationPanel::new();
+        {
+            let mut conversation = panel.conversation.lock().unwrap();
+            conversation.items.push(MessageItem::Input(
+                serde_json::from_value::<InputItem>(serde_json::json!({
+                    "type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": "user-marker"}
+                    ]
+                }))
+                .unwrap(),
+            ));
+            conversation.add_output(
+                serde_json::from_value(serde_json::json!({
+                    "type": "message", "id": "message", "role": "assistant",
+                    "status": "completed", "content": [
+                        {"type": "output_text", "text": "assistant-marker", "annotations": []}
+                    ]
+                }))
+                .unwrap(),
+            );
+            conversation.add_output(OutputItem::FunctionCall(tool_call(10, "command")));
+            conversation.add_info_string("info-marker");
+            for index in 0..3 {
+                conversation.add_output(OutputItem::FunctionCall(tool_call(index, "read_file")));
+            }
+            conversation.items.push(MessageItem::Usage(10, 5, 0, None));
+        }
+        panel.upsert_peer_exchange("exchange", "peer-marker", "question", None);
+        // Nonzero origin catches accidental screen-relative padding/hit tests.
+        let area = Rect::new(7, 3, 100, 40);
+        for width in [100, 55, 100] {
+            let area = Rect { width, ..area };
+            let mut buffer = Buffer::empty(area);
+            panel.render(area, &mut buffer);
+            assert_eq!(super::transcript_content_area(area).x, area.x + 2);
+            assert_eq!(panel.render_cache.width, width - 3);
+            for marker in [
+                "user-marker",
+                "assistant-marker",
+                "command",
+                "info-marker",
+                "Exploring",
+                "tokens",
+                "peer-marker",
+            ] {
+                let row = (area.y..area.bottom())
+                    .find(|&y| {
+                        let text: String = (area.x..area.right())
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect();
+                        text.contains(marker)
+                    })
+                    .unwrap_or_else(|| panic!("missing {marker}"));
+                let first = (area.x..area.right())
+                    .find(|&x| buffer[(x, row)].symbol() != " ")
+                    .unwrap();
+                assert_eq!(first, area.x + 2, "{marker}");
+            }
+            let peer_row = (area.y..area.bottom())
+                .find(|&y| {
+                    let text: String = (area.x..area.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    text.contains("peer-marker")
+                })
+                .unwrap();
+            panel.handle_click(area.x + 1, peer_row);
+            assert!(
+                panel.expanded_items.is_empty(),
+                "gutter must not toggle items"
+            );
+            panel.handle_click(area.x + 2, peer_row);
+            assert!(!panel.expanded_items.is_empty());
+            panel.handle_click(area.x + 2, peer_row);
+        }
+    }
+
+    #[test]
+    fn transcript_inset_saturates_on_narrow_panels() {
+        for width in 0..5 {
+            let area = Rect::new(7, 3, width, 2);
+            let content = super::transcript_content_area(area);
+            assert!(content.x >= area.x && content.right() <= area.right());
+            assert_eq!(
+                content.width,
+                width.saturating_sub(if width >= 4 {
+                    3
+                } else if width >= 3 {
+                    2
+                } else {
+                    1
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn usage_header_expands_turn_snapshot_and_details_do_not_toggle() {
+        use crate::response::message_item::MessageItem;
+        use async_openai::types::responses::InputItem;
+        let snapshot = |body: &str| {
+            MessageItem::Input(InputItem::Item(Item::Message(
+            ApiMessageItem::Input(InputMessage {
+                content: vec![InputContent::InputText(format!(
+                    "<!-- programmer-associated-memory-ids: [\"mem_test\"] -->\n<!-- programmer-associated-memory: persistent recalled context -->\nRelevant memories from previous sessions:\n{body}"
+                ).into())],
+                role: InputRole::Developer,
+                status: None,
+            }),
+        )))
+        };
+        let mut panel = ConversationPanel::new();
+        {
+            let mut conv = panel.conversation.lock().unwrap();
+            conv.items.push(snapshot("old turn memory"));
+            conv.items.push(MessageItem::Usage(1, 1, 0, Some(1)));
+            conv.items.push(snapshot("[ProjectFact] original snapshot"));
+            conv.items
+                .push(MessageItem::Usage(188867, 268, 62848, Some(1)));
+        }
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buffer = Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        let top = (0..area.height)
+            .find(|&y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("189135 tokens")
+            })
+            .unwrap();
+        panel.handle_click(2, top);
+        assert!(panel.expanded_items.contains(&3));
+        panel.render(area, &mut buffer);
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("189135 tokens(33% cached)"));
+        assert!(text.contains("original snapshot"));
+        assert!(!text.contains("old turn memory"));
+        let top = (0..area.height)
+            .find(|&y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("189135 tokens")
+            })
+            .unwrap();
+        panel.handle_click(2, top + 1);
+        assert!(panel.expanded_items.contains(&3));
+        panel.handle_click(2, top);
+        assert!(!panel.expanded_items.contains(&3));
+        let mut buffer = Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!text.contains("original snapshot"));
+    }
 
     #[test]
     fn unavailable_usage_renders_after_reply_in_the_conversation() {
@@ -1920,6 +2211,88 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn delegation_lifecycle_updates_one_slot_preserves_fold_and_resets_pending() {
+        use crate::response::message_item::PeerDelegationState::*;
+        let mut panel = ConversationPanel::new();
+        let area = Rect::new(0, 0, 120, 24);
+        panel.upsert_peer_delegation(
+            "id".into(),
+            "source-session".into(),
+            Some("task excerpt\nfull-task-marker".into()),
+            Pending,
+        );
+        let collapsed = render_text(&mut panel, area);
+        assert!(collapsed.contains("task excerpt · pending"), "{collapsed}");
+        assert!(!collapsed.contains("full-task-marker"));
+        let row = collapsed
+            .lines()
+            .position(|line| line.contains('↔'))
+            .unwrap() as u16;
+        panel.handle_click(2, row);
+        assert!(panel.expanded_items.contains(&0));
+        for (state, label) in [
+            (AcceptedQueued, "accepted · queued"),
+            (Started, "started"),
+            (Rejected, "rejected"),
+            (Pending, "pending"),
+        ] {
+            panel.upsert_peer_delegation("id".into(), "source-session".into(), None, state);
+            assert_eq!(panel.items_snapshot().len(), 1);
+            assert!(panel.expanded_items.contains(&0));
+            let rendered = render_text(&mut panel, area);
+            assert!(rendered.contains(label), "{rendered}");
+            assert!(rendered.contains("full-task-marker"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn peer_exchange_click_fold_and_upsert_preserve_one_slot() {
+        let mut panel = ConversationPanel::new();
+        let area = Rect::new(0, 0, 100, 24);
+        let source = "e172f842-2450-4ac5-88ec-691aef419bfa";
+        panel.upsert_peer_exchange("exchange", source, "question-body-marker", None);
+        let collapsed = render_text(&mut panel, area);
+        assert!(collapsed.contains("↔ e172f842 · pending"), "{collapsed}");
+        assert!(!collapsed.contains("question-body-marker"));
+        assert!(!collapsed.contains(source));
+        let row = collapsed
+            .lines()
+            .position(|line| line.contains('↔'))
+            .unwrap() as u16;
+        panel.handle_click(2, row);
+        assert!(panel.expanded_items.contains(&0));
+        let expanded = render_text(&mut panel, area);
+        assert!(expanded.contains(source), "{expanded}");
+        assert!(expanded.contains("question-body-marker"));
+        assert!(expanded.contains("Pending reply…"));
+
+        panel.upsert_peer_exchange(
+            "exchange",
+            source,
+            "question-body-marker",
+            Some("answer-body-marker".into()),
+        );
+        assert_eq!(panel.items_snapshot().len(), 1);
+        assert!(panel.expanded_items.contains(&0));
+        let answered = render_text(&mut panel, area);
+        assert!(answered.contains("↔ e172f842 · answered"), "{answered}");
+        assert!(answered.contains("answer-body-marker"), "{answered}");
+        assert!(!answered.contains("Pending reply…"));
+        assert!(!answered.contains("approved"));
+        let row = answered
+            .lines()
+            .position(|line| line.contains('↔'))
+            .unwrap() as u16;
+        panel.handle_click(2, row);
+        let collapsed = render_text(&mut panel, area);
+        assert!(!panel.expanded_items.contains(&0));
+        assert!(!collapsed.contains("answer-body-marker"));
+        assert!(collapsed.contains("answered"));
+        panel.upsert_peer_exchange("another", "other source", "another question", None);
+        assert_eq!(panel.items_snapshot().len(), 2);
     }
 
     #[test]

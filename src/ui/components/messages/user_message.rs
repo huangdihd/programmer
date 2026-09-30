@@ -25,7 +25,6 @@ use std::sync::LazyLock;
 
 use crate::ui::markdown_theme::palette;
 
-const PAD_LEFT: u16 = 1;
 const PAD_RIGHT: u16 = 1;
 const PAD_TOP: u16 = 1;
 const PAD_BOTTOM: u16 = 1;
@@ -50,15 +49,15 @@ impl<'a> UserMessage<'a> {
         let bar_bg = palette::SURFACE;
 
         // `self.width` includes the Paragraph block padding. Images are
-        // rendered inside the padded area, so exclude both padding columns
+        // rendered inside the padded area, so exclude the right padding column
         // before calculating the terminal image size.
-        let inner_width = self.width.saturating_sub(PAD_LEFT + PAD_RIGHT);
+        let inner_width = self.width.saturating_sub(PAD_RIGHT);
 
         let lines = display_lines(self.input_item, inner_width, accent);
 
         Paragraph::new(Text::from(lines))
             .style(Style::new().fg(text_fg).bg(bar_bg))
-            .block(Block::default().padding(Padding::new(PAD_LEFT, PAD_RIGHT, PAD_TOP, PAD_BOTTOM)))
+            .block(Block::default().padding(Padding::new(0, PAD_RIGHT, PAD_TOP, PAD_BOTTOM)))
             .wrap(Wrap { trim: false })
     }
 }

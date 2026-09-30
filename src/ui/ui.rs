@@ -74,6 +74,7 @@ impl App<'_> {
             ActivePhase::ToolRunning => StatusState::ToolRunning,
             ActivePhase::CreatingToolCall => StatusState::CreatingToolCall,
             ActivePhase::Outputting => StatusState::Outputting,
+            ActivePhase::None if self.auto_compact.active_id.is_some() => StatusState::Compacting,
             ActivePhase::None => match &cp.receiving_response {
                 // Request in flight but nothing has streamed back yet: either
                 // still connecting, or backing off between retries.
@@ -262,6 +263,7 @@ impl App<'_> {
         // ---- completion popup (floats above the input panel) ----
         if let Some(ref completion) = self.input_panel.completion
             && completion.visible
+            && self.question_panel.is_none()
         {
             let max_visible = 10u16;
             let count = (completion.candidates.len() as u16).min(max_visible);
@@ -408,7 +410,14 @@ impl App<'_> {
         let question_height: u16 = self
             .question_panel
             .as_ref()
-            .map(|q| q.needed_height())
+            .map(|q| {
+                let sidebar_width = if self.sidebar.is_some() {
+                    Sidebar::needed_width().min(area.width / 3)
+                } else {
+                    0
+                };
+                q.needed_height_for_width(area.width.saturating_sub(sidebar_width))
+            })
             .unwrap_or(3);
         let approval_height: u16 = if let Some(ref review) = self.pending_review {
             let detail_count = crate::ui::tool_details::format_tool_details(

@@ -23,9 +23,9 @@ use crate::ui::text::truncate_to_width;
 
 use super::muted_style;
 
-/// Combined horizontal padding of the parent `AssistantMessage` block
-/// (`PAD_LEFT` + `PAD_RIGHT`).
-const BLOCK_PAD: u16 = 2;
+/// Right padding of the parent `AssistantMessage` block. The conversation
+/// viewport owns the common left inset.
+const BLOCK_PAD: u16 = 1;
 /// Extra left indent applied to expanded reasoning lines, keeping a visual
 /// nesting relationship under the "✻ Thought" header.
 const INDENT: u16 = 2;
