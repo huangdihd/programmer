@@ -16,7 +16,8 @@
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::types::responses::{
-    CreateResponse, InputParam, OutputItem, OutputMessageContent, Response, Tool,
+    CreateResponse, InputParam, OutputItem, OutputMessageContent, Response,
+    ResponseFormatJsonSchema, ResponseTextParam, Tool,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -100,9 +101,13 @@ impl MemoryModel {
             context.to_string()
         };
         let prompt = format!(
-            "Conversation so far:\n{context}\n\nCurrent user request:\n{query}\n\nMemory manifest:\n{}\n\nReturn a JSON array containing only the IDs of memories that are relevant to the current request, most relevant first. Prefer memories that are still accurate; ignore stale entries that the conversation contradicts. Return at most 5 IDs and no explanation.",
+            "Conversation so far:\n{context}\n\nCurrent user request:\n{query}\n\nMemory manifest:\n{}\n\nSelect only memories that are relevant to the current request, most relevant first. Prefer memories that are still accurate; ignore stale entries that the conversation contradicts.",
             serde_json::to_string(&manifest).map_err(|error| error.to_string())?
         );
+        let candidate_ids = entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
         let request = CreateResponse {
             model: Some(self.model.clone()),
             input: InputParam::Text(prompt),
@@ -117,6 +122,7 @@ impl MemoryModel {
             // through the timeout.
             reasoning: Some(async_openai::types::responses::ReasoningEffort::None.into()),
             temperature: Some(0.0),
+            text: Some(selection_response_format(&candidate_ids)),
             // Reasoning tokens count against this cap, so it needs headroom
             // beyond the tiny JSON array we ask for: a model that thinks even
             // briefly would otherwise return an empty, incomplete message.
@@ -145,16 +151,47 @@ impl MemoryModel {
             .strip_suffix("```")
             .unwrap_or(text.trim())
             .trim();
-        let mut ids: Vec<String> = serde_json::from_str(json).map_err(|error| {
-            format!(
-                "invalid memory selection: {error} (response started with {:?})",
-                preview(json)
-            )
-        })?;
+        let mut ids = serde_json::from_str::<MemorySelection>(json)
+            .map_err(|error| {
+                format!(
+                    "invalid memory selection: {error} (response started with {:?})",
+                    preview(json)
+                )
+            })?
+            .ids;
         ids.retain(|id| entries.iter().any(|entry| &entry.id == id));
         ids.truncate(5);
         Ok(ids)
     }
+}
+
+#[derive(Deserialize)]
+struct MemorySelection {
+    ids: Vec<String>,
+}
+
+fn selection_response_format(candidate_ids: &[String]) -> ResponseTextParam {
+    ResponseFormatJsonSchema {
+        name: "memory_selection".to_string(),
+        description: Some("IDs of memories relevant to the current request".to_string()),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": candidate_ids,
+                    },
+                    "maxItems": 5,
+                },
+            },
+            "required": ["ids"],
+            "additionalProperties": false,
+        }),
+        strict: Some(true),
+    }
+    .into()
 }
 
 /// Pull the selection out of a non-streaming response, or explain why there
@@ -532,6 +569,27 @@ mod tests {
             body[key] = value.clone();
         }
         serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn selection_format_strictly_limits_output_to_manifest_ids() {
+        let format = selection_response_format(&["mem_a".into(), "mem_b".into()]);
+        let value = serde_json::to_value(format).unwrap();
+
+        assert_eq!(value["format"]["type"], "json_schema");
+        assert_eq!(value["format"]["strict"], true);
+        assert_eq!(
+            value["format"]["schema"]["properties"]["ids"]["items"]["enum"],
+            json!(["mem_a", "mem_b"])
+        );
+        assert_eq!(value["format"]["schema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn structured_memory_selection_deserializes() {
+        let selection: MemorySelection =
+            serde_json::from_str(r#"{"ids":["mem_a","mem_b"]}"#).unwrap();
+        assert_eq!(selection.ids, ["mem_a", "mem_b"]);
     }
 
     #[test]

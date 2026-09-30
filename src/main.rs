@@ -35,6 +35,7 @@ mod diagnostics;
 mod headless;
 mod mcp;
 mod memory;
+mod peers;
 mod prompts;
 mod providers;
 mod response;
@@ -85,7 +86,7 @@ fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
     let session_mgr = SessionManager::new();
     let mut startup_messages: Vec<String> = Vec::new();
 
-    let (mut session_uuid, saved_items, saved_history, saved_todos, saved_agents) =
+    let (mut session_uuid, mut saved_items, mut saved_history, mut saved_todos, mut saved_agents) =
         match (resume, &session_mgr) {
             (Some(Some(uuid)), Some(mgr)) => match mgr.load(&uuid) {
                 Some(session) => {
@@ -208,6 +209,18 @@ fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
     } else {
         None
     };
+
+    // An offline peer inquiry may have saved an exchange between the picker
+    // read and lock acquisition. Restore the authoritative locked snapshot.
+    if session_lock.is_some()
+        && let Some(saved) = session_mgr.as_ref().and_then(|mgr| mgr.load(&session_uuid))
+    {
+        saved_history = saved.history.clone();
+        saved_todos = saved.todos.clone();
+        saved_agents = saved.agents.clone();
+        tasks::restore(&saved.tasks);
+        saved_items = SessionManager::into_items(saved);
+    }
 
     Some(SessionBootstrap {
         uuid: session_uuid,

@@ -34,6 +34,7 @@ pub(crate) async fn handle_key_events(
     // intentionally are not listed here, so Esc still cancels that turn.
     if key_event.code == KeyCode::Esc
         && app.cancel.active_id.is_some()
+        && app.peers.consent.is_none()
         && !independent_overlay_owns_escape(app)
     {
         app.events.send(AppEvent::Cancel);
@@ -81,23 +82,32 @@ pub(crate) async fn handle_key_events(
         return Ok(());
     }
 
-    // ---- tool-call approval (Manual mode) ----
-    if app.pending_review.is_some() {
-        return handle_approval_key(app, key_event);
-    }
+    // Questions own the rendered bottom surface. A newly arrived tool review
+    // must not consume Enter while the user sees peer consent instead.
     // ---- question panel ----
+    super::super::peers::refresh_consent_models(app);
     if let Some(panel) = app.question_panel.as_mut() {
         match panel.handle_key(key_event) {
             crate::ui::components::question_panel::AnswerAction::Answer(text) => {
-                let question = panel.question_text().to_string();
-                panel.answer(text.clone());
+                panel.answer(text);
                 app.question_panel = None;
-                app.conversation_panel
-                    .add_info_string(format!("❓ {}\n→ {}", question, text));
+            }
+            crate::ui::components::question_panel::AnswerAction::SelectModel(model) => {
+                if let Err(error) =
+                    super::super::command_handlers::settings::switch_model(app, &model)
+                {
+                    app.conversation_panel.add_error_string(error);
+                }
+                super::super::peers::refresh_consent_models(app);
             }
             crate::ui::components::question_panel::AnswerAction::None => {}
         }
         return Ok(());
+    }
+
+    // ---- tool-call approval (Manual mode) ----
+    if app.pending_review.is_some() {
+        return handle_approval_key(app, key_event);
     }
 
     // ---- plan review (Plan mode) ----

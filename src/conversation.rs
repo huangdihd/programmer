@@ -868,6 +868,39 @@ mod tests {
         AssistantRole, FunctionToolCall, OutputMessage, OutputMessageContent, OutputTextContent,
     };
 
+    #[test]
+    fn peer_exchanges_never_enter_api_inputs() {
+        let mut conversation = Conversation::default();
+        for answer in [None, Some("private peer reply".to_string())] {
+            conversation.items.push(MessageItem::PeerExchange {
+                id: "exchange".into(),
+                from: "peer".into(),
+                question: "private peer question".into(),
+                answer,
+            });
+        }
+        for state in [
+            crate::response::message_item::PeerDelegationState::Pending,
+            crate::response::message_item::PeerDelegationState::AcceptedQueued,
+            crate::response::message_item::PeerDelegationState::Started,
+            crate::response::message_item::PeerDelegationState::Rejected,
+        ] {
+            conversation.items.push(MessageItem::PeerDelegation {
+                id: "delegation".into(),
+                from: "peer".into(),
+                body: Some("private peer task".into()),
+                state,
+            });
+        }
+        let InputParam::Items(items) = conversation.to_input_param("test-model", None, None, None)
+        else {
+            panic!("expected item input");
+        };
+        assert_eq!(items.len(), 1, "only the system/developer prompt remains");
+        let serialized = serde_json::to_string(&items).unwrap();
+        assert!(!serialized.contains("private peer"));
+    }
+
     fn user_message(text: &str) -> ApiMessageItem {
         ApiMessageItem::Input(InputMessage {
             content: vec![InputContent::InputText(text.into())],

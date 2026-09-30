@@ -143,6 +143,9 @@ fn is_foldable(item: &MessageItem) -> bool {
             | MessageItem::Output(OutputItem::FunctionCall(_))
             | MessageItem::ToolOutput { .. }
             | MessageItem::Compacted { .. }
+            | MessageItem::PeerExchange { .. }
+            | MessageItem::PeerDelegation { .. }
+            | MessageItem::Usage(..)
     )
 }
 
@@ -776,7 +779,10 @@ impl ConversationPanel {
                 .unwrap()
                 .items
                 .get(index)
-                .is_some_and(is_foldable)
+                .is_some_and(|item| {
+                    is_foldable(item)
+                        && (!matches!(item, MessageItem::Usage(..)) || buffer_y == top)
+                })
                 && !self.expanded_items.remove(&index)
             {
                 self.expanded_items.insert(index);
@@ -1105,6 +1111,73 @@ impl ConversationPanel {
     pub fn add_info_string(&mut self, message: impl Into<String>) {
         self.conversation.lock().unwrap().add_info_string(message);
         self.stick_to_bottom = true;
+    }
+
+    /// Update an exchange in its original slot, preserving its fold state.
+    pub fn upsert_peer_exchange(
+        &mut self,
+        id: impl Into<String>,
+        from: impl Into<String>,
+        question: impl Into<String>,
+        answer: Option<String>,
+    ) {
+        let id = id.into();
+        let mut conversation = self.conversation.lock().unwrap();
+        let index = conversation.items.iter().position(|item| {
+            matches!(item, MessageItem::PeerExchange { id: existing, .. } if existing == &id)
+        });
+        let item = MessageItem::PeerExchange {
+            id,
+            from: from.into(),
+            question: question.into(),
+            answer,
+        };
+        if let Some(index) = index {
+            conversation.items[index] = item;
+            conversation.mutation_version = conversation.mutation_version.wrapping_add(1);
+        } else {
+            conversation.items.push(item);
+        }
+    }
+
+    /// Update a lifecycle observation without moving its slot or changing its fold.
+    pub fn upsert_peer_delegation(
+        &mut self,
+        id: String,
+        from: String,
+        body: Option<String>,
+        state: crate::response::message_item::PeerDelegationState,
+    ) {
+        let mut conversation = self.conversation.lock().unwrap();
+        if let Some(MessageItem::PeerDelegation {
+            from: saved_from,
+            body: saved_body,
+            state: saved_state,
+            ..
+        }) = conversation.items.iter_mut().find(|item| {
+            matches!(item,
+                MessageItem::PeerDelegation { id: existing, .. } if existing == &id)
+        }) {
+            if *saved_from == from
+                && (body.is_none() || *saved_body == body)
+                && *saved_state == state
+            {
+                return;
+            }
+            *saved_from = from;
+            if body.is_some() {
+                *saved_body = body;
+            }
+            *saved_state = state;
+            conversation.mutation_version = conversation.mutation_version.wrapping_add(1);
+        } else {
+            conversation.items.push(MessageItem::PeerDelegation {
+                id,
+                from,
+                body,
+                state,
+            });
+        }
     }
 
     pub fn insert_info_string(&mut self, index: usize, message: impl Into<String>) {

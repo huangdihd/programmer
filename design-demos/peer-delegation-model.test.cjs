@@ -1,0 +1,58 @@
+// Preview-only browser regression. NODE_PATH=<cached playwright node_modules> node this-file
+const {chromium}=require('playwright');
+const assert=require('node:assert/strict');
+const {pathToFileURL}=require('node:url');
+const path=require('node:path');
+(async()=>{
+  const browser=await chromium.launch();
+  try {
+    const page=await browser.newPage({viewport:{width:1440,height:1000}});
+    const errors=[]; let network=0;
+    page.on('pageerror',e=>errors.push(e.message));
+    page.on('request',r=>{if(!r.url().startsWith('file:'))network++;});
+    await page.goto(pathToFileURL(path.join(__dirname,'peer-delegation-model.html')).href);
+    const pending=async()=>assert.equal(await page.locator('#recordState').textContent(),'待确认');
+    const model=async value=>assert.equal(await page.locator('#sessionModel').textContent(),value);
+    await pending(); assert.equal(await page.locator('#no').getAttribute('aria-pressed'),'true');
+    await page.keyboard.press('m');
+    assert.equal(await page.locator('#picker').isVisible(),true);
+    await page.keyboard.press('ArrowDown');
+    assert.match(await page.locator('[role=option][aria-selected=true]').textContent(),/fast/);
+    await page.keyboard.press('ArrowUp');
+    assert.match(await page.locator('[role=option][aria-selected=true]').textContent(),/balanced/);
+    await page.locator('#filter').fill('reasoning');
+    assert.equal(await page.locator('[role=option]').count(),1);
+    await page.keyboard.press('Enter'); await pending(); await model('mock-b / reasoning');
+    assert.equal(await page.locator('#consent').isVisible(),true);
+    assert.equal(await page.locator('#no').getAttribute('aria-pressed'),'true');
+    await page.keyboard.press('m'); await page.locator('#filter').fill('not found');
+    await page.keyboard.press('Enter'); await pending();
+    assert.equal(await page.locator('#picker').isVisible(),true);
+    await page.locator('#filter').fill(''); await page.keyboard.type('ynmd'); await pending();
+    assert.equal(await page.locator('#full').isVisible(),false);
+    await page.keyboard.press('Escape'); await pending(); await model('mock-b / reasoning');
+    await page.keyboard.press('d'); assert.equal(await page.locator('#full').isVisible(),true);
+    await page.keyboard.press('d'); await page.locator('#no').click();
+    assert.equal(await page.locator('#recordState').textContent(),'已拒绝'); await model('mock-b / reasoning');
+    await page.locator('#reset').click(); await page.keyboard.press('m');
+    await page.locator('#filter').fill('fast'); await page.locator('[role=option]').click(); await pending();
+    await page.keyboard.press('ArrowRight'); await page.keyboard.press('Enter');
+    assert.equal(await page.locator('#recordState').textContent(),'已接受 · 排队'); await model('mock-a / fast');
+    await page.locator('#reset').click(); await page.keyboard.press('m');
+    await page.keyboard.press('Escape'); await page.keyboard.press('Escape');
+    assert.equal(await page.locator('#recordState').textContent(),'已拒绝');
+    await page.locator('#reset').click(); await page.locator('#theme').click(); await page.locator('#narrow').click();
+    await page.keyboard.press('m');
+    await page.screenshot({path:path.join(__dirname,'peer-delegation-model-picker.png'),fullPage:true});
+    await page.keyboard.press('Escape'); await pending();
+    assert.equal(await page.locator('#terminal').evaluate(e=>e.scrollWidth<=e.clientWidth),true);
+    await page.locator('#theme').click(); await page.locator('#narrow').click();
+    await page.screenshot({path:path.join(__dirname,'peer-delegation-model.png'),fullPage:true});
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    await page.keyboard.press('m');
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    assert.deepEqual(errors,[]); assert.equal(network,0);
+    console.log('PASS: M/filter/arrows/Enter select-only/empty results/Esc isolation/No retains model/Yes queues/D/light/narrow/mobile; 0 pageerrors, 0 network requests');
+  } finally {await browser.close();}
+})().catch(e=>{console.error(e);process.exitCode=1;});

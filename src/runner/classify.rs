@@ -347,6 +347,9 @@ pub(crate) fn build_classifier_context(items: &[&MessageItem]) -> (String, Strin
             MessageItem::Meta { label, text } => {
                 full_ctx.push(format!("\n[{label}]\n{text}"));
             }
+            MessageItem::PeerExchange { .. } | MessageItem::PeerDelegation { .. } => {
+                // UI projection; the untrusted developer wrapper carries the context.
+            }
             MessageItem::Usage(_, _, _, _) => {
                 // Token usage counters — not useful for classification.
             }

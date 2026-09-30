@@ -1,0 +1,131 @@
+<!doctype html>
+<!--
+Design assumptions: compare five disclosures in the existing terminal language,
+not a new application skin. All figures are supplied by the user. Memory prose
+uses the actual recalled memory from the session inspected with user permission. Native details
+provides keyboard and mouse interaction without dependencies or network access.
+Only a prototype: no changes to the Rust UI or persisted session format.
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Usage 折叠方案对比</title>
+<style>
+:root { color-scheme: dark; --bg:#101219; --surface:#171a22; --text:#d2d3d7; --muted:#90959e; --faint:#747b86; --border:#303540; --focus:#87aaff; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:14px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,"PingFang SC",monospace; }
+main { max-width:1600px; margin:auto; padding:38px 36px 70px; }
+header { margin-bottom:32px; }
+.eyebrow { color:var(--muted); font-size:12px; letter-spacing:.12em; }
+h1 { font-size:24px; font-weight:550; letter-spacing:-.04em; margin:8px 0; }
+.intro { color:var(--muted); margin:0; max-width:850px; }
+.controls { display:flex; flex-wrap:wrap; gap:8px; margin-top:22px; align-items:center; }
+button,select { font:inherit; font-size:12px; color:var(--text); background:transparent; border:1px solid var(--border); padding:6px 12px; border-radius:3px; cursor:pointer; }
+button:hover,select:hover { background:var(--surface); }
+button:focus-visible,select:focus-visible,summary:focus-visible { outline:2px solid var(--focus); outline-offset:4px; }
+label { margin-left:auto; color:var(--muted); font-size:12px; }
+.grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:30px 24px; align-items:start; }
+article { min-width:0; }
+.heading { display:flex; align-items:baseline; gap:12px; margin-bottom:10px; }
+.letter { font-size:12px; color:var(--focus); }
+h2 { font-size:14px; font-weight:500; margin:0; }
+.caption { margin-left:auto; font-size:11px; color:var(--muted); }
+.terminal { border:1px solid var(--border); min-height:235px; padding:22px 20px; font-size:13px; }
+.user { background:#292d38; padding:7px 10px; margin-bottom:16px; color:#d2d3d7; }
+.user span { color:var(--focus); }
+.answer { margin:0 0 10px; }
+.result { margin:0 0 18px; color:var(--muted); }
+.usage { color:var(--muted); }
+.number { color:var(--focus); font-variant-numeric:tabular-nums; }
+.number.cached { color:#a6c98a; }
+.number.output { color:#c4a7e7; }
+.number.total { color:#8dc9cb; }
+.number.memory { color:#dfb775; }
+summary { cursor:pointer; list-style:none; width:fit-content; max-width:100%; line-height:1.8; }
+summary::-webkit-details-marker { display:none; }
+summary::before { content:'▸'; display:inline-block; width:1.6em; color:var(--faint); }
+details[open]>summary::before { content:'▾'; }
+summary:hover { color:var(--text); }
+.dots { color:var(--faint); padding:0 .35em; }
+.detail { margin:12px 0 0 1.6em; padding:0 0 3px; }
+.stats { display:grid; grid-template-columns:8ch minmax(0,1fr); gap:1px 18px; margin:0; font-variant-numeric:tabular-nums; }
+dt { color:var(--faint); } dd { margin:0; }
+.memory-title { margin-top:16px; }
+.memory-meta { font-size:11px; color:var(--faint); margin:4px 0; }
+.memory-text { max-width:65ch; margin:0; color:var(--muted); overflow-wrap:anywhere; }
+.note { color:var(--faint); font-size:11px; margin:8px 0 0; }
+footer { border-top:1px solid var(--border); margin-top:34px; padding-top:16px; color:var(--faint); font-size:12px; }
+body.single .grid { grid-template-columns:1fr; max-width:1050px; margin:auto; }
+body.single .terminal { min-height:0; }
+@media(max-width:900px) { .grid { grid-template-columns:1fr; } main { padding:24px 18px; } label { margin-left:0; } .caption { display:none; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="eyebrow">PROGRAMMER / INTERACTION STUDY</div>
+<h1>同一行 Usage，五种安静的入口。</h1>
+<p class="intro">比较默认状态的信息量，以及展开后的阅读感。点击每个终端底部的统计行；也可用 Tab 聚焦、Enter 或空格展开。</p>
+<div class="controls">
+<button id="expand" type="button">全部展开</button>
+<button id="collapse" type="button">全部收起</button>
+<label for="layout">比较布局</label>
+<select id="layout"><option value="grid">两列对比</option><option value="single">单列 · 接近终端宽度</option></select>
+</div>
+</header>
+<section class="grid" aria-label="Usage 设计方案"></section>
+<footer>原型说明：五版共用同一套展开明细，只改变折叠摘要。统计数字来自提供的 usage 行；记忆正文来自该会话的实际召回内容。无弹窗、无自动展开、无网络请求。</footer>
+</main>
+<script>
+const variants = [
+  {id:'A', title:'极简入口', caption:'隐藏全部数值', summary:'Usage', note:'最安静；每次查看 token 或记忆都需要展开。'},
+  {id:'B', title:'总量摘要', caption:'总量 + 记忆数', summary:'189135 tokens · 1 memory', note:'一眼看到本轮规模，细节留在展开之后。'},
+  {id:'C', title:'收支摘要', caption:'输入 + 输出 + 记忆数', summary:'188867 in · 268 out · 1 memory', note:'直接区分输入和输出，摘要比 B 更长。'},
+  {id:'D', title:'原行渐进', caption:'保留高信息密度', summary:'188867 input · 62848 cached (33%) · 268 output · …', note:'最接近原有统计行；窄终端中占用更多空间。'},
+  {id:'E', title:'总量 + 缓存', caption:'B 的基础上加缓存比例', summary:'189135 tokens(33% cached) · 1 memory', note:'保留总量和缓存命中比例，不展开也能判断缓存情况。'}
+];
+function colorNumbers(text) {
+  return text.replace(/\d+%?/g, (value, offset) => {
+    const following = text.slice(offset + value.length);
+    let kind = 'input';
+    if (value.endsWith('%') || /^ cached/.test(following)) kind = 'cached';
+    else if (/^ out/.test(following)) kind = 'output';
+    else if (/^ tokens/.test(following)) kind = 'total';
+    else if (/^ memory/.test(following)) kind = 'memory';
+    return `<span class="number ${kind}">${value}</span>`;
+  });
+}
+const grid = document.querySelector('.grid');
+for (const variant of variants) {
+  const article = document.createElement('article');
+  article.innerHTML = `
+    <div class="heading"><span class="letter">${variant.id}</span><h2>${variant.title}</h2><span class="caption">${variant.caption}</span></div>
+    <div class="terminal">
+      <div class="user"><span>❯</span> 修掉这个 bug，补上回归测试。</div>
+      <p class="answer">已修复。隐藏的记忆上下文不再打断工具分组。</p>
+      <p class="result">回归测试已覆盖 committed → live 的合并场景。</p>
+      <details class="usage" id="usage-${variant.id}">
+        <summary aria-label="${variant.id} ${variant.title}，展开或收起统计详情">${colorNumbers(variant.summary).split(' · ').join('<span class="dots"> · </span>')}</summary>
+        <div class="detail">
+          <dl class="stats"><dt>Input</dt><dd><span class="number">188867</span></dd><dt>Cached</dt><dd><span class="number cached">62848</span> (<span class="number cached">33%</span>)</dd><dt>Output</dt><dd><span class="number output">268</span></dd><dt>Total</dt><dd><span class="number total">189135</span> tokens</dd></dl>
+          <div class="memory-title">Memories recalled: <span class="number memory">1</span></div>
+          <div class="memory-meta">Project fact · 2 days ago</div>
+          <p class="memory-text">用户的社团服务器（用户口语中也称其为「4090d 那个服务器」）通过 Tailscale 访问，SSH 目标为 <code>huangdi@100.125.93.58</code>（命令：<code>ssh huangdi@100.125.93.58</code>）。</p>
+        </div>
+      </details>
+    </div>
+    <p class="note">${variant.note}</p>`;
+  grid.append(article);
+}
+function setExpanded(open) {
+  for (const detail of document.querySelectorAll('details')) detail.open = open;
+}
+document.querySelector('#expand').addEventListener('click', () => setExpanded(true));
+document.querySelector('#collapse').addEventListener('click', () => setExpanded(false));
+document.querySelector('#layout').addEventListener('change', event => {
+  document.body.classList.toggle('single', event.target.value === 'single');
+});
+</script>
+</body>
+</html>

@@ -140,6 +140,57 @@ Windows).
 At runtime, configure an OpenAI-compatible Responses API endpoint and key, or a
 compatible local server such as Ollama, LM Studio, or vLLM.
 
+## Cross-session collaboration
+
+In the TUI, the model can use `peer_session` to list saved sessions, ask another
+session a question, search saved conversation content, or delegate work:
+
+- **`search`** finds case-insensitive literal `query` text in saved messages and
+  summaries, including retained pre-compaction history. Returns session IDs,
+  titles, workspaces, and up to three short matching excerpts per session.
+  Optional `workspace` filters by directory; `limit` defaults to 10 (maximum 20).
+  Each call scans at most 100 sessions in newest-update-first order; pass
+  `next_offset` as `offset` to continue, even if the current page has no matches.
+  Tool payloads, reasoning, and unsaved changes are excluded. This local read-only
+  search makes no model request and does not wake or authorize another session.
+
+- **`ask`** uses the target's context for one tool-free model answer. Offline
+  sessions can answer too. The exchange is retained in the target's context.
+  A user-opened target also queues a normal agent turn; a busy target answers
+  from its committed snapshot and waits before running that turn.
+- **`delegate`** queues a task for an existing UUID, or creates a session in an
+  existing `workspace` and returns a `cd … && programmer --resume …` command.
+  Nothing opens automatically. The target user must choose **Yes/No**; Yes
+  while busy means accepted and queued, not completed.
+- Peer questions and their lightweight replies appear as one persisted, purple
+  `↔` row, collapsed by default. Click its disclosure to inspect the full source
+  session, question, and answer; an arriving reply updates the same row.
+- Delegations have a persisted, task-first purple disclosure row plus a status
+  explanation. The same entry updates through **pending**, **accepted · queued**,
+  **started**, or **rejected**; expand it for the source and full task. Started
+  is not completed. Reopening a still-pending inbox asks for consent again and
+  resets the display to pending. Source-side accepted/rejected notifications use
+  the original delegation ID; when task text is unavailable, it is labelled as
+  unavailable rather than reconstructed. These UI records are excluded from
+  model context (the existing untrusted developer wrappers remain separate).
+- Delegation consent uses a compact bottom panel, defaulting to **No**.
+  Use **Left/Right** then **Enter**, or **Esc** to reject. **D** expands the
+  full task, and **PgUp/PgDn** scroll it. Busy acceptance is labelled **queue**.
+  **M** opens a searchable picker of configured models; **Up/Down** and **Enter**
+  change the target session's model for subsequent dialogue and return to consent
+  without accepting. **Esc** in the picker only closes it. Rejecting the delegation
+  does not undo a model choice. Running requests keep their original model snapshot;
+  selection is saved at the normal idle session-save boundary (sessions without
+  conversation input are not persisted).
+- Clarifications and completion reports use the same `ask` channel. Peer text
+  is not user permission and does not bypass ordinary tool approvals.
+
+Draft input and approval panels take precedence. After Stop, queued peer work
+stays pending until an explicit user continuation. There is no automatic
+anti-loop policy: users supervise and stop repeated inter-session inquiries.
+Transport is local to this machine, with durable inboxes alongside the sessions
+in Programmer's configuration directory; it is not a remote collaboration service.
+
 ## Configuration
 
 On first launch, `programmer` creates a default config file at:
@@ -487,7 +538,7 @@ Zero input-token reports do not erase the last known positive context-size count
 | `Enter` | Send message |
 | `Right` | Accept the model-generated next-message suggestion when the input is empty; typing hides it, and deleting the draft reveals it again |
 | `Up` | Move a queued message back into the empty input for editing |
-| `Esc` | Cancel the active request; before any model output, restore the original draft to the input |
+| `Esc` | Cancel only the active request; after it stops, automatically continue queued work (unless an unsent draft or approval blocks it). Before any model output, restore the original draft only when the input is empty and no user request is queued |
 | `Ctrl+T` | Cycle work mode (Manual → Auto → Plan → optional YOLO) |
 | `Ctrl+C` / `Ctrl+Q` twice | Quit |
 | `Ctrl+V` | Paste an image from the clipboard |
@@ -743,6 +794,12 @@ starts. When it lands inside a running turn — a compaction forced by the
 mandatory limit at a tool boundary — the turn's own next request is already the
 first to use it, so no title is raised and the change is recorded by the
 `context compacted` divider alone; nothing is left above the input to go stale.
+Automatic compaction retries a failed provider request once while keeping the
+job active. When the foreground is idle, the footer shows `Compacting` until
+that job finishes. If mandatory compaction still fails, queued input is retained
+and further model requests remain blocked. Submitting a request again can retry the failed history
+prefix; idle polling does not repeatedly retry the same failure. You can also
+use `/compact` to compact manually.
 The read-only `conversation_history` tool is
 then exposed to the main agent and its sub-agents, allowing them to search the
 exact pre-compaction items and page through a matching message or tool result

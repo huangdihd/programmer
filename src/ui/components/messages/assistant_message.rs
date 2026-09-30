@@ -28,9 +28,7 @@ use crate::ui::components::messages::assistant::tool_call::ToolCallMessage;
 use crate::ui::components::messages::assistant::unsupported::UnsupportedMessage;
 use crate::ui::markdown_theme::palette;
 
-// The conversation panel adds a 1-column margin on each side; keep one more
-// column of breathing room inside the message block.
-const PAD_LEFT: u16 = 1;
+// The conversation viewport owns the left inset; preserve right breathing room.
 const PAD_RIGHT: u16 = 1;
 /// Gray panel behind expanded reasoning/tool details.
 pub(crate) const EXPANDED_BG: Color = palette::SURFACE;
@@ -108,7 +106,7 @@ impl<'a> AssistantMessage<'a> {
                     .into_parts()
             }
             OutputItem::FunctionCall(call) => (
-                ToolCallMessage::new(call, self.width.saturating_sub(PAD_LEFT + PAD_RIGHT))
+                ToolCallMessage::new(call, self.width.saturating_sub(PAD_RIGHT))
                     .output(self.tool_output.map(|(output, _, _)| output))
                     .failed(
                         self.tool_output
@@ -143,8 +141,7 @@ impl<'a> AssistantMessage<'a> {
         // the extra row only for compact reasoning/tool indicators, where it
         // visually separates status lines from the next transcript item.
         let bottom_padding = u16::from(!matches!(self.output_item, OutputItem::Message(_)));
-        let mut block =
-            Block::default().padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, bottom_padding));
+        let mut block = Block::default().padding(Padding::new(0, PAD_RIGHT, 0, bottom_padding));
         if self.expanded && foldable {
             block = block.style(Style::new().bg(EXPANDED_BG));
         }
@@ -177,7 +174,7 @@ pub(crate) fn render_reasoning(
         .into_parts();
     let buttons = scan_copy_buttons(&text, &codes);
     let block = Block::default()
-        .padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 1))
+        .padding(Padding::new(0, PAD_RIGHT, 0, 1))
         .style(if expanded {
             Style::new().bg(EXPANDED_BG)
         } else {
@@ -210,8 +207,8 @@ pub(crate) fn scan_copy_buttons_from_lines(
             {
                 buttons.push(CodeCopyButton {
                     row: row as u16,
-                    x_start: PAD_LEFT + x,
-                    x_end: PAD_LEFT + x + width,
+                    x_start: x,
+                    x_end: x + width,
                     content: content.clone(),
                 });
             }
@@ -227,6 +224,25 @@ mod tests {
     use async_openai::types::responses::{
         AssistantRole, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent,
     };
+
+    #[test]
+    fn standalone_tool_disclosure_has_no_extra_left_padding() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        let item: OutputItem = serde_json::from_value(serde_json::json!({
+            "type": "function_call", "id": "tool-1", "call_id": "call-1",
+            "name": "read_file", "arguments": "{}", "status": "completed"
+        }))
+        .unwrap();
+        for expanded in [false, true] {
+            let area = Rect::new(0, 0, 80, 12);
+            let mut buffer = Buffer::empty(area);
+            let (paragraph, _) = AssistantMessage::new(&item, 80)
+                .expanded(expanded)
+                .into_paragraph();
+            paragraph.render(area, &mut buffer);
+            assert_eq!(buffer[(0, 0)].symbol(), if expanded { "▾" } else { "▸" });
+        }
+    }
 
     #[test]
     fn text_message_has_no_trailing_padding_row() {

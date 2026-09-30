@@ -19,6 +19,8 @@ pub mod compacting_message;
 pub mod error_message;
 pub mod info_message;
 mod notice_message;
+pub mod peer_delegation;
+pub mod peer_exchange;
 pub mod pending_message;
 pub mod tool_result;
 pub mod usage_message;

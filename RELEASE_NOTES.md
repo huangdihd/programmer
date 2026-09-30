@@ -1,3 +1,21 @@
+### programmer v0.2.19
+
+- Add cross-session search, questions, and durable delegation with local consent,
+  explicit lifecycle records, and an in-panel model picker. Offline inquiries
+  use a tool-free snapshot; delegated work never starts a target automatically.
+- Keep queued work eligible after Escape cancels the active request, without
+  overwriting drafts or bypassing approvals and peer consent.
+- Align transcript padding and user gutters, improve peer message rendering,
+  and fold token usage and injected-memory details into expandable rows.
+- Select relevant memories with a strict JSON schema restricted to candidate IDs.
+- Retry failed automatic compaction once, show its active state, and retain
+  queued input when mandatory compaction remains blocked.
+- Include collaboration and usage design previews and behavioral regressions.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.18...v0.2.19
+
+---
+
 ### programmer v0.2.18
 
 - Remove keyword filtering from memory candidates and increase the default global

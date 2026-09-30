@@ -287,6 +287,24 @@ fn render_item(index: usize, item: &MessageItem, pretty: bool) -> Result<String,
         MessageItem::Info(message) => {
             json!({ "index": index, "kind": "info", "message": message })
         }
+        MessageItem::PeerExchange {
+            id,
+            from,
+            question,
+            answer,
+        } => json!({
+            "index": index, "kind": "peer_exchange", "id": id, "from": from,
+            "question": question, "answer": answer,
+        }),
+        MessageItem::PeerDelegation {
+            id,
+            from,
+            body,
+            state,
+        } => json!({
+            "index": index, "kind": "peer_delegation", "id": id, "from": from,
+            "body": body, "state": state,
+        }),
         MessageItem::Meta { label, text } => {
             json!({ "index": index, "kind": "meta", "label": label, "text": text })
         }
@@ -341,6 +359,8 @@ fn item_kind(item: &MessageItem) -> &'static str {
         MessageItem::Error(_) => "error",
         MessageItem::Warning(_) => "warning",
         MessageItem::Info(_) => "info",
+        MessageItem::PeerExchange { .. } => "peer_exchange",
+        MessageItem::PeerDelegation { .. } => "peer_delegation",
         MessageItem::Meta { .. } => "meta",
         MessageItem::Usage(_, _, _, _) => "usage",
         MessageItem::Compacted { .. } => "earlier_compaction",
@@ -377,6 +397,37 @@ mod tests {
         conversation.add_info_string("another archived entry");
         conversation.apply_compaction("summary without the detail".to_string());
         Arc::new(Mutex::new(conversation))
+    }
+
+    #[tokio::test]
+    async fn delegation_history_preserves_typed_state_and_task() {
+        let mut conversation = Conversation::new();
+        conversation.items.push(MessageItem::PeerDelegation {
+            id: "delegation-id".into(),
+            from: "source".into(),
+            body: Some("archived delegated task".into()),
+            state: crate::response::message_item::PeerDelegationState::AcceptedQueued,
+        });
+        conversation.apply_compaction("summary".into());
+        let conversation = Arc::new(Mutex::new(conversation));
+        let found = run(
+            r#"{"action":"search","query":"delegated task"}"#,
+            &conversation,
+        )
+        .await
+        .unwrap();
+        assert!(found.contains("peer_delegation"));
+        let exact = run(r#"{"action":"read","index":0}"#, &conversation)
+            .await
+            .unwrap();
+        for expected in [
+            "delegation-id",
+            "source",
+            "archived delegated task",
+            "accepted_queued",
+        ] {
+            assert!(exact.contains(expected), "{exact}");
+        }
     }
 
     #[tokio::test]

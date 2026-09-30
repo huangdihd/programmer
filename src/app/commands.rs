@@ -168,6 +168,11 @@ async fn start_request_as_with_images(
             images,
         );
         app.auto_compact.mandatory_waiting = true;
+        // A new request may retry a failed prefix. Keep the background dedup
+        // marker otherwise, so idle polling cannot spin on a provider failure.
+        if app.auto_compact.active_id.is_none() {
+            app.auto_compact.last_cutoff = None;
+        }
         let input_tokens = app.auto_compact.last_input_tokens.unwrap_or_default();
         if !maybe_start_auto_compact(app, input_tokens) {
             app.auto_compact.mandatory_waiting = false;
@@ -1027,9 +1032,22 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> 
     let sender = app.events.sender.clone();
     tokio::spawn(async move {
         let request = build_compact_request(input_items, model_name, thinking_level);
-        let result =
-            stream_compact_response(&client, request, crate::cancel::CancellationToken::new())
-                .await;
+        // Keep the same job active during recovery: queued input must not be
+        // left idle between a transient provider failure and its retry.
+        let result = stream_compact_response(
+            &client,
+            request.clone(),
+            crate::cancel::CancellationToken::new(),
+        )
+        .await;
+        let result = match result {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                stream_compact_response(&client, request, crate::cancel::CancellationToken::new())
+                    .await
+            }
+        };
         let _ = sender.send(Event::App(AppEvent::AutoCompactFinished {
             job_id,
             history_epoch,
@@ -1375,6 +1393,89 @@ mod tests {
             "test-project".to_string(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn consent_model_switch_is_silent_dirty_and_preserves_running_snapshot() {
+        use crate::config::programmer_config::ProviderConfig;
+        use crate::ui::{components::question_panel::QuestionPanel, event::AnswerTx};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = command_test_app().await;
+        app.config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                api_key: String::new(),
+                models: Some(vec!["old".into(), "new".into()]),
+                default_model: None,
+            },
+        );
+        app.provider_manager = crate::providers::ProviderManager::from_config(&app.config);
+        app.current_model = "test/old".into();
+        let runner = app.build_runner().expect("snapshot");
+        app.cancel.active_id = Some(42);
+        let cancel = app.cancel.active.clone();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut panel = QuestionPanel::delegation("source", "task", true, AnswerTx(tx));
+        panel.set_delegation_models(
+            &app.current_model,
+            vec![crate::commands::CompletionCandidate {
+                value: "test/new".into(),
+                label: "test/new".into(),
+            }],
+        );
+        app.question_panel = Some(panel);
+        let (_consent_tx, consent_rx) = tokio::sync::oneshot::channel();
+        app.peers.consent = Some((
+            crate::peers::PeerEnvelope::new(
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                crate::peers::PeerKind::Delegation,
+                "task".into(),
+                None,
+            )
+            .unwrap(),
+            consent_rx,
+        ));
+        // Model selection is routed before tool review and must not answer consent.
+        let before = app.conversation_panel.items_snapshot().len();
+        for code in [KeyCode::Char('m'), KeyCode::Down, KeyCode::Enter] {
+            crate::app::events::handle_key_events(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::NONE),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(app.current_model, "test/new");
+        assert!(app.session.dirty);
+        assert_eq!(app.conversation_panel.items_snapshot().len(), before);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(runner.model_str, "test/old");
+        assert_eq!(runner.model_name, "old");
+        assert_eq!(app.build_runner().unwrap().model_str, "test/new");
+        assert_eq!(app.cancel.active_id, Some(42));
+        assert!(!cancel.is_cancelled());
+        // Peer consent owns Escape even while a turn is active.
+        for code in [KeyCode::Char('m'), KeyCode::Esc] {
+            crate::app::events::handle_key_events(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::NONE),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(app.question_panel.is_some());
+        assert_eq!(app.cancel.active_id, Some(42));
+        assert!(!cancel.is_cancelled());
+        crate::app::events::handle_key_events(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.await.unwrap(), "No");
+        assert_eq!(app.current_model, "test/new");
     }
 
     #[tokio::test]

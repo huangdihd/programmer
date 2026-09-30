@@ -1,0 +1,71 @@
+<!doctype html>
+<!-- PREVIEW ONLY. Terminal-native lifecycle exploration, based on peer-delegation-v2.html
+and src/app/peers.rs. One persistent delegation record is updated, not appended.
+Assumptions: task wording below restates the supplied UI-test/no-file-modifications
+brief; source UUID is illustrative, retained from the previous preview. Pending,
+local acceptance/queue, execution start and rejection are distinct. No completion
+is inferred from acceptance. No network, storage, approvals or real execution. -->
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>委派生命周期 · 单条记录预览</title><style>
+:root{color-scheme:dark;--bg:#101219;--surface:#171a22;--text:#d2d3d7;--muted:#90959e;--line:#303540;--blue:#87aaff;--cyan:#8dc9cb;--green:#a6c98a;--peer:#c4a7e7;--selected:#243f45;--warn:#dec58a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.8 ui-monospace,SFMono-Regular,Menlo,Consolas,"PingFang SC",monospace}body.light{color-scheme:light;--bg:#fafbfe;--surface:#fff;--text:#25314a;--muted:#66738a;--line:#d2deef;--blue:#2868d7;--cyan:#007c92;--green:#32813a;--peer:#8241c7;--selected:#d9f3f7;--warn:#996c08}main{max-width:1400px;margin:auto;padding:28px 32px}h1{font-size:21px;font-weight:600;margin:0 0 3px}p{margin:0}.muted,.sub{color:var(--muted)}.sub{font-size:12px}button,select{font:inherit;color:inherit;background:transparent;border:1px solid var(--line);padding:5px 11px;cursor:pointer}button:hover,select:hover{border-color:var(--cyan)}button:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--blue);outline-offset:3px}button[aria-pressed=true]{color:var(--cyan);border-color:var(--cyan)}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:20px}.toolbar.secondary{margin:10px 0 17px;font-size:12px}.spacer{flex:1}.terminal{height:620px;border:1px solid var(--line);background:var(--surface);display:flex;flex-direction:column;--gutter:25px}.title{display:flex;justify-content:space-between;gap:12px;padding:8px var(--gutter);border-bottom:1px solid var(--line);color:var(--cyan);font-size:12px}.workspace{display:flex;min-height:0;flex:1}.mainpane{flex:1;min-width:0;display:flex;flex-direction:column}.conversation{padding:24px var(--gutter);flex:1;overflow:auto;min-height:100px}.welcome{color:var(--blue);margin-bottom:30px}.welcome strong{display:block;font-size:15px;font-weight:500}.welcome p{font-size:12px}.peer{margin:0;font-size:14px}.peer summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:10px}.peer summary::-webkit-details-marker{display:none}.peer summary:before{content:'▸';color:var(--peer);flex:none}.peer[open] summary:before{content:'▾'}.record-copy{min-width:0;flex:1}.peer-title{color:var(--peer)}.record-head{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}.state{font-size:12px;color:var(--warn);white-space:nowrap}.state[data-state=started]{color:var(--green)}.state[data-state=rejected]{color:var(--muted)}.source-short{color:var(--muted);font-size:12px}.record-meta{font-size:12px;color:var(--muted);margin-top:2px}.strip{display:flex;flex-wrap:wrap;gap:8px;font-size:11px;margin-top:6px;color:var(--muted)}.strip .current{color:var(--peer)}.terminal[data-variant="1"] .record-head{flex-wrap:nowrap}.terminal[data-variant="1"] .peer-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.terminal[data-variant="1"] .record-meta,.terminal:not([data-variant="3"]) .strip{display:none}.terminal[data-variant="3"] .record-meta{display:none}.details{margin:16px 0 0 20px;font-size:12px;overflow-wrap:anywhere}.details dl{display:grid;grid-template-columns:6em 1fr;gap:6px;margin:0}.details dt{color:var(--muted)}.details dd{margin:0}.task-text{white-space:pre-wrap}.detail-note{color:var(--muted);margin-top:12px}.aside{width:180px;padding:22px 18px;border-left:1px solid var(--line);color:var(--muted);font-size:12px}.aside strong{display:block;color:var(--green);font-weight:500;margin-bottom:5px}.aside hr{border:0;border-top:1px solid var(--line);margin:20px 0}.consent{margin:0 var(--gutter);padding:12px 0;border-top:1px solid var(--cyan)}.consent h2{font-size:14px;color:var(--cyan);margin:0;font-weight:500}.consent p{font-size:12px}.disclosure{border:0;padding:2px 0;color:var(--blue);font-size:12px}.full{white-space:pre-wrap;max-height:140px;overflow:auto;font-size:12px;padding:7px 0;overflow-wrap:anywhere}.actions{display:flex;gap:16px;margin:7px 0}.actions button{border:0;padding:2px 12px}.actions .selected{background:var(--selected);color:var(--cyan)}.hints{font-size:11px!important;color:var(--muted)}.input{border-top:1px solid var(--line);padding:10px var(--gutter);color:var(--muted);font-size:12px}.footer{padding:5px var(--gutter);border-top:1px solid var(--line);font-size:11px;color:var(--muted)}.explain{font-size:12px;color:var(--muted);margin-top:14px}.explain strong{color:var(--text);font-weight:400}.terminal.narrow{max-width:710px;height:650px}.terminal.narrow .aside{display:none}[hidden]{display:none!important}@media(max-width:800px){main{padding:18px 12px}.aside{display:none}.terminal{--gutter:16px;height:680px}.toolbar{gap:6px}button{padding:4px 7px}.source-short{display:none}.terminal[data-variant="1"] .record-head{gap:7px}.peer{font-size:12px}.title span:last-child{display:none}}
+</style></head><body><main>
+<h1>一次委派，一条记录。</h1><p class="sub">交互预览 · 所有状态仅为模拟，不会发送真实审批、消息或执行任务。</p>
+<nav class="toolbar" aria-label="呈现方案"><button data-variant="1" aria-pressed="false">1 单行紧凑</button><button data-variant="2" aria-pressed="true">2 任务优先 · 推荐</button><button data-variant="3" aria-pressed="false">3 状态轨迹</button><span class="spacer"></span><button id="detailsToggle" aria-expanded="false" aria-controls="peer">展开详情</button><button id="theme" aria-pressed="false">亮色</button><button id="narrow" aria-pressed="false">窄窗口</button></nav>
+<div class="toolbar secondary"><label for="stateControl" class="muted">模拟状态</label><select id="stateControl"><option value="pending">待确认</option><option value="queued">已接受 · 排队</option><option value="started">已开始</option><option value="rejected">已拒绝</option></select><button id="reset">重置演示</button><span class="muted">原位更新，不追加 Info；接受 ≠ 完成。</span></div>
+<section class="terminal" id="terminal" data-variant="2" aria-label="终端预览"><header class="title"><span>Programmer / programmer</span><span>PREVIEW · 无真实授权</span></header><div class="workspace"><div class="mainpane"><div class="conversation"><div class="welcome"><strong>Welcome back!</strong><p>Programmer · A coding agent written in Rust</p><p class="muted">~/RustroverProjects/programmer</p></div>
+<details class="peer" id="peer"><summary><div class="record-copy"><div class="record-head"><span class="peer-title">↔ 委派 UI 测试 · 不修改文件</span><span id="recordState" class="state" data-state="pending" role="status">待确认</span><span class="source-short">来自 e1167c4e</span></div><p class="record-meta" id="recordMeta">收到委派，等待你的选择。</p><div class="strip" id="strip" aria-label="模拟状态轨迹"></div></div></summary><div class="details"><dl><dt>来源 Session</dt><dd>e1167c4e-51dd-4001-a4ba-f16dde158359 <span class="muted">（示例 UUID）</span></dd><dt>任务全文</dt><dd class="task-text" id="taskText"></dd><dt>当前状态</dt><dd id="detailState"></dd></dl><p class="detail-note">任务文案按本次「委派 UI 测试、不修改文件」要求整理。此处不是历史消息副本。</p></div></details>
+</div><section class="consent" id="consent" aria-label="模拟委派确认"><h2>接受这项委派？</h2><p>委派 UI 测试 · 不修改文件</p><button id="expandTask" class="disclosure" aria-expanded="false" aria-controls="full">▸ 展开任务全文 · D</button><div class="full" id="full" tabindex="0" hidden></div><p class="muted">模拟忙碌场景：Yes 接受并排队，不中断当前任务。</p><div class="actions"><button id="no" class="selected" aria-pressed="true">› No · 拒绝</button><button id="yes" aria-pressed="false">Yes · 接受并排队</button></div><p class="hints">← → 选择　Enter 确认　Esc 拒绝　D 展开全文</p></section><div class="input">› Talk with the programmer…</div></div><aside class="aside"><strong>Providers</strong>● llmhub [current]<hr><strong>Workspace</strong>programmer<hr><strong>Session</strong>本地交互预览<br>无消息投递</aside></div><footer class="footer">Auto　 default/off　<span id="footerState">Waiting for answer</span></footer></section>
+<p class="explain" id="explain"><strong>2 · 任务优先</strong>　第一行识别任务，第二行解释状态；详情按需展开。底部只负责确认，不再重复输出状态消息。</p>
+</main><script>
+const $ = id => document.getElementById(id);
+const task = '请进行一次委派 UI 测试，不修改任何文件。\n\n检查收到委派后的确认界面，以及接受并排队、开始执行和拒绝时的状态展示。反馈观察结果，不实施代码修改。';
+const states = {
+  pending: {label:'待确认', note:'收到委派，等待你的选择。', footer:'Waiting for answer', history:['收到', '待确认']},
+  queued: {label:'已接受 · 排队', note:'等待当前任务结束；不抢占输入或待处理审批。接受不等于完成。', footer:'Queued · 尚未开始', history:['收到', '已接受', '排队']},
+  started: {label:'已开始', note:'已进入委派执行；尚无完成报告。', footer:'Started · 非完成状态', history:['收到', '已接受', '已开始']},
+  rejected: {label:'已拒绝', note:'未启动模型执行；由系统通知来源 Session。', footer:'Rejected · 未执行', history:['收到', '已拒绝']}
+};
+const explanations = {1:'<strong>1 · 单行紧凑</strong>　任务、当前状态、短来源同一行；窄屏截断标题，展开可看全文。',2:'<strong>2 · 任务优先</strong>　第一行识别任务，第二行解释状态；详情按需展开。底部只负责确认，不再重复输出状态消息。',3:'<strong>3 · 状态轨迹</strong>　任务下保留紧凑路径；仅显示当前模拟分支已发生的节点，不预告完成。'};
+let current = 'pending', selected = 0;
+$('taskText').textContent = task;
+$('full').textContent = task;
+function select(value) {
+  selected = value;
+  ['no','yes'].forEach((id,i) => {$(id).classList.toggle('selected',i===value);$(id).setAttribute('aria-pressed',String(i===value));});
+  $('no').textContent = (value===0?'› ':'')+'No · 拒绝';
+  $('yes').textContent = (value===1?'› ':'')+'Yes · 接受并排队';
+}
+function setState(value) {
+  current = value;
+  const state = states[value];
+  $('stateControl').value = value;
+  $('recordState').textContent = state.label;
+  $('recordState').dataset.state = value;
+  $('recordMeta').textContent = state.note;
+  $('detailState').textContent = state.label+' · '+state.note;
+  $('footerState').textContent = state.footer;
+  $('consent').hidden = value!=='pending';
+  $('strip').replaceChildren(...state.history.map((label,i) => {const node=document.createElement('span');node.textContent=(i?'→ ':'')+label;if(i===state.history.length-1)node.className='current';return node;}));
+  if(value==='pending') select(0);
+}
+function toggleTask(){const open=$('full').hidden;$('full').hidden=!open;$('expandTask').setAttribute('aria-expanded',String(open));$('expandTask').textContent=(open?'▾ 收起':'▸ 展开')+'任务全文 · D';}
+document.querySelectorAll('[data-variant]').forEach(button => {if(button.tagName!=='BUTTON')return;button.onclick=()=>{$('terminal').dataset.variant=button.dataset.variant;document.querySelectorAll('button[data-variant]').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));$('explain').innerHTML=explanations[button.dataset.variant];};});
+$('detailsToggle').onclick=()=>{$('peer').open=!$('peer').open;};
+$('peer').addEventListener('toggle',()=>{$('detailsToggle').setAttribute('aria-expanded',String($('peer').open));$('detailsToggle').textContent=$('peer').open?'收起详情':'展开详情';});
+$('stateControl').onchange=e=>setState(e.target.value);
+$('expandTask').onclick=toggleTask;
+$('no').onclick=()=>setState('rejected');
+$('yes').onclick=()=>setState('queued');
+$('reset').onclick=()=>{setState('pending');$('peer').open=false;if(!$('full').hidden)toggleTask();};
+$('theme').onclick=()=>{const light=document.body.classList.toggle('light');$('theme').setAttribute('aria-pressed',String(light));$('theme').textContent=light?'暗色':'亮色';};
+$('narrow').onclick=()=>{const narrow=$('terminal').classList.toggle('narrow');$('narrow').setAttribute('aria-pressed',String(narrow));$('narrow').textContent=narrow?'宽窗口':'窄窗口';};
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='SELECT'||e.altKey||e.ctrlKey||e.metaKey)return;
+  if(e.key.toLowerCase()==='d'){e.preventDefault();if(current==='pending')toggleTask();else $('peer').open=!$('peer').open;return;}
+  if(current!=='pending')return;
+  if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();select(1-selected);$('no').blur();$('yes').blur();}
+  else if(e.key==='Escape'){e.preventDefault();setState('rejected');}
+  else if(e.key==='Enter'&&(e.target===document.body||e.target.closest('.actions'))){e.preventDefault();setState(selected===1?'queued':'rejected');}
+});
+setState('pending');
+</script></body></html>

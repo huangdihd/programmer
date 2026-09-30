@@ -198,14 +198,14 @@ impl IncrementalMarkdownParagraph {
     /// wrapped for the content width, so individual borrowed `Line`s can be
     /// rendered without materializing a conversation-sized `Text`.
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, source_offset: u16) {
-        if area.width <= 2 || area.height == 0 {
+        if area.width <= 1 || area.height == 0 {
             return;
         }
         let start = source_offset;
         let end = start.saturating_add(area.height).min(self.height);
         self.for_each_line(start, end, |row, line| {
             let destination_y = area.y.saturating_add(row.saturating_sub(start));
-            line.render(Rect::new(area.x + 1, destination_y, area.width - 2, 1), buf);
+            line.render(Rect::new(area.x, destination_y, area.width - 1, 1), buf);
         });
     }
 
@@ -871,6 +871,60 @@ mod tests {
         let (full_lines, full_codes) = render_markdown(source, 60);
         assert_eq!(incremental.lines(), full_lines);
         assert_eq!(incremental.codes(), full_codes);
+    }
+
+    #[test]
+    fn incremental_copy_coordinates_match_full_paragraph_at_viewport_origin() {
+        let source = "paragraph before code\n\n```rust\nfn main() {}\n```\n\ntail";
+        for width in [25, 60] {
+            let item = message(source);
+            let mut state = IncrementalMarkdownState::default();
+            // Materialize a stable prefix before appending the code block.
+            state.render(
+                "paragraph before code\n\n",
+                9,
+                message_markdown_width(width),
+            );
+            let incremental = IncrementalMarkdownParagraph::new(state.render(
+                source,
+                9,
+                message_markdown_width(width),
+            ));
+            let (full, buttons) = AssistantMessage::new(&item, width).into_paragraph();
+            let height = full.line_count(width) as u16;
+            assert_eq!(incremental.height(), height);
+            let area = Rect::new(9, 4, width, height);
+            let mut actual = Buffer::empty(area);
+            incremental.render(area, &mut actual, 0);
+            let mut expected = Buffer::empty(area);
+            full.render(area, &mut expected);
+            assert_eq!(actual, expected);
+            assert!(!buttons.is_empty());
+            for button in buttons {
+                for x in button.x_start..button.x_end {
+                    assert_eq!(
+                        incremental.copy_button(button.row, x),
+                        Some(button.content.clone())
+                    );
+                }
+                assert_eq!(incremental.copy_button(button.row, button.x_end), None);
+                assert_ne!(
+                    actual[(area.x + button.x_start, area.y + button.row)].symbol(),
+                    " "
+                );
+            }
+            let clipped = Rect::new(9, 4, width, height.saturating_sub(1));
+            let mut scrolled = Buffer::empty(clipped);
+            incremental.render(clipped, &mut scrolled, 1);
+            for y in 0..clipped.height {
+                for x in 0..width {
+                    assert_eq!(
+                        scrolled[(clipped.x + x, clipped.y + y)],
+                        expected[(area.x + x, area.y + y + 1)]
+                    );
+                }
+            }
+        }
     }
 
     #[test]

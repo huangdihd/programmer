@@ -23,7 +23,6 @@ use crate::ui::components::messages::assistant::detail_style;
 use crate::ui::components::messages::assistant_message::EXPANDED_BG;
 use crate::ui::markdown_theme::palette;
 
-const PAD_LEFT: u16 = 1;
 const PAD_RIGHT: u16 = 1;
 
 /// Renders the result of a tool call (a `function_call_output`). Collapsed it is
@@ -68,7 +67,7 @@ impl<'a> ToolResultMessage<'a> {
         let all: Vec<&str> = text.lines().collect();
         let multiline = all.len() > 1;
 
-        let block = Block::default().padding(Padding::new(PAD_LEFT, PAD_RIGHT, 0, 1));
+        let block = Block::default().padding(Padding::new(0, PAD_RIGHT, 0, 1));
 
         if !self.expanded {
             let first = all.first().copied().unwrap_or("[no output]");
@@ -109,7 +108,7 @@ impl<'a> ToolResultMessage<'a> {
 
         // The Paragraph receives the full outer width, but the image is
         // rendered inside the block padding.
-        let preview_width = self.width.saturating_sub(PAD_LEFT + PAD_RIGHT);
+        let preview_width = self.width.saturating_sub(PAD_RIGHT);
 
         lines.extend(crate::ui::image_preview::preview_lines(
             &self.output.output,

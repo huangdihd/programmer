@@ -21,6 +21,7 @@ pub(crate) mod commands;
 pub(crate) mod diagnostics;
 pub(crate) mod events;
 pub(crate) mod helpers;
+pub(crate) mod peers;
 pub(crate) mod session;
 pub(crate) mod surface;
 
@@ -305,6 +306,7 @@ pub struct App<'a> {
     pub(crate) thinking_level: crate::thinking::ThinkingLevel,
     /// Retry policy selected by `/keepretry` for main model turns.
     /// Images belonging to the queued follow-up message while a turn is busy.
+    pub(crate) peers: peers::PeerState,
     pub(crate) pending_images: Vec<async_openai::types::responses::InputImageContent>,
     /// Event handler.
     pub events: EventHandler,
@@ -534,6 +536,7 @@ impl App<'_> {
             vision_enabled,
             native_selection_mode: false,
             thinking_level,
+            peers: peers::PeerState::default(),
             pending_images: Vec::new(),
             events: EventHandler::new(),
             config,
@@ -835,6 +838,10 @@ impl App<'_> {
             self.agents.clone(),
             child_runtime,
         )));
+        base_providers.push(Arc::new(crate::peers::PeerSessionProvider::new(
+            self.session.uuid.clone(),
+            self.provider_manager.clone(),
+        )));
         let tools = Arc::new(ToolRegistry::new(base_providers));
 
         Some(TurnRunner {
@@ -862,6 +869,8 @@ impl App<'_> {
     ) -> (color_eyre::Result<()>, Option<String>) {
         // Kick off diagnostics baseline seeding on startup.
         crate::app::diagnostics::maybe_seed_diagnostics_baseline(&mut self);
+        // Receive durable peer requests even before the first user turn.
+        self.events.schedule_status_tick();
 
         let result = async {
             // Paint startup state immediately. After this, raw stream chunks only
@@ -895,9 +904,8 @@ impl App<'_> {
                     // Status timing remains at 10 FPS. Edge-drag selection has
                     // a separate, smoother timer so it can advance one row per
                     // step without making background housekeeping run faster.
-                    if self.footer.status.status.is_busy() {
-                        self.events.schedule_status_tick();
-                    }
+                    // Housekeeping includes peer inbox delivery while idle.
+                    self.events.schedule_status_tick();
                     if self.conversation_panel.selection_auto_scroll_active() {
                         self.events.schedule_selection_scroll();
                     }
