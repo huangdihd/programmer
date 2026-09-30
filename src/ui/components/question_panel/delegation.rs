@@ -244,8 +244,7 @@ impl Delegation {
         let body_y = inner.y.saturating_add(1);
         let model_y = choices_y.saturating_sub(1);
         if model_y > inner.y {
-            Paragraph::new(format!("Model: {} (session)", self.model))
-                .render(row(model_y), buf);
+            Paragraph::new(format!("Model: {} (session)", self.model)).render(row(model_y), buf);
         }
         let body_height = model_y.saturating_sub(body_y);
         if body_height > 0 {
