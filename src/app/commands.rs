@@ -18,6 +18,7 @@
 use super::App;
 use super::surface::TuiSurface;
 use super::{command_handlers, diagnostics, session};
+use crate::cancel::OperationId;
 use crate::classifier::{PlanPhase, WorkMode};
 use crate::commands::Command;
 use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
@@ -193,11 +194,11 @@ pub(crate) async fn start_runtime_update_request(
     app: &mut App<'_>,
     task_events: Vec<crate::tasks::TaskLifecycleEvent>,
     agent_events: Vec<crate::agents::AgentSnapshot>,
-    pending_user: Option<(String, Vec<InputImageContent>)>,
+    pending_user: Option<super::scheduling::UserRequest>,
 ) {
     if task_events.is_empty() && agent_events.is_empty() {
-        if let Some((text, images)) = pending_user {
-            start_request_with_images(app, text, images).await;
+        if let Some(request) = pending_user {
+            start_request_with_images(app, request.text, request.images).await;
         }
         return;
     }
@@ -213,8 +214,8 @@ pub(crate) async fn start_runtime_update_request(
         update.push_str(&format_agent_updates(&agent_events));
     }
     let mut inputs = vec![(update, InputRole::Developer, Vec::new())];
-    if let Some((text, images)) = pending_user {
-        inputs.push((text, InputRole::User, images));
+    if let Some(request) = pending_user {
+        inputs.push((request.text, InputRole::User, request.images));
     }
     start_ready_request(app, inputs, None).await;
 }
@@ -284,13 +285,9 @@ pub(in crate::app) fn start_keep_retry(app: &mut App<'_>, mode: KeepRetryMode) {
         "Retrying the previous model request with {} until it succeeds. Press Esc to stop.",
         mode.label()
     ));
-    app.cancel.active = crate::cancel::CancellationToken::new();
-    app.cancel.next_id = app.cancel.next_id.wrapping_add(1);
-    let operation_id = app.cancel.next_id;
-    app.cancel.active_id = Some(operation_id);
-    app.cancel.turn_conversation_cutoff = Some(app.conversation_panel.items_snapshot().len());
-    app.cancel.response_started = false;
-    app.cancel.active_user_request = None;
+    let operation_id = app
+        .cancel
+        .begin(Some(app.conversation_panel.items_snapshot().len()));
 
     let surface = TuiSurface {
         tx: app.events.sender.clone(),
@@ -390,12 +387,7 @@ async fn start_ready_request(
     // Fresh turn: start from an un-cancelled root token so a prior turn's Esc
     // doesn't carry over to this one. Bump the operation id synchronously
     // before spawning so the UI can tag all turn events and filter stale ones.
-    app.cancel.active = crate::cancel::CancellationToken::new();
-    app.cancel.next_id = app.cancel.next_id.wrapping_add(1);
-    let operation_id = app.cancel.next_id;
-    app.cancel.active_id = Some(operation_id);
-    app.cancel.turn_conversation_cutoff = Some(conversation_cutoff);
-    app.cancel.response_started = false;
+    let operation_id = app.cancel.begin(Some(conversation_cutoff));
     app.cancel.active_user_request =
         original_draft.map(|(draft, history_text)| super::ActiveUserRequest {
             draft,
@@ -404,9 +396,7 @@ async fn start_ready_request(
         });
 
     let Some(runner) = app.build_runner() else {
-        app.cancel.active_id = None;
-        app.cancel.turn_conversation_cutoff = None;
-        app.cancel.active_user_request = None;
+        app.cancel.clear();
         app.conversation_panel
             .add_error_string(format!("unknown provider/model: {}", app.current_model));
         return;
@@ -596,7 +586,10 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
         .map(|(w, h)| (h.saturating_sub(2).max(1), w.max(1)))
         .unwrap_or((24, 80));
     let security = app.security.snapshot();
-    match crate::tasks::spawn_bang_secure(&command, None, Some(&command), rows, cols, &security) {
+    match app
+        .tasks
+        .spawn_bang_secure(&command, None, Some(&command), rows, cols, &security)
+    {
         Ok(id) => {
             // The record in the conversation; the transcript follows when the
             // command exits and the agent picks it up.
@@ -605,7 +598,7 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
                  the agent will respond when it exits"
             ));
             session::mark_dirty(app);
-            let mut pane = TerminalPane::new(id, command);
+            let mut pane = TerminalPane::new(app.tasks.clone(), id, command);
             // Grab input immediately — the user typed `!` to interact.
             pane.grabbed = true;
             app.terminal_pane = Some(pane);
@@ -694,7 +687,7 @@ fn normalize_session_title(response: &str) -> Result<String, String> {
     }
 }
 
-pub(super) fn maybe_start_input_suggestion(app: &mut App<'_>, operation_id: u64) {
+pub(super) fn maybe_start_input_suggestion(app: &mut App<'_>, operation_id: OperationId) {
     use async_openai::types::responses::{InputItem, InputParam, Item};
 
     if !app.input_panel.get_content().is_empty() || app.cancel.active_id.is_some() {
@@ -928,10 +921,7 @@ pub(crate) fn start_compact(app: &mut App<'_>) {
     ));
 
     app.conversation_panel.phase = ActivePhase::Compacting;
-    app.cancel.active = crate::cancel::CancellationToken::new();
-    app.cancel.next_id = app.cancel.next_id.wrapping_add(1);
-    let operation_id = app.cancel.next_id;
-    app.cancel.active_id = Some(operation_id);
+    let operation_id = app.cancel.begin(None);
     let cancel_token = app.cancel.active.child();
     let thinking_level = app.thinking_level;
     let sender = app.events.sender.clone();
@@ -1081,9 +1071,9 @@ pub(super) fn open_terminal(app: &mut App<'_>, arg: &str) {
     // Accept an id as the first token (completion may append the task name).
     let first = arg.split_whitespace().next().unwrap_or("");
     if first.eq_ignore_ascii_case("clear") {
-        let cleared = crate::tasks::clear_finished();
+        let cleared = app.tasks.clear_finished();
         if let Some(sidebar) = app.sidebar.as_mut() {
-            sidebar.retain_existing_tasks();
+            sidebar.retain_existing_tasks(&app.tasks);
         }
         app.conversation_panel
             .add_info_string(format!("Cleared {cleared} finished task(s)."));
@@ -1092,7 +1082,9 @@ pub(super) fn open_terminal(app: &mut App<'_>, arg: &str) {
     }
     let id = if first.is_empty() {
         // Auto-select the sole running task.
-        let running: Vec<u64> = crate::tasks::snapshot_all()
+        let running: Vec<u64> = app
+            .tasks
+            .snapshot_all()
             .iter()
             .filter(|t| t.status == crate::tasks::TaskStatus::Running)
             .map(|t| t.id)
@@ -1121,12 +1113,12 @@ pub(super) fn open_terminal(app: &mut App<'_>, arg: &str) {
         }
     };
 
-    let Some(snapshot) = crate::tasks::snapshot(id) else {
+    let Some(snapshot) = app.tasks.snapshot(id) else {
         app.conversation_panel
             .add_warning_string(format!("task {id} was not found"));
         return;
     };
-    app.terminal_pane = Some(TerminalPane::new(id, snapshot.name));
+    app.terminal_pane = Some(TerminalPane::new(app.tasks.clone(), id, snapshot.name));
 }
 
 // ---------------------------------------------------------------------------
@@ -1358,6 +1350,7 @@ mod tests {
         format_task_updates, normalize_input_suggestion, normalize_session_title,
         ordered_message_content, queue_pending_request,
     };
+    use crate::cancel::OperationId;
     use async_openai::types::responses::{ImageDetail, InputContent, InputImageContent};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -1386,6 +1379,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            crate::tasks::TaskManager::default(),
             "test-session".to_string(),
             None,
             Vec::new(),
@@ -1413,7 +1407,7 @@ mod tests {
         app.provider_manager = crate::providers::ProviderManager::from_config(&app.config);
         app.current_model = "test/old".into();
         let runner = app.build_runner().expect("snapshot");
-        app.cancel.active_id = Some(42);
+        app.cancel.active_id = Some(OperationId(42));
         let cancel = app.cancel.active.clone();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let mut panel = QuestionPanel::delegation("source", "task", true, AnswerTx(tx));
@@ -1454,7 +1448,7 @@ mod tests {
         assert_eq!(runner.model_str, "test/old");
         assert_eq!(runner.model_name, "old");
         assert_eq!(app.build_runner().unwrap().model_str, "test/new");
-        assert_eq!(app.cancel.active_id, Some(42));
+        assert_eq!(app.cancel.active_id, Some(OperationId(42)));
         assert!(!cancel.is_cancelled());
         // Peer consent owns Escape even while a turn is active.
         for code in [KeyCode::Char('m'), KeyCode::Esc] {
@@ -1466,7 +1460,7 @@ mod tests {
             .unwrap();
         }
         assert!(app.question_panel.is_some());
-        assert_eq!(app.cancel.active_id, Some(42));
+        assert_eq!(app.cancel.active_id, Some(OperationId(42)));
         assert!(!cancel.is_cancelled());
         crate::app::events::handle_key_events(
             &mut app,

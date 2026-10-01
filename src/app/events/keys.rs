@@ -44,7 +44,7 @@ pub(crate) async fn handle_key_events(
     // ---- Ctrl+Z while a command tool is running: keep its process alive as
     // a background task. Do this before modal routing so the foreground turn
     // can finish and the promoted task can appear in the sidebar immediately.
-    if is_promote_shortcut(key_event) && crate::tasks::promote_running_command().is_some() {
+    if is_promote_shortcut(key_event) && app.tasks.promote_running_command().is_some() {
         return Ok(());
     }
 
@@ -469,7 +469,9 @@ fn apply_rewind(
         RestoreMode::CodeAndConversation | RestoreMode::ConversationOnly
     );
     if restore_code
-        && (crate::tasks::snapshot_all()
+        && (app
+            .tasks
+            .snapshot_all()
             .iter()
             .any(|task| task.status == crate::tasks::TaskStatus::Running)
             || app
@@ -734,12 +736,14 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
 
     if pane.grabbed {
         // Cursor keys need the child's DECCKM mode to pick CSI vs SS3.
-        let app_cursor =
-            crate::tasks::with_screen(pane.task_id, |s| s.application_cursor()).unwrap_or(false);
+        let app_cursor = app
+            .tasks
+            .with_screen(pane.task_id, |s| s.application_cursor())
+            .unwrap_or(false);
         if let Some(bytes) = key_event_to_bytes(key_event, app_cursor) {
-            let _ = crate::tasks::write_bytes(pane.task_id, &bytes);
+            let _ = app.tasks.write_bytes(pane.task_id, &bytes);
             // Typing snaps the view back to live output.
-            crate::tasks::scroll_screen(pane.task_id, i32::MIN);
+            app.tasks.scroll_screen(pane.task_id, i32::MIN);
         }
         return;
     }
@@ -769,7 +773,9 @@ pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::
         return;
     }
 
-    let mode = crate::tasks::with_screen(pane.task_id, |s| s.mouse_protocol_mode())
+    let mode = app
+        .tasks
+        .with_screen(pane.task_id, |s| s.mouse_protocol_mode())
         .unwrap_or(vt100::MouseProtocolMode::None);
 
     // The wheel scrolls the local scrollback unless a grabbed program is
@@ -777,11 +783,11 @@ pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::
     let program_wants_mouse = pane.grabbed && mode != vt100::MouseProtocolMode::None;
     match mouse.kind {
         MouseEventKind::ScrollUp if !program_wants_mouse => {
-            crate::tasks::scroll_screen(pane.task_id, 3);
+            app.tasks.scroll_screen(pane.task_id, 3);
             return;
         }
         MouseEventKind::ScrollDown if !program_wants_mouse => {
-            crate::tasks::scroll_screen(pane.task_id, -3);
+            app.tasks.scroll_screen(pane.task_id, -3);
             return;
         }
         _ => {}
@@ -795,7 +801,7 @@ pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::
         return;
     };
     if let Some(bytes) = mouse_event_to_bytes(mouse, grid, mode) {
-        let _ = crate::tasks::write_bytes(pane.task_id, &bytes);
+        let _ = app.tasks.write_bytes(pane.task_id, &bytes);
     }
 }
 
@@ -809,7 +815,7 @@ pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
     // While the terminal panel has input grabbed, a paste goes to the PTY.
     if let Some(pane) = app.terminal_pane.as_ref() {
         if pane.grabbed {
-            let _ = crate::tasks::write_bytes(pane.task_id, data.as_bytes());
+            let _ = app.tasks.write_bytes(pane.task_id, data.as_bytes());
         }
         return;
     }
@@ -1040,6 +1046,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            crate::tasks::TaskManager::default(),
             "mcp-escape-routing-test".to_string(),
             None,
             Vec::new(),
@@ -1047,7 +1054,7 @@ mod tests {
             "test".to_string(),
         )
         .await;
-        app.cancel.active_id = Some(42);
+        app.cancel.active_id = Some(crate::cancel::OperationId(42));
         app.mcp_panel = Some(crate::ui::components::mcp_panel::McpPanel::new());
 
         handle_key_events(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -1055,7 +1062,7 @@ mod tests {
             .unwrap();
 
         assert!(app.mcp_panel.is_none());
-        assert_eq!(app.cancel.active_id, Some(42));
+        assert_eq!(app.cancel.active_id, Some(crate::cancel::OperationId(42)));
         assert!(!app.cancel.active.is_cancelled());
     }
 }

@@ -337,11 +337,38 @@ pub(crate) enum SessionLockError {
     Io(String),
 }
 
+/// Loading is read-only: missing files are distinct from unreadable or invalid data.
+#[derive(Debug)]
+pub(crate) enum SessionLoadError {
+    Read {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        error: serde_json::Error,
+    },
+}
+
+impl std::fmt::Display for SessionLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, error } => write!(formatter, "read {}: {error}", path.display()),
+            Self::Parse { path, error } => write!(formatter, "parse {}: {error}", path.display()),
+        }
+    }
+}
+
 pub(crate) struct SessionManager {
     sessions_dir: PathBuf,
 }
 
 impl SessionManager {
+    #[cfg(test)]
+    pub(crate) fn for_test(sessions_dir: PathBuf) -> Self {
+        Self { sessions_dir }
+    }
+
     /// Create a new manager pointing at `~/.config/programmer/sessions/`.
     pub(crate) fn new() -> Option<Self> {
         let dir = dirs::config_dir()?.join("programmer").join("sessions");
@@ -412,34 +439,33 @@ impl SessionManager {
         }
     }
 
-    /// Load a session by UUID. Returns `None` if not found or unreadable.
-    /// An unparseable file is set aside as `<uuid>.json.corrupt` — not
-    /// deleted, since a parse failure can also mean a schema mismatch with
-    /// another version of the program, and the data may still be recoverable.
-    pub(crate) fn load(&self, uuid: &str) -> Option<Session> {
+    /// A missing file is `Ok(None)`; all other failures preserve the original file.
+    pub(crate) fn load(&self, uuid: &str) -> Result<Option<Session>, SessionLoadError> {
         let path = self.session_path(uuid);
-        let bytes = std::fs::read(&path).ok()?;
-        match serde_json::from_slice(&bytes) {
-            Ok(session) => Some(session),
-            Err(_) => {
-                let quarantine = path.with_extension("json.corrupt");
-                let _ = std::fs::rename(&path, &quarantine);
-                None
-            }
-        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SessionLoadError::Read { path, error }),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| SessionLoadError::Parse { path, error })
     }
 
     /// Save a session to its file atomically: write to a temp file first,
     /// then rename, so a crash mid-write never leaves a truncated file.
     pub(crate) fn save(&self, session: &mut Session) -> Result<(), String> {
-        session.updated_at = now_secs();
         self.ensure_dir()?;
-        let path = self.session_path(&session.uuid);
-        let json = serde_json::to_string_pretty(session).map_err(|e| format!("serialize: {e}"))?;
+        let mut snapshot = session.clone();
+        snapshot.updated_at = now_secs();
+        let path = self.session_path(&snapshot.uuid);
+        let json =
+            serde_json::to_string_pretty(&snapshot).map_err(|e| format!("serialize: {e}"))?;
         // Atomic write: tmp → rename.
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
         std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+        session.updated_at = snapshot.updated_at;
         Ok(())
     }
 
@@ -909,6 +935,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persistence_load_distinguishes_missing_read_and_parse_without_mutation() {
+        let sessions_dir = std::env::temp_dir().join(format!("programmer-load-test-{}", uuid_v4()));
+        let manager = SessionManager {
+            sessions_dir: sessions_dir.clone(),
+        };
+        assert!(manager.load("missing").unwrap().is_none());
+        assert!(!sessions_dir.exists());
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let unreadable = manager.session_path("directory");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(matches!(
+            manager.load("directory"),
+            Err(SessionLoadError::Read { .. })
+        ));
+        let invalid = manager.session_path("invalid");
+        std::fs::write(&invalid, b"{invalid JSON").unwrap();
+        let previous_quarantine = invalid.with_extension("json.corrupt");
+        std::fs::write(&previous_quarantine, b"older recovery data").unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                manager.load("invalid"),
+                Err(SessionLoadError::Parse { .. })
+            ));
+            assert_eq!(std::fs::read(&invalid).unwrap(), b"{invalid JSON");
+            assert_eq!(
+                std::fs::read(&previous_quarantine).unwrap(),
+                b"older recovery data"
+            );
+        }
+        std::fs::remove_dir_all(sessions_dir).unwrap();
+    }
+
+    #[test]
+    fn persistence_write_failure_preserves_saved_bytes_and_can_retry() {
+        let sessions_dir = std::env::temp_dir().join(format!("programmer-save-test-{}", uuid_v4()));
+        let manager = SessionManager {
+            sessions_dir: sessions_dir.clone(),
+        };
+        let mut session = manager.create();
+        manager.save(&mut session).unwrap();
+        let path = manager.session_path(&session.uuid);
+        let original = std::fs::read(&path).unwrap();
+        session.updated_at = 1;
+        session.title = "retry me".to_string();
+        let temporary = path.with_extension("tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        assert!(manager.save(&mut session).is_err());
+        assert_eq!(session.updated_at, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir(&temporary).unwrap();
+        manager.save(&mut session).unwrap();
+        assert_eq!(
+            manager.load(&session.uuid).unwrap().unwrap().title,
+            "retry me"
+        );
+        std::fs::remove_dir_all(sessions_dir).unwrap();
+    }
+
+    #[test]
+    fn persistence_rename_failure_does_not_acknowledge_snapshot() {
+        let sessions_dir =
+            std::env::temp_dir().join(format!("programmer-rename-test-{}", uuid_v4()));
+        let manager = SessionManager {
+            sessions_dir: sessions_dir.clone(),
+        };
+        let mut session = manager.create();
+        session.updated_at = 1;
+        let path = manager.session_path(&session.uuid);
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(
+            manager
+                .save(&mut session)
+                .unwrap_err()
+                .starts_with("rename:")
+        );
+        assert_eq!(session.updated_at, 1);
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+        manager.save(&mut session).unwrap();
+        assert!(manager.load(&session.uuid).unwrap().is_some());
+        std::fs::remove_dir_all(sessions_dir).unwrap();
+    }
+
+    #[test]
     fn peer_delegation_round_trips_all_states_and_missing_task() {
         use crate::response::message_item::PeerDelegationState::*;
         for state in [Pending, AcceptedQueued, Started, Rejected, Cancelled] {
@@ -1158,8 +1268,8 @@ mod tests {
         mgr.save(&mut first).unwrap();
         mgr.save(&mut second).unwrap();
 
-        let loaded_first = mgr.load(&first.uuid).unwrap();
-        let loaded_second = mgr.load(&second.uuid).unwrap();
+        let loaded_first = mgr.load(&first.uuid).unwrap().unwrap();
+        let loaded_second = mgr.load(&second.uuid).unwrap().unwrap();
         assert!(loaded_first.vision_enabled);
         assert!(!loaded_second.vision_enabled);
         assert_eq!(
@@ -1221,7 +1331,7 @@ mod tests {
         assert_ne!(forked.uuid, source.uuid);
         assert_eq!(forked.title, "Original (fork)");
         assert_eq!(forked.history, source.history);
-        assert!(mgr.load(&forked.uuid).is_some());
+        assert!(mgr.load(&forked.uuid).unwrap().is_some());
         std::fs::remove_dir_all(sessions_dir).unwrap();
     }
 }

@@ -17,7 +17,7 @@
 //! (stream chunks, phase changes, review requests) into [`AppEvent`]s on the
 //! app's event channel. A fresh instance is built for each turn.
 
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
 use crate::runner::{AgentSurface, ReviewDecision, RunnerEvent};
 use crate::ui::event::{AppEvent, Event, ReplyTx};
 use async_openai::types::responses::FunctionToolCall;
@@ -35,7 +35,7 @@ pub(crate) struct TuiSurface {
     /// "🤖 approved by Auto mode".
     pub approval_label: String,
     /// The monotonically increasing operation id assigned to this turn.
-    pub operation_id: u64,
+    pub operation_id: OperationId,
     /// The turn's root cancellation token, so `review()` can race the
     /// approval wait against an Esc press.
     pub cancel: CancellationToken,
@@ -47,6 +47,9 @@ impl AgentSurface for TuiSurface {
         let app_ev = match ev {
             RunnerEvent::StreamChunk(b) => AppEvent::ChunkReceived(self.operation_id, Box::new(*b)),
             RunnerEvent::ResponseCommitted => AppEvent::ResponseCommitted(self.operation_id),
+            RunnerEvent::Activity(description) => {
+                AppEvent::RunnerActivity(self.operation_id, description.to_string())
+            }
             RunnerEvent::Phase(p) => AppEvent::RunnerPhase(self.operation_id, p),
             RunnerEvent::UsageSafePoint { input_tokens } => {
                 let (resume, _receiver) = oneshot::channel();
@@ -99,8 +102,17 @@ impl AgentSurface for TuiSurface {
         }
     }
 
-    fn tool_event_sender(&self) -> Option<mpsc::UnboundedSender<Event>> {
-        Some(self.tx.clone())
+    fn questions(&self) -> Option<crate::tools::ask_user::QuestionHandler> {
+        let sender = self.tx.clone();
+        Some(crate::tools::ask_user::QuestionHandler::new(
+            move |request| {
+                let _ = sender.send(Event::App(AppEvent::QuestionPrompt {
+                    question: request.question,
+                    answer_tx: crate::ui::event::AnswerTx(request.answer),
+                    operation_id: request.operation_id,
+                }));
+            },
+        ))
     }
 
     fn skill_prompt(&self) -> Option<String> {
@@ -115,7 +127,7 @@ impl AgentSurface for TuiSurface {
         self.approval_label.clone()
     }
 
-    fn operation_id(&self) -> u64 {
+    fn operation_id(&self) -> OperationId {
         self.operation_id
     }
 }
@@ -125,6 +137,41 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn question_endpoint_maps_request_and_reply_without_a_forwarding_task() {
+        let (tx, mut receiver) = mpsc::unbounded_channel();
+        let surface = TuiSurface {
+            tx,
+            skill_prompt: None,
+            plan_prompt: None,
+            approval_label: "test".to_string(),
+            operation_id: OperationId(42),
+            cancel: CancellationToken::new(),
+        };
+        let questions = surface.questions().expect("interactive endpoint");
+        let question = crate::tools::ask_user::run(
+            r#"{"question":"Proceed?","kind":"yes_no"}"#,
+            &questions,
+            &surface.cancel,
+            surface.operation_id,
+        );
+        tokio::pin!(question);
+        assert!(futures::poll!(&mut question).is_pending());
+        let Event::App(AppEvent::QuestionPrompt {
+            question: prompt,
+            answer_tx,
+            operation_id,
+        }) = receiver.try_recv().expect("question queued synchronously")
+        else {
+            panic!("expected question event")
+        };
+        assert_eq!(operation_id, OperationId(42));
+        assert_eq!(prompt.text, "Proceed?");
+        answer_tx.send("Yes".to_string());
+        assert_eq!(question.await.unwrap(), "Yes");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn usage_safe_point_waits_for_frontend_resume() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let surface = TuiSurface {
@@ -132,7 +179,7 @@ mod tests {
             skill_prompt: None,
             plan_prompt: None,
             approval_label: "test".to_string(),
-            operation_id: 42,
+            operation_id: OperationId(42),
             cancel: CancellationToken::new(),
         };
         let waiter = tokio::spawn(async move { surface.usage_safe_point(150_000).await });
@@ -142,7 +189,7 @@ mod tests {
         else {
             panic!("unexpected event")
         };
-        assert_eq!(operation_id, 42);
+        assert_eq!(operation_id, OperationId(42));
         assert_eq!(tokens, 150_000);
         assert!(!waiter.is_finished());
         resume.send(()).expect("resume runner");

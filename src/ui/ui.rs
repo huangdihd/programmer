@@ -51,7 +51,10 @@ fn status_for_pending_turn(active_turn: bool, retrying: bool) -> StatusState {
 impl App<'_> {
     /// The single status the footer shows, by precedence: user-input waits
     /// first, then the current busy phase, then idle.
-    fn resolve_status(&self) -> StatusState {
+    pub(crate) fn resolve_status(&self) -> StatusState {
+        if self.conversation_panel.phase == ActivePhase::Cancelling {
+            return StatusState::Cancelling;
+        }
         if self.question_panel.is_some() {
             return StatusState::WaitingAnswer;
         }
@@ -397,7 +400,13 @@ impl App<'_> {
             self.footer.status.status.emoji_label(),
             title_subject,
         ));
-        self.footer.status.detail = None;
+        self.footer.status.detail =
+            (self.footer.status.status == StatusState::Cancelling).then(|| {
+                format!(
+                    "waiting for {} to return (last observed)",
+                    self.cancel.activity.as_deref().unwrap_or("runner")
+                )
+            });
         self.footer.work_mode = self.work_mode;
         self.footer.sandbox_mode = self.security.sandbox_mode();
         self.footer.sandbox_profile = self.config.active_security_profile.clone();
@@ -486,7 +495,7 @@ impl App<'_> {
                 .as_ref()
                 .map(|sidebar| sidebar.expanded_task_ids().clone())
                 .unwrap_or_default();
-            let sidebar_tasks = crate::tasks::snapshot_for_sidebar(&expanded_task_ids);
+            let sidebar_tasks = self.tasks.snapshot_for_sidebar(&expanded_task_ids);
             let sidebar_agents = self.agents.snapshot_all();
             let active_provider = self
                 .current_model

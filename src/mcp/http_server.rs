@@ -74,6 +74,7 @@ pub(crate) enum ConsoleEvent {
 
 /// Shared state between the HTTP handler and the console.
 pub(crate) struct ServerState {
+    tasks: crate::tasks::TaskManager,
     /// Current work mode; the console mutates it on Ctrl+T.
     pub(crate) mode: Arc<Mutex<WorkMode>>,
     /// Classifier client for `auto` mode (None → auto refuses dangerous tools).
@@ -95,6 +96,7 @@ pub async fn serve(
     let mode = Arc::new(Mutex::new(mode));
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let state = Arc::new(ServerState {
+        tasks: crate::tasks::TaskManager::default(),
         mode: Arc::clone(&mode),
         classifier,
         event_tx,
@@ -174,11 +176,17 @@ impl ServerState {
         match self.decide(id, &name, &args).await {
             Ok(()) => {
                 self.emit(ConsoleEvent::Running { id });
-                let (text, is_error) =
-                    match crate::tools::run_local_tool_secure(&name, &args, &self.security).await {
-                        Ok(text) => (text, false),
-                        Err(text) => (text, true),
-                    };
+                let (text, is_error) = match crate::tools::run_local_tool_secure(
+                    &self.tasks,
+                    &name,
+                    &args,
+                    &self.security,
+                )
+                .await
+                {
+                    Ok(text) => (text, false),
+                    Err(text) => (text, true),
+                };
                 self.emit(ConsoleEvent::Finished {
                     id,
                     outcome: if is_error {

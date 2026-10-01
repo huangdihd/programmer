@@ -14,7 +14,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use async_openai::error::OpenAIError;
-use async_openai::types::responses::{FunctionCallOutputItemParam, InputItem, OutputItem};
+use async_openai::types::responses::{
+    FunctionCallOutputItemParam, InputContent, InputItem, MessageItem as ApiMessageItem, OutputItem,
+};
 use std::sync::Arc;
 
 /// Display-only observations; never an execution authorization or completion claim.
@@ -126,6 +128,92 @@ impl Clone for MessageItem {
             MessageItem::Compacted { summary } => MessageItem::Compacted {
                 summary: summary.clone(),
             },
+        }
+    }
+}
+
+/// Extract the first text part of an input message, regardless of its role.
+pub(crate) fn extract_input_text(input: &InputItem) -> Option<String> {
+    use async_openai::types::responses::Item;
+
+    match input {
+        InputItem::Item(Item::Message(ApiMessageItem::Input(input_msg))) => {
+            input_msg.content.iter().find_map(|c| match c {
+                InputContent::InputText(t) => Some(t.text.clone()),
+                _ => None,
+            })
+        }
+        InputItem::EasyMessage(msg) => match &msg.content {
+            async_openai::types::responses::EasyInputContent::Text(t) => Some(t.clone()),
+            async_openai::types::responses::EasyInputContent::ContentList(parts) => {
+                parts.iter().find_map(|c| match c {
+                    InputContent::InputText(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+            }
+        },
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_input_text_handles_non_message() {
+        let input: InputItem = serde_json::from_value(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "result"
+        }))
+        .unwrap();
+        assert!(extract_input_text(&input).is_none());
+    }
+
+    #[test]
+    fn extract_input_text_handles_easy_text_without_filtering_roles() {
+        let input = InputItem::EasyMessage(
+            serde_json::from_value(serde_json::json!({
+                "role": "developer",
+                "content": "instructions"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(extract_input_text(&input).as_deref(), Some("instructions"));
+    }
+
+    #[test]
+    fn extract_input_text_preserves_first_text_part_for_both_message_forms() {
+        use async_openai::types::responses::Item;
+
+        for content in [
+            serde_json::json!([
+                {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "auto"},
+                {"type": "input_text", "text": " first "},
+                {"type": "input_text", "text": "second"}
+            ]),
+            serde_json::json!([
+                {"type": "input_text", "text": ""},
+                {"type": "input_text", "text": "second"}
+            ]),
+            serde_json::json!([]),
+            serde_json::json!([
+                {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "auto"}
+            ]),
+        ] {
+            let expected = content
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(|part| part.get("text").and_then(serde_json::Value::as_str));
+            let message = serde_json::json!({"role": "user", "content": content});
+            let easy = InputItem::EasyMessage(serde_json::from_value(message.clone()).unwrap());
+            let structured = InputItem::Item(Item::Message(ApiMessageItem::Input(
+                serde_json::from_value(message).unwrap(),
+            )));
+            assert_eq!(extract_input_text(&easy).as_deref(), expected);
+            assert_eq!(extract_input_text(&structured).as_deref(), expected);
         }
     }
 }

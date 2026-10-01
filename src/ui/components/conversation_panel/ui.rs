@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::response::message_item::MessageItem;
+use crate::response::message_item::{MessageItem, extract_input_text};
 use crate::ui::components::conversation_panel::conversation_panel::{
     ActivePhase, CachedLiveSlot, CachedParagraph, CachedToolGroup, ConversationPanel,
     LiveGroupHeader, LiveParagraph, LiveParagraphContent, LiveRenderCache, MaterializedLiveCache,
@@ -57,7 +57,7 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
     match item {
         MessageItem::Input(input) if is_hidden_developer_input(input) => 0,
         MessageItem::Input(input) => {
-            let text = crate::app::helpers::extract_input_text(input).unwrap_or_default();
+            let text = extract_input_text(input).unwrap_or_default();
             rough_line_count(&text, w).saturating_add(input_image_rows(input))
         }
         MessageItem::Output(output) => match output {
@@ -369,6 +369,7 @@ fn empty_live_slot() -> CachedLiveSlot {
 
 #[allow(clippy::too_many_arguments)]
 fn build_live_group_slot<'a>(
+    tasks: &crate::tasks::TaskManager,
     group: &ToolGroup,
     conversation_items: &'a [MessageItem],
     receiving_items: &'a [(&'a OutputItem, bool)],
@@ -391,7 +392,7 @@ fn build_live_group_slot<'a>(
             let call = function_call(&conversation_items[member_index]).unwrap();
             (!outputs_by_call.contains_key(call.call_id.as_str())
                 && call.name == crate::tools::command::NAME)
-                .then(|| crate::tools::command::live_output(&call.call_id))
+                .then(|| crate::tools::command::live_output(tasks, &call.call_id))
                 .flatten()
         })
         .collect();
@@ -949,7 +950,7 @@ impl Widget for &mut ConversationPanel {
                 MessageItem::Output(OutputItem::FunctionCall(call))
                     if !has_output && call.name == crate::tools::command::NAME =>
                 {
-                    crate::tools::command::live_output(&call.call_id)
+                    crate::tools::command::live_output(&self.tasks, &call.call_id)
                 }
                 _ => None,
             };
@@ -984,7 +985,8 @@ impl Widget for &mut ConversationPanel {
                         let call = function_call(&conv.items[member_index]).unwrap();
                         !outputs_by_call.contains_key(call.call_id.as_str())
                             && call.name == crate::tools::command::NAME
-                            && crate::tools::command::live_output(&call.call_id).is_some()
+                            && crate::tools::command::live_output(&self.tasks, &call.call_id)
+                                .is_some()
                     })
             });
             let history_dirty = if is_group_start {
@@ -1050,7 +1052,9 @@ impl Widget for &mut ConversationPanel {
                             let call = function_call(&conv.items[member_index]).unwrap();
                             (!outputs_by_call.contains_key(call.call_id.as_str())
                                 && call.name == crate::tools::command::NAME)
-                                .then(|| crate::tools::command::live_output(&call.call_id))
+                                .then(|| {
+                                    crate::tools::command::live_output(&self.tasks, &call.call_id)
+                                })
                                 .flatten()
                         })
                         .collect();
@@ -1314,6 +1318,7 @@ impl Widget for &mut ConversationPanel {
                     let group_expanded = self.live_expanded_groups.contains(&group.key)
                         || self.expanded_tool_groups.contains(&group.key);
                     let slot = build_live_group_slot(
+                        &self.tasks,
                         group,
                         &conv.items,
                         &receiving_items,

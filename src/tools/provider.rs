@@ -28,12 +28,11 @@ use super::{
     edit_file, fetch, grep, load_skill, mcp_bridge, memory, read_file, read_image,
     request_permission, run_local_tool, task, todo, write_file,
 };
+use crate::cancel::OperationId;
 use crate::mcp::McpManager;
-use crate::ui::event::Event;
 use async_openai::types::responses::{FunctionCallOutput, FunctionToolCall, Tool};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::UnboundedSender;
 
 /// A provider's verdict on whether a call needs the work-mode classifier — the
 /// single "does this go through the classifier?" decision that used to be split
@@ -82,26 +81,21 @@ impl ToolProvider for AgentToolProvider {
     async fn call(
         &self,
         call: &FunctionToolCall,
-        ctx: &ToolCtx<'_>,
+        _ctx: &ToolCtx<'_>,
     ) -> Result<FunctionCallOutput, String> {
-        agent::run(
-            &call.arguments,
-            &self.manager,
-            &self.runtime,
-            ctx.sender.clone(),
-        )
-        .await
-        .map(FunctionCallOutput::Text)
+        agent::run(&call.arguments, &self.manager, &self.runtime)
+            .await
+            .map(FunctionCallOutput::Text)
     }
 }
 
 /// What a provider needs at call time beyond the call itself. Currently just the
-/// front-end event channel that interactive tools (`ask_user`) prompt through,
+/// question endpoint that interactive tools prompt through,
 /// the operation id for event tagging, and the cancellation token.
 pub(crate) struct ToolCtx<'a> {
-    pub sender: &'a UnboundedSender<Event>,
+    pub questions: &'a ask_user::QuestionHandler,
     pub cancel: &'a crate::cancel::CancellationToken,
-    pub operation_id: u64,
+    pub operation_id: OperationId,
 }
 
 /// A source of tools the agent can call. Implemented once for the local
@@ -177,6 +171,8 @@ impl ToolProvider for SkillToolProvider {
 /// The built-in local tools, exposed as one provider — the local analogue of an
 /// MCP server.
 pub(crate) struct LocalToolProvider {
+    diagnostics_state: Arc<Mutex<crate::diagnostics::DiagnosticsState>>,
+    tasks: crate::tasks::TaskManager,
     todos: Arc<Mutex<crate::todos::TodoList>>,
     security: Arc<crate::security::SecurityHandle>,
     file_scope: u64,
@@ -188,14 +184,29 @@ pub(crate) struct LocalToolProvider {
 }
 
 impl LocalToolProvider {
+    pub(crate) fn with_diagnostics_state(
+        mut self,
+        state: Arc<Mutex<crate::diagnostics::DiagnosticsState>>,
+    ) -> Self {
+        self.diagnostics_state = state;
+        self
+    }
+
+    pub(crate) fn with_tasks(mut self, tasks: crate::tasks::TaskManager) -> Self {
+        self.tasks = tasks;
+        self
+    }
+
     pub(crate) fn new(
         todos: Arc<Mutex<crate::todos::TodoList>>,
         security: Arc<crate::security::SecurityHandle>,
     ) -> Self {
         Self {
+            tasks: crate::tasks::TaskManager::default(),
             todos,
             security,
             file_scope: 0,
+            diagnostics_state: Default::default(),
             checkpoint: None,
             memory_enabled: true,
             memory_model: None,
@@ -210,9 +221,11 @@ impl LocalToolProvider {
         file_scope: u64,
     ) -> Self {
         Self {
+            tasks: crate::tasks::TaskManager::default(),
             todos,
             security,
             file_scope,
+            diagnostics_state: Default::default(),
             checkpoint: None,
             memory_enabled: true,
             memory_model: None,
@@ -333,14 +346,14 @@ impl ToolProvider for LocalToolProvider {
         ctx: &ToolCtx<'_>,
     ) -> Result<FunctionCallOutput, String> {
         if call.name == ask_user::NAME {
-            // ask_user needs the UI channel, so it isn't part of run_local_tool.
-            ask_user::run(&call.arguments, ctx.sender, ctx.cancel, ctx.operation_id)
+            // Questions require the front-end endpoint, unlike local tools.
+            ask_user::run(&call.arguments, ctx.questions, ctx.cancel, ctx.operation_id)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == request_permission::NAME {
             request_permission::run(
                 &call.arguments,
-                ctx.sender,
+                ctx.questions,
                 ctx.cancel,
                 ctx.operation_id,
                 &self.security,
@@ -351,7 +364,17 @@ impl ToolProvider for LocalToolProvider {
             let security = self.security.snapshot();
             // The command tool streams its output to the live registry (keyed by
             // call id) so the TUI can render it as it runs.
-            command::run_with_live_secure(&call.arguments, &call.call_id, ctx.cancel, &security)
+            command::run_with_live_secure(
+                &self.tasks,
+                &call.arguments,
+                &call.call_id,
+                ctx.cancel,
+                &security,
+            )
+            .await
+            .map(FunctionCallOutput::Text)
+        } else if call.name == diagnostics::NAME {
+            diagnostics::run_with_state(&self.diagnostics_state, ctx.cancel)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == todo::NAME {
@@ -392,13 +415,13 @@ impl ToolProvider for LocalToolProvider {
                 .await
         } else if call.name == task::NAME {
             let security = self.security.snapshot();
-            task::run_with_security(&call.arguments, &security)
+            task::run_with_security(&self.tasks, &call.arguments, &security)
                 .await
                 .map(FunctionCallOutput::Text)
         } else {
             let security = self.security.snapshot();
             security.authorize_tool_call(&call.name, &call.arguments)?;
-            run_local_tool(&call.name, &call.arguments)
+            run_local_tool(&self.tasks, &call.name, &call.arguments)
                 .await
                 .map(FunctionCallOutput::Text)
         }
@@ -629,6 +652,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn providers_share_only_the_injected_task_manager() {
+        let tasks = crate::tasks::TaskManager::default();
+        let parent = LocalToolProvider::default().with_tasks(tasks.clone());
+        let child = LocalToolProvider::default().with_tasks(tasks.clone());
+        let unrelated = LocalToolProvider::default();
+        let questions = ask_user::QuestionHandler::default();
+        let cancel = crate::cancel::CancellationToken::new();
+        let context = ToolCtx {
+            questions: &questions,
+            cancel: &cancel,
+            operation_id: OperationId::UNTAGGED,
+        };
+        parent
+            .call(
+                &call(
+                    task::NAME,
+                    r#"{"action":"create","command":"echo shared-provider-task"}"#,
+                ),
+                &context,
+            )
+            .await
+            .expect("parent creates task");
+        let id = tasks
+            .snapshot_all()
+            .first()
+            .expect("registered in injected manager")
+            .id;
+        tasks.wait_until_finished(id).await.expect("task completes");
+        let shared = child
+            .call(&call(task::NAME, r#"{"action":"list"}"#), &context)
+            .await
+            .expect("child lists tasks");
+        assert!(
+            matches!(shared, FunctionCallOutput::Text(text) if text.contains("shared-provider-task"))
+        );
+        let isolated = unrelated
+            .call(&call(task::NAME, r#"{"action":"list"}"#), &context)
+            .await
+            .expect("unrelated lists tasks");
+        assert!(
+            matches!(isolated, FunctionCallOutput::Text(text) if !text.contains("shared-provider-task"))
+        );
+    }
+
     #[test]
     fn local_provider_advertises_builtins_with_metadata() {
         let p = LocalToolProvider::default();
@@ -771,14 +839,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diagnostics_provider_uses_injected_state_and_turn_cancellation() {
+        let state = Arc::new(Mutex::new(crate::diagnostics::DiagnosticsState::default()));
+        let previous_generation = state.lock().unwrap().begin_update();
+        let provider = LocalToolProvider::default().with_diagnostics_state(state.clone());
+        let questions = ask_user::QuestionHandler::default();
+        let cancel = crate::cancel::CancellationToken::new();
+        cancel.cancel();
+        let context = ToolCtx {
+            questions: &questions,
+            cancel: &cancel,
+            operation_id: OperationId::UNTAGGED,
+        };
+        let result = provider
+            .call(&call(diagnostics::NAME, "{}"), &context)
+            .await;
+        assert!(result.unwrap_err().contains("cancelled"));
+        let state = state.lock().unwrap();
+        assert!(!state.is_current(previous_generation));
+        assert!(state.baseline.is_none());
+    }
+
+    #[tokio::test]
     async fn registry_dispatches_a_local_call_and_rejects_unknown() {
         let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider::default())]);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let questions = ask_user::QuestionHandler::default();
         let cancel = crate::cancel::CancellationToken::new();
         let ctx = ToolCtx {
-            sender: &tx,
+            questions: &questions,
             cancel: &cancel,
-            operation_id: 0,
+            operation_id: OperationId::UNTAGGED,
         };
 
         // A real local dispatch: write a temp file, then read it back.

@@ -5,15 +5,13 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-use super::ask_user::{Question, QuestionKind};
+use super::ask_user::{Question, QuestionHandler, QuestionKind};
 use super::function_tool;
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
 use crate::security::{AccessKind, SandboxMode, SecurityHandle};
-use crate::ui::event::Event;
 use async_openai::types::responses::Tool;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::mpsc;
 
 pub const NAME: &str = "request_permission";
 
@@ -72,23 +70,23 @@ enum Args {
 }
 
 struct RequestContext<'a> {
-    sender: &'a mpsc::UnboundedSender<Event>,
+    questions: &'a QuestionHandler,
     cancel: &'a CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
     security: &'a SecurityHandle,
 }
 
 pub async fn run(
     arguments: &str,
-    sender: &mpsc::UnboundedSender<Event>,
+    questions: &QuestionHandler,
     cancel: &CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
     security: &SecurityHandle,
 ) -> Result<String, String> {
     let args: Args = serde_json::from_str(arguments)
         .map_err(|error| format!("error: invalid arguments: {error}"))?;
     let context = RequestContext {
-        sender,
+        questions,
         cancel,
         operation_id,
         security,
@@ -213,7 +211,7 @@ async fn prompt_approval(text: String, context: &RequestContext<'_>) -> Result<b
                 other_index: 2,
             },
         },
-        context.sender,
+        context.questions,
         context.cancel,
         context.operation_id,
     )
@@ -246,14 +244,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_permission_request_never_changes_policy() {
+        let manager = SecurityManager::standalone().expect("standalone security");
+        let security = SecurityHandle::new(Arc::new(manager));
+        security.set_sandbox_mode(SandboxMode::Restricted).unwrap();
+        let (questions, mut receiver) = super::super::ask_user::question_channel();
+        let cancel = CancellationToken::new();
+        let args = r#"{"kind":"sandbox","mode":"network","operation":null,"path":null,"reason":"download dependencies"}"#;
+        let request = run(args, &questions, &cancel, OperationId(17), &security);
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        let prompt = receiver.try_recv().expect("permission question");
+        assert_eq!(prompt.operation_id, OperationId(17));
+        cancel.cancel();
+        let output = request.await.unwrap();
+        assert!(output.contains("permission denied"));
+        assert_eq!(security.sandbox_mode(), SandboxMode::Restricted);
+        assert!(
+            prompt
+                .answer
+                .send("Approve for this session".to_string())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn stricter_sandbox_request_is_rejected_without_prompt() {
         let manager = SecurityManager::standalone().expect("standalone security");
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
         security.set_sandbox_mode(SandboxMode::Network).unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::ask_user::question_channel();
         let cancel = CancellationToken::new();
         let args = r#"{"kind":"sandbox","mode":"restricted","operation":null,"path":null,"reason":"tighten security"}"#;
-        let output = run(args, &tx, &cancel, 7, &security).await;
+        let output = run(args, &tx, &cancel, OperationId(7), &security).await;
         assert!(
             output
                 .expect_err("stricter mode must be rejected")
@@ -267,7 +290,7 @@ mod tests {
         let manager = SecurityManager::standalone().expect("standalone security");
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
         security.set_sandbox_mode(SandboxMode::Restricted).unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::ask_user::question_channel();
         let cancel = CancellationToken::new();
         let args = r#"{"kind":"sandbox","mode":"network","operation":null,"path":null,"reason":"download dependencies"}"#;
 
@@ -275,17 +298,17 @@ mod tests {
             let tx = tx.clone();
             let cancel = cancel.clone();
             let security = security.clone();
-            async move { run(args, &tx, &cancel, 7, &security).await }
+            async move { run(args, &tx, &cancel, OperationId(7), &security).await }
         });
 
         let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
             .await
             .expect("permission prompt")
             .expect("event channel");
-        let Event::App(crate::ui::event::AppEvent::QuestionPrompt { answer_tx, .. }) = event else {
-            panic!("expected a question prompt");
-        };
-        answer_tx.send("Approve for this session".to_string());
+        let answer_tx = event.answer;
+        answer_tx
+            .send("Approve for this session".to_string())
+            .unwrap();
 
         let output = task
             .await
@@ -316,7 +339,7 @@ mod tests {
                 .is_err()
         );
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::ask_user::question_channel();
         let cancel = CancellationToken::new();
         let args = serde_json::json!({
             "kind": "filesystem",
@@ -330,17 +353,17 @@ mod tests {
             let tx = tx.clone();
             let cancel = cancel.clone();
             let security = security.clone();
-            async move { run(&args, &tx, &cancel, 9, &security).await }
+            async move { run(&args, &tx, &cancel, OperationId(9), &security).await }
         });
 
         let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
             .await
             .expect("permission prompt")
             .expect("event channel");
-        let Event::App(crate::ui::event::AppEvent::QuestionPrompt { answer_tx, .. }) = event else {
-            panic!("expected a question prompt");
-        };
-        answer_tx.send("Approve for this session".to_string());
+        let answer_tx = event.answer;
+        answer_tx
+            .send("Approve for this session".to_string())
+            .unwrap();
 
         let output = task
             .await
@@ -389,7 +412,7 @@ mod tests {
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
         security.set_sandbox_mode(SandboxMode::Off).unwrap();
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::ask_user::question_channel();
         let cancel = CancellationToken::new();
         let args = serde_json::json!({
             "kind": "filesystem",
@@ -403,17 +426,15 @@ mod tests {
             let tx = tx.clone();
             let cancel = cancel.clone();
             let security = security.clone();
-            async move { run(&args, &tx, &cancel, 10, &security).await }
+            async move { run(&args, &tx, &cancel, OperationId(10), &security).await }
         });
 
         let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
             .await
             .expect("permission prompt")
             .expect("event channel");
-        let Event::App(crate::ui::event::AppEvent::QuestionPrompt { answer_tx, .. }) = event else {
-            panic!("expected a question prompt");
-        };
-        answer_tx.send("Deny".to_string());
+        let answer_tx = event.answer;
+        answer_tx.send("Deny".to_string()).unwrap();
 
         let output = task
             .await

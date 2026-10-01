@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use super::App;
 use super::PendingReview;
 use super::{commands, diagnostics, session};
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
 use crate::classifier::WorkMode;
 use crate::commands::CompletionEngine;
 use crate::response::message_item::MessageItem;
@@ -95,33 +95,28 @@ async fn handle_crossterm(
     Ok(())
 }
 
-/// Returns true when an operation id from an event matches the current active
-/// turn. Non-turn events (Cancel, Start, …) always pass through.
-fn is_current_turn(app: &App<'_>, op_id: u64) -> bool {
-    is_current_turn_id(app.cancel.active_id, op_id)
-}
-
 /// Non-terminal events are accepted only while their operation is both current
 /// and live. A cancelled operation remains current until its finish event
 /// arrives, but its late phase/prompt/chunk events must not resurrect UI state.
-fn is_live_turn(app: &App<'_>, op_id: u64) -> bool {
-    is_live_turn_id(
-        app.cancel.active_id,
-        app.cancel.active.is_cancelled(),
-        op_id,
-    )
+fn is_live_turn(app: &App<'_>, op_id: OperationId) -> bool {
+    app.cancel.is_live(op_id)
 }
 
 /// Core check: does `event_op_id` belong to the turn identified by `active_id`?
 /// `event_op_id == 0` means "untagged" and always passes (pre-operation-id or
-/// non-turn events). Exposed so tests exercise the same logic [`is_current_turn`]
-/// calls.
-fn is_current_turn_id(active_id: Option<u64>, event_op_id: u64) -> bool {
-    event_op_id == 0 || active_id == Some(event_op_id)
+/// non-turn events). Tests exercise the same identity checks as the lifecycle.
+#[cfg(test)]
+fn is_current_turn_id(active_id: Option<OperationId>, event_op_id: OperationId) -> bool {
+    event_op_id.is_current(active_id)
 }
 
-fn is_live_turn_id(active_id: Option<u64>, cancelled: bool, event_op_id: u64) -> bool {
-    is_current_turn_id(active_id, event_op_id) && (event_op_id == 0 || !cancelled)
+#[cfg(test)]
+fn is_live_turn_id(
+    active_id: Option<OperationId>,
+    cancelled: bool,
+    event_op_id: OperationId,
+) -> bool {
+    event_op_id.is_live(active_id, cancelled)
 }
 
 /// Dispatch an [`AppEvent`] to its handler.
@@ -143,6 +138,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             if !is_live_turn(app, op_id) {
                 return;
             }
+            app.cancel.activity = Some("response committed; finishing response".to_string());
             app.conversation_panel.commit_live();
             app.cancel.response_started = true;
             app.sync_todos_from_store();
@@ -151,13 +147,20 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             if !is_live_turn(app, op_id) {
                 return;
             }
+            app.cancel.activity = Some("retry backoff".to_string());
             app.conversation_panel.abort_receiving();
             app.conversation_panel.phase = ActivePhase::None;
+        }
+        AppEvent::RunnerActivity(op_id, description) => {
+            if is_live_turn(app, op_id) {
+                app.cancel.activity = Some(description);
+            }
         }
         AppEvent::RunnerPhase(op_id, p) => {
             if !is_live_turn(app, op_id) {
                 return;
             }
+            app.cancel.activity = Some(p.label().to_string());
             use crate::runner::RunnerPhase;
             app.conversation_panel.phase = match p {
                 RunnerPhase::Streaming => {
@@ -239,15 +242,12 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             app.conversation_panel.phase = ActivePhase::None;
         }
         AppEvent::TurnFinished(op_id, result) => {
-            if !is_current_turn(app, op_id) {
+            if !app.cancel.finish(op_id) {
                 return;
             }
             // Clear the active operation so stale events from this (or any
             // earlier) turn are dropped and Esc won't try to cancel a
             // turn that has already ended.
-            app.cancel.active_id = None;
-            app.cancel.turn_conversation_cutoff = None;
-            app.cancel.active_user_request = None;
             app.waiting_for_subagents = false;
             // A prompt may have been installed just before cancellation won the
             // race. Turn completion is the final defensive cleanup boundary.
@@ -325,11 +325,11 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             flush_agent_notifications(app, token).await;
         }
         AppEvent::CompactFinished(op_id, cutoff, result, cancel_token) => {
-            if !is_current_turn(app, op_id) {
+            if !app.cancel.finish(op_id) {
                 return;
             }
             handle_compact_finished(app, cutoff, result, cancel_token);
-            // handle_compact_finished clears active_id and resets the phase
+            // Finishing releases ownership and resets the phase
             // back to idle. If the user queued a message while compacting,
             // start it now — just like TurnFinished does for normal turns.
             start_queued_work(app).await;
@@ -509,20 +509,23 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             generation,
             snapshot,
         } => {
-            if generation != app.diagnostics_update_generation {
+            if !app
+                .diagnostics_state
+                .lock()
+                .unwrap()
+                .publish(generation, snapshot.as_ref())
+            {
                 return;
             }
             app.diag.lsp_configured = crate::app::helpers::lsp_checker_configured();
             match snapshot {
                 None => {
-                    app.diagnostics_state.lock().unwrap().baseline = None;
                     app.conversation_panel.add_info_string(
                         "No diagnostics profile configured. Use /diagnostics manage to add one.",
                     );
                 }
                 Some(snapshot) => {
                     let rendered = snapshot.render();
-                    app.diagnostics_state.lock().unwrap().baseline = Some(snapshot.diagnostics);
                     if snapshot.errors.is_empty() {
                         app.conversation_panel
                             .add_info_string(format!("Diagnostics updated.\n{rendered}"));
@@ -603,27 +606,28 @@ fn expire_quit_confirmation(app: &mut App<'_>, now: std::time::Instant) {
 fn take_pending_request(
     panel: &mut ConversationPanel,
     pending_images: &mut Vec<InputImageContent>,
-) -> Option<(String, Vec<InputImageContent>)> {
+) -> Option<super::scheduling::UserRequest> {
     panel
         .pending_message
         .take()
-        .map(|text| (text, std::mem::take(pending_images)))
+        .map(|text| super::scheduling::UserRequest {
+            text,
+            images: std::mem::take(pending_images),
+        })
 }
 
 pub(crate) async fn start_queued_work(app: &mut App<'_>) {
-    if app.cancel.active_id.is_some()
-        || has_blocking_surface(app)
-        || !app.input_panel.get_content().is_empty()
-        || app.peers.consent.is_some()
-    {
+    use super::scheduling::{StartDecision, StartupState, WorkSource};
+
+    if StartupState::from_app(app).decide(WorkSource::Queued) != StartDecision::Start {
         return;
     }
     let pending_user = take_pending_request(&mut app.conversation_panel, &mut app.pending_images);
     app.task_notifications.discard_consumed();
     app.agent_notifications.discard_consumed(&app.agents);
     if app.task_notifications.pending.is_empty() && app.agent_notifications.pending.is_empty() {
-        if let Some((text, images)) = pending_user {
-            commands::start_request_with_images(app, text, images).await;
+        if let Some(request) = pending_user {
+            commands::start_request_with_images(app, request.text, request.images).await;
         }
         return;
     }
@@ -661,7 +665,7 @@ pub(crate) async fn start_queued_work(app: &mut App<'_>) {
 }
 
 fn handle_task_state_changed(app: &mut App<'_>, event: crate::tasks::TaskLifecycleEvent) {
-    if event.generation != crate::tasks::current_generation() {
+    if event.generation != app.tasks.current_generation() {
         return;
     }
     app.task_notifications.push(event);
@@ -735,7 +739,7 @@ pub(crate) fn has_blocking_surface(app: &App<'_>) -> bool {
             && app.plan_phase == crate::classifier::PlanPhase::Reviewing)
 }
 
-fn discard_reviews_for_operation(app: &mut App<'_>, operation_id: u64) {
+fn discard_reviews_for_operation(app: &mut App<'_>, operation_id: OperationId) {
     if app
         .pending_review
         .as_ref()
@@ -788,7 +792,22 @@ async fn handle_cancel(app: &mut App<'_>) {
     let restore_draft = !app.cancel.response_started
         && app.conversation_panel.pending_message.is_none()
         && app.input_panel.get_content().is_empty();
-    app.cancel.active.cancel();
+    if app.cancel.activity.is_none()
+        || app.cancel.activity.as_deref() == Some("streaming")
+        || app.question_panel.is_some()
+        || app.pending_review.is_some()
+        || app.waiting_for_subagents
+        || app.auto_compact.mandatory_waiting
+    {
+        app.cancel.activity = Some(
+            app.resolve_status()
+                .emoji_label()
+                .split_once(' ')
+                .map_or("runner", |(_, label)| label)
+                .to_string(),
+        );
+    }
+    app.cancel.cancel_current();
     if restore_draft && let Some(request) = app.cancel.active_user_request.take() {
         app.conversation_panel.truncate(request.conversation_cutoff);
         app.input_panel
@@ -805,8 +824,9 @@ async fn handle_cancel(app: &mut App<'_>) {
     app.conversation_panel.abort_receiving();
     app.conversation_panel.phase = ActivePhase::Cancelling;
     app.conversation_panel.flush_usage();
-    app.conversation_panel
-        .add_info_string("Request cancelled by user.".to_string());
+    app.conversation_panel.add_info_string(
+        "Cancellation requested; waiting for the active operation to finish.".to_string(),
+    );
     // Release any blocking UI prompts so the runner's review() / ask_user
     // futures unblock and can reach the next cancel check-point.
     if let Some(operation_id) = app.cancel.active_id {
@@ -836,18 +856,11 @@ fn handle_start_init(app: &mut App<'_>, prompt: String) {
     diagnostics::maybe_seed_diagnostics_baseline(app);
     session::mark_dirty(app);
     // Fresh turn: start from an un-cancelled root token.
-    app.cancel.active = CancellationToken::new();
-    app.cancel.next_id = app.cancel.next_id.wrapping_add(1);
-    let operation_id = app.cancel.next_id;
-    app.cancel.active_id = Some(operation_id);
-    app.cancel.turn_conversation_cutoff = Some(conversation_cutoff);
-    app.cancel.response_started = false;
-    app.cancel.active_user_request = None;
+    let operation_id = app.cancel.begin(Some(conversation_cutoff));
 
     // Spawn the init turn through the same runner path.
     let Some(runner) = app.build_runner() else {
-        app.cancel.active_id = None;
-        app.cancel.turn_conversation_cutoff = None;
+        app.cancel.clear();
         app.conversation_panel
             .add_error_string(format!("unknown provider/model: {}", app.current_model));
         return;
@@ -932,16 +945,14 @@ fn compaction_details(turns: usize, compaction: &crate::ui::event::CompactionRes
 }
 
 /// `/compact` finished: install the summary as the new context boundary, or
-/// surface the error. Always clears the active operation id and phase so a
-/// cancelled compaction doesn't leave the UI stuck in Cancelling.
+/// surface the error after lifecycle ownership is released. Always resets the
+/// phase so cancelled compaction cannot leave the UI stuck in Cancelling.
 fn handle_compact_finished(
     app: &mut App<'_>,
     cutoff: usize,
     result: Result<crate::ui::event::CompactionResult, String>,
     cancel_token: CancellationToken,
 ) {
-    app.cancel.active_id = None;
-    app.cancel.turn_conversation_cutoff = None;
     app.conversation_panel.phase = ActivePhase::None;
     if cancel_token.is_cancelled() {
         return;
@@ -1212,7 +1223,8 @@ fn poll_finished_terminals(app: &mut App<'_>) {
     use crate::tasks::TaskStatus;
 
     let is_running = |id: u64| {
-        crate::tasks::snapshot(id)
+        app.tasks
+            .snapshot(id)
             .map(|s| s.status == TaskStatus::Running)
             .unwrap_or(false)
     };
@@ -1230,7 +1242,9 @@ fn poll_finished_terminals(app: &mut App<'_>) {
             pane.finished_ticks += 1;
             if pane.finished_ticks >= TASK_EXIT_GRACE_TICKS {
                 let pane = app.terminal_pane.take().unwrap();
-                let status = crate::tasks::snapshot(pane.task_id)
+                let status = app
+                    .tasks
+                    .snapshot(pane.task_id)
                     .map(|s| s.status.label())
                     .unwrap_or("gone");
                 app.conversation_panel.add_info_string(format!(
@@ -1246,7 +1260,12 @@ fn poll_finished_terminals(app: &mut App<'_>) {
 pub(crate) fn update_completions(app: &mut App<'_>) {
     let content = app.input_panel.get_content();
     app.input_panel.completion = if content.starts_with('/') {
-        CompletionEngine::complete(&content, &app.provider_manager, &app.skill_registry)
+        CompletionEngine::complete(
+            &app.tasks,
+            &content,
+            &app.provider_manager,
+            &app.skill_registry,
+        )
     } else if content.starts_with('!') {
         // Shell-style completion for `!command` lines.
         CompletionEngine::complete_bang(&content)
@@ -1269,11 +1288,13 @@ pub(crate) fn update_completions(app: &mut App<'_>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationPanel, QUIT_CONFIRM_TIMEOUT, QUIT_CONFIRM_WARNING,
-        estimated_tokens_after_compaction, handle_cancel, handle_event, is_current_turn_id,
-        is_live_turn_id, quit_confirmation_expired, quit_is_confirmed, reducing_compaction_usage,
-        remove_quit_confirmation_warning, start_queued_work, take_pending_request,
+        ActivePhase, ConversationPanel, QUIT_CONFIRM_TIMEOUT, QUIT_CONFIRM_WARNING,
+        estimated_tokens_after_compaction, handle_app_event, handle_cancel, handle_event,
+        is_current_turn_id, is_live_turn_id, quit_confirmation_expired, quit_is_confirmed,
+        reducing_compaction_usage, remove_quit_confirmation_warning, start_queued_work,
+        take_pending_request,
     };
+    use crate::cancel::OperationId;
     use crate::response::message_item::MessageItem;
     use crate::ui::event::{AppEvent, Event};
     use std::time::{Duration, Instant};
@@ -1370,48 +1391,52 @@ mod tests {
 
     #[test]
     fn is_current_turn_allows_untagged_zero_events() {
-        assert!(is_current_turn_id(Some(1), 0));
+        assert!(is_current_turn_id(Some(OperationId(1)), OperationId(0)));
     }
 
     #[test]
     fn is_current_turn_passes_when_ids_match() {
-        assert!(is_current_turn_id(Some(5), 5));
+        assert!(is_current_turn_id(Some(OperationId(5)), OperationId(5)));
     }
 
     #[test]
     fn is_current_turn_filters_stale_events() {
-        assert!(!is_current_turn_id(Some(3), 7));
+        assert!(!is_current_turn_id(Some(OperationId(3)), OperationId(7)));
     }
 
     #[test]
     fn is_current_turn_always_passes_zero_op_id() {
-        assert!(is_current_turn_id(Some(42), 0));
-        assert!(is_current_turn_id(None, 0));
-        assert!(is_current_turn_id(Some(99), 0));
+        assert!(is_current_turn_id(Some(OperationId(42)), OperationId(0)));
+        assert!(is_current_turn_id(None, OperationId(0)));
+        assert!(is_current_turn_id(Some(OperationId(99)), OperationId(0)));
     }
 
     #[test]
     fn is_current_turn_filters_when_no_active_turn() {
-        assert!(!is_current_turn_id(None, 5));
-        assert!(!is_current_turn_id(None, 1));
+        assert!(!is_current_turn_id(None, OperationId(5)));
+        assert!(!is_current_turn_id(None, OperationId(1)));
     }
 
     #[test]
     fn is_current_turn_filters_lower_id() {
         // A stale event from an older, lower-numbered turn.
-        assert!(!is_current_turn_id(Some(5), 3));
+        assert!(!is_current_turn_id(Some(OperationId(5)), OperationId(3)));
     }
 
     #[test]
     fn cancelled_turn_rejects_late_non_terminal_events() {
-        assert!(is_live_turn_id(Some(7), false, 7));
+        assert!(is_live_turn_id(Some(OperationId(7)), false, OperationId(7)));
         assert!(
-            !is_live_turn_id(Some(7), true, 7),
+            !is_live_turn_id(Some(OperationId(7)), true, OperationId(7)),
             "late phase and prompt events must not revive cancelled UI state"
         );
-        assert!(!is_live_turn_id(Some(8), false, 7));
+        assert!(!is_live_turn_id(
+            Some(OperationId(8)),
+            false,
+            OperationId(7)
+        ));
         assert!(
-            is_live_turn_id(None, true, 0),
+            is_live_turn_id(None, true, OperationId(0)),
             "untagged non-turn events retain their compatibility behavior"
         );
     }
@@ -1428,10 +1453,9 @@ mod tests {
             image_url: Some("data:image/png;base64,AAAA".to_string()),
         }];
 
-        let (text, taken_images) =
-            take_pending_request(&mut panel, &mut images).expect("pending request");
-        assert_eq!(text, "queued during compact");
-        assert_eq!(taken_images.len(), 1);
+        let request = take_pending_request(&mut panel, &mut images).expect("pending request");
+        assert_eq!(request.text, "queued during compact");
+        assert_eq!(request.images.len(), 1);
         assert!(images.is_empty());
         assert!(take_pending_request(&mut panel, &mut images).is_none());
     }
@@ -1447,6 +1471,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            crate::tasks::TaskManager::default(),
             session.to_string(),
             None,
             Vec::new(),
@@ -1554,7 +1579,7 @@ mod tests {
         app.auto_compact.mandatory_waiting = true;
         // The mandatory safe-point pass suspends a live turn and resumes it, so
         // the compaction is in effect for that turn's next request.
-        app.cancel.active_id = Some(7);
+        app.cancel.active_id = Some(OperationId(7));
         app.input_panel
             .show_next_turn_compaction("left over from an earlier pass".to_string());
 
@@ -1601,6 +1626,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            crate::tasks::TaskManager::default(),
             "automatic-compaction-thresholds".to_string(),
             None,
             Vec::new(),
@@ -1619,13 +1645,13 @@ mod tests {
             app.conversation_panel
                 .add_info_string(format!("reply {turn}"));
         }
-        app.cancel.active_id = Some(9);
+        app.cancel.active_id = Some(OperationId(9));
         app.cancel.turn_conversation_cutoff = Some(app.conversation_panel.items_snapshot().len());
 
         let (resume, _rx) = tokio::sync::oneshot::channel();
         handle_event(
             &mut app,
-            Event::App(AppEvent::UsageSafePoint(9, 110_000, resume)),
+            Event::App(AppEvent::UsageSafePoint(OperationId(9), 110_000, resume)),
         )
         .await
         .unwrap();
@@ -1639,7 +1665,7 @@ mod tests {
         let (resume, _rx) = tokio::sync::oneshot::channel();
         handle_event(
             &mut app,
-            Event::App(AppEvent::UsageSafePoint(9, 160_000, resume)),
+            Event::App(AppEvent::UsageSafePoint(OperationId(9), 160_000, resume)),
         )
         .await
         .unwrap();
@@ -1655,7 +1681,7 @@ mod tests {
         app.input_panel.set_content("original request");
         let draft = app.input_panel.draft_snapshot();
         app.input_panel.clear();
-        app.cancel.active_id = Some(7);
+        app.cancel.active_id = Some(OperationId(7));
         app.cancel.next_id = 7;
         app.cancel.active_user_request = Some(crate::app::ActiveUserRequest {
             draft,
@@ -1669,12 +1695,70 @@ mod tests {
         handle_event(
             app,
             Event::App(AppEvent::TurnFinished(
-                id,
+                OperationId(id),
                 Err(crate::runner::RunnerError::Cancelled),
             )),
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_keeps_last_activity_until_matching_terminal() {
+        for description in [
+            "tool batch: command, read_file",
+            "hook diagnostics (after tools)",
+            "context usage safe point / compaction",
+        ] {
+            let mut app = cancellation_test_app().await;
+            handle_app_event(
+                &mut app,
+                AppEvent::RunnerActivity(OperationId(7), description.to_string()),
+            )
+            .await;
+            handle_cancel(&mut app).await;
+            let activity = app.cancel.activity.clone();
+            assert_eq!(activity.as_deref(), Some(description));
+            handle_app_event(
+                &mut app,
+                AppEvent::RunnerPhase(OperationId(7), crate::runner::RunnerPhase::Streaming),
+            )
+            .await;
+            handle_app_event(
+                &mut app,
+                AppEvent::RunnerActivity(OperationId(7), "late hook".into()),
+            )
+            .await;
+            handle_app_event(
+                &mut app,
+                AppEvent::RunnerActivity(OperationId(6), "stale tool".into()),
+            )
+            .await;
+            assert_eq!(app.cancel.activity, activity);
+            assert_eq!(app.conversation_panel.phase, ActivePhase::Cancelling);
+            assert_eq!(
+                app.resolve_status(),
+                crate::ui::components::status_bar::status_bar::StatusState::Cancelling
+            );
+            cancelled_terminal(&mut app, 6).await;
+            assert_eq!(app.cancel.activity, activity);
+            assert_eq!(app.cancel.active_id, Some(OperationId(7)));
+            cancelled_terminal(&mut app, 7).await;
+            assert!(app.cancel.activity.is_none());
+            assert!(app.cancel.active_id.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_committed_response_reports_finishing_not_connecting() {
+        let mut app = cancellation_test_app().await;
+        handle_app_event(&mut app, AppEvent::ResponseCommitted(OperationId(7))).await;
+        handle_cancel(&mut app).await;
+        assert_eq!(
+            app.cancel.activity.as_deref(),
+            Some("response committed; finishing response")
+        );
+        assert_eq!(app.cancel.active_id, Some(OperationId(7)));
     }
 
     #[tokio::test]
@@ -1685,7 +1769,7 @@ mod tests {
             .await
             .unwrap();
         assert!(app.cancel.active.is_cancelled());
-        assert_eq!(app.cancel.active_id, Some(7));
+        assert_eq!(app.cancel.active_id, Some(OperationId(7)));
         assert!(app.input_panel.get_content().is_empty());
         start_queued_work(&mut app).await;
         cancelled_terminal(&mut app, 6).await;
@@ -1721,7 +1805,7 @@ mod tests {
         app.task_notifications
             .push(crate::tasks::TaskLifecycleEvent {
                 sequence: 1,
-                generation: crate::tasks::current_generation(),
+                generation: app.tasks.current_generation(),
                 task_id: 1,
                 origin: crate::tasks::TaskOrigin::TaskTool,
                 old_status: crate::tasks::TaskStatus::Running,
@@ -1816,7 +1900,7 @@ mod tests {
                     })).unwrap(),
                     reason: "independent child approval".into(), position: (1, 1),
                     reply: crate::ui::event::ReplyTx(reply),
-                    selected: 0, operation_id: 0, agent_id: None, agent_generation: None,
+                    selected: 0, operation_id: OperationId::UNTAGGED, agent_id: None, agent_generation: None,
                 });
             }
             handle_cancel(&mut app).await;
@@ -1843,6 +1927,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            crate::tasks::TaskManager::default(),
             "cancel-draft-test".to_string(),
             None,
             Vec::new(),
@@ -1872,7 +1957,7 @@ mod tests {
                 status: Some(OutputStatus::Completed),
             }),
         );
-        app.cancel.active_id = Some(1);
+        app.cancel.active_id = Some(OperationId(1));
         app.cancel.response_started = false;
         app.cancel.active_user_request = Some(crate::app::ActiveUserRequest {
             draft,

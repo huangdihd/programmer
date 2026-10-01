@@ -30,6 +30,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
+/// Identity of a foreground operation, distinct from job, agent and session ids.
+/// Zero is reserved for events that are not owned by a foreground operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OperationId(pub(crate) u64);
+
+impl OperationId {
+    pub const UNTAGGED: Self = Self(0);
+
+    pub(crate) fn is_current(self, active: Option<Self>) -> bool {
+        self == Self::UNTAGGED || active == Some(self)
+    }
+
+    pub(crate) fn is_live(self, active: Option<Self>, cancelled: bool) -> bool {
+        self.is_current(active) && (self == Self::UNTAGGED || !cancelled)
+    }
+}
+
 /// A cheap, cloneable cancellation flag with optional parent linkage and
 /// awaitable notification.
 ///

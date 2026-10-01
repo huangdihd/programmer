@@ -25,8 +25,8 @@ pub const NAME: &str = "command";
 /// Snapshot the live (still-running) output for a command tool call, cleaned of
 /// terminal control sequences, or `None` if that call isn't currently running.
 /// Read by the conversation panel to render command output as it streams in.
-pub fn live_output(call_id: &str) -> Option<String> {
-    let raw = crate::tasks::command_live_output(call_id)?;
+pub fn live_output(manager: &crate::tasks::TaskManager, call_id: &str) -> Option<String> {
+    let raw = manager.command_live_output(call_id)?;
     Some(clean_terminal_output(&raw))
 }
 
@@ -62,8 +62,9 @@ enum TimeoutAction {
     Background,
 }
 
-pub async fn run(arguments: &str) -> Result<String, String> {
+pub async fn run(manager: &crate::tasks::TaskManager, arguments: &str) -> Result<String, String> {
     run_inner(
+        manager,
         arguments,
         None,
         &crate::cancel::CancellationToken::new(),
@@ -78,23 +79,26 @@ pub async fn run(arguments: &str) -> Result<String, String> {
 /// MCP server and headless callers that have nowhere to show live output.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn run_with_live(
+    manager: &crate::tasks::TaskManager,
     arguments: &str,
     call_id: &str,
     cancel: &crate::cancel::CancellationToken,
 ) -> Result<String, String> {
-    run_inner(arguments, Some(call_id), cancel, None).await
+    run_inner(manager, arguments, Some(call_id), cancel, None).await
 }
 
 pub(crate) async fn run_with_live_secure(
+    manager: &crate::tasks::TaskManager,
     arguments: &str,
     call_id: &str,
     cancel: &crate::cancel::CancellationToken,
     security: &crate::security::SecurityManager,
 ) -> Result<String, String> {
-    run_inner(arguments, Some(call_id), cancel, Some(security)).await
+    run_inner(manager, arguments, Some(call_id), cancel, Some(security)).await
 }
 
 async fn run_inner(
+    manager: &crate::tasks::TaskManager,
     arguments: &str,
     live_id: Option<&str>,
     cancel: &crate::cancel::CancellationToken,
@@ -106,17 +110,14 @@ async fn run_inner(
     };
 
     let id = match security {
-        Some(security) => crate::tasks::spawn_command_secure(
-            &args.command,
-            args.dir.as_deref(),
-            live_id,
-            security,
-        ),
-        None => crate::tasks::spawn_command(&args.command, args.dir.as_deref(), live_id),
+        Some(security) => {
+            manager.spawn_command_secure(&args.command, args.dir.as_deref(), live_id, security)
+        }
+        None => manager.spawn_command(&args.command, args.dir.as_deref(), live_id),
     }
     .map_err(|error| command_spawn_error(&error))?;
     let timeout_secs = args.timeout.unwrap_or(120);
-    let wait = wait_for_finish_or_promotion(id);
+    let wait = wait_for_finish_or_promotion(manager, id);
     let wait_or_cancel = async {
         tokio::select! {
             biased;
@@ -127,28 +128,28 @@ async fn run_inner(
     let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), wait_or_cancel).await;
 
     match outcome {
-        Ok(Some(Ok(CommandOutcome::Finished(snapshot)))) => completed_result(id, snapshot),
+        Ok(Some(Ok(CommandOutcome::Finished(snapshot)))) => completed_result(manager, id, snapshot),
         Ok(Some(Ok(CommandOutcome::Promoted))) => Ok(background_result(id)),
         Ok(Some(Err(error))) => {
-            crate::tasks::forget_command(id);
+            manager.forget_command(id);
             Err(error)
         }
-        Ok(None) if crate::tasks::is_background(id) => Ok(background_result(id)),
+        Ok(None) if manager.is_background(id) => Ok(background_result(id)),
         Ok(None) => {
-            stop_command(id).await;
-            crate::tasks::forget_command(id);
+            stop_command(manager, id).await;
+            manager.forget_command(id);
             Err("error: failed to run command: cancelled".to_string())
         }
         Err(_) if args.timeout_action == TimeoutAction::Background => {
-            match crate::tasks::promote_command(id) {
+            match manager.promote_command(id) {
                 Ok(()) => Ok(background_result(id)),
-                Err(_) => completed_result(id, crate::tasks::wait_until_finished(id).await?),
+                Err(_) => completed_result(manager, id, manager.wait_until_finished(id).await?),
             }
         }
-        Err(_) if crate::tasks::is_background(id) => Ok(background_result(id)),
+        Err(_) if manager.is_background(id) => Ok(background_result(id)),
         Err(_) => {
-            stop_command(id).await;
-            crate::tasks::forget_command(id);
+            stop_command(manager, id).await;
+            manager.forget_command(id);
             Err(format!(
                 "error: failed to run command: command timed out after {timeout_secs}s"
             ))
@@ -161,16 +162,19 @@ enum CommandOutcome {
     Promoted,
 }
 
-async fn wait_for_finish_or_promotion(id: u64) -> Result<CommandOutcome, String> {
+async fn wait_for_finish_or_promotion(
+    manager: &crate::tasks::TaskManager,
+    id: u64,
+) -> Result<CommandOutcome, String> {
     tokio::select! {
         biased;
-        result = crate::tasks::wait_until_finished(id) => {
+        result = manager.wait_until_finished(id) => {
             result.map(CommandOutcome::Finished)
         }
-        result = crate::tasks::wait_until_promoted(id) => {
+        result = manager.wait_until_promoted(id) => {
             match result? {
                 true => Ok(CommandOutcome::Promoted),
-                false => crate::tasks::wait_until_finished(id)
+                false => manager.wait_until_finished(id)
                     .await
                     .map(CommandOutcome::Finished),
             }
@@ -178,11 +182,15 @@ async fn wait_for_finish_or_promotion(id: u64) -> Result<CommandOutcome, String>
     }
 }
 
-fn completed_result(id: u64, snapshot: crate::tasks::TaskSnapshot) -> Result<String, String> {
+fn completed_result(
+    manager: &crate::tasks::TaskManager,
+    id: u64,
+    snapshot: crate::tasks::TaskSnapshot,
+) -> Result<String, String> {
     // The exit code is the authoritative success signal — a non-zero status
     // means the command failed, regardless of what it printed.
     let output = format_output(snapshot.exit_code, &snapshot.output, &snapshot.stderr);
-    crate::tasks::forget_command(id);
+    manager.forget_command(id);
     if snapshot.exit_code.unwrap_or(-1) == 0 {
         Ok(output)
     } else {
@@ -204,9 +212,9 @@ fn command_spawn_error(error: &str) -> String {
     format!("error: failed to run command: {detail}")
 }
 
-async fn stop_command(id: u64) {
-    let _ = crate::tasks::kill(id);
-    let _ = crate::tasks::wait_until_finished(id).await;
+async fn stop_command(manager: &crate::tasks::TaskManager, id: u64) {
+    let _ = manager.kill(id);
+    let _ = manager.wait_until_finished(id).await;
 }
 
 fn format_output(code: Option<i32>, stdout: &str, stderr: &str) -> String {
@@ -412,6 +420,7 @@ mod live_tests {
 
     #[tokio::test]
     async fn live_output_streams_while_running_then_clears() {
+        let manager = crate::tasks::TaskManager::default();
         // A command that prints a marker immediately, then stays alive briefly,
         // so the live buffer can be observed before the command finishes.
         let call_id = "live-output-test";
@@ -422,12 +431,16 @@ mod live_tests {
         };
 
         let cancel = crate::cancel::CancellationToken::new();
-        let handle = tokio::spawn(async move { run_with_live(args, call_id, &cancel).await });
+        let worker_manager = manager.clone();
+        let handle =
+            tokio::spawn(
+                async move { run_with_live(&worker_manager, args, call_id, &cancel).await },
+            );
 
         // Poll for the marker to appear in the live buffer while running.
         let mut seen = false;
         for _ in 0..60 {
-            if let Some(out) = live_output(call_id)
+            if let Some(out) = live_output(&manager, call_id)
                 && out.contains("streaming-marker")
             {
                 seen = true;
@@ -445,15 +458,18 @@ mod live_tests {
         // Once finished, the live buffer is removed so the committed result
         // renders instead.
         assert!(
-            live_output(call_id).is_none(),
+            live_output(&manager, call_id).is_none(),
             "live buffer should be cleared after the command finishes"
         );
     }
 
     #[tokio::test]
     async fn timeout_kills_the_command_task() {
+        let manager = crate::tasks::TaskManager::default();
         let args = format!(r#"{{"command":{},"timeout":0}}"#, json!(long_command()));
-        let error = run(&args).await.expect_err("command should time out");
+        let error = run(&manager, &args)
+            .await
+            .expect_err("command should time out");
         assert!(
             error.contains("command timed out after 0s"),
             "unexpected error: {error}"
@@ -462,11 +478,14 @@ mod live_tests {
 
     #[tokio::test]
     async fn cancellation_kills_the_command_task() {
+        let manager = crate::tasks::TaskManager::default();
         let args = format!(r#"{{"command":{}}}"#, json!(long_command()));
         let cancel = crate::cancel::CancellationToken::new();
         let child = cancel.child();
-        let handle =
-            tokio::spawn(async move { run_with_live(&args, "cancel-command-test", &child).await });
+        let worker_manager = manager.clone();
+        let handle = tokio::spawn(async move {
+            run_with_live(&worker_manager, &args, "cancel-command-test", &child).await
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.cancel();
 
@@ -475,31 +494,34 @@ mod live_tests {
             .expect("join")
             .expect_err("command should be cancelled");
         assert!(error.contains("cancelled"), "unexpected error: {error}");
-        assert!(live_output("cancel-command-test").is_none());
+        assert!(live_output(&manager, "cancel-command-test").is_none());
     }
 
     #[tokio::test]
     async fn timeout_can_promote_instead_of_kill() {
+        let manager = crate::tasks::TaskManager::default();
         let args = format!(
             r#"{{"command":{},"timeout":0,"timeout_action":"background"}}"#,
             json!(long_command())
         );
-        let result = run(&args).await.expect("command should move to background");
+        let result = run(&manager, &args)
+            .await
+            .expect("command should move to background");
         let id = background_task_id(&result);
-        let snapshot = crate::tasks::snapshot_all()
+        let snapshot = manager
+            .snapshot_all()
             .into_iter()
             .find(|task| task.id == id)
             .expect("promoted task should be listed");
         assert_eq!(snapshot.status, crate::tasks::TaskStatus::Running);
 
-        crate::tasks::kill(id).expect("kill promoted task");
-        let _ = crate::tasks::wait_until_finished(id)
-            .await
-            .expect("task stops");
+        manager.kill(id).expect("kill promoted task");
+        let _ = manager.wait_until_finished(id).await.expect("task stops");
     }
 
     #[tokio::test]
     async fn manual_promotion_completes_the_tool_call_without_killing() {
+        let manager = crate::tasks::TaskManager::default();
         let call_id = "manual-promote-command";
         let command = if cfg!(windows) {
             "echo manual-ready && ping -n 30 127.0.0.1 > NUL"
@@ -509,18 +531,25 @@ mod live_tests {
         let args = format!(r#"{{"command":{}}}"#, json!(command));
         let cancel = crate::cancel::CancellationToken::new();
         let child = cancel.child();
-        let handle = tokio::spawn(async move { run_with_live(&args, call_id, &child).await });
+        let worker_manager = manager.clone();
+        let handle =
+            tokio::spawn(
+                async move { run_with_live(&worker_manager, &args, call_id, &child).await },
+            );
 
         let mut ready = false;
         for _ in 0..60 {
-            if live_output(call_id).is_some_and(|output| output.contains("manual-ready")) {
+            if live_output(&manager, call_id).is_some_and(|output| output.contains("manual-ready"))
+            {
                 ready = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(ready, "command should be running before manual promotion");
-        let id = crate::tasks::promote_command_for_call(call_id).expect("manual promotion");
+        let id = manager
+            .promote_command_for_call(call_id)
+            .expect("manual promotion");
         // Once ownership changes, cancelling the foreground turn must not
         // reclaim and kill the promoted process.
         cancel.cancel();
@@ -530,20 +559,19 @@ mod live_tests {
             .expect("promotion is a successful tool result");
         assert_eq!(background_task_id(&result), id);
         assert_eq!(
-            crate::tasks::snapshot(id).expect("same task").status,
+            manager.snapshot(id).expect("same task").status,
             crate::tasks::TaskStatus::Running
         );
 
-        crate::tasks::kill(id).expect("kill promoted task");
-        let _ = crate::tasks::wait_until_finished(id)
-            .await
-            .expect("task stops");
+        manager.kill(id).expect("kill promoted task");
+        let _ = manager.wait_until_finished(id).await.expect("task stops");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires the host OS sandbox and a built programmer binary"]
     async fn sandboxed_command_enforces_filesystem_and_environment() {
+        let manager = crate::tasks::TaskManager::default();
         let root = std::env::temp_dir().join(format!(
             "programmer-command-sandbox-{}",
             uuid::Uuid::new_v4()
@@ -561,6 +589,7 @@ mod live_tests {
         .to_string();
 
         run_with_live_secure(
+            &manager,
             &inside_args,
             "sandbox-inside",
             &crate::cancel::CancellationToken::new(),
@@ -579,6 +608,7 @@ mod live_tests {
         })
         .to_string();
         let error = run_with_live_secure(
+            &manager,
             &outside_args,
             "sandbox-outside",
             &crate::cancel::CancellationToken::new(),
@@ -594,6 +624,7 @@ mod live_tests {
 
         let environment_args = serde_json::json!({"command": "env"}).to_string();
         let environment = run_with_live_secure(
+            &manager,
             &environment_args,
             "sandbox-environment",
             &crate::cancel::CancellationToken::new(),

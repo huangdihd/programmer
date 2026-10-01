@@ -151,8 +151,8 @@ impl Sidebar {
         &self.expanded_tasks
     }
 
-    pub(crate) fn retain_existing_tasks(&mut self) {
-        let existing = crate::tasks::task_ids();
+    pub(crate) fn retain_existing_tasks(&mut self, tasks: &crate::tasks::TaskManager) {
+        let existing = tasks.task_ids();
         self.expanded_tasks.retain(|id| existing.contains(id));
     }
 

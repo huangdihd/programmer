@@ -20,9 +20,9 @@
 //! reports the outputs via `ToolCallsCompleted`; the headless runner awaits it
 //! inline.
 
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
+use crate::tools::ask_user::QuestionHandler;
 use crate::tools::provider::{ToolCtx, ToolRegistry};
-use crate::ui::event::Event;
 use async_openai::types::responses::FunctionToolCall;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -30,18 +30,18 @@ use std::sync::Arc;
 /// Execute one tool call through the registry and stamp the approval label
 /// (unless the classifier already set one). Takes everything by value so each
 /// future is self-contained and can be driven concurrently in a `buffered`
-/// stream; the captured handles (`sender`, `registry`) are cheap `Arc`-backed
+/// stream; the captured handles (`questions`, `registry`) are cheap `Arc`-backed
 /// clones.
 async fn run_labeled_call(
     call: FunctionToolCall,
-    sender: tokio::sync::mpsc::UnboundedSender<Event>,
+    questions: QuestionHandler,
     registry: Arc<ToolRegistry>,
     label: String,
     cancel: CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
 ) -> crate::tools::ToolOutput {
     let ctx = ToolCtx {
-        sender: &sender,
+        questions: &questions,
         cancel: &cancel,
         operation_id,
     };
@@ -71,9 +71,9 @@ pub(crate) async fn run_tool_batch(
     denied: Vec<crate::tools::ToolOutput>,
     cancel: CancellationToken,
     approval_label: String,
-    sender: tokio::sync::mpsc::UnboundedSender<Event>,
+    questions: QuestionHandler,
     registry: Arc<ToolRegistry>,
-    operation_id: u64,
+    operation_id: OperationId,
 ) -> Vec<crate::tools::ToolOutput> {
     let mut outputs = denied;
     let mut i = 0;
@@ -93,7 +93,7 @@ pub(crate) async fn run_tool_batch(
                 .map(|call| {
                     run_labeled_call(
                         call.clone(),
-                        sender.clone(),
+                        questions.clone(),
                         registry.clone(),
                         approval_label.clone(),
                         cancel.clone(),
@@ -109,7 +109,7 @@ pub(crate) async fn run_tool_batch(
         } else {
             let out = run_labeled_call(
                 allowed[i].clone(),
-                sender.clone(),
+                questions.clone(),
                 registry.clone(),
                 approval_label.clone(),
                 cancel.clone(),
@@ -170,7 +170,7 @@ mod tests {
             &call("command", "{}"),
             "blocked for the test",
         )];
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = QuestionHandler::default();
         let outputs = run_tool_batch(
             allowed,
             denied,
@@ -178,7 +178,7 @@ mod tests {
             "test-label".to_string(),
             tx,
             local_registry(),
-            0,
+            OperationId::UNTAGGED,
         )
         .await;
 
@@ -203,7 +203,7 @@ mod tests {
     async fn cancelled_batch_stops_early_but_keeps_denials() {
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = QuestionHandler::default();
         let denied = vec![crate::runner::classify::classifier_denied_output(
             &call("command", "{}"),
             "blocked",
@@ -215,7 +215,7 @@ mod tests {
             "test-label".to_string(),
             tx,
             local_registry(),
-            0,
+            OperationId::UNTAGGED,
         )
         .await;
         // Cancelled before running anything allowed: only the denial remains.
@@ -227,7 +227,7 @@ mod tests {
     async fn long_running_tool_is_interrupted_by_cancel() {
         // `command` with a long sleep: cancel fires after a short delay.
         let cancel = CancellationToken::new();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = QuestionHandler::default();
 
         // Spawn a batch with one long command and cancel it after 50ms.
         let allowed = vec![call("command", r#"{"command":"sleep 30","timeout":120}"#)];
@@ -240,7 +240,7 @@ mod tests {
                 "test-label".to_string(),
                 tx,
                 local_registry(),
-                1,
+                OperationId(1),
             )
             .await
         });

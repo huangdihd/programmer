@@ -16,9 +16,9 @@
 use super::*;
 
 /// Promote the running foreground command associated with one tool call.
-pub fn promote_command_for_call(call_id: &str) -> Result<u64, String> {
+pub fn promote_command_for_call(manager: &TaskManager, call_id: &str) -> Result<u64, String> {
     let id = {
-        let reg = registry().lock().unwrap();
+        let reg = manager.state.registry.lock().unwrap();
         reg.iter()
             .find(|entry| {
                 entry.kind == TaskKind::Command
@@ -28,7 +28,7 @@ pub fn promote_command_for_call(call_id: &str) -> Result<u64, String> {
             .map(|entry| entry.id)
             .ok_or_else(|| format!("error: no running command for call {call_id}"))?
     };
-    promote_command(id)?;
+    manager.promote_command(id)?;
     Ok(id)
 }
 
@@ -40,8 +40,10 @@ fn stdin_reader_cmd() -> &'static str {
     if cfg!(windows) { "sort" } else { "cat" }
 }
 
-fn notification_enabled(id: u64) -> bool {
-    registry()
+fn notification_enabled(manager: &TaskManager, id: u64) -> bool {
+    manager
+        .state
+        .registry
         .lock()
         .unwrap()
         .iter()
@@ -65,6 +67,7 @@ fn sidebar_output_keeps_only_a_bounded_tail() {
 
 #[test]
 fn lifecycle_events_only_cover_background_tasks_and_can_be_consumed() {
+    let manager = TaskManager::default();
     let started = Instant::now();
     let mut entry = TaskEntry {
         id: 41,
@@ -88,14 +91,15 @@ fn lifecycle_events_only_cover_background_tasks_and_can_be_consumed() {
         pty: None,
     };
 
-    let event = lifecycle_event(
-        &entry,
-        TaskStatus::Running,
-        TaskStatus::Completed,
-        Some(0),
-        started,
-    )
-    .expect("background task should notify");
+    let event = manager
+        .lifecycle_event(
+            &entry,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            Some(0),
+            started,
+        )
+        .expect("background task should notify");
     assert_eq!(event.task_id, 41);
     assert_eq!(event.generation, 7);
     assert_eq!(event.new_status, TaskStatus::Completed);
@@ -106,32 +110,40 @@ fn lifecycle_events_only_cover_background_tasks_and_can_be_consumed() {
 
     entry.kind = TaskKind::Command;
     assert!(
-        lifecycle_event(
-            &entry,
-            TaskStatus::Running,
-            TaskStatus::Completed,
-            Some(0),
-            started,
-        )
-        .is_none()
+        manager
+            .lifecycle_event(
+                &entry,
+                TaskStatus::Running,
+                TaskStatus::Completed,
+                Some(0),
+                started,
+            )
+            .is_none()
     );
     entry.kind = TaskKind::Background;
     assert!(
-        lifecycle_event(
-            &entry,
-            TaskStatus::Running,
-            TaskStatus::Killed,
-            None,
-            started,
-        )
-        .is_some()
+        manager
+            .lifecycle_event(
+                &entry,
+                TaskStatus::Running,
+                TaskStatus::Killed,
+                None,
+                started,
+            )
+            .is_some()
     );
 }
 
 #[tokio::test]
 async fn spawn_completes_and_captures_output() {
-    let id = spawn(echo_cmd(), None, Some("echo test")).expect("spawn");
-    let (snap, still_running) = wait(id, Duration::from_secs(10)).await.expect("wait");
+    let manager = TaskManager::default();
+    let id = manager
+        .spawn(echo_cmd(), None, Some("echo test"))
+        .expect("spawn");
+    let (snap, still_running) = manager
+        .wait(id, Duration::from_secs(10))
+        .await
+        .expect("wait");
     assert!(!still_running, "echo should finish quickly");
     assert_eq!(snap.status, TaskStatus::Completed);
     assert!(snap.output.contains("task-out"), "output: {}", snap.output);
@@ -140,31 +152,41 @@ async fn spawn_completes_and_captures_output() {
 
 #[tokio::test]
 async fn command_task_is_hidden_and_closes_stdin() {
-    let id =
-        spawn_command(stdin_reader_cmd(), None, Some("command-hidden")).expect("spawn command");
-    let snap = wait_until_finished(id).await.expect("closed stdin exits");
+    let manager = TaskManager::default();
+    let id = manager
+        .spawn_command(stdin_reader_cmd(), None, Some("command-hidden"))
+        .expect("spawn command");
+    let snap = manager
+        .wait_until_finished(id)
+        .await
+        .expect("closed stdin exits");
     assert_eq!(snap.status, TaskStatus::Completed);
     assert!(
-        !snapshot_all().iter().any(|task| task.id == id),
+        !manager.snapshot_all().iter().any(|task| task.id == id),
         "command tasks stay out of the public task list during stage one"
     );
     assert!(
-        persist_all().iter().all(|task| task.id != id),
+        manager.persist_all().iter().all(|task| task.id != id),
         "command output is already persisted in the conversation"
     );
 }
 
 #[tokio::test]
 async fn command_live_output_is_keyed_by_call_id() {
+    let manager = TaskManager::default();
     let command = if cfg!(windows) {
         "echo command-live && ping -n 3 127.0.0.1 > NUL"
     } else {
         "echo command-live && sleep 1"
     };
-    let id = spawn_command(command, None, Some("command-live-id")).expect("spawn command");
+    let id = manager
+        .spawn_command(command, None, Some("command-live-id"))
+        .expect("spawn command");
     let mut seen = false;
     for _ in 0..60 {
-        if command_live_output("command-live-id").is_some_and(|text| text.contains("command-live"))
+        if manager
+            .command_live_output("command-live-id")
+            .is_some_and(|text| text.contains("command-live"))
         {
             seen = true;
             break;
@@ -175,52 +197,70 @@ async fn command_live_output_is_keyed_by_call_id() {
         seen,
         "live output should be readable while the command runs"
     );
-    let _ = wait_until_finished(id).await.expect("command finishes");
-    assert!(command_live_output("command-live-id").is_none());
+    let _ = manager
+        .wait_until_finished(id)
+        .await
+        .expect("command finishes");
+    assert!(manager.command_live_output("command-live-id").is_none());
 }
 
 #[tokio::test]
 async fn promoting_command_exposes_the_same_running_task() {
+    let manager = TaskManager::default();
     let command = if cfg!(windows) {
         "echo before-promote && ping -n 30 127.0.0.1 > NUL"
     } else {
         "echo before-promote && sleep 30"
     };
-    let id = spawn_command(command, None, Some("promote-command")).expect("spawn command");
+    let id = manager
+        .spawn_command(command, None, Some("promote-command"))
+        .expect("spawn command");
 
-    promote_command(id).expect("promote");
-    assert!(wait_until_promoted(id).await.expect("promotion state"));
-    let snapshot = snapshot_all()
+    manager.promote_command(id).expect("promote");
+    assert!(
+        manager
+            .wait_until_promoted(id)
+            .await
+            .expect("promotion state")
+    );
+    let snapshot = manager
+        .snapshot_all()
         .into_iter()
         .find(|task| task.id == id)
         .expect("promoted task is visible");
     assert_eq!(snapshot.status, TaskStatus::Running);
-    assert!(task_ids().contains(&id));
-    assert!(persist_all().iter().any(|task| task.id == id));
-    assert!(command_live_output("promote-command").is_none());
+    assert!(manager.task_ids().contains(&id));
+    assert!(manager.persist_all().iter().any(|task| task.id == id));
+    assert!(manager.command_live_output("promote-command").is_none());
 
-    kill(id).expect("kill promoted task");
-    let _ = wait_until_finished(id).await.expect("task stops");
+    manager.kill(id).expect("kill promoted task");
+    let _ = manager.wait_until_finished(id).await.expect("task stops");
 }
 
 #[tokio::test]
 async fn failing_command_is_marked_failed() {
-    let id = spawn("exit 3", None, None).expect("spawn");
-    let (snap, _) = wait(id, Duration::from_secs(10)).await.expect("wait");
+    let manager = TaskManager::default();
+    let id = manager.spawn("exit 3", None, None).expect("spawn");
+    let (snap, _) = manager
+        .wait(id, Duration::from_secs(10))
+        .await
+        .expect("wait");
     assert_eq!(snap.status, TaskStatus::Failed);
     assert_eq!(snap.exit_code, Some(3));
 }
 
 #[tokio::test]
 async fn kill_terminates_a_running_task() {
+    let manager = TaskManager::default();
     let long = if cfg!(windows) {
         "ping -n 60 127.0.0.1"
     } else {
         "sleep 60"
     };
-    let id = spawn(long, None, None).expect("spawn");
-    kill(id).expect("kill");
-    let snap = wait_until_finished(id)
+    let id = manager.spawn(long, None, None).expect("spawn");
+    manager.kill(id).expect("kill");
+    let snap = manager
+        .wait_until_finished(id)
         .await
         .expect("the task should have finished after kill");
     assert_eq!(snap.status, TaskStatus::Killed);
@@ -228,13 +268,14 @@ async fn kill_terminates_a_running_task() {
 
 #[tokio::test]
 async fn pipe_stderr_is_kept_separate_from_stdout() {
+    let manager = TaskManager::default();
     let command = if cfg!(windows) {
         "echo stdout-text & echo stderr-text 1>&2"
     } else {
         "echo stdout-text; echo stderr-text 1>&2"
     };
-    let id = spawn(command, None, None).expect("spawn");
-    let snap = wait_until_finished(id).await.expect("wait");
+    let id = manager.spawn(command, None, None).expect("spawn");
+    let snap = manager.wait_until_finished(id).await.expect("wait");
     assert!(
         snap.output.contains("stdout-text"),
         "stdout: {}",
@@ -249,6 +290,7 @@ async fn pipe_stderr_is_kept_separate_from_stdout() {
 
 #[test]
 fn persist_all_excludes_foreground_commands() {
+    let manager = TaskManager::default();
     let entry = TaskEntry {
         id: 99,
         kind: TaskKind::Command,
@@ -271,30 +313,48 @@ fn persist_all_excludes_foreground_commands() {
         pty: None,
     };
     {
-        let mut reg = registry().lock().unwrap();
+        let mut reg = manager.state.registry.lock().unwrap();
         reg.push(entry);
     }
-    assert!(!persist_all().iter().any(|task| task.id == 99));
+    assert!(!manager.persist_all().iter().any(|task| task.id == 99));
     // Clean up — the test helper leaked an entry.
-    registry().lock().unwrap().retain(|e| e.id != 99);
+    manager
+        .state
+        .registry
+        .lock()
+        .unwrap()
+        .retain(|e| e.id != 99);
 }
 
 #[tokio::test]
 async fn closed_stdin_exits_process() {
-    let id = spawn(stdin_reader_cmd(), None, None).expect("spawn");
+    let manager = TaskManager::default();
+    let id = manager
+        .spawn(stdin_reader_cmd(), None, None)
+        .expect("spawn");
     // Close stdin immediately — the process should exit quickly.
-    write_stdin(id, "", true).expect("close stdin");
-    let (snap, _) = wait(id, Duration::from_secs(10)).await.expect("wait");
+    manager.write_stdin(id, "", true).expect("close stdin");
+    let (snap, _) = manager
+        .wait(id, Duration::from_secs(10))
+        .await
+        .expect("wait");
     assert_eq!(snap.status, TaskStatus::Completed);
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn screen_text_returns_visible_grid() {
-    let id = spawn_interactive("echo visible-text", None, None, 24, 80).expect("spawn");
-    let _ = wait(id, Duration::from_secs(10)).await.expect("wait");
+    let manager = TaskManager::default();
+    let id = manager
+        .spawn_interactive("echo visible-text", None, None, 24, 80)
+        .expect("spawn");
+    let _ = manager
+        .wait(id, Duration::from_secs(10))
+        .await
+        .expect("wait");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let text = screen_snapshot(id)
+    let text = manager
+        .screen_snapshot(id)
         .expect("interactive task has a screen")
         .text;
     assert!(
@@ -306,86 +366,108 @@ async fn screen_text_returns_visible_grid() {
 #[cfg(unix)]
 #[tokio::test]
 async fn screen_snapshot_clone_is_standalone() {
-    let id = spawn_interactive("echo snapshot-test", None, None, 24, 80).expect("spawn");
-    let _ = wait(id, Duration::from_secs(10)).await.expect("wait");
+    let manager = TaskManager::default();
+    let id = manager
+        .spawn_interactive("echo snapshot-test", None, None, 24, 80)
+        .expect("spawn");
+    let _ = manager
+        .wait(id, Duration::from_secs(10))
+        .await
+        .expect("wait");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut snap1 = screen_snapshot(id).expect("first snapshot");
+    let mut snap1 = manager.screen_snapshot(id).expect("first snapshot");
     assert!(!snap1.text.is_empty());
     let original_text = snap1.text.clone();
     snap1.text.push_str(" locally mutated");
     // A fresh snapshot must not share the first snapshot's owned text.
-    let snap2 = screen_snapshot(id).expect("second snapshot");
+    let snap2 = manager.screen_snapshot(id).expect("second snapshot");
     assert_eq!(snap2.text, original_text);
-    registry().lock().unwrap().retain(|entry| entry.id != id);
+    manager
+        .state
+        .registry
+        .lock()
+        .unwrap()
+        .retain(|entry| entry.id != id);
 }
 
 #[tokio::test]
 async fn wait_times_out_on_running_task() {
+    let manager = TaskManager::default();
     let long = if cfg!(windows) {
         "ping -n 30 127.0.0.1"
     } else {
         "sleep 30"
     };
-    let id = spawn(long, None, None).expect("spawn");
-    let (snap, still_running) = wait(id, Duration::from_millis(300)).await.expect("wait");
+    let id = manager.spawn(long, None, None).expect("spawn");
+    let (snap, still_running) = manager
+        .wait(id, Duration::from_millis(300))
+        .await
+        .expect("wait");
     assert!(still_running);
     assert_eq!(snap.status, TaskStatus::Running);
-    let _ = kill(id);
+    let _ = manager.kill(id);
 }
 
 #[tokio::test]
 async fn agent_wait_consumes_completion_but_timeout_restores_notification() {
-    let completed_id = spawn(echo_cmd(), None, None).expect("spawn completed task");
-    let (_, still_running) = wait_for_agent(completed_id, Duration::from_secs(10))
+    let manager = TaskManager::default();
+    let completed_id = manager
+        .spawn(echo_cmd(), None, None)
+        .expect("spawn completed task");
+    let (_, still_running) = manager
+        .wait_for_agent(completed_id, Duration::from_secs(10))
         .await
         .expect("wait for completed task");
     assert!(!still_running);
-    assert!(!notification_enabled(completed_id));
+    assert!(!notification_enabled(&manager, completed_id));
 
     let long = if cfg!(windows) {
         "ping -n 30 127.0.0.1"
     } else {
         "sleep 30"
     };
-    let running_id = spawn(long, None, None).expect("spawn running task");
-    let (_, still_running) = wait_for_agent(running_id, Duration::from_millis(10))
+    let running_id = manager.spawn(long, None, None).expect("spawn running task");
+    let (_, still_running) = manager
+        .wait_for_agent(running_id, Duration::from_millis(10))
         .await
         .expect("timed wait");
     assert!(still_running);
-    assert!(notification_enabled(running_id));
-    kill(running_id).expect("clean up running task");
+    assert!(notification_enabled(&manager, running_id));
+    manager.kill(running_id).expect("clean up running task");
 }
 
 #[tokio::test]
 async fn cancelled_agent_wait_restores_notification() {
+    let manager = TaskManager::default();
     let long = if cfg!(windows) {
         "ping -n 30 127.0.0.1"
     } else {
         "sleep 30"
     };
-    let id = spawn(long, None, None).expect("spawn");
-    let wait = wait_for_agent(id, Duration::from_secs(30));
+    let id = manager.spawn(long, None, None).expect("spawn");
+    let wait = manager.wait_for_agent(id, Duration::from_secs(30));
     assert!(
         tokio::time::timeout(Duration::from_millis(10), wait)
             .await
             .is_err()
     );
-    assert!(notification_enabled(id));
-    kill(id).expect("clean up cancelled wait");
+    assert!(notification_enabled(&manager, id));
+    manager.kill(id).expect("clean up cancelled wait");
 }
 
 #[tokio::test]
 async fn agent_kill_consumes_terminal_notification() {
+    let manager = TaskManager::default();
     let long = if cfg!(windows) {
         "ping -n 30 127.0.0.1"
     } else {
         "sleep 30"
     };
-    let id = spawn(long, None, None).expect("spawn");
-    kill_for_agent(id).expect("agent kill");
-    let snap = wait_until_finished(id).await.expect("task stops");
+    let id = manager.spawn(long, None, None).expect("spawn");
+    manager.kill_for_agent(id).expect("agent kill");
+    let snap = manager.wait_until_finished(id).await.expect("task stops");
     assert_eq!(snap.status, TaskStatus::Killed);
-    assert!(!notification_enabled(id));
+    assert!(!notification_enabled(&manager, id));
 }
 
 #[test]
@@ -405,15 +487,104 @@ fn strip_ansi_removes_escapes_and_handles_cr() {
 #[cfg(unix)]
 #[tokio::test]
 async fn interactive_task_records_transcript() {
-    let id = spawn_interactive("printf 'tr-123\\n'", None, None, 24, 80).expect("spawn");
-    let (_, still) = wait(id, Duration::from_secs(10)).await.expect("wait");
+    let manager = TaskManager::default();
+    let id = manager
+        .spawn_interactive("printf 'tr-123\\n'", None, None, 24, 80)
+        .expect("spawn");
+    let (_, still) = manager
+        .wait(id, Duration::from_secs(10))
+        .await
+        .expect("wait");
     assert!(!still);
     // Give the reader thread a moment to drain the PTY tail.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let text = transcript(id).expect("interactive task has a transcript");
+    let text = manager
+        .transcript(id)
+        .expect("interactive task has a transcript");
     assert!(text.contains("tr-123"), "transcript: {text}");
     // Pipe tasks have no transcript.
-    let pid = spawn("echo hi", None, None).expect("spawn");
-    assert!(transcript(pid).is_none());
-    let _ = wait(pid, Duration::from_secs(10)).await;
+    let pid = manager.spawn("echo hi", None, None).expect("spawn");
+    assert!(manager.transcript(pid).is_none());
+    let _ = manager.wait(pid, Duration::from_secs(10)).await;
+}
+
+#[tokio::test]
+async fn managers_isolate_ids_events_generation_and_cleanup() {
+    let first = TaskManager::default();
+    let second = TaskManager::default();
+    let (first_sender, mut first_events) = tokio::sync::mpsc::unbounded_channel();
+    let (second_sender, mut second_events) = tokio::sync::mpsc::unbounded_channel();
+    first.install_event_sink(first_sender);
+    second.install_event_sink(second_sender);
+
+    let first_id = first
+        .spawn("echo first-manager", None, None)
+        .expect("first task");
+    let second_id = second
+        .spawn("echo second-manager", None, None)
+        .expect("second task");
+    assert_eq!(first_id, 1);
+    assert_eq!(second_id, 1);
+    let first_clone = first.clone();
+    let first_result = first_clone
+        .wait_until_finished(first_id)
+        .await
+        .expect("clone sees task");
+    let second_result = second
+        .wait_until_finished(second_id)
+        .await
+        .expect("second completes");
+    assert!(first_result.output.contains("first-manager"));
+    assert!(!first_result.output.contains("second-manager"));
+    assert!(second_result.output.contains("second-manager"));
+
+    let first_event = tokio::time::timeout(Duration::from_secs(5), first_events.recv())
+        .await
+        .expect("first event arrives")
+        .expect("first sink open");
+    let second_event = tokio::time::timeout(Duration::from_secs(5), second_events.recv())
+        .await
+        .expect("second event arrives")
+        .expect("second sink open");
+    assert_eq!(first_event.sequence, 1);
+    assert_eq!(second_event.sequence, 1);
+    assert!(first_event.stdout_tail.contains("first-manager"));
+    assert!(second_event.stdout_tail.contains("second-manager"));
+    assert!(first_events.try_recv().is_err());
+    assert!(second_events.try_recv().is_err());
+
+    let second_generation = second.current_generation();
+    first.kill_all();
+    assert!(first_clone.snapshot_all().is_empty());
+    assert!(second.snapshot(second_id).is_some());
+    assert_eq!(second.current_generation(), second_generation);
+    assert_eq!(first.current_generation(), second_generation + 1);
+    assert_eq!(second.clear_finished(), 1);
+}
+
+#[tokio::test]
+async fn completion_waiters_observe_drained_output_and_late_waits_return() {
+    let manager = TaskManager::default();
+    let command = if cfg!(windows) {
+        "echo final-stdout & echo final-stderr 1>&2"
+    } else {
+        "printf final-stdout; printf final-stderr >&2"
+    };
+    let id = manager.spawn(command, None, None).expect("spawn");
+    let clone = manager.clone();
+    let (first, second) = tokio::join!(
+        manager.wait_until_finished(id),
+        clone.wait_until_finished(id),
+    );
+    for snapshot in [first.expect("first waiter"), second.expect("second waiter")] {
+        assert_eq!(snapshot.status, TaskStatus::Completed);
+        assert!(snapshot.output.contains("final-stdout"));
+        assert!(snapshot.stderr.contains("final-stderr"));
+    }
+    let late = tokio::time::timeout(Duration::from_millis(100), manager.wait_until_finished(id))
+        .await
+        .expect("already-finished wait is immediate")
+        .expect("task retained");
+    assert_eq!(late.status, TaskStatus::Completed);
+    assert!(manager.wait_until_finished(id + 1).await.is_err());
 }

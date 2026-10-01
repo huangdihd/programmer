@@ -21,11 +21,13 @@ pub(crate) mod commands;
 pub(crate) mod diagnostics;
 pub(crate) mod events;
 pub(crate) mod helpers;
+mod lifecycle;
 pub(crate) mod peers;
+mod scheduling;
 pub(crate) mod session;
 pub(crate) mod surface;
 
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
 use crate::classifier::WorkMode;
 use crate::config::programmer_config::ProgrammerConfig;
 use crate::mcp::McpServerStatus;
@@ -109,7 +111,7 @@ pub(crate) struct PendingReview {
     /// Which approval option is highlighted (0=Approve, 1=Deny).
     pub(crate) selected: usize,
     /// Main-turn operation id, or zero for an independently running sub-agent.
-    pub(crate) operation_id: u64,
+    pub(crate) operation_id: OperationId,
     /// Child id for a sub-agent review; absent for the main turn.
     pub(crate) agent_id: Option<u64>,
     pub(crate) agent_generation: Option<u64>,
@@ -132,15 +134,16 @@ pub(crate) struct CancelState {
     /// already gone by the time it runs.
     pub(crate) active: CancellationToken,
     /// Monotonically increasing counter — every turn (including retries and
-    /// `/init`) bumps this by 1 so operation ids are never reused within a
-    /// single process lifetime. It wraps naturally on overflow, but two turns
-    /// always get distinct ids in practice.
+    /// `/init`) bumps this by 1 so operation ids are never reused within an
+    /// App lifetime. Exhaustion fails explicitly rather than reusing an id.
     pub(crate) next_id: u64,
     /// The current turn's operation id, or `None` when idle. Set synchronously
     /// before the turn spawns and cleared when `AppEvent::TurnFinished`
     /// arrives, so the UI never races between "start" and "what is my id?" and
     /// stale events from an earlier turn are always dropped.
-    pub(crate) active_id: Option<u64>,
+    pub(crate) active_id: Option<OperationId>,
+    /// Last observed work; frozen when cancellation is requested until terminal acknowledgement.
+    pub(crate) activity: Option<String>,
     /// Conversation length immediately before the active turn was appended.
     /// Automatic compaction may only summarize items before this boundary.
     pub(crate) turn_conversation_cutoff: Option<usize>,
@@ -174,6 +177,7 @@ pub(crate) struct SessionState {
     /// so a burst of changes within a turn collapses into a single save at turn
     /// end instead of writing after every event.
     pub(crate) dirty: bool,
+    pub(crate) persistence: session::PersistenceState,
     /// Model-generated title persisted with the session.
     pub(crate) title: String,
     /// Prevent duplicate title requests while the first one is in flight.
@@ -287,6 +291,7 @@ impl TaskNotificationState {
 
 /// Application.
 pub struct App<'a> {
+    pub(crate) tasks: crate::tasks::TaskManager,
     /// Is the application running?
     pub running: bool,
     /// Time of the first Ctrl+C press while waiting for exit confirmation.
@@ -376,8 +381,6 @@ pub struct App<'a> {
     /// feedback (baseline + edit-turn counter). The TUI holds this so it
     /// persists across per-turn engines.
     pub(crate) diagnostics_state: Arc<std::sync::Mutex<crate::runner::DiagnosticsState>>,
-    /// Rejects stale results when diagnostics are manually refreshed twice.
-    pub(crate) diagnostics_update_generation: u64,
     /// Tracks whether the current mouse-drag started in the sidebar area.
     pub(crate) sidebar_click_active: bool,
     /// Cancellation tokens for the current request lifecycle.
@@ -389,7 +392,7 @@ pub struct App<'a> {
     pub(crate) auto_compact: AutoCompactState,
     pub(crate) waiting_for_subagents: bool,
     /// Operation whose completed turn is currently generating an input hint.
-    pub(crate) active_suggestion_operation_id: Option<u64>,
+    pub(crate) active_suggestion_operation_id: Option<OperationId>,
     /// Cancels obsolete hint requests when another user turn starts.
     pub(crate) input_suggestion_cancel: Option<crate::cancel::CancellationToken>,
     pub(crate) checkpoint_store: Option<Arc<Mutex<crate::checkpoint::CheckpointStore>>>,
@@ -440,9 +443,10 @@ impl App<'_> {
         saved_history: Vec<String>,
         saved_todos: Vec<crate::todos::Todo>,
         saved_agents: Vec<crate::agents::PersistedAgent>,
+        tasks: crate::tasks::TaskManager,
         session_uuid: String,
         session_mgr: Option<SessionManager>,
-        startup_messages: Vec<String>,
+        mut startup_messages: Vec<String>,
         open_provider_panel: bool,
         project_name: String,
     ) -> Self {
@@ -463,9 +467,22 @@ impl App<'_> {
         let mut saved_activated_skills: Option<Vec<String>> = None;
         let mut saved_file_snapshots: Vec<crate::security::policy::PersistedFileSnapshot> =
             Vec::new();
-        if let Some(mgr) = &session_mgr
-            && let Some(saved) = mgr.load(&session_uuid)
+        let mut persistence = session::PersistenceState::default();
+        let restored_session = match session_mgr
+            .as_ref()
+            .map(|manager| manager.load(&session_uuid))
+            .transpose()
         {
+            Ok(saved) => saved.flatten(),
+            Err(error) => {
+                startup_messages.push(format!(
+                    "Session restore failed; saving is blocked: {error}"
+                ));
+                persistence.load_error = Some(error.to_string());
+                None
+            }
+        };
+        if let Some(saved) = restored_session {
             if let Some(wm) = saved.work_mode {
                 work_mode = wm;
             }
@@ -489,6 +506,7 @@ impl App<'_> {
             }
         }
         let mut conversation_panel = ConversationPanel::new();
+        conversation_panel.tasks = tasks.clone();
         conversation_panel.restore_items(saved_items);
         if let Ok(mut conversation) = conversation_panel.conversation.lock() {
             conversation.last_request_input_tokens = saved_last_request_input_tokens;
@@ -542,6 +560,7 @@ impl App<'_> {
             config,
             input_panel,
             conversation_panel,
+            tasks,
             footer: Footer::new(),
             provider_panel: open_provider_panel.then(ProviderPanel::new),
             skills_panel: None,
@@ -573,12 +592,12 @@ impl App<'_> {
             diagnostics_state: Arc::new(std::sync::Mutex::new(
                 crate::runner::DiagnosticsState::default(),
             )),
-            diagnostics_update_generation: 0,
             sidebar_click_active: false,
             cancel: CancelState {
                 active: CancellationToken::new(),
                 next_id: 0,
                 active_id: None,
+                activity: None,
                 turn_conversation_cutoff: None,
                 stream_retrying: Arc::new(AtomicBool::new(false)),
                 response_started: false,
@@ -588,6 +607,7 @@ impl App<'_> {
                 uuid: session_uuid,
                 mgr: session_mgr,
                 dirty: false,
+                persistence,
                 did_save: false,
                 title_generation_started: !session_title.is_empty(),
                 title_generation_id: 0,
@@ -638,7 +658,7 @@ impl App<'_> {
         }
 
         let (task_event_tx, mut task_event_rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::tasks::install_event_sink(task_event_tx);
+        app.tasks.install_event_sink(task_event_tx);
         let app_event_tx = app.events.sender.clone();
         tokio::spawn(async move {
             while let Some(event) = task_event_rx.recv().await {
@@ -772,6 +792,8 @@ impl App<'_> {
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
             Arc::new(
                 LocalToolProvider::new(self.todo_store.clone(), self.security.clone())
+                    .with_diagnostics_state(self.diagnostics_state.clone())
+                    .with_tasks(self.tasks.clone())
                     .with_checkpoint(self.checkpoint_recorder())
                     .with_memory_enabled(self.config.memory.enabled)
                     .with_memory_model(memory_model.clone())
@@ -810,6 +832,8 @@ impl App<'_> {
         };
 
         let child_runtime = crate::agents::AgentRuntime {
+            tasks: self.tasks.clone(),
+            events: self.events.sender.clone(),
             provider_manager: Arc::new(self.provider_manager.clone()),
             client: client.clone(),
             model_name: model_name.clone(),
@@ -1270,6 +1294,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                crate::tasks::TaskManager::default(),
                 "startup-test".to_string(),
                 None,
                 Vec::new(),

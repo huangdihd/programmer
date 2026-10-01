@@ -173,7 +173,7 @@ fn new(app: &mut App<'_>) -> CommandOutcome {
     app.conversation_panel.clear_messages();
     diagnostics::reset_diagnostics_state(app);
     app.pending_images.clear();
-    let killed = crate::tasks::kill_all();
+    let killed = app.tasks.kill_all();
     app.task_notifications.clear();
     app.agents.cancel_all();
     app.agents = crate::agents::AgentManager::default();

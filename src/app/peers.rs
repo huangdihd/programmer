@@ -19,7 +19,7 @@ pub(crate) struct PeerState {
     session: String,
     presence: Option<crate::peers::online::Presence>,
     pub(crate) consent: Option<(PeerEnvelope, oneshot::Receiver<String>)>,
-    pub(crate) runner_prompts: VecDeque<(u64, QuestionPanel)>,
+    pub(crate) runner_prompts: VecDeque<(crate::cancel::OperationId, QuestionPanel)>,
     answering: HashMap<String, tokio::task::JoinHandle<Result<PeerEnvelope, String>>>,
     previewed: HashSet<String>,
     accepted: HashSet<String>,
@@ -49,23 +49,6 @@ fn has_draft(app: &App<'_>) -> bool {
         || app.conversation_panel.pending_message.is_some()
 }
 
-fn can_start(app: &App<'_>) -> bool {
-    eligible(
-        app.cancel.active_id.is_some() || app.auto_compact.active_id.is_some(),
-        has_draft(app),
-        super::events::has_blocking_surface(app) || app.peers.consent.is_some(),
-    ) && !app.auto_compact.mandatory_waiting
-        // The mandatory-compaction queue currently loses the developer role.
-        // Leave peer work durable rather than route it through that user queue.
-        && !app.mandatory_compact_tokens().is_some_and(|limit| {
-            app.auto_compact.last_input_tokens.is_some_and(|tokens| tokens >= limit)
-        })
-}
-
-fn eligible(busy: bool, draft: bool, modal: bool) -> bool {
-    !busy && !draft && !modal
-}
-
 pub(crate) fn sync_session(app: &mut App<'_>) {
     if app.peers.session != app.session.uuid {
         if app.peers.consent.is_some() {
@@ -86,6 +69,7 @@ pub(crate) fn refresh_consent_models(app: &mut App<'_>) {
         return;
     }
     let models = crate::commands::CompletionEngine::complete(
+        &app.tasks,
         "/model ",
         &app.provider_manager,
         &app.skill_registry,
@@ -336,15 +320,13 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
     if ready.is_empty() {
         return;
     }
-    if eligible(
-        app.cancel.active_id.is_some() || app.auto_compact.active_id.is_some(),
-        has_draft(app),
-        super::events::has_blocking_surface(app) || app.peers.consent.is_some(),
-    ) && let Some(tokens) = app.auto_compact.last_input_tokens
-        && app
-            .mandatory_compact_tokens()
-            .is_some_and(|limit| tokens >= limit)
-    {
+    let decision =
+        super::scheduling::StartupState::from_app(app).decide(super::scheduling::WorkSource::Peer);
+    if decision == super::scheduling::StartDecision::CompactPeer {
+        let tokens = app
+            .auto_compact
+            .last_input_tokens
+            .expect("compaction threshold requires tokens");
         // Keep peer input out of the user-role mandatory queue. Force mandatory
         // threshold/cooldown semantics, but leave the durable inbox untouched.
         app.auto_compact.mandatory_waiting = true;
@@ -354,7 +336,7 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
         }
         return;
     }
-    if !can_start(app) {
+    if decision != super::scheduling::StartDecision::Start {
         return;
     }
     let snapshot = app.conversation_panel.items_snapshot();
@@ -714,14 +696,32 @@ mod tests {
     }
 
     #[test]
+    fn empty_peer_inbox_is_not_work() {
+        assert!(ready_work(&[], &HashSet::new()).is_empty());
+    }
+
+    #[test]
     fn idle_peers_require_no_active_turn_draft_or_modal() {
-        assert!(eligible(false, false, false));
-        for blockers in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
+        use super::super::scheduling::{StartDecision, StartupState, WorkSource};
+        assert_eq!(
+            StartupState::default().decide(WorkSource::Peer),
+            StartDecision::Start
+        );
+        for state in [
+            StartupState {
+                active_turn: true,
+                ..Default::default()
+            },
+            StartupState {
+                text_draft: true,
+                ..Default::default()
+            },
+            StartupState {
+                blocking_surface: true,
+                ..Default::default()
+            },
         ] {
-            assert!(!eligible(blockers.0, blockers.1, blockers.2));
+            assert_eq!(state.decide(WorkSource::Peer), StartDecision::Wait);
         }
     }
 }

@@ -44,8 +44,7 @@ pub(crate) fn save_profile(profile: &crate::diagnostics::DiagnosticsProfile) -> 
 /// Re-run the configured checkers without blocking the TUI and update the
 /// shared sidebar snapshot when the matching result arrives.
 pub(crate) fn start_update(app: &mut App<'_>, notify_started: bool) {
-    app.diagnostics_update_generation = app.diagnostics_update_generation.wrapping_add(1);
-    let generation = app.diagnostics_update_generation;
+    let generation = app.diagnostics_state.lock().unwrap().begin_update();
     if notify_started {
         app.conversation_panel
             .add_info_string("Updating diagnostics in the background…");
@@ -79,22 +78,18 @@ pub(crate) fn maybe_seed_diagnostics_baseline(app: &mut App<'_>) {
         return;
     }
     let state = app.diagnostics_state.clone();
+    let generation = state.lock().unwrap().begin_update();
     tokio::spawn(async move {
         let cwd =
             std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
-        let snapshot = crate::diagnostics::collect(&cwd, &crate::cancel::CancellationToken::new())
-            .await
-            .unwrap_or_default();
-        let mut state = state.lock().unwrap();
-        if state.baseline.is_none() {
-            state.baseline = Some(snapshot.diagnostics);
-        }
+        let snapshot =
+            crate::diagnostics::collect(&cwd, &crate::cancel::CancellationToken::new()).await;
+        state.lock().unwrap().publish(generation, snapshot.as_ref());
     });
 }
 
 /// Forget the diagnostics baseline and edit counter in the shared state.
 pub(crate) fn reset_diagnostics_state(app: &mut App<'_>) {
     let mut state = app.diagnostics_state.lock().unwrap();
-    state.baseline = None;
-    state.mutating_turns = 0;
+    state.reset();
 }

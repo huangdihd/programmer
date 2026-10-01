@@ -27,6 +27,13 @@ const DIM: Color = Color::DarkGray;
 
 impl Widget for &Footer {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // Cancellation context must not be squeezed out by model and branding.
+        if self.status.status
+            == crate::ui::components::status_bar::status_bar::StatusState::Cancelling
+        {
+            (&self.status).render(area, buf);
+            return;
+        }
         let mode_text = format!("  {} {} ", self.work_mode.icon(), self.work_mode.label());
         let mode_len = mode_text.len() as u16;
         let sandbox_text = self.sandbox_text();
@@ -117,5 +124,29 @@ impl Widget for &Footer {
         ratatui::widgets::Paragraph::new("GPL-3.0-or-later \u{b7} \u{a9} 2026")
             .style(Style::default().fg(DIM))
             .render(chunks[5], buf);
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::ui::components::status_bar::status_bar::StatusState;
+
+    #[test]
+    fn cancelling_footer_prioritizes_wait_context_over_model_and_branding() {
+        let mut footer = Footer::new();
+        footer.current_model = "a-very-long-provider-model-name".into();
+        footer.status.set(StatusState::Cancelling);
+        footer.status.detail = Some("waiting for tool batch: command (last observed)".into());
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buffer = Buffer::empty(area);
+        (&footer).render(area, &mut buffer);
+        let line = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(line.contains("Cancelling"));
+        assert!(line.contains("tool batch: command"));
+        assert!(!line.contains("provider"));
+        assert!(!line.contains("GPL"));
     }
 }

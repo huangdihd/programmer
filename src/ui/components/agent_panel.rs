@@ -32,11 +32,18 @@ pub(crate) struct AgentPanel {
 }
 
 impl AgentPanel {
-    pub(crate) fn new(id: u64, name: String, conversation: Arc<Mutex<Conversation>>) -> Self {
+    pub(crate) fn new(
+        tasks: crate::tasks::TaskManager,
+        id: u64,
+        name: String,
+        conversation: Arc<Mutex<Conversation>>,
+    ) -> Self {
+        let mut conversation = ConversationPanel::from_shared(conversation);
+        conversation.tasks = tasks;
         Self {
             id,
             name,
-            conversation: ConversationPanel::from_shared(conversation),
+            conversation,
         }
     }
 

@@ -147,6 +147,7 @@ fn handle_sidebar_click(app: &mut App<'_>, target: &ClickTarget) {
                 (app.agents.snapshot(*id), app.agents.conversation(*id))
             {
                 app.agent_panel = Some(crate::ui::components::agent_panel::AgentPanel::new(
+                    app.tasks.clone(),
                     *id,
                     snapshot.name,
                     conversation,

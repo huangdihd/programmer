@@ -18,13 +18,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::function_tool;
-use crate::cancel::CancellationToken;
-use crate::ui::event::{AnswerTx, AppEvent, Event};
-use tokio::sync::mpsc;
+use crate::cancel::{CancellationToken, OperationId};
+use std::sync::Arc;
+use tokio::sync::oneshot;
 
 pub const NAME: &str = "ask_user";
 
-/// A question to present to the user via the TUI.
+/// A question to present to the user.
 #[derive(Debug, Clone)]
 pub struct Question {
     pub text: String,
@@ -41,6 +41,48 @@ pub enum QuestionKind {
     },
     /// Free-form text input.
     Text,
+}
+
+/// A tool question, independent of any front-end event protocol.
+pub struct QuestionRequest {
+    pub question: Question,
+    pub answer: oneshot::Sender<String>,
+    pub operation_id: OperationId,
+}
+
+/// Synchronously hands a question to the front-end; waiting and cancellation
+/// remain owned by the tool. No forwarding task or second queue is needed.
+#[derive(Clone)]
+pub struct QuestionHandler(Arc<dyn Fn(QuestionRequest) + Send + Sync>);
+
+impl QuestionHandler {
+    pub fn new(handler: impl Fn(QuestionRequest) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(handler))
+    }
+
+    fn request(&self, request: QuestionRequest) {
+        (self.0)(request);
+    }
+}
+
+impl Default for QuestionHandler {
+    fn default() -> Self {
+        Self::new(drop)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn question_channel() -> (
+    QuestionHandler,
+    tokio::sync::mpsc::UnboundedReceiver<QuestionRequest>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    (
+        QuestionHandler::new(move |request| {
+            let _ = sender.send(request);
+        }),
+        receiver,
+    )
 }
 
 pub fn tool() -> Tool {
@@ -80,9 +122,9 @@ struct Args {
 
 pub async fn run(
     arguments: &str,
-    sender: &mpsc::UnboundedSender<Event>,
+    questions: &QuestionHandler,
     cancel: &CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
 ) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
@@ -130,23 +172,23 @@ pub async fn run(
         }
     };
 
-    prompt(question, sender, cancel, operation_id).await
+    prompt(question, questions, cancel, operation_id).await
 }
 
 pub(crate) async fn prompt(
     question: Question,
-    sender: &mpsc::UnboundedSender<Event>,
+    questions: &QuestionHandler,
     cancel: &CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
 ) -> Result<String, String> {
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-    let _ = sender.send(Event::App(AppEvent::QuestionPrompt {
+    questions.request(QuestionRequest {
         question,
-        answer_tx: AnswerTx(answer_tx),
+        answer: answer_tx,
         operation_id,
-    }));
+    });
     // Race the user's answer against Esc (cancel). If cancelled, the
-    // AnswerTx is dropped and answer_rx sees a closed channel.
+    // the answer receiver is dropped and late replies are ignored.
     match cancel.wait_or(answer_rx).await {
         Some(Ok(answer)) => Ok(answer),
         _ => Ok("(cancelled)".to_string()),
@@ -159,8 +201,26 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn closed_question_endpoint_returns_cancelled_without_hanging() {
+        let (questions, receiver) = question_channel();
+        drop(receiver);
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            run(
+                r#"{"question":"test?","kind":"text"}"#,
+                &questions,
+                &CancellationToken::new(),
+                OperationId(9),
+            ),
+        )
+        .await
+        .expect("closed front-end must not hang");
+        assert_eq!(result, Ok("(cancelled)".to_string()));
+    }
+
+    #[tokio::test]
     async fn ask_user_returns_cancelled_when_token_fires() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let (tx, mut rx) = question_channel();
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
 
@@ -168,7 +228,7 @@ mod tests {
         let handle = tokio::spawn({
             let args = r#"{"question":"test?","kind":"text"}"#.to_string();
             let sender = tx.clone();
-            async move { run(&args, &sender, &cancel_for_task, 1).await }
+            async move { run(&args, &sender, &cancel_for_task, OperationId(1)).await }
         });
 
         // Wait for the QuestionPrompt to appear.
@@ -176,7 +236,7 @@ mod tests {
             .await
             .expect("question prompt should be sent")
             .expect("channel open");
-        assert!(matches!(ev, Event::App(AppEvent::QuestionPrompt { .. })));
+        assert_eq!(ev.operation_id, OperationId(1));
 
         // Cancel before answering — ask_user should wake up with "(cancelled)".
         cancel.cancel();
@@ -187,18 +247,19 @@ mod tests {
             .expect("task should not panic");
 
         assert_eq!(result, Ok("(cancelled)".to_string()));
+        assert!(ev.answer.send("late answer".to_string()).is_err());
     }
 
     #[tokio::test]
     async fn ask_user_returns_answer_when_not_cancelled() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let (tx, mut rx) = question_channel();
         let cancel = CancellationToken::new();
 
         let handle = tokio::spawn({
             let args = r#"{"question":"test?","kind":"text"}"#.to_string();
             let sender = tx.clone();
             let cancel_clone = cancel.clone();
-            async move { run(&args, &sender, &cancel_clone, 1).await }
+            async move { run(&args, &sender, &cancel_clone, OperationId(1)).await }
         });
 
         // Pull the QuestionPrompt and send an answer.
@@ -206,9 +267,7 @@ mod tests {
             .await
             .expect("question prompt should be sent")
             .expect("channel open");
-        if let Event::App(AppEvent::QuestionPrompt { answer_tx, .. }) = ev {
-            answer_tx.send("hello".to_string());
-        }
+        ev.answer.send("hello".to_string()).unwrap();
 
         let result = tokio::time::timeout(Duration::from_millis(500), handle)
             .await

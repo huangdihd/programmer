@@ -690,6 +690,7 @@ impl CompletionEngine {
     /// Returns `None` when the input does not trigger completions (e.g. doesn't
     /// start with `/`) or when no candidates match.
     pub(crate) fn complete(
+        tasks: &crate::tasks::TaskManager,
         input: &str,
         pm: &ProviderManager,
         skill_registry: &crate::skills::SkillRegistry,
@@ -721,7 +722,7 @@ impl CompletionEngine {
             CompletionKind::Fixed(values) => Self::complete_subcommand(text, cmd, values),
             CompletionKind::Providers => Self::complete_providers(text, cmd, pm),
             CompletionKind::Skill => Self::complete_skill(text, cmd, skill_registry),
-            CompletionKind::Terminal => Self::complete_terminal(text, cmd),
+            CompletionKind::Terminal => Self::complete_terminal(tasks, text, cmd),
             CompletionKind::Permission => Self::complete_permission(text, cmd),
         }
     }
@@ -825,12 +826,17 @@ impl CompletionEngine {
     /// Complete a `/terminal` task id from all running tasks. Each candidate is
     /// `"<id>  <name>"`; the id is the first token so it still parses when
     /// accepted with the name appended.
-    fn complete_terminal(text: &str, cmd: &str) -> Option<CompletionState> {
+    fn complete_terminal(
+        tasks: &crate::tasks::TaskManager,
+        text: &str,
+        cmd: &str,
+    ) -> Option<CompletionState> {
         let after_cmd = text[cmd.len()..].trim_start();
         let prefix = format!("/{} ", cmd);
         let mut candidates = vec!["clear".to_string()];
         candidates.extend(
-            crate::tasks::snapshot_all()
+            tasks
+                .snapshot_all()
                 .iter()
                 .filter(|t| t.status == crate::tasks::TaskStatus::Running)
                 .map(|t| format!("{}  {}", t.id, t.name)),
@@ -2046,8 +2052,13 @@ mod tests {
 
         let provider_manager = ProviderManager::from_config(&crate::ProgrammerConfig::default());
         let skill_registry = crate::skills::SkillRegistry::default();
-        let state = CompletionEngine::complete("/sand", &provider_manager, &skill_registry)
-            .expect("sandbox alias command-name completion");
+        let state = CompletionEngine::complete(
+            &crate::tasks::TaskManager::default(),
+            "/sand",
+            &provider_manager,
+            &skill_registry,
+        )
+        .expect("sandbox alias command-name completion");
         assert_eq!(
             state
                 .candidates
@@ -2234,14 +2245,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn terminal_completion_lists_all_running_tasks() {
-        let interactive_id =
-            crate::tasks::spawn_interactive("cat", None, Some("catname"), 10, 40).expect("spawn");
-        let pipe_id = crate::tasks::spawn("sleep 5", None, Some("sleep")).expect("spawn");
+        let tasks = crate::tasks::TaskManager::default();
+        let interactive_id = tasks
+            .spawn_interactive("cat", None, Some("catname"), 10, 40)
+            .expect("spawn");
+        let pipe_id = tasks.spawn("sleep 5", None, Some("sleep")).expect("spawn");
         // Task registration is asynchronous; yield once so both entries are
         // visible before querying completion when the full suite runs in
         // parallel with other task lifecycle tests.
         tokio::task::yield_now().await;
-        let state = CompletionEngine::complete_terminal("terminal ", "terminal")
+        let state = CompletionEngine::complete_terminal(&tasks, "terminal ", "terminal")
             .expect("candidates for running tasks");
         assert!(
             state
@@ -2258,7 +2271,7 @@ mod tests {
                 "candidates: {:?}",
                 state.candidates
             );
-            crate::tasks::kill(id).ok();
+            tasks.kill(id).ok();
         }
     }
 

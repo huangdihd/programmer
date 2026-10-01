@@ -82,7 +82,10 @@ impl PeerSessionProvider {
                 let message = required_message(args.message)?;
                 let (target, command) = if let Some(target) = args.session_id {
                     validate_target(&self.source, &target)?;
-                    let session = manager.load(&target).ok_or("Target session not found")?;
+                    let session = manager
+                        .load(&target)
+                        .map_err(|error| error.to_string())?
+                        .ok_or("Target session not found")?;
                     (
                         target.clone(),
                         resume_command(&session.working_dir, &target),
@@ -173,8 +176,10 @@ impl PeerSessionProvider {
                     }
                     match manager.try_lock(&target) {
                         Ok(_lock) => {
-                            let mut session =
-                                manager.load(&target).ok_or("Target session not found")?;
+                            let mut session = manager
+                                .load(&target)
+                                .map_err(|error| error.to_string())?
+                                .ok_or("Target session not found")?;
                             let model = session
                                 .current_model
                                 .clone()
