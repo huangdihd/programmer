@@ -292,24 +292,37 @@ impl PartialResponse {
             }
 
             ResponseContentPartDone(part_done_event) => {
-                let Some(Some(OutputItem::Message(output_message))) =
-                    self.items.get_mut(part_done_event.output_index as usize)
+                let Some(content_index) = bounded_item_part_index(part_done_event.content_index)
                 else {
                     return;
                 };
-                let content_index = part_done_event.content_index as usize;
-                if content_index < output_message.content.len() {
-                    match part_done_event.part {
-                        OutputContent::OutputText(output_text) => {
-                            output_message.content[content_index] =
-                                OutputMessageContent::OutputText(output_text);
+                let Some(Some(item)) = self.items.get_mut(part_done_event.output_index as usize)
+                else {
+                    return;
+                };
+                match (item, part_done_event.part) {
+                    (OutputItem::Message(message), OutputContent::OutputText(text)) => {
+                        if let Some(part) = message.content.get_mut(content_index) {
+                            *part = OutputMessageContent::OutputText(text);
                         }
-                        OutputContent::Refusal(refusal) => {
-                            output_message.content[content_index] =
-                                OutputMessageContent::Refusal(refusal);
-                        }
-                        _ => {}
                     }
+                    (OutputItem::Message(message), OutputContent::Refusal(refusal)) => {
+                        if let Some(part) = message.content.get_mut(content_index) {
+                            *part = OutputMessageContent::Refusal(refusal);
+                        }
+                    }
+                    (OutputItem::Reasoning(reasoning), OutputContent::ReasoningText(text)) => {
+                        let contents = reasoning.content.get_or_insert_with(Vec::new);
+                        while contents.len() <= content_index {
+                            contents.push(ReasoningItemContent::ReasoningText(
+                                ReasoningTextContent {
+                                    text: String::new(),
+                                },
+                            ));
+                        }
+                        contents[content_index] = ReasoningItemContent::ReasoningText(text);
+                    }
+                    _ => {}
                 }
             }
 
@@ -428,14 +441,22 @@ impl PartialResponse {
                 else {
                     return;
                 };
-                let Some(contents) = reasoning_item.content.as_mut() else {
+                let Some(content_index) =
+                    bounded_item_part_index(reasoning_text_done_event.content_index)
+                else {
                     return;
                 };
-                if let Some(ReasoningItemContent::ReasoningText(reasoning_text)) =
-                    contents.get_mut(reasoning_text_done_event.content_index as usize)
-                {
-                    reasoning_text.text = reasoning_text_done_event.text;
+                // Done carries the authoritative text even when no delta preceded it.
+                let contents = reasoning_item.content.get_or_insert_with(Vec::new);
+                while contents.len() <= content_index {
+                    contents.push(ReasoningItemContent::ReasoningText(ReasoningTextContent {
+                        text: String::new(),
+                    }));
                 }
+                contents[content_index] =
+                    ReasoningItemContent::ReasoningText(ReasoningTextContent {
+                        text: reasoning_text_done_event.text,
+                    });
             }
 
             ResponseReasoningSummaryPartAdded(summary_part_added_event) => {
@@ -799,6 +820,42 @@ mod tests {
 
     fn fresh() -> PartialResponse {
         PartialResponse::new(CancellationToken::new())
+    }
+
+    #[test]
+    fn reasoning_content_part_done_preserves_summary_and_other_parts() {
+        let mut partial = fresh();
+        partial.set_item(
+            serde_json::from_value(serde_json::json!({
+                "type": "reasoning", "id": "r1",
+                "summary": [{"type": "summary_text", "text": "summary"}],
+                "content": [
+                    {"type": "reasoning_text", "text": "partial"},
+                    {"type": "reasoning_text", "text": "second"}
+                ]
+            }))
+            .unwrap(),
+            0,
+        );
+        for content_index in [u32::MAX, 0] {
+            partial.handle_response_stream_event(
+                serde_json::from_value(serde_json::json!({
+                    "type": "response.content_part.done", "sequence_number": 1,
+                    "item_id": "r1", "output_index": 0, "content_index": content_index,
+                    "part": {"type": "reasoning_text", "text": "complete"}
+                }))
+                .unwrap(),
+            );
+        }
+        let item = serde_json::to_value(partial.items[0].as_ref().unwrap()).unwrap();
+        assert_eq!(
+            item["content"],
+            serde_json::json!([
+                {"type": "reasoning_text", "text": "complete"},
+                {"type": "reasoning_text", "text": "second"}
+            ])
+        );
+        assert_eq!(item["summary"][0]["text"], "summary");
     }
 
     fn msg_item() -> OutputItem {

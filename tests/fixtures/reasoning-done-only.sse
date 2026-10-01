@@ -1,0 +1,9 @@
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reasoning_1","summary":[],"status":"in_progress"},"sequence_number":0}
+
+data: {"type":"response.reasoning_text.done","item_id":"reasoning_1","output_index":0,"content_index":0,"text":"Done without delta.","sequence_number":1}
+
+data: {"type":"response.reasoning_text.done","item_id":"reasoning_1","output_index":0,"content_index":1,"text":"Second done-only part.","sequence_number":2}
+
+data: {"type":"response.completed","response":{"created_at":0,"id":"resp_reasoning","model":"mock","object":"response","output":[],"status":"completed"},"sequence_number":3}
+
+: eof

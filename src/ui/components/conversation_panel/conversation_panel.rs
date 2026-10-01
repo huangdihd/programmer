@@ -1158,6 +1158,23 @@ impl ConversationPanel {
             matches!(item,
                 MessageItem::PeerDelegation { id: existing, .. } if existing == &id)
         }) {
+            if *saved_from != from
+                || body
+                    .as_ref()
+                    .zip(saved_body.as_ref())
+                    .is_some_and(|(new_body, existing_body)| new_body != existing_body)
+            {
+                return;
+            }
+            if matches!(
+                *saved_state,
+                crate::response::message_item::PeerDelegationState::Started
+                    | crate::response::message_item::PeerDelegationState::Rejected
+                    | crate::response::message_item::PeerDelegationState::Cancelled
+            ) && *saved_state != state
+            {
+                return;
+            }
             if *saved_from == from
                 && (body.is_none() || *saved_body == body)
                 && *saved_state == state

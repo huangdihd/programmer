@@ -32,6 +32,10 @@ pub fn paragraph(
             "rejected",
             "Declined; no delegated model execution was started.",
         ),
+        PeerDelegationState::Cancelled => (
+            "cancelled",
+            "Cancelled by the source session before delegated execution started.",
+        ),
     };
     let accent = Style::new().fg(palette::PURPLE);
     let excerpt = body
@@ -92,6 +96,7 @@ mod tests {
             PeerDelegationState::AcceptedQueued,
             PeerDelegationState::Started,
             PeerDelegationState::Rejected,
+            PeerDelegationState::Cancelled,
         ] {
             for width in [0, 1, 2, 8, 40, 160] {
                 let area = Rect::new(0, 0, width, 4);

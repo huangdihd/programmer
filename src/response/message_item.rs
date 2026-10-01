@@ -25,6 +25,7 @@ pub enum PeerDelegationState {
     AcceptedQueued,
     Started,
     Rejected,
+    Cancelled,
 }
 
 #[derive(Debug)]
