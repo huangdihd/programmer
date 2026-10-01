@@ -15,8 +15,7 @@
 
 //! Standalone helper functions and constants that don't depend on `App`.
 
-use crate::response::message_item::MessageItem;
-use async_openai::types::responses::{InputContent, InputItem, MessageItem as ApiMessageItem};
+use crate::response::message_item::{MessageItem, extract_input_text};
 
 // ---------------------------------------------------------------------------
 // PROJECT.md overview reminder
@@ -47,32 +46,10 @@ pub(crate) fn first_user_text(items: &[MessageItem]) -> Option<String> {
     })
 }
 
-pub(crate) fn extract_input_text(input: &InputItem) -> Option<String> {
-    use async_openai::types::responses::Item;
-
-    match input {
-        InputItem::Item(Item::Message(ApiMessageItem::Input(input_msg))) => {
-            input_msg.content.iter().find_map(|c| match c {
-                InputContent::InputText(t) => Some(t.text.clone()),
-                _ => None,
-            })
-        }
-        InputItem::EasyMessage(msg) => match &msg.content {
-            async_openai::types::responses::EasyInputContent::Text(t) => Some(t.clone()),
-            async_openai::types::responses::EasyInputContent::ContentList(parts) => {
-                parts.iter().find_map(|c| match c {
-                    InputContent::InputText(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-            }
-        },
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_openai::types::responses::InputItem;
 
     fn user_input(text: &str) -> MessageItem {
         let input: InputItem = serde_json::from_value(serde_json::json!({
@@ -106,17 +83,5 @@ mod tests {
     fn first_user_text_returns_none_for_empty() {
         assert!(first_user_text(&[]).is_none());
         assert!(first_user_text(&[MessageItem::Info("no user input".to_string())]).is_none());
-    }
-
-    #[test]
-    fn extract_input_text_handles_non_message() {
-        // serde_json will just fail to deserialize a function call as an InputItem
-        let input: InputItem = serde_json::from_value(serde_json::json!({
-            "type": "function_call_output",
-            "call_id": "c1",
-            "output": "result"
-        }))
-        .unwrap();
-        assert!(extract_input_text(&input).is_none());
     }
 }

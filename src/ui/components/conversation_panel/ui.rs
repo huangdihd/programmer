@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::response::message_item::MessageItem;
+use crate::response::message_item::{MessageItem, extract_input_text};
 use crate::ui::components::conversation_panel::conversation_panel::{
     ActivePhase, CachedLiveSlot, CachedParagraph, CachedToolGroup, ConversationPanel,
     LiveGroupHeader, LiveParagraph, LiveParagraphContent, LiveRenderCache, MaterializedLiveCache,
@@ -57,7 +57,7 @@ fn estimate_item_height(item: &MessageItem, width: u16) -> u16 {
     match item {
         MessageItem::Input(input) if is_hidden_developer_input(input) => 0,
         MessageItem::Input(input) => {
-            let text = crate::app::helpers::extract_input_text(input).unwrap_or_default();
+            let text = extract_input_text(input).unwrap_or_default();
             rough_line_count(&text, w).saturating_add(input_image_rows(input))
         }
         MessageItem::Output(output) => match output {

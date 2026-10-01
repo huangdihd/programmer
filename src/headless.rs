@@ -251,6 +251,7 @@ impl HeadlessAgent {
 
         let agents = crate::agents::AgentManager::default();
         let child_runtime = crate::agents::AgentRuntime {
+            events: tokio::sync::mpsc::unbounded_channel().0,
             provider_manager: Arc::new(provider_manager.clone()),
             client: client.clone(),
             model_name: model_name.clone(),

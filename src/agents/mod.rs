@@ -447,6 +447,8 @@ impl AgentPolicyFactory {
 
 #[derive(Clone)]
 pub(crate) struct AgentRuntime {
+    /// Parent front-end notifications and reviews, bound when the runtime is built.
+    pub(crate) events: mpsc::UnboundedSender<Event>,
     pub(crate) provider_manager: Arc<crate::providers::ProviderManager>,
     pub(crate) client: Client<OpenAIConfig>,
     pub(crate) model_name: String,
@@ -663,6 +665,7 @@ mod tests {
         }
         let security = crate::security::SecurityManager::standalone().unwrap();
         AgentRuntime {
+            events: mpsc::unbounded_channel().0,
             provider_manager: Arc::new(crate::providers::ProviderManager::from_config(&config)),
             client: Client::with_config(OpenAIConfig::default()),
             model_name: "memory-model".to_string(),
@@ -753,6 +756,10 @@ mod tests {
             cancel: CancellationToken::new(),
         };
 
+        assert!(
+            surface.questions().is_none(),
+            "children must still pre-deny interactive tools"
+        );
         surface.on_event(RunnerEvent::Phase(RunnerPhase::Associating));
         // Phases are tagged so they land on the child's row, never on the main
         // turn's status bar.

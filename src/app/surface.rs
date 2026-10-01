@@ -99,8 +99,17 @@ impl AgentSurface for TuiSurface {
         }
     }
 
-    fn tool_event_sender(&self) -> Option<mpsc::UnboundedSender<Event>> {
-        Some(self.tx.clone())
+    fn questions(&self) -> Option<crate::tools::ask_user::QuestionHandler> {
+        let sender = self.tx.clone();
+        Some(crate::tools::ask_user::QuestionHandler::new(
+            move |request| {
+                let _ = sender.send(Event::App(AppEvent::QuestionPrompt {
+                    question: request.question,
+                    answer_tx: crate::ui::event::AnswerTx(request.answer),
+                    operation_id: request.operation_id,
+                }));
+            },
+        ))
     }
 
     fn skill_prompt(&self) -> Option<String> {
@@ -123,6 +132,41 @@ impl AgentSurface for TuiSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn question_endpoint_maps_request_and_reply_without_a_forwarding_task() {
+        let (tx, mut receiver) = mpsc::unbounded_channel();
+        let surface = TuiSurface {
+            tx,
+            skill_prompt: None,
+            plan_prompt: None,
+            approval_label: "test".to_string(),
+            operation_id: 42,
+            cancel: CancellationToken::new(),
+        };
+        let questions = surface.questions().expect("interactive endpoint");
+        let question = crate::tools::ask_user::run(
+            r#"{"question":"Proceed?","kind":"yes_no"}"#,
+            &questions,
+            &surface.cancel,
+            surface.operation_id,
+        );
+        tokio::pin!(question);
+        assert!(futures::poll!(&mut question).is_pending());
+        let Event::App(AppEvent::QuestionPrompt {
+            question: prompt,
+            answer_tx,
+            operation_id,
+        }) = receiver.try_recv().expect("question queued synchronously")
+        else {
+            panic!("expected question event")
+        };
+        assert_eq!(operation_id, 42);
+        assert_eq!(prompt.text, "Proceed?");
+        answer_tx.send("Yes".to_string());
+        assert_eq!(question.await.unwrap(), "Yes");
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn usage_safe_point_waits_for_frontend_resume() {

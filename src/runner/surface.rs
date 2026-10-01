@@ -28,9 +28,8 @@
 //!    forwards to its parent, and ultimately to the human at the TUI.
 
 use super::RunnerEvent;
-use crate::ui::event::Event;
+use crate::tools::ask_user::QuestionHandler;
 use async_openai::types::responses::FunctionToolCall;
-use tokio::sync::mpsc::UnboundedSender;
 
 /// The outcome of asking a surface to review a tool call whose classifier
 /// verdict was `Ask`.
@@ -75,11 +74,9 @@ pub(crate) trait AgentSurface: Send + Sync {
     // --- Front-end context (defaulted; the headless surface takes the None /
     // headless answer). ---
 
-    /// The channel tools use to reach the front-end — `ask_user`'s prompt, live
-    /// task updates. `None` (the default) means there is no interactive
-    /// front-end, so `ask_user` is pre-denied rather than left hanging on a dead
-    /// answer channel.
-    fn tool_event_sender(&self) -> Option<UnboundedSender<Event>> {
+    /// The front-end's question endpoint. Without it, interactive tools are
+    /// pre-denied instead of waiting for an answer that cannot arrive.
+    fn questions(&self) -> Option<QuestionHandler> {
         None
     }
 

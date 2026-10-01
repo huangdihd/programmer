@@ -100,8 +100,7 @@ src/
 │   │   └── mouse.rs
 │   ├── helpers.rs            #   Small utilities (drain approvals, mode transitions, …)
 │   ├── session.rs            #   Session save/load hooks
-│   ├── stream.rs             #   API stream management + retry
-│   └── tools.rs              #   Tool-call routing (execute + approval queue)
+│   └── surface.rs            #   TUI adapter for the shared runner's host interface
 │
 ├── checkpoint.rs             # Per-session rewind manifests, blobs, conflict-safe restore
 ├── classifier/               # Auto-mode tool-call classification
@@ -135,9 +134,17 @@ src/
 ├── providers/                # Multi-provider management
 │   └── mod.rs                #   ProviderManager: add/edit/delete/switch API backends
 │
+├── conversation.rs           # Shared conversation model and API-input projection
+├── runner/                   # Shared turn execution for TUI, headless, and child agents
+│   ├── mod.rs                #   TurnRunner and execution events
+│   ├── surface.rs            #   AgentSurface: host notifications, review, and interaction
+│   ├── hooks.rs              #   TurnHook: checks and feedback around tool batches
+│   ├── tools.rs              #   Ordered tool batches through ToolRegistry
+│   └── stream.rs             #   API streaming and retry
+│
 ├── response/                 # API response parsing
 │   ├── mod.rs
-│   ├── message_item.rs       #   MessageItem enum (User, Assistant, ToolCall, ToolResult, …)
+│   ├── message_item.rs       #   MessageItem records and shared input-text extraction
 │   ├── partial_response.rs   #   Streamed partial response accumulator
 │   └── response_finish_reason.rs
 │
@@ -157,6 +164,7 @@ src/
 │
 ├── tools/                    # Tool definitions + execution
 │   ├── mod.rs                #   Tool enum, tools() list, shell(), resolve_program(), environment_info()
+│   ├── provider.rs           #   ToolProvider contract and ToolRegistry routing
 │   ├── command.rs            #   Shell command execution
 │   ├── read_file.rs          #   Read file with offset/limit
 │   ├── write_file.rs         #   Write/create file (whole-file replacement)
@@ -229,6 +237,7 @@ src/
 
 ## Conventions
 
+- **Runner boundaries:** Production runner code depends on `AgentSurface`, not App or UI event types. Tool calls receive a narrow `QuestionHandler` through `ToolCtx`; `app/surface.rs` adapts questions to TUI events synchronously. Cancellation and waiting remain in the tool. Child-agent lifecycle notifications are bound in `AgentRuntime`, not passed through generic tool context. Shared input-text extraction belongs to `response/message_item.rs`.
 - **Error handling:** `color_eyre::Result<T>` throughout; `.wrap_err()` for context; `?` propagation. `thiserror` for library-style error types.
 - **Cancellation and queues:** Esc cancels only the active request, not the queue. Dispatch waits for its matching terminal event; stale events cannot advance the queue. User drafts, approvals, and peer consent still block dispatch. Before any model output, restore the original draft only into an empty input with no queued user request; otherwise retain the cancelled input in conversation history. Task/agent notifications and already-authorized peer work remain eligible after cancellation, without restarting the cancelled request.
 - **Async:** `#[tokio::main]` on `main()`, `tokio::spawn` for concurrent tasks. All tool execution is async.

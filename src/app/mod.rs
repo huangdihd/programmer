@@ -810,6 +810,7 @@ impl App<'_> {
         };
 
         let child_runtime = crate::agents::AgentRuntime {
+            events: self.events.sender.clone(),
             provider_manager: Arc::new(self.provider_manager.clone()),
             client: client.clone(),
             model_name: model_name.clone(),

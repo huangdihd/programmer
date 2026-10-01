@@ -163,7 +163,7 @@ pub struct ToolOutput {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn run_tool_call(
     call: &FunctionToolCall,
-    sender: &tokio::sync::mpsc::UnboundedSender<crate::ui::event::Event>,
+    questions: &ask_user::QuestionHandler,
     mcp: Option<&crate::mcp::McpManager>,
 ) -> ToolOutput {
     // Every branch yields a `Result<FunctionCallOutput, String>`: `Ok` is a
@@ -172,10 +172,10 @@ pub(crate) async fn run_tool_call(
     let result: Result<FunctionCallOutput, String> = if call.name.starts_with("mcp__") {
         mcp_bridge::run_mcp_call(call, mcp).await
     } else if call.name == ask_user::NAME {
-        // ask_user needs the UI channel, so it isn't part of run_local_tool.
+        // Questions require the front-end endpoint, unlike local tools.
         ask_user::run(
             &call.arguments,
-            sender,
+            questions,
             &crate::cancel::CancellationToken::new(),
             0,
         )
@@ -537,7 +537,7 @@ mod tests {
     /// parsing the output text — the whole point of the authoritative flag.
     #[tokio::test]
     async fn run_tool_call_reports_failure_authoritatively() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = ask_user::QuestionHandler::default();
         let call = |name: &str, args: &str| FunctionToolCall {
             arguments: args.to_string(),
             call_id: "c1".to_string(),

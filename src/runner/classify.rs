@@ -21,7 +21,7 @@
 
 use crate::cancel::CancellationToken;
 use crate::classifier::{Classifier, ClassifyContext, Verdict};
-use crate::response::message_item::MessageItem;
+use crate::response::message_item::{MessageItem, extract_input_text};
 use async_openai::types::responses::{FunctionCallOutput, FunctionToolCall, OutputItem};
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -221,7 +221,7 @@ pub(crate) fn build_classifier_context(items: &[&MessageItem]) -> (String, Strin
         for it in items.iter().rev() {
             match it {
                 MessageItem::Input(input) => {
-                    if let Some(text) = crate::app::helpers::extract_input_text(input) {
+                    if let Some(text) = extract_input_text(input) {
                         recent.push(format!(
                             "[User]\n{}",
                             truncate_chars(text.trim(), CLASSIFIER_LIGHT_MSG_CHARS)
@@ -269,7 +269,7 @@ pub(crate) fn build_classifier_context(items: &[&MessageItem]) -> (String, Strin
     for it in items {
         match it {
             MessageItem::Input(input) => {
-                if let Some(text) = crate::app::helpers::extract_input_text(input) {
+                if let Some(text) = extract_input_text(input) {
                     full_ctx.push(format!("\n[User]\n{}", text.trim()));
                 }
             }

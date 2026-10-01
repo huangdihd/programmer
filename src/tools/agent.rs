@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use super::function_tool;
 use crate::agents::{AgentManager, AgentRuntime, AgentSnapshot, AgentStatus};
-use crate::ui::event::Event;
 
 pub const NAME: &str = "agent";
 const DEFAULT_WAIT_SECS: u64 = 60;
@@ -91,7 +90,6 @@ pub(crate) async fn run(
     arguments: &str,
     manager: &AgentManager,
     runtime: &AgentRuntime,
-    events: tokio::sync::mpsc::UnboundedSender<Event>,
 ) -> Result<String, String> {
     let args: Args = serde_json::from_str(arguments)
         .map_err(|error| format!("error: invalid arguments: {error}"))?;
@@ -103,6 +101,7 @@ pub(crate) async fn run(
                 .ok_or_else(|| "error: 'prompt' is required for spawn".to_string())?;
             let runtime =
                 runtime.with_overrides(args.model.as_deref(), args.thinking.as_deref())?;
+            let events = runtime.events.clone();
             let id = manager.spawn(prompt.clone(), args.name, runtime, events)?;
             Ok(format!(
                 "started sub-agent {id}: {}\nThe parent will be notified when it finishes. Continue useful work or use action=wait id={id} only when the result is required immediately.",

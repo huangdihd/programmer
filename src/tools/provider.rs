@@ -29,11 +29,9 @@ use super::{
     request_permission, run_local_tool, task, todo, write_file,
 };
 use crate::mcp::McpManager;
-use crate::ui::event::Event;
 use async_openai::types::responses::{FunctionCallOutput, FunctionToolCall, Tool};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::UnboundedSender;
 
 /// A provider's verdict on whether a call needs the work-mode classifier — the
 /// single "does this go through the classifier?" decision that used to be split
@@ -82,24 +80,19 @@ impl ToolProvider for AgentToolProvider {
     async fn call(
         &self,
         call: &FunctionToolCall,
-        ctx: &ToolCtx<'_>,
+        _ctx: &ToolCtx<'_>,
     ) -> Result<FunctionCallOutput, String> {
-        agent::run(
-            &call.arguments,
-            &self.manager,
-            &self.runtime,
-            ctx.sender.clone(),
-        )
-        .await
-        .map(FunctionCallOutput::Text)
+        agent::run(&call.arguments, &self.manager, &self.runtime)
+            .await
+            .map(FunctionCallOutput::Text)
     }
 }
 
 /// What a provider needs at call time beyond the call itself. Currently just the
-/// front-end event channel that interactive tools (`ask_user`) prompt through,
+/// question endpoint that interactive tools prompt through,
 /// the operation id for event tagging, and the cancellation token.
 pub(crate) struct ToolCtx<'a> {
-    pub sender: &'a UnboundedSender<Event>,
+    pub questions: &'a ask_user::QuestionHandler,
     pub cancel: &'a crate::cancel::CancellationToken,
     pub operation_id: u64,
 }
@@ -333,14 +326,14 @@ impl ToolProvider for LocalToolProvider {
         ctx: &ToolCtx<'_>,
     ) -> Result<FunctionCallOutput, String> {
         if call.name == ask_user::NAME {
-            // ask_user needs the UI channel, so it isn't part of run_local_tool.
-            ask_user::run(&call.arguments, ctx.sender, ctx.cancel, ctx.operation_id)
+            // Questions require the front-end endpoint, unlike local tools.
+            ask_user::run(&call.arguments, ctx.questions, ctx.cancel, ctx.operation_id)
                 .await
                 .map(FunctionCallOutput::Text)
         } else if call.name == request_permission::NAME {
             request_permission::run(
                 &call.arguments,
-                ctx.sender,
+                ctx.questions,
                 ctx.cancel,
                 ctx.operation_id,
                 &self.security,
@@ -773,10 +766,10 @@ mod tests {
     #[tokio::test]
     async fn registry_dispatches_a_local_call_and_rejects_unknown() {
         let reg = ToolRegistry::new(vec![Arc::new(LocalToolProvider::default())]);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let questions = ask_user::QuestionHandler::default();
         let cancel = crate::cancel::CancellationToken::new();
         let ctx = ToolCtx {
-            sender: &tx,
+            questions: &questions,
             cancel: &cancel,
             operation_id: 0,
         };

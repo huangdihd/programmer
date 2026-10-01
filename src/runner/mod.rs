@@ -592,15 +592,15 @@ impl TurnRunner {
         surface: &dyn AgentSurface,
     ) -> Option<Vec<crate::tools::ToolOutput>> {
         // Interactive tools need a front-end to answer them. A surface that
-        // provides a tool-event channel (the TUI) can; without one (headless),
+        // provides a question endpoint (the TUI) can; without one (headless),
         // pre-deny them so they cannot hang on a dead answer channel.
-        let tool_sender = surface.tool_event_sender();
+        let questions = surface.questions();
         let mut denied: Vec<crate::tools::ToolOutput> = Vec::new();
         let mut classifiable: Vec<FunctionToolCall> = Vec::new();
         for call in calls {
             if let Err(reason) = self.tools.validate(&call) {
                 denied.push(classify::invalid_tool_call_output(&call, &reason));
-            } else if self.tools.requires_interaction(&call.name) && tool_sender.is_none() {
+            } else if self.tools.requires_interaction(&call.name) && questions.is_none() {
                 let reason = format!("{} is unavailable in non-interactive mode", call.name);
                 denied.push(classify::classifier_denied_output(&call, &reason));
             } else {
@@ -676,10 +676,6 @@ impl TurnRunner {
             RunnerPhase::RunningTools
         };
         surface.on_event(RunnerEvent::Phase(phase));
-        // Use the front-end's tool channel when it has one (so ask_user and live
-        // task updates reach the UI); otherwise a throwaway channel with a
-        // dropped receiver — safe because ask_user is already pre-denied there.
-        let sender = tool_sender.unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().0);
         let op_id = surface.operation_id();
         let waiting_subagents = allowed.iter().any(|call| {
             call.name == crate::tools::agent::NAME && crate::tools::agent::is_wait(&call.arguments)
@@ -692,7 +688,7 @@ impl TurnRunner {
             denied,
             cancel.clone(),
             surface.approval_label(),
-            sender,
+            questions.unwrap_or_default(),
             self.tools.clone(),
             op_id,
         )
@@ -1662,17 +1658,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_turn_pre_denies_ask_user_and_continues() {
-        // Response 1 calls ask_user (which must be denied, not hang).
+    async fn run_turn_pre_denies_interactive_tools_and_continues() {
+        // Both question tools must be denied before classification, not hang.
         // Response 2 finishes.
         let body1 = format!(
-            "{}{}",
+            "{}{}{}",
             item_added_frame(
                 1,
                 0,
                 &call_item("a1", "ask_user", "{\"question\":\"?\",\"kind\":\"text\"}",),
             ),
-            completed_frame(2),
+            item_added_frame(
+                2,
+                1,
+                &call_item(
+                    "p1",
+                    "request_permission",
+                    r#"{"kind":"sandbox","mode":"network","operation":null,"path":null,"reason":"download dependencies"}"#
+                ),
+            ),
+            completed_frame(3),
         );
         let body2 = format!(
             "{}{}",
@@ -1694,17 +1699,22 @@ mod tests {
         .expect("must not hang on ask_user")
         .expect("turn completes");
         assert_eq!(result.final_text, "done anyway");
-        // The ask_user call got a denial tool output.
-        let denied = conv.lock().unwrap().items().any(|it| {
-            matches!(
-                it,
-                MessageItem::ToolOutput { output, failed: true, .. }
-                    if matches!(&output.output,
-                        async_openai::types::responses::FunctionCallOutput::Text(t)
-                            if t.contains("non-interactive"))
-            )
-        });
-        assert!(denied, "ask_user should be denied");
+        // Each interactive call got a denial tool output.
+        let denied = conv
+            .lock()
+            .unwrap()
+            .items()
+            .filter(|it| {
+                matches!(
+                    it,
+                    MessageItem::ToolOutput { output, failed: true, .. }
+                        if matches!(&output.output,
+                            async_openai::types::responses::FunctionCallOutput::Text(t)
+                                if t.contains("non-interactive"))
+                )
+            })
+            .count();
+        assert_eq!(denied, 2, "both interactive tools should be denied");
     }
 
     /// A surface that decides every `review` the same way and records the
