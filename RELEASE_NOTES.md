@@ -1,3 +1,22 @@
+### programmer v0.2.21
+
+- Make operation ownership explicit and preserve queued requests until cancellation
+  finishes, without bypassing drafts, approvals, or peer consent.
+- Show the last observed execution stage while cancelling, and interrupt pending
+  hooks and memory-association waits promptly.
+- Publish explicit diagnostics results to the sidebar from the same snapshot,
+  rejecting stale updates and retaining known findings after incomplete checks.
+- Preserve session files on load failures and keep unsaved changes after save
+  failures, without automatic idle retries.
+- Isolate task managers per runtime and strengthen runner/tool boundaries with
+  typed operation identifiers and narrow question handlers.
+- Add lifecycle, persistence, task isolation, diagnostics, and cancellation
+  regression coverage and update architecture documentation.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.20...v0.2.21
+
+---
+
 ### programmer v0.2.20
 
 - Preserve raw Responses API reasoning from `reasoning_text.done` events without
