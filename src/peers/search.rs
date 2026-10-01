@@ -40,7 +40,10 @@ pub(super) fn search(
     // Bound each call even when nothing matches. The caller can continue scanning.
     for meta in sessions.iter().skip(offset).take(100) {
         next += 1;
-        let Some(session) = manager.load(&meta.uuid) else {
+        let Some(session) = manager
+            .load(&meta.uuid)
+            .map_err(|error| error.to_string())?
+        else {
             skipped += 1;
             continue;
         };

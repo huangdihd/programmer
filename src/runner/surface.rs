@@ -28,6 +28,7 @@
 //!    forwards to its parent, and ultimately to the human at the TUI.
 
 use super::RunnerEvent;
+use crate::cancel::OperationId;
 use crate::tools::ask_user::QuestionHandler;
 use async_openai::types::responses::FunctionToolCall;
 
@@ -104,8 +105,8 @@ pub(crate) trait AgentSurface: Send + Sync {
     /// The operation id of this turn, for tagging progress events so a
     /// front-end can drop events from stale turns. Defaults to 0 for headless
     /// (where no event channel exists to receive them).
-    fn operation_id(&self) -> u64 {
-        0
+    fn operation_id(&self) -> OperationId {
+        OperationId::UNTAGGED
     }
 }
 

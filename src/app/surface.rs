@@ -17,7 +17,7 @@
 //! (stream chunks, phase changes, review requests) into [`AppEvent`]s on the
 //! app's event channel. A fresh instance is built for each turn.
 
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
 use crate::runner::{AgentSurface, ReviewDecision, RunnerEvent};
 use crate::ui::event::{AppEvent, Event, ReplyTx};
 use async_openai::types::responses::FunctionToolCall;
@@ -35,7 +35,7 @@ pub(crate) struct TuiSurface {
     /// "🤖 approved by Auto mode".
     pub approval_label: String,
     /// The monotonically increasing operation id assigned to this turn.
-    pub operation_id: u64,
+    pub operation_id: OperationId,
     /// The turn's root cancellation token, so `review()` can race the
     /// approval wait against an Esc press.
     pub cancel: CancellationToken,
@@ -47,6 +47,9 @@ impl AgentSurface for TuiSurface {
         let app_ev = match ev {
             RunnerEvent::StreamChunk(b) => AppEvent::ChunkReceived(self.operation_id, Box::new(*b)),
             RunnerEvent::ResponseCommitted => AppEvent::ResponseCommitted(self.operation_id),
+            RunnerEvent::Activity(description) => {
+                AppEvent::RunnerActivity(self.operation_id, description.to_string())
+            }
             RunnerEvent::Phase(p) => AppEvent::RunnerPhase(self.operation_id, p),
             RunnerEvent::UsageSafePoint { input_tokens } => {
                 let (resume, _receiver) = oneshot::channel();
@@ -124,7 +127,7 @@ impl AgentSurface for TuiSurface {
         self.approval_label.clone()
     }
 
-    fn operation_id(&self) -> u64 {
+    fn operation_id(&self) -> OperationId {
         self.operation_id
     }
 }
@@ -141,7 +144,7 @@ mod tests {
             skill_prompt: None,
             plan_prompt: None,
             approval_label: "test".to_string(),
-            operation_id: 42,
+            operation_id: OperationId(42),
             cancel: CancellationToken::new(),
         };
         let questions = surface.questions().expect("interactive endpoint");
@@ -161,7 +164,7 @@ mod tests {
         else {
             panic!("expected question event")
         };
-        assert_eq!(operation_id, 42);
+        assert_eq!(operation_id, OperationId(42));
         assert_eq!(prompt.text, "Proceed?");
         answer_tx.send("Yes".to_string());
         assert_eq!(question.await.unwrap(), "Yes");
@@ -176,7 +179,7 @@ mod tests {
             skill_prompt: None,
             plan_prompt: None,
             approval_label: "test".to_string(),
-            operation_id: 42,
+            operation_id: OperationId(42),
             cancel: CancellationToken::new(),
         };
         let waiter = tokio::spawn(async move { surface.usage_safe_point(150_000).await });
@@ -186,7 +189,7 @@ mod tests {
         else {
             panic!("unexpected event")
         };
-        assert_eq!(operation_id, 42);
+        assert_eq!(operation_id, OperationId(42));
         assert_eq!(tokens, 150_000);
         assert!(!waiter.is_finished());
         resume.send(()).expect("resume runner");

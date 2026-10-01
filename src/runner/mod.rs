@@ -108,19 +108,7 @@ pub(crate) struct TurnRunner {
     pub max_steps: Option<usize>,
 }
 
-/// Cross-turn mutable state shared between the runner's hooks and the front-end
-/// (the UI renders the baseline; both survive the per-turn runners because the
-/// front-end holds this behind an `Arc<Mutex<_>>` and hands each turn's runner a
-/// clone). The [`hooks::DiagnosticsHook`] owns `baseline`; the
-/// the overview-reminder hook owns `mutating_turns`.
-#[derive(Default)]
-pub(crate) struct DiagnosticsState {
-    /// The last diagnostics snapshot to diff against; `None` until the first run
-    /// establishes the baseline.
-    pub baseline: Option<Vec<crate::diagnostics::Diagnostic>>,
-    /// File-editing turns seen so far, driving the reminder cadence.
-    pub mutating_turns: usize,
-}
+pub(crate) use crate::diagnostics::DiagnosticsState;
 
 /// The result of a completed turn.
 #[derive(Debug)]
@@ -200,6 +188,8 @@ pub(crate) enum RunnerEvent<'a> {
     ToolCall { name: &'a str },
     /// The turn moved to a new phase.
     Phase(RunnerPhase),
+    /// More precise work boundary, including waits after the final response.
+    Activity(&'a str),
     /// A recoverable problem worth telling the user about, such as a memory
     /// association that failed and therefore recalled nothing. Front-ends
     /// render it as an informational line; it never stops the turn.
@@ -237,6 +227,7 @@ impl Drop for MemoryAssociationTask {
 }
 
 enum AssociationPoll {
+    Cancelled,
     Pending,
     Finished(Result<Vec<crate::memory::MemoryEntry>, String>),
 }
@@ -257,6 +248,7 @@ fn spawn_memory_association(
 async fn poll_memory_association(
     task: &mut MemoryAssociationTask,
     grace: std::time::Duration,
+    cancel: &CancellationToken,
 ) -> AssociationPoll {
     let Some(handle) = task.handle.as_mut() else {
         return AssociationPoll::Pending;
@@ -267,14 +259,15 @@ async fn poll_memory_association(
     let joined = if handle.is_finished() {
         task.handle.take().unwrap().await
     } else {
-        match tokio::time::timeout(grace, handle).await {
-            Ok(joined) => {
+        match cancel.wait_or(tokio::time::timeout(grace, handle)).await {
+            None => return AssociationPoll::Cancelled,
+            Some(Ok(joined)) => {
                 // The borrowed handle has completed; remove it so Drop does
                 // not retain or abort a finished task.
                 task.handle.take();
                 joined
             }
-            Err(_) => return AssociationPoll::Pending,
+            Some(Err(_)) => return AssociationPoll::Pending,
         }
     };
     AssociationPoll::Finished(
@@ -362,7 +355,11 @@ impl TurnRunner {
                 } else {
                     std::time::Duration::ZERO
                 };
-                match poll_memory_association(task, grace).await {
+                match poll_memory_association(task, grace, cancel).await {
+                    AssociationPoll::Cancelled => {
+                        ensure_tool_output_pairing(conversation);
+                        return Err(RunnerError::Cancelled);
+                    }
                     AssociationPoll::Pending => {}
                     AssociationPoll::Finished(Ok(entries)) => {
                         conversation.lock().unwrap().recalled_memories = Some(entries.len());
@@ -478,7 +475,13 @@ impl TurnRunner {
 
             // ---- no tool calls → the turn is done ----
             if calls.is_empty() {
+                surface.on_event(RunnerEvent::Activity(
+                    "final response committed; finishing turn",
+                ));
                 if let Some((input_tokens, _, _)) = usage {
+                    surface.on_event(RunnerEvent::Activity(
+                        "context usage safe point / compaction",
+                    ));
                     surface.usage_safe_point(input_tokens).await;
                 }
                 let usage = conversation.lock().unwrap().accumulated_usage;
@@ -522,7 +525,7 @@ impl TurnRunner {
                     surface,
                     cancel,
                 )
-                .await;
+                .await?;
             }
 
             let outputs = self.run_calls(conversation, calls, cancel, surface).await;
@@ -552,7 +555,7 @@ impl TurnRunner {
                             surface,
                             cancel,
                         )
-                        .await;
+                        .await?;
                     }
                     if edited_programmer_md {
                         programmer_md_edited = true;
@@ -569,6 +572,9 @@ impl TurnRunner {
                         post_edit_reminder_added = true;
                     }
                     if let Some((input_tokens, _, _)) = usage {
+                        surface.on_event(RunnerEvent::Activity(
+                            "context usage safe point / compaction",
+                        ));
                         surface.usage_safe_point(input_tokens).await;
                     }
                 }
@@ -683,6 +689,12 @@ impl TurnRunner {
         if waiting_subagents {
             surface.on_event(RunnerEvent::WaitingSubagents(true));
         }
+        let tool_names = allowed
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        surface.on_event(RunnerEvent::Activity(&format!("tool batch: {tool_names}")));
         let outputs = tools::run_tool_batch(
             allowed,
             denied,
@@ -712,7 +724,7 @@ impl TurnRunner {
         summary: &hooks::BatchSummary,
         surface: &dyn AgentSurface,
         cancel: &CancellationToken,
-    ) {
+    ) -> Result<(), RunnerError> {
         let ctx = hooks::HookContext {
             conversation,
             surface,
@@ -721,9 +733,27 @@ impl TurnRunner {
         };
         let mut parts: Vec<String> = Vec::new();
         for hook in &self.hooks {
-            let out = match phase {
-                hooks::HookPhase::Before => hook.before_tool_batch(&ctx).await,
-                hooks::HookPhase::After => hook.after_tool_batch(&ctx).await,
+            let side = match phase {
+                hooks::HookPhase::Before => "before tools",
+                hooks::HookPhase::After => "after tools",
+            };
+            surface.on_event(RunnerEvent::Activity(&format!(
+                "hook {} ({side})",
+                hook.name()
+            )));
+            // Hooks need not implement cooperative cancellation themselves.
+            // Keep committed calls paired before returning control to the owner.
+            let Some(out) = cancel
+                .wait_or(async {
+                    match phase {
+                        hooks::HookPhase::Before => hook.before_tool_batch(&ctx).await,
+                        hooks::HookPhase::After => hook.after_tool_batch(&ctx).await,
+                    }
+                })
+                .await
+            else {
+                ensure_tool_output_pairing(conversation);
+                return Err(RunnerError::Cancelled);
             };
             if let Some(text) = out
                 && !text.is_empty()
@@ -732,7 +762,7 @@ impl TurnRunner {
             }
         }
         if parts.is_empty() {
-            return;
+            return Ok(());
         }
         let combined = parts.join("\n\n");
         match phase {
@@ -744,6 +774,7 @@ impl TurnRunner {
                     .add_meta("\u{25B8} System", &combined);
             }
         }
+        Ok(())
     }
 }
 
@@ -1359,13 +1390,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_association_grace_cancels_promptly_and_aborts_prefetch() {
+        let (mut sender, receiver) = tokio::sync::oneshot::channel();
+        let mut task = pending_association(receiver);
+        let cancel = CancellationToken::new();
+        {
+            let poll =
+                poll_memory_association(&mut task, std::time::Duration::from_secs(60), &cancel);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("pending association returned before cancellation"),
+                _ = tokio::task::yield_now() => {}
+            }
+            cancel.cancel();
+            let result = tokio::time::timeout(std::time::Duration::from_millis(100), &mut poll)
+                .await
+                .expect("cancellation must interrupt association grace");
+            assert!(matches!(result, AssociationPoll::Cancelled));
+        }
+        drop(task);
+        tokio::time::timeout(std::time::Duration::from_millis(100), sender.closed())
+            .await
+            .expect("turn exit must abort the association task");
+    }
+
+    #[tokio::test]
     async fn first_step_never_waits_for_memory_association() {
         let (_sender, receiver) = tokio::sync::oneshot::channel();
         let mut task = pending_association(receiver);
 
         let poll = tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            poll_memory_association(&mut task, std::time::Duration::ZERO),
+            poll_memory_association(
+                &mut task,
+                std::time::Duration::ZERO,
+                &CancellationToken::new(),
+            ),
         )
         .await
         .expect("a zero-grace poll must return immediately");
@@ -1383,7 +1444,12 @@ mod tests {
             let _ = sender.send(Ok(Vec::new()));
         });
 
-        let poll = poll_memory_association(&mut task, std::time::Duration::from_millis(100)).await;
+        let poll = poll_memory_association(
+            &mut task,
+            std::time::Duration::from_millis(100),
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(matches!(poll, AssociationPoll::Finished(Ok(entries)) if entries.is_empty()));
         assert!(task.handle.is_none());
@@ -1394,12 +1460,22 @@ mod tests {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let mut task = pending_association(receiver);
 
-        let poll = poll_memory_association(&mut task, std::time::Duration::from_millis(5)).await;
+        let poll = poll_memory_association(
+            &mut task,
+            std::time::Duration::from_millis(5),
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(matches!(poll, AssociationPoll::Pending));
         assert!(task.handle.is_some());
 
         sender.send(Ok(Vec::new())).unwrap();
-        let poll = poll_memory_association(&mut task, std::time::Duration::from_millis(100)).await;
+        let poll = poll_memory_association(
+            &mut task,
+            std::time::Duration::from_millis(100),
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(matches!(poll, AssociationPoll::Finished(Ok(entries)) if entries.is_empty()));
     }
 
@@ -1603,6 +1679,99 @@ mod tests {
         assert!(matches!(error, RunnerError::StepLimit { limit: 1 }));
     }
 
+    async fn assert_hanging_hook_cancels(after: bool) {
+        use crate::runner::hooks::{HookContext, TurnHook};
+
+        struct HangingHook {
+            after: bool,
+            entered: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl TurnHook for HangingHook {
+            fn name(&self) -> &str {
+                "hanging"
+            }
+            async fn before_tool_batch(&self, _context: &HookContext<'_>) -> Option<String> {
+                if self.after {
+                    return None;
+                }
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+            async fn after_tool_batch(&self, _context: &HookContext<'_>) -> Option<String> {
+                if !self.after {
+                    return None;
+                }
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let body = format!(
+            "{}{}",
+            item_added_frame(
+                1,
+                0,
+                &call_item("c1", "read_file", "{\"path\":\"Cargo.toml\"}")
+            ),
+            completed_frame(2),
+        );
+        let (base, _server) = spawn_mock_responses(vec![body]).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut runner = engine_for(&base);
+        runner.hooks = vec![Arc::new(HangingHook {
+            after,
+            entered: entered.clone(),
+        })];
+        let mut conversation = Conversation::new();
+        conversation.add_input_message(user("read the manifest"));
+        let conversation = Mutex::new(conversation);
+        let cancel = CancellationToken::new();
+        let turn = runner.run_turn(&conversation, &cancel, &HeadlessSurface);
+        tokio::pin!(turn);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = entered.notified() => {}
+                result = &mut turn => panic!("turn exited before hook: {result:?}"),
+            }
+        })
+        .await
+        .expect("hook must be entered");
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), &mut turn)
+            .await
+            .expect("cancellation must interrupt a hanging hook");
+        assert!(matches!(result, Err(RunnerError::Cancelled)));
+        let conversation = conversation.lock().unwrap();
+        let outputs = conversation
+            .items()
+            .filter_map(|item| match item {
+                MessageItem::ToolOutput { output, failed, .. } => Some((output, failed)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs.len(),
+            1,
+            "committed call must have exactly one output"
+        );
+        assert_eq!(outputs[0].0.call_id, "c1");
+        assert_eq!(
+            *outputs[0].1, !after,
+            "after-hook cancellation preserves the real output"
+        );
+    }
+
+    #[tokio::test]
+    async fn hanging_before_hook_cancels_and_pairs_committed_call() {
+        assert_hanging_hook_cancels(false).await;
+    }
+
+    #[tokio::test]
+    async fn hanging_after_hook_cancels_and_preserves_committed_output() {
+        assert_hanging_hook_cancels(true).await;
+    }
+
     #[tokio::test]
     async fn a_custom_hook_fires_after_a_tool_batch_and_injects_feedback() {
         // Demonstrates the pluggable-hook abstraction end to end: an arbitrary
@@ -1735,6 +1904,7 @@ mod tests {
                 RunnerEvent::StreamChunk(_)
                 | RunnerEvent::ResponseCommitted
                 | RunnerEvent::Phase(_)
+                | RunnerEvent::Activity(_)
                 | RunnerEvent::UsageSafePoint { .. }
                 | RunnerEvent::WaitingSubagents(_) => return,
             };
@@ -2138,7 +2308,7 @@ mod tests {
             skill_prompt: None,
             plan_prompt: None,
             approval_label: "test".into(),
-            operation_id: 1,
+            operation_id: crate::cancel::OperationId(1),
             cancel: cancel.clone(),
         };
 

@@ -26,6 +26,10 @@ TUI built with [Ratatui](https://ratatui.rs).
   profiles, and native process sandboxing protect the workspace.
 - **IDE-style diagnostics** — automatically run configured checkers after edits,
   compare findings against a baseline, and integrate persistent LSP diagnostics.
+  The `diagnostics` tool publishes the same checker snapshot to the sidebar (no
+  second run). Tool calls follow turn cancellation; incomplete runs keep the last
+  known findings rather than declaring them resolved. Older background refreshes
+  and baseline seeds cannot overwrite a newer diagnostics request.
   `/init` can create both `PROGRAMMER.md` and `.programmer/diagnostics.toml`.
 - **MCP and skills** — connect stdio or HTTP MCP servers, expose Programmer's own
   tools as an MCP server, and extend the agent with built-in, shared, global, or
@@ -785,6 +789,11 @@ If a tracked file no longer has the content Programmer last wrote, restore
 stops before changing any file. Before changing files, Programmer creates a
 recovery checkpoint so its file changes can be undone from the same panel.
 
+When Esc requests cancellation, the footer keeps the last observed phase, tool
+batch, hook, or response-finalization wait until the matching operation finishes.
+`Cancelling` is an acknowledgement wait, not confirmation that a subprocess has
+been killed. Queued requests still wait for that terminal acknowledgement.
+
 Automatic compaction observes the real `input_tokens` returned after every API
 response. For tool-using responses it waits until all call outputs are recorded,
 then summarizes a stable prefix in the background. Input stays usable and new
@@ -986,6 +995,12 @@ Terminal emulators generally reserve `Cmd+V` for text paste, so image paste uses
 | `/session` `/s` | Show current session UUID |
 | `/title [text]` | Regenerate the current session title, or set it manually |
 | `/usage` | Show cumulative usage and the latest request's input-token count |
+
+Session loading distinguishes missing files from read or parse failures. Failed
+loads report an error and leave the original file untouched; they are not
+silently replaced with an empty session. Failed saves retain the unsaved state
+and report an error, but idle ticks do not retry them. A new change or an explicit
+save attempt can try again.
 
 ## Project structure
 

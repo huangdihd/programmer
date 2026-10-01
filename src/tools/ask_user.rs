@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::function_tool;
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -47,7 +47,7 @@ pub enum QuestionKind {
 pub struct QuestionRequest {
     pub question: Question,
     pub answer: oneshot::Sender<String>,
-    pub operation_id: u64,
+    pub operation_id: OperationId,
 }
 
 /// Synchronously hands a question to the front-end; waiting and cancellation
@@ -124,7 +124,7 @@ pub async fn run(
     arguments: &str,
     questions: &QuestionHandler,
     cancel: &CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
 ) -> Result<String, String> {
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
@@ -179,7 +179,7 @@ pub(crate) async fn prompt(
     question: Question,
     questions: &QuestionHandler,
     cancel: &CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
 ) -> Result<String, String> {
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     questions.request(QuestionRequest {
@@ -210,7 +210,7 @@ mod tests {
                 r#"{"question":"test?","kind":"text"}"#,
                 &questions,
                 &CancellationToken::new(),
-                9,
+                OperationId(9),
             ),
         )
         .await
@@ -228,7 +228,7 @@ mod tests {
         let handle = tokio::spawn({
             let args = r#"{"question":"test?","kind":"text"}"#.to_string();
             let sender = tx.clone();
-            async move { run(&args, &sender, &cancel_for_task, 1).await }
+            async move { run(&args, &sender, &cancel_for_task, OperationId(1)).await }
         });
 
         // Wait for the QuestionPrompt to appear.
@@ -236,7 +236,7 @@ mod tests {
             .await
             .expect("question prompt should be sent")
             .expect("channel open");
-        assert_eq!(ev.operation_id, 1);
+        assert_eq!(ev.operation_id, OperationId(1));
 
         // Cancel before answering — ask_user should wake up with "(cancelled)".
         cancel.cancel();
@@ -259,7 +259,7 @@ mod tests {
             let args = r#"{"question":"test?","kind":"text"}"#.to_string();
             let sender = tx.clone();
             let cancel_clone = cancel.clone();
-            async move { run(&args, &sender, &cancel_clone, 1).await }
+            async move { run(&args, &sender, &cancel_clone, OperationId(1)).await }
         });
 
         // Pull the QuestionPrompt and send an answer.

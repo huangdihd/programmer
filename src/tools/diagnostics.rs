@@ -44,12 +44,119 @@ pub fn tool() -> Tool {
 
 pub async fn run(_arguments: &str) -> Result<String, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-    Ok(
-        match diagnostics::collect(&cwd, &crate::cancel::CancellationToken::new()).await {
-            Some(snapshot) => snapshot.render(),
-            None => "No diagnostics profile is configured. Run /init or call \
-                 configure_diagnostics to set one up."
-                .to_string(),
-        },
+    run_in(
+        &cwd,
+        &Default::default(),
+        &crate::cancel::CancellationToken::new(),
     )
+    .await
+}
+
+pub(crate) async fn run_with_state(
+    state: &std::sync::Arc<std::sync::Mutex<diagnostics::DiagnosticsState>>,
+    cancel: &crate::cancel::CancellationToken,
+) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    run_in(&cwd, state, cancel).await
+}
+
+async fn run_in(
+    cwd: &Path,
+    state: &std::sync::Arc<std::sync::Mutex<diagnostics::DiagnosticsState>>,
+    cancel: &crate::cancel::CancellationToken,
+) -> Result<String, String> {
+    let generation = state.lock().unwrap().begin_update();
+    let snapshot = cancel.wait_or(diagnostics::collect(cwd, cancel)).await;
+    if cancel.is_cancelled() {
+        state.lock().unwrap().publish(generation, None);
+        return Err("Diagnostics cancelled".to_string());
+    }
+    let snapshot = snapshot.flatten();
+    state.lock().unwrap().publish(generation, snapshot.as_ref());
+    Ok(match snapshot {
+        Some(snapshot) => snapshot.render(),
+        None => "No diagnostics profile is configured. Run /init or call configure_diagnostics to set one up.".to_string(),
+    })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn missing_failed_and_cancelled_diagnostics_never_report_clean() {
+        let directory = std::path::PathBuf::from(".programmer")
+            .join(format!("diagnostics-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(directory.join(".programmer")).unwrap();
+        let state = Arc::new(Mutex::new(diagnostics::DiagnosticsState::default()));
+        let cancel = crate::cancel::CancellationToken::new();
+        let missing = run_in(&directory, &state, &cancel).await.unwrap();
+        assert!(missing.contains("No diagnostics profile"));
+        assert!(state.lock().unwrap().baseline.is_none());
+        std::fs::write(directory.join(diagnostics::PROFILE_PATH), "invalid toml").unwrap();
+        let failed = run_in(&directory, &state, &cancel).await.unwrap();
+        assert!(failed.contains("checker failed"));
+        assert!(!failed.contains("project is clean"));
+        assert!(state.lock().unwrap().baseline.is_none());
+        std::fs::write(
+            directory.join(diagnostics::PROFILE_PATH),
+            "[[checkers]]\nname = 'slow'\ncommand = 'sleep 5'\nparser = 'gnu'\n",
+        )
+        .unwrap();
+        let cancellation = cancel.clone();
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                run_in(&directory, &state, &cancel)
+            ),
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                cancellation.cancel();
+            }
+        );
+        assert!(result.unwrap().unwrap_err().contains("cancelled"));
+        assert!(state.lock().unwrap().baseline.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_clean_snapshot_replaces_sidebar_four_warnings_six_lints_once() {
+        let directory = std::path::PathBuf::from(".programmer")
+            .join(format!("diagnostics-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(directory.join(".programmer")).unwrap();
+        std::fs::write(
+            directory.join(diagnostics::PROFILE_PATH),
+            "[[checkers]]\nname = 'count'\ncommand = 'echo run >> runs'\nparser = 'gnu'\n",
+        )
+        .unwrap();
+        let old = (0..10)
+            .map(|index| diagnostics::Diagnostic {
+                file: "src/main.rs".into(),
+                line: index + 1,
+                col: None,
+                severity: if index < 4 {
+                    diagnostics::Severity::Warning
+                } else {
+                    diagnostics::Severity::Lint
+                },
+                code: None,
+                message: "old finding".into(),
+            })
+            .collect();
+        let state = Arc::new(Mutex::new(crate::runner::DiagnosticsState::default()));
+        state.lock().unwrap().baseline = Some(old);
+        let output = run_in(
+            directory.as_path(),
+            &state,
+            &crate::cancel::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("project is clean"));
+        assert_eq!(
+            std::fs::read_to_string(directory.join("runs")).unwrap(),
+            "run\n"
+        );
+        assert_eq!(state.lock().unwrap().baseline, Some(Vec::new()));
+    }
 }

@@ -124,22 +124,36 @@ impl TurnHook for DiagnosticsHook {
         let cwd =
             std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
         // No state lock held across this await — see the run_turn comment.
-        let snapshot = crate::diagnostics::collect(&cwd, ctx.cancel)
+        let generation = self.state.lock().unwrap().begin_update();
+        let snapshot = ctx
+            .cancel
+            .wait_or(crate::diagnostics::collect(&cwd, ctx.cancel))
             .await
-            .unwrap_or_default();
+            .flatten();
+        if ctx.cancel.is_cancelled() {
+            self.state.lock().unwrap().publish(generation, None);
+            return None;
+        }
+        let Some(snapshot) = snapshot else {
+            self.state.lock().unwrap().publish(generation, None);
+            return None;
+        };
 
         let mut parts: Vec<String> = Vec::new();
         let mut st = self.state.lock().unwrap();
+        if !st.is_current(generation) {
+            return None;
+        }
         match &st.baseline {
-            Some(old) => {
+            Some(old) if snapshot.errors.is_empty() => {
                 if let Some(summary) =
                     crate::diagnostics::diff(old, &snapshot.diagnostics).summary()
                 {
                     parts.push(summary);
                 }
             }
-            None => {
-                if !snapshot.diagnostics.is_empty() {
+            _ => {
+                if snapshot.errors.is_empty() && !snapshot.diagnostics.is_empty() {
                     parts.push(format!(
                         "Diagnostics baseline established: {} problem(s) currently \
                          in the project. Future edits will report changes relative \
@@ -152,7 +166,7 @@ impl TurnHook for DiagnosticsHook {
         for e in &snapshot.errors {
             parts.push(format!("Diagnostics checker error: {e}"));
         }
-        st.baseline = Some(snapshot.diagnostics);
+        st.publish(generation, Some(&snapshot));
         drop(st);
 
         if parts.is_empty() {

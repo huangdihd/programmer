@@ -36,6 +36,44 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
 
+/// Session-owned diagnostics state shared by tools, hooks and front-ends.
+#[derive(Default)]
+pub(crate) struct DiagnosticsState {
+    pub baseline: Option<Vec<Diagnostic>>,
+    pub mutating_turns: usize,
+    generation: u64,
+}
+
+impl DiagnosticsState {
+    /// Reserve before awaiting a checker, including background seeds.
+    pub fn begin_update(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    pub fn publish(&mut self, generation: u64, snapshot: Option<&Snapshot>) -> bool {
+        if !self.is_current(generation) {
+            return false;
+        }
+        // Only a complete run can resolve previous findings. Keep the last
+        // known baseline on cancellation, missing profiles or checker failure.
+        if let Some(snapshot) = snapshot.filter(|snapshot| snapshot.errors.is_empty()) {
+            self.baseline = Some(snapshot.diagnostics.clone());
+        }
+        true
+    }
+
+    pub fn reset(&mut self) {
+        self.begin_update();
+        self.baseline = None;
+        self.mutating_turns = 0;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostic
 // ---------------------------------------------------------------------------
@@ -203,6 +241,10 @@ pub async fn collect(cwd: &Path, cancel: &crate::cancel::CancellationToken) -> O
     let mut diagnostics = Vec::new();
     let mut errors = Vec::new();
     for checker in &profile.checkers {
+        if cancel.is_cancelled() {
+            errors.push("Diagnostics cancelled".to_string());
+            break;
+        }
         // `run_checker` dispatches to the command or LSP backend by kind.
         match run_checker(checker, cwd, cancel).await {
             Ok(mut ds) => diagnostics.append(&mut ds),
@@ -294,6 +336,43 @@ mod tests {
             severity: sev,
             code: None,
             message: msg.to_string(),
+        }
+    }
+
+    #[test]
+    fn shared_generation_rejects_old_refresh_and_seed_even_after_reset() {
+        let mut state = DiagnosticsState::default();
+        let refresh = state.begin_update();
+        let seed = state.begin_update();
+        let tool = state.begin_update();
+        assert!(state.publish(tool, Some(&Snapshot::default())));
+        let stale = Snapshot {
+            diagnostics: vec![diag("a.rs", 1, Severity::Warning, "old")],
+            errors: vec![],
+        };
+        assert!(!state.publish(refresh, Some(&stale)));
+        assert!(!state.publish(seed, Some(&stale)));
+        assert_eq!(state.baseline, Some(vec![]));
+        state.reset();
+        assert!(!state.publish(tool, Some(&Snapshot::default())));
+        assert!(state.baseline.is_none());
+    }
+
+    #[test]
+    fn incomplete_snapshot_does_not_resolve_last_known_findings() {
+        let mut state = DiagnosticsState::default();
+        let baseline = vec![diag("a.rs", 1, Severity::Warning, "old")];
+        state.baseline = Some(baseline.clone());
+        for snapshot in [
+            None,
+            Some(Snapshot {
+                diagnostics: vec![],
+                errors: vec!["failed".into()],
+            }),
+        ] {
+            let generation = state.begin_update();
+            assert!(state.publish(generation, snapshot.as_ref()));
+            assert_eq!(state.baseline, Some(baseline.clone()));
         }
     }
 

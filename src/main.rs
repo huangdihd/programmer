@@ -72,6 +72,7 @@ async fn build_mcp_classifier() -> Option<(
 
 /// Resolved session data ready for the application.
 struct SessionBootstrap {
+    tasks: tasks::TaskManager,
     uuid: String,
     items: Vec<crate::response::message_item::MessageItem>,
     history: Vec<String>,
@@ -83,21 +84,28 @@ struct SessionBootstrap {
 }
 
 fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
+    let tasks = tasks::TaskManager::default();
     let session_mgr = SessionManager::new();
     let mut startup_messages: Vec<String> = Vec::new();
 
     let (mut session_uuid, mut saved_items, mut saved_history, mut saved_todos, mut saved_agents) =
         match (resume, &session_mgr) {
             (Some(Some(uuid)), Some(mgr)) => match mgr.load(&uuid) {
-                Some(session) => {
+                Ok(Some(session)) => {
                     let history = session.history.clone();
                     let todos = session.todos.clone();
                     let agents = session.agents.clone();
-                    tasks::restore(&session.tasks);
+                    tasks.restore(&session.tasks);
                     let items = SessionManager::into_items(session);
                     (uuid, items, history, todos, agents)
                 }
-                None => {
+                Err(error) => {
+                    eprintln!(
+                        "Cannot resume session {uuid}: {error}. Original file was not changed."
+                    );
+                    return None;
+                }
+                Ok(None) => {
                     startup_messages
                         .push(format!("Session {uuid} not found, creating a new session."));
                     let session = mgr.create();
@@ -109,15 +117,21 @@ fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
                     let was_empty = sessions.is_empty();
                     match session::pick_session(&sessions, mgr) {
                         Some(uuid) => match mgr.load(&uuid) {
-                            Some(session) => {
+                            Ok(Some(session)) => {
                                 let history = session.history.clone();
                                 let todos = session.todos.clone();
                                 let agents = session.agents.clone();
-                                tasks::restore(&session.tasks);
+                                tasks.restore(&session.tasks);
                                 let items = SessionManager::into_items(session);
                                 (uuid, items, history, todos, agents)
                             }
-                            None => {
+                            Err(error) => {
+                                eprintln!(
+                                    "Cannot resume session {uuid}: {error}. Original file was not changed."
+                                );
+                                return None;
+                            }
+                            Ok(None) => {
                                 startup_messages.push(format!(
                                     "Session {uuid} not found on disk, starting a new session."
                                 ));
@@ -178,9 +192,16 @@ fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
                 if !prompt_session_fork(pid) {
                     return None;
                 }
-                let Some(source) = mgr.load(&session_uuid) else {
-                    eprintln!("Session {session_uuid} could not be loaded for forking.");
-                    return None;
+                let source = match mgr.load(&session_uuid) {
+                    Ok(Some(source)) => source,
+                    Ok(None) => {
+                        eprintln!("Session {session_uuid} was not found for forking.");
+                        return None;
+                    }
+                    Err(error) => {
+                        eprintln!("Cannot load session for forking: {error}");
+                        return None;
+                    }
                 };
                 let forked = match mgr.fork(&source) {
                     Ok(session) => session,
@@ -212,17 +233,31 @@ fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
 
     // An offline peer inquiry may have saved an exchange between the picker
     // read and lock acquisition. Restore the authoritative locked snapshot.
-    if session_lock.is_some()
-        && let Some(saved) = session_mgr.as_ref().and_then(|mgr| mgr.load(&session_uuid))
-    {
+    let locked_snapshot = if session_lock.is_some() {
+        match session_mgr
+            .as_ref()
+            .map(|manager| manager.load(&session_uuid))
+            .transpose()
+        {
+            Ok(saved) => saved.flatten(),
+            Err(error) => {
+                eprintln!("Cannot restore locked session: {error}. Original file was not changed.");
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(saved) = locked_snapshot {
         saved_history = saved.history.clone();
         saved_todos = saved.todos.clone();
         saved_agents = saved.agents.clone();
-        tasks::restore(&saved.tasks);
+        tasks.restore(&saved.tasks);
         saved_items = SessionManager::into_items(saved);
     }
 
     Some(SessionBootstrap {
+        tasks,
         uuid: session_uuid,
         items: saved_items,
         history: saved_history,
@@ -342,6 +377,7 @@ async fn async_main(mut args: cli::Args) -> color_eyre::Result<()> {
             bootstrap.history,
             bootstrap.todos,
             bootstrap.agents,
+            bootstrap.tasks,
             bootstrap.uuid,
             bootstrap.mgr,
             bootstrap.messages,

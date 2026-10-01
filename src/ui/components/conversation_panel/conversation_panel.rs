@@ -455,6 +455,7 @@ impl ConversationScrollState {
 
 #[derive(Debug)]
 pub struct ConversationPanel {
+    pub(crate) tasks: crate::tasks::TaskManager,
     /// The UI-free conversation model: history items and turn-usage counter.
     /// The panel adds the view state below on top of it. Shared with the
     /// runner task that drives the turn — the runner appends under brief locks
@@ -596,6 +597,7 @@ impl ConversationPanel {
         conversation: std::sync::Arc<std::sync::Mutex<crate::conversation::Conversation>>,
     ) -> Self {
         ConversationPanel {
+            tasks: crate::tasks::TaskManager::default(),
             conversation,
             scroll_view_state: ConversationScrollState::default(),
             pending_message: None,

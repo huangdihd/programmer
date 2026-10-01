@@ -20,7 +20,7 @@
 //! reports the outputs via `ToolCallsCompleted`; the headless runner awaits it
 //! inline.
 
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
 use crate::tools::ask_user::QuestionHandler;
 use crate::tools::provider::{ToolCtx, ToolRegistry};
 use async_openai::types::responses::FunctionToolCall;
@@ -38,7 +38,7 @@ async fn run_labeled_call(
     registry: Arc<ToolRegistry>,
     label: String,
     cancel: CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
 ) -> crate::tools::ToolOutput {
     let ctx = ToolCtx {
         questions: &questions,
@@ -73,7 +73,7 @@ pub(crate) async fn run_tool_batch(
     approval_label: String,
     questions: QuestionHandler,
     registry: Arc<ToolRegistry>,
-    operation_id: u64,
+    operation_id: OperationId,
 ) -> Vec<crate::tools::ToolOutput> {
     let mut outputs = denied;
     let mut i = 0;
@@ -178,7 +178,7 @@ mod tests {
             "test-label".to_string(),
             tx,
             local_registry(),
-            0,
+            OperationId::UNTAGGED,
         )
         .await;
 
@@ -215,7 +215,7 @@ mod tests {
             "test-label".to_string(),
             tx,
             local_registry(),
-            0,
+            OperationId::UNTAGGED,
         )
         .await;
         // Cancelled before running anything allowed: only the denial remains.
@@ -240,7 +240,7 @@ mod tests {
                 "test-label".to_string(),
                 tx,
                 local_registry(),
-                1,
+                OperationId(1),
             )
             .await
         });

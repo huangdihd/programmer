@@ -196,9 +196,13 @@ impl HeadlessAgent {
             None
         };
         let conversation = Arc::new(Mutex::new(Conversation::new()));
+        let diagnostics_state = Arc::new(Mutex::new(DiagnosticsState::default()));
+        let tasks = crate::tasks::TaskManager::default();
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
             Arc::new(
                 LocalToolProvider::new(todo_store.clone(), security.clone())
+                    .with_diagnostics_state(diagnostics_state.clone())
+                    .with_tasks(tasks.clone())
                     .with_memory_enabled(config.memory.enabled)
                     .with_memory_model(memory_model.clone())
                     .with_memory_context(Some(conversation.clone())),
@@ -251,6 +255,7 @@ impl HeadlessAgent {
 
         let agents = crate::agents::AgentManager::default();
         let child_runtime = crate::agents::AgentRuntime {
+            tasks: tasks.clone(),
             events: tokio::sync::mpsc::unbounded_channel().0,
             provider_manager: Arc::new(provider_manager.clone()),
             client: client.clone(),
@@ -282,7 +287,6 @@ impl HeadlessAgent {
         )));
         let tools = Arc::new(ToolRegistry::new(base_providers));
 
-        let diagnostics_state = Arc::new(Mutex::new(DiagnosticsState::default()));
         let hooks: Vec<Arc<dyn crate::runner::hooks::TurnHook>> = if args.no_diagnostics {
             Vec::new()
         } else {
@@ -376,10 +380,16 @@ impl HeadlessAgent {
 
     async fn refresh_diagnostics_baseline(&self) {
         let cwd = current_dir();
-        let baseline = crate::diagnostics::collect(&cwd, &self.cancel)
+        let generation = self.diagnostics_state.lock().unwrap().begin_update();
+        let snapshot = self
+            .cancel
+            .wait_or(crate::diagnostics::collect(&cwd, &self.cancel))
             .await
-            .map(|snapshot| snapshot.diagnostics);
-        self.diagnostics_state.lock().unwrap().baseline = baseline;
+            .flatten();
+        self.diagnostics_state
+            .lock()
+            .unwrap()
+            .publish(generation, snapshot.as_ref());
     }
 }
 
@@ -397,7 +407,7 @@ impl AgentSurface for CliSurface {
             return;
         }
         let event = match event {
-            RunnerEvent::StreamChunk(_) => return,
+            RunnerEvent::StreamChunk(_) | RunnerEvent::Activity(_) => return,
             RunnerEvent::ResponseCommitted => json!({
                 "schema_version": OUTPUT_SCHEMA_VERSION,
                 "type": "response_committed",

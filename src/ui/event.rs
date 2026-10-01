@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
 use crate::tools::ask_user::Question;
 use async_openai::types::responses::{FunctionToolCall, ResponseStreamEvent};
 use color_eyre::eyre::OptionExt;
@@ -58,21 +58,23 @@ pub enum AppEvent {
     /// A raw streaming chunk of the runner's in-flight response, forwarded by
     /// the TUI surface for live token rendering. Tagged with the operation id
     /// of the turn that produced it.
-    ChunkReceived(u64, Box<ResponseStreamEvent>),
+    ChunkReceived(OperationId, Box<ResponseStreamEvent>),
     /// The runner committed the streamed response's items to the shared
     /// conversation: drop the live in-progress view (the committed copy renders
     /// from the conversation now). Tagged with the operation id.
-    ResponseCommitted(u64),
+    ResponseCommitted(OperationId),
     /// A `/keepretry` attempt failed and a fresh attempt will start after its delay.
     /// The front-end drops any uncommitted partial response from the failed attempt.
-    KeepRetryAttempt(u64),
+    KeepRetryAttempt(OperationId),
     /// The runner's turn moved to a new phase (classifying, running tools, …).
     /// Tagged with the operation id.
-    RunnerPhase(u64, crate::runner::RunnerPhase),
+    RunnerPhase(OperationId, crate::runner::RunnerPhase),
+    /// Last observed runner work boundary, ignored after cancellation.
+    RunnerActivity(OperationId, String),
     /// Real input usage reported by a response at a call/output-safe point.
-    UsageSafePoint(u64, u32, oneshot::Sender<()>),
+    UsageSafePoint(OperationId, u32, oneshot::Sender<()>),
     /// The main runner entered or left an `agent wait` tool call.
-    WaitingSubagents(u64, bool),
+    WaitingSubagents(OperationId, bool),
     /// The runner asks the user to review a tool call the classifier flagged
     /// (`Ask` verdict). Carries the call, the classifier's reason, the call's
     /// 1-based position and batch total, and the oneshot the decision goes
@@ -83,7 +85,7 @@ pub enum AppEvent {
         reason: String,
         position: (usize, usize),
         reply: ReplyTx,
-        operation_id: u64,
+        operation_id: OperationId,
         agent_id: Option<u64>,
         agent_generation: Option<u64>,
     },
@@ -91,7 +93,7 @@ pub enum AppEvent {
     /// (usage flush, session save, pending-message start) hangs off this.
     /// Tagged with the operation id so stale turn-finishes are dropped.
     TurnFinished(
-        u64,
+        OperationId,
         Result<crate::runner::TurnResult, crate::runner::RunnerError>,
     ),
     /// `/compact` finished: `Ok` carries the summary to install as the new
@@ -99,7 +101,7 @@ pub enum AppEvent {
     /// run so a summary from a cancelled compaction is dropped. Tagged with
     /// the operation id.
     CompactFinished(
-        u64,
+        OperationId,
         usize,
         Result<CompactionResult, String>,
         CancellationToken,
@@ -121,7 +123,7 @@ pub enum AppEvent {
     /// Background prediction of the next user message finished.
     InputSuggestionGenerated {
         session_uuid: String,
-        operation_id: u64,
+        operation_id: OperationId,
         result: Result<String, String>,
     },
     /// A background process entered a terminal state.
@@ -141,7 +143,7 @@ pub enum AppEvent {
     },
     /// A recoverable problem reported by the runner, shown as an
     /// informational conversation line.
-    Notice(u64, String),
+    Notice(OperationId, String),
     /// Debounced request to hand accumulated task updates to the agent.
     FlushTaskNotifications(u64),
     /// Debounced request to hand completed sub-agent results to the parent.
@@ -201,7 +203,7 @@ pub enum AppEvent {
     QuestionPrompt {
         question: Question,
         answer_tx: AnswerTx,
-        operation_id: u64,
+        operation_id: OperationId,
     },
     /// A newer programmer release exists. Carries the new tag; the UI shows a
     /// one-line notice suggesting `programmer upgrade`.
@@ -239,6 +241,11 @@ impl std::fmt::Debug for AppEvent {
                 .finish(),
             Self::ResponseCommitted(id) => f.debug_tuple("ResponseCommitted").field(id).finish(),
             Self::KeepRetryAttempt(id) => f.debug_tuple("KeepRetryAttempt").field(id).finish(),
+            Self::RunnerActivity(id, detail) => f
+                .debug_tuple("RunnerActivity")
+                .field(id)
+                .field(detail)
+                .finish(),
             Self::RunnerPhase(id, _) => f.debug_tuple("RunnerPhase").field(id).finish(),
             Self::UsageSafePoint(id, tokens, _) => f
                 .debug_tuple("UsageSafePoint")

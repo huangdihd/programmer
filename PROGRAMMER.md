@@ -87,12 +87,14 @@ src/
 ├── agents/                   # In-process sub-agent registry, runtime, and lifecycle
 ├── consts.rs                 # Tunable constants (output length, concurrency, tick rate, …)
 ├── prompts.rs                # Centralised system prompt + classifier instructions
-├── cancel.rs                 # CancellationToken for request lifecycle
+├── cancel.rs                 # CancellationToken and typed foreground OperationId
 ├── clipboard.rs              # Copy-to-clipboard (OSC 52)
 ├── terminal.rs               # TerminalGuard: raw-mode enter/restore
 │
 ├── app/                      # Application core
 │   ├── mod.rs                #   App struct, ApprovalState, DiagnosticsState, CancelState, event loop
+│   ├── lifecycle.rs          #   Foreground begin/cancel/finish transitions and stale-event ownership
+│   ├── scheduling.rs         #   UserRequest text/images, StartupState + WorkSource pure startup policy
 │   ├── commands.rs           #   Slash-command dispatch (/:init, :model, :mode, :skills, :mcp, …)
 │   ├── diagnostics.rs        #   Diagnostics snapshot + diff integration
 │   ├── events/               #   Key + mouse event routing
@@ -157,7 +159,7 @@ src/
 │   └── skill.rs              #   Skill: name, description, body, source, constraints
 │
 ├── tasks/                    # Background task system
-│   └── mod.rs                #   TaskRegistry (global), TaskHandle, status/io/kill
+│   └── mod.rs                #   Clone-shared TaskManager per app/server, status/io/kill
 │
 ├── todos/                    # Per-session todo list
 │   └── mod.rs                #   Todo, TodoList, sync via ~/.config/programmer/todos.json
@@ -239,12 +241,13 @@ src/
 
 - **Runner boundaries:** Production runner code depends on `AgentSurface`, not App or UI event types. Tool calls receive a narrow `QuestionHandler` through `ToolCtx`; `app/surface.rs` adapts questions to TUI events synchronously. Cancellation and waiting remain in the tool. Child-agent lifecycle notifications are bound in `AgentRuntime`, not passed through generic tool context. Shared input-text extraction belongs to `response/message_item.rs`.
 - **Error handling:** `color_eyre::Result<T>` throughout; `.wrap_err()` for context; `?` propagation. `thiserror` for library-style error types.
-- **Cancellation and queues:** Esc cancels only the active request, not the queue. Dispatch waits for its matching terminal event; stale events cannot advance the queue. User drafts, approvals, and peer consent still block dispatch. Before any model output, restore the original draft only into an empty input with no queued user request; otherwise retain the cancelled input in conversation history. Task/agent notifications and already-authorized peer work remain eligible after cancellation, without restarting the cancelled request.
+- **Cancellation and queues:** Foreground events carry `cancel::OperationId`; zero is explicitly `UNTAGGED` for non-turn surfaces. `app/lifecycle.rs` centralizes begin/cancel/finish transitions: cancellation retains ownership until a terminal event, while non-terminal events require a live token. Esc cancels only the active request, not the queue. Dispatch waits for its matching terminal event; stale events cannot advance the queue. User drafts, approvals, and peer consent still block dispatch. Before any model output, restore the original draft only into an empty input with no queued user request; otherwise retain the cancelled input in conversation history. Task/agent notifications and already-authorized peer work remain eligible after cancellation, without restarting the cancelled request.
 - **Async:** `#[tokio::main]` on `main()`, `tokio::spawn` for concurrent tasks. All tool execution is async.
 - **Configuration:** `ProgrammerConfig` deserializes from TOML via the `config` crate. Environment variables prefixed with `Programmer` override file values. Config lives at `~/.config/programmer/config.toml`. The optional top-level `soul` value replaces only the identity/mindset section of the developer prompt.
 - **Markdown links:** Assistant inline HTTP(S) links are resolved from original cached paragraph styles by `conversation_panel/links.rs`; stationary clicks launch the browser without a shell. Drags cancel activation; ambiguous labels and unsupported link forms are inert.
 - **UI themes:** `/theme [auto|light|dark]` persists the top-level `theme` setting (default `auto`). Startup OSC 11 background detection shares the ratatui-image query; missing results fall back to dark. `ui/theme.rs` resolves paired semantic UI-role tokens (decorative headings, borders, tool summaries, and status colors are distinct) at frame presentation, leaving cached Markdown styles intact and child terminal colors untouched.
-- **Sessions:** Stored as JSON at `~/.config/programmer/sessions/<uuid>.json`. Each session contains message items, history, the latest input suggestion, todos, and persisted task state.
+- **Sessions:** Stored as JSON under the platform config directory's `programmer/sessions/<uuid>.json`. Each session contains message items, history, the latest input suggestion, todos, and persisted task state. `SessionManager::load` distinguishes missing files from typed read/parse failures without renaming the original. App persistence builds an owned snapshot and acknowledges dirty state only after a successful save. `PersistenceState` allows one idle attempt per new change; a failed save is not retried by ticks or timers. New changes or explicit saves may attempt again.
+- **Task ownership:** Each application/server owns a clone-shared `TaskManager`; tool providers, child agents, task rendering, and persistence use that same instance. Independent managers isolate task IDs, lifecycle events, generation, and cleanup. Do not reintroduce a global registry.
 - **Module visibility:** `pub(crate)` for internal visibility; `pub` only where needed externally. UI internals are `mod` (private). Tool modules are `pub` within `tools/`.
 - **Tests:** Primarily inline `#[cfg(test)]` modules at the bottom of source files, plus CLI integration tests under `tests/`.
 - **Copyright header:** GPL-3.0-or-later header block on every `.rs` file.

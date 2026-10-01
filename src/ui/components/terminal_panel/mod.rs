@@ -32,8 +32,8 @@ use crate::tasks;
 use crate::ui::markdown_theme::palette;
 
 /// State for the open terminal panel.
-#[derive(Debug)]
 pub struct TerminalPane {
+    tasks: tasks::TaskManager,
     /// The task being shown.
     pub task_id: u64,
     /// Label for the header (the task's name).
@@ -57,12 +57,13 @@ pub struct TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(task_id: u64, name: String) -> Self {
+    pub fn new(tasks: tasks::TaskManager, task_id: u64, name: String) -> Self {
         TerminalPane {
             task_id,
             name,
             grabbed: false,
-            interactive: tasks::is_interactive(task_id),
+            interactive: tasks.is_interactive(task_id),
+            tasks,
             read_only_scroll: 0,
             last_size: None,
             grid: None,
@@ -106,7 +107,8 @@ impl TerminalPane {
 
     fn read_only_max_scroll(&self) -> usize {
         let visible_lines = self.grid.map(|grid| grid.height as usize).unwrap_or(1);
-        tasks::snapshot(self.task_id)
+        self.tasks
+            .snapshot(self.task_id)
             .map(|snapshot| {
                 read_only_lines(&snapshot)
                     .len()
@@ -118,7 +120,7 @@ impl TerminalPane {
     /// Push the current grid size to the PTY when it changes.
     pub fn maybe_resize(&mut self, rows: u16, cols: u16) {
         if self.interactive && self.last_size != Some((rows, cols)) {
-            let _ = tasks::resize(self.task_id, rows, cols);
+            let _ = self.tasks.resize(self.task_id, rows, cols);
             self.last_size = Some((rows, cols));
         }
     }
@@ -283,7 +285,7 @@ fn fkey(n: u8) -> Option<&'static [u8]> {
 pub fn render(pane: &TerminalPane, area: Rect, buf: &mut Buffer) {
     Clear.render(area, buf);
 
-    let snap = tasks::snapshot(pane.task_id);
+    let snap = pane.tasks.snapshot(pane.task_id);
     let status = snap.as_ref().map(|s| s.status.label()).unwrap_or("gone");
 
     // Header.
@@ -321,7 +323,7 @@ pub fn render(pane: &TerminalPane, area: Rect, buf: &mut Buffer) {
     // Grid.
     let grid = grid_area(area);
     if pane.interactive {
-        let painted = tasks::with_screen(pane.task_id, |screen| {
+        let painted = pane.tasks.with_screen(pane.task_id, |screen| {
             render_screen(screen, pane.grabbed, grid, buf);
         });
         if painted.is_none() {
@@ -584,13 +586,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn renders_live_task_screen_into_buffer() {
+        let tasks = tasks::TaskManager::default();
         // Drive a real PTY task and confirm its echoed output lands in the
         // rendered ratatui buffer (exercises the whole cell-paint path).
-        let id = tasks::spawn_interactive("cat", None, Some("cat"), 10, 40).expect("spawn");
-        tasks::write_bytes(id, b"hello-term\r").expect("write");
+        let id = tasks
+            .spawn_interactive("cat", None, Some("cat"), 10, 40)
+            .expect("spawn");
+        tasks.write_bytes(id, b"hello-term\r").expect("write");
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        let pane = TerminalPane::new(id, "cat".to_string());
+        let pane = TerminalPane::new(tasks.clone(), id, "cat".to_string());
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
         render(&pane, area, &mut buf);
@@ -601,22 +606,24 @@ mod tests {
             .collect();
         assert!(text.contains("hello-term"), "buffer text: {text}");
 
-        tasks::kill(id).ok();
+        tasks.kill(id).ok();
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn renders_pipe_task_output_read_only() {
-        let id = tasks::spawn(
-            "printf 'pipe-out-%s\\n' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; \
+        let tasks = tasks::TaskManager::default();
+        let id = tasks
+            .spawn(
+                "printf 'pipe-out-%s\\n' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; \
              printf 'pipe-err\\n' >&2",
-            None,
-            Some("pipe"),
-        )
-        .expect("spawn");
+                None,
+                Some("pipe"),
+            )
+            .expect("spawn");
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        let mut pane = TerminalPane::new(id, "pipe".to_string());
+        let mut pane = TerminalPane::new(tasks.clone(), id, "pipe".to_string());
         assert!(!pane.accepts_input());
         let area = Rect::new(0, 0, 50, 12);
         pane.grid = Some(grid_area(area));

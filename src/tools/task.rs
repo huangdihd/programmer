@@ -219,18 +219,20 @@ pub fn action_is_mutating(arguments: &str) -> bool {
     }
 }
 
-pub async fn run(arguments: &str) -> Result<String, String> {
-    run_inner(arguments, None).await
+pub async fn run(manager: &tasks::TaskManager, arguments: &str) -> Result<String, String> {
+    run_inner(manager, arguments, None).await
 }
 
 pub(crate) async fn run_with_security(
+    manager: &tasks::TaskManager,
     arguments: &str,
     security: &crate::security::SecurityManager,
 ) -> Result<String, String> {
-    run_inner(arguments, Some(security)).await
+    run_inner(manager, arguments, Some(security)).await
 }
 
 async fn run_inner(
+    manager: &tasks::TaskManager,
     arguments: &str,
     security: Option<&crate::security::SecurityManager>,
 ) -> Result<String, String> {
@@ -249,7 +251,7 @@ async fn run_inner(
                 let rows = args.rows.unwrap_or(24).clamp(4, 200);
                 let cols = args.cols.unwrap_or(80).clamp(20, 400);
                 let id = match security {
-                    Some(security) => tasks::spawn_interactive_secure(
+                    Some(security) => manager.spawn_interactive_secure(
                         &command,
                         args.dir.as_deref(),
                         args.name.as_deref(),
@@ -257,7 +259,7 @@ async fn run_inner(
                         cols,
                         security,
                     ),
-                    None => tasks::spawn_interactive(
+                    None => manager.spawn_interactive(
                         &command,
                         args.dir.as_deref(),
                         args.name.as_deref(),
@@ -266,7 +268,7 @@ async fn run_inner(
                     ),
                 }?;
                 if let Some(max) = args.max_output {
-                    let _ = tasks::set_max_output(id, max);
+                    let _ = manager.set_max_output(id, max);
                 }
                 return Ok(format!(
                     "started interactive task {id}: {command}\n\
@@ -276,16 +278,16 @@ async fn run_inner(
                 ));
             }
             let id = match security {
-                Some(security) => tasks::spawn_secure(
+                Some(security) => manager.spawn_secure(
                     &command,
                     args.dir.as_deref(),
                     args.name.as_deref(),
                     security,
                 ),
-                None => tasks::spawn(&command, args.dir.as_deref(), args.name.as_deref()),
+                None => manager.spawn(&command, args.dir.as_deref(), args.name.as_deref()),
             }?;
             if let Some(max) = args.max_output {
-                let _ = tasks::set_max_output(id, max);
+                let _ = manager.set_max_output(id, max);
             }
             Ok(format!(
                 "started background task {id}: {command}\n\
@@ -295,7 +297,7 @@ async fn run_inner(
         }
 
         "list" => {
-            let all = tasks::snapshot_all();
+            let all = manager.snapshot_all();
             if all.is_empty() {
                 return Ok("no background tasks".to_string());
             }
@@ -305,13 +307,15 @@ async fn run_inner(
 
         "output" => {
             let id = require_id(args.id, "output")?;
-            let snap = tasks::snapshot(id).ok_or_else(|| format!("error: no task with id {id}"))?;
+            let snap = manager
+                .snapshot(id)
+                .ok_or_else(|| format!("error: no task with id {id}"))?;
             Ok(render_full(&snap, args.tail.unwrap_or(DEFAULT_TAIL_CHARS)))
         }
 
         "write" => {
             let id = require_id(args.id, "write")?;
-            if tasks::is_interactive(id) {
+            if manager.is_interactive(id) {
                 return Err(format!(
                     "error: task {id} is interactive — send input with action=keys, not write"
                 ));
@@ -326,7 +330,7 @@ async fn run_inner(
             if !input.is_empty() && !input.ends_with('\n') {
                 input.push('\n');
             }
-            tasks::write_stdin(id, &input, eof)?;
+            manager.write_stdin(id, &input, eof)?;
             let mut msg = if input.is_empty() {
                 format!("closed stdin of task {id}")
             } else {
@@ -344,8 +348,9 @@ async fn run_inner(
         "wait" => {
             let id = require_id(args.id, "wait")?;
             let timeout = args.timeout.unwrap_or(DEFAULT_WAIT_SECS).min(MAX_WAIT_SECS);
-            let (snap, still_running) =
-                tasks::wait_for_agent(id, Duration::from_secs(timeout)).await?;
+            let (snap, still_running) = manager
+                .wait_for_agent(id, Duration::from_secs(timeout))
+                .await?;
             let mut text = render_full(&snap, args.tail.unwrap_or(DEFAULT_TAIL_CHARS));
             if still_running {
                 text.push_str(&format!(
@@ -358,18 +363,18 @@ async fn run_inner(
 
         "kill" => {
             let id = require_id(args.id, "kill")?;
-            tasks::kill_for_agent(id)?;
+            manager.kill_for_agent(id)?;
             Ok(format!("kill signal sent to task {id}"))
         }
 
         "clear" => {
-            let cleared = tasks::clear_finished();
+            let cleared = manager.clear_finished();
             Ok(format!("cleared {cleared} finished task(s)"))
         }
 
         "screen" => {
             let id = require_id(args.id, "screen")?;
-            let snap = tasks::screen_snapshot(id)?;
+            let snap = manager.screen_snapshot(id)?;
             let mut header = format!(
                 "task {id} screen ({cols}x{rows}), cursor row={r} col={c}",
                 cols = snap.cols,
@@ -411,7 +416,7 @@ async fn run_inner(
             if bytes.is_empty() {
                 return Err("error: 'text' and/or 'keys' is required for keys".to_string());
             }
-            let screen_text = tasks::write_bytes_and_wait(id, &bytes, 100, 5000).await?;
+            let screen_text = manager.write_bytes_and_wait(id, &bytes, 100, 5000).await?;
             Ok(format!(
                 "sent input to task {id}\n--- screen ---\n{screen_text}"
             ))
@@ -435,7 +440,8 @@ async fn run_inner(
             // hasn't asked for it does nothing useful. Scroll events are exempt
             // — some programs enable alternate-screen scrolling without full
             // mouse reporting.
-            let mode = tasks::with_screen(id, |s| s.mouse_protocol_mode())
+            let mode = manager
+                .with_screen(id, |s| s.mouse_protocol_mode())
                 .ok_or_else(|| format!("error: task {id} is not interactive"))?;
             if !is_scroll && mode == vt100::MouseProtocolMode::None {
                 return Err(format!(
@@ -463,7 +469,7 @@ async fn run_inner(
                 "move" => bytes.extend(tasks::sgr_mouse(3 + 32, x, y, false)),
                 other => return Err(format!("error: unknown mouse_action '{other}'")),
             }
-            tasks::write_bytes(id, &bytes)?;
+            manager.write_bytes(id, &bytes)?;
             if is_scroll && args.x.is_none() && args.y.is_none() {
                 Ok(format!(
                     "sent mouse {gesture} to task {id}\n\
@@ -484,8 +490,9 @@ async fn run_inner(
                 .as_deref()
                 .ok_or_else(|| "error: 'pattern' is required for expect_screen".to_string())?;
             let timeout = args.timeout.unwrap_or(DEFAULT_WAIT_SECS).min(MAX_WAIT_SECS);
-            let (snap, matched) =
-                tasks::expect_screen(id, pattern, Duration::from_secs(timeout)).await?;
+            let (snap, matched) = manager
+                .expect_screen(id, pattern, Duration::from_secs(timeout))
+                .await?;
             let mut msg = format!(
                 "task {id} screen ({cols}x{rows}), cursor row={r} col={c}",
                 cols = snap.cols,
@@ -512,13 +519,14 @@ async fn run_inner(
 
         "screen_diff" => {
             let id = require_id(args.id, "screen_diff")?;
-            let diff = tasks::screen_diff(id)?;
+            let diff = manager.screen_diff(id)?;
             Ok(format!("task {id} screen diff:\n{diff}"))
         }
 
         "transcript" => {
             let id = require_id(args.id, "transcript")?;
-            let text = tasks::transcript(id)
+            let text = manager
+                .transcript(id)
                 .ok_or_else(|| format!("error: no task with id {id} or not interactive"))?;
             if text.is_empty() {
                 Ok(format!("task {id} transcript is empty"))
@@ -532,7 +540,7 @@ async fn run_inner(
             let (Some(rows), Some(cols)) = (args.rows, args.cols) else {
                 return Err("error: 'rows' and 'cols' are required for resize".to_string());
             };
-            tasks::resize(id, rows.clamp(4, 200), cols.clamp(20, 400))?;
+            manager.resize(id, rows.clamp(4, 200), cols.clamp(20, 400))?;
             Ok(format!("resized task {id} to {cols}x{rows}"))
         }
 
@@ -634,31 +642,40 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn send_mouse_requires_a_mouse_enabled_program() {
+        let manager = tasks::TaskManager::default();
         // `cat` never enables mouse reporting, so send_mouse must refuse.
-        let created = run(r#"{"action":"create","command":"cat","interactive":true}"#)
-            .await
-            .expect("create");
+        let created = run(
+            &manager,
+            r#"{"action":"create","command":"cat","interactive":true}"#,
+        )
+        .await
+        .expect("create");
         let id: u64 = created
             .split_whitespace()
             .nth(3)
             .and_then(|w| w.trim_end_matches(':').parse().ok())
             .expect("id");
-        let err = run(&format!(
-            r#"{{"action":"send_mouse","id":{id},"x":1,"y":1}}"#
-        ))
+        let err = run(
+            &manager,
+            &format!(r#"{{"action":"send_mouse","id":{id},"x":1,"y":1}}"#),
+        )
         .await
         .expect_err("cat has no mouse reporting");
         assert!(err.contains("mouse reporting"), "got: {err}");
-        let _ = run(&format!(r#"{{"action":"kill","id":{id}}}"#)).await;
+        let _ = run(&manager, &format!(r#"{{"action":"kill","id":{id}}}"#)).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn interactive_create_keys_screen_round_trip() {
+        let manager = tasks::TaskManager::default();
         // `cat` echoes typed input; create it interactive, type, and read back.
-        let created = run(r#"{"action":"create","command":"cat","interactive":true}"#)
-            .await
-            .expect("create should succeed");
+        let created = run(
+            &manager,
+            r#"{"action":"create","command":"cat","interactive":true}"#,
+        )
+        .await
+        .expect("create should succeed");
         assert!(created.contains("interactive task"), "got: {created}");
         let id: u64 = created
             .split_whitespace()
@@ -667,47 +684,58 @@ mod tests {
             .expect("id in create message");
 
         // Pipe stdin is refused for interactive tasks.
-        let refused = run(&format!(r#"{{"action":"write","id":{id},"input":"x"}}"#))
-            .await
-            .expect_err("write should be refused");
+        let refused = run(
+            &manager,
+            &format!(r#"{{"action":"write","id":{id},"input":"x"}}"#),
+        )
+        .await
+        .expect_err("write should be refused");
         assert!(refused.contains("interactive"), "got: {refused}");
 
-        run(&format!(
-            r#"{{"action":"keys","id":{id},"text":"marker-xyz","keys":["enter"]}}"#
-        ))
+        run(
+            &manager,
+            &format!(r#"{{"action":"keys","id":{id},"text":"marker-xyz","keys":["enter"]}}"#),
+        )
         .await
         .expect("keys should succeed");
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let screen = run(&format!(r#"{{"action":"screen","id":{id}}}"#))
+        let screen = run(&manager, &format!(r#"{{"action":"screen","id":{id}}}"#))
             .await
             .expect("screen should succeed");
         assert!(screen.contains("marker-xyz"), "screen: {screen}");
 
-        let _ = run(&format!(r#"{{"action":"kill","id":{id}}}"#)).await;
+        let _ = run(&manager, &format!(r#"{{"action":"kill","id":{id}}}"#)).await;
     }
 
     #[tokio::test]
     async fn create_view_wait_round_trip() {
-        let created = run(r#"{"action":"create","command":"echo task-tool-test"}"#)
-            .await
-            .expect("create should succeed");
+        let manager = tasks::TaskManager::default();
+        let created = run(
+            &manager,
+            r#"{"action":"create","command":"echo task-tool-test"}"#,
+        )
+        .await
+        .expect("create should succeed");
         let id: u64 = created
             .split_whitespace()
             .nth(3)
             .and_then(|w| w.trim_end_matches(':').parse().ok())
             .expect("id in create message");
 
-        let waited = run(&format!(r#"{{"action":"wait","id":{id},"timeout":10}}"#))
-            .await
-            .expect("wait should succeed");
+        let waited = run(
+            &manager,
+            &format!(r#"{{"action":"wait","id":{id},"timeout":10}}"#),
+        )
+        .await
+        .expect("wait should succeed");
         assert!(waited.contains("completed"), "got: {waited}");
         assert!(waited.contains("task-tool-test"), "got: {waited}");
 
-        let listed = run(r#"{"action":"list"}"#).await.expect("list");
+        let listed = run(&manager, r#"{"action":"list"}"#).await.expect("list");
         assert!(listed.contains(&format!("[{id}]")), "got: {listed}");
 
-        let missing = run(r#"{"action":"output","id":999999}"#)
+        let missing = run(&manager, r#"{"action":"output","id":999999}"#)
             .await
             .expect_err("unknown id should fail");
         assert!(missing.contains("no task"), "got: {missing}");

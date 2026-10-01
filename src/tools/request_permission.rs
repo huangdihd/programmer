@@ -7,7 +7,7 @@
 
 use super::ask_user::{Question, QuestionHandler, QuestionKind};
 use super::function_tool;
-use crate::cancel::CancellationToken;
+use crate::cancel::{CancellationToken, OperationId};
 use crate::security::{AccessKind, SandboxMode, SecurityHandle};
 use async_openai::types::responses::Tool;
 use serde::Deserialize;
@@ -72,7 +72,7 @@ enum Args {
 struct RequestContext<'a> {
     questions: &'a QuestionHandler,
     cancel: &'a CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
     security: &'a SecurityHandle,
 }
 
@@ -80,7 +80,7 @@ pub async fn run(
     arguments: &str,
     questions: &QuestionHandler,
     cancel: &CancellationToken,
-    operation_id: u64,
+    operation_id: OperationId,
     security: &SecurityHandle,
 ) -> Result<String, String> {
     let args: Args = serde_json::from_str(arguments)
@@ -251,11 +251,11 @@ mod tests {
         let (questions, mut receiver) = super::super::ask_user::question_channel();
         let cancel = CancellationToken::new();
         let args = r#"{"kind":"sandbox","mode":"network","operation":null,"path":null,"reason":"download dependencies"}"#;
-        let request = run(args, &questions, &cancel, 17, &security);
+        let request = run(args, &questions, &cancel, OperationId(17), &security);
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
         let prompt = receiver.try_recv().expect("permission question");
-        assert_eq!(prompt.operation_id, 17);
+        assert_eq!(prompt.operation_id, OperationId(17));
         cancel.cancel();
         let output = request.await.unwrap();
         assert!(output.contains("permission denied"));
@@ -276,7 +276,7 @@ mod tests {
         let (tx, mut rx) = super::super::ask_user::question_channel();
         let cancel = CancellationToken::new();
         let args = r#"{"kind":"sandbox","mode":"restricted","operation":null,"path":null,"reason":"tighten security"}"#;
-        let output = run(args, &tx, &cancel, 7, &security).await;
+        let output = run(args, &tx, &cancel, OperationId(7), &security).await;
         assert!(
             output
                 .expect_err("stricter mode must be rejected")
@@ -298,7 +298,7 @@ mod tests {
             let tx = tx.clone();
             let cancel = cancel.clone();
             let security = security.clone();
-            async move { run(args, &tx, &cancel, 7, &security).await }
+            async move { run(args, &tx, &cancel, OperationId(7), &security).await }
         });
 
         let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
@@ -353,7 +353,7 @@ mod tests {
             let tx = tx.clone();
             let cancel = cancel.clone();
             let security = security.clone();
-            async move { run(&args, &tx, &cancel, 9, &security).await }
+            async move { run(&args, &tx, &cancel, OperationId(9), &security).await }
         });
 
         let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
@@ -426,7 +426,7 @@ mod tests {
             let tx = tx.clone();
             let cancel = cancel.clone();
             let security = security.clone();
-            async move { run(&args, &tx, &cancel, 10, &security).await }
+            async move { run(&args, &tx, &cancel, OperationId(10), &security).await }
         });
 
         let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())

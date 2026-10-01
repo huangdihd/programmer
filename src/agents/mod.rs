@@ -447,6 +447,7 @@ impl AgentPolicyFactory {
 
 #[derive(Clone)]
 pub(crate) struct AgentRuntime {
+    pub(crate) tasks: crate::tasks::TaskManager,
     /// Parent front-end notifications and reviews, bound when the runtime is built.
     pub(crate) events: mpsc::UnboundedSender<Event>,
     pub(crate) provider_manager: Arc<crate::providers::ProviderManager>,
@@ -522,6 +523,8 @@ impl AgentRuntime {
         } else {
             None
         };
+        let diagnostics_state =
+            Arc::new(Mutex::new(crate::diagnostics::DiagnosticsState::default()));
         let mut providers: Vec<Arc<dyn ToolProvider>> = vec![
             Arc::new(
                 LocalToolProvider::new_scoped(
@@ -529,6 +532,8 @@ impl AgentRuntime {
                     self.security.clone(),
                     file_scope,
                 )
+                .with_diagnostics_state(diagnostics_state.clone())
+                .with_tasks(self.tasks.clone())
                 .with_checkpoint(self.checkpoint.clone())
                 .with_memory_enabled(self.memory_config.enabled)
                 .with_memory_model(memory_model.clone())
@@ -551,9 +556,7 @@ impl AgentRuntime {
             vision_enabled: self.vision_enabled,
             thinking_level: self.thinking_level,
             memory_model,
-            hooks: crate::runner::hooks::standard_hooks(Arc::new(Mutex::new(
-                crate::runner::DiagnosticsState::default(),
-            ))),
+            hooks: crate::runner::hooks::standard_hooks(diagnostics_state),
             stream_retrying: Arc::new(AtomicBool::new(false)),
             stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: Some(DEFAULT_MAX_STEPS),
@@ -599,7 +602,7 @@ impl AgentSurface for SubagentSurface {
             reason: format!("Sub-agent #{}: {reason}", self.id),
             position,
             reply: ReplyTx(reply_tx),
-            operation_id: 0,
+            operation_id: crate::cancel::OperationId::UNTAGGED,
             agent_id: Some(self.id),
             agent_generation: Some(self.generation),
         }));
@@ -665,6 +668,7 @@ mod tests {
         }
         let security = crate::security::SecurityManager::standalone().unwrap();
         AgentRuntime {
+            tasks: crate::tasks::TaskManager::default(),
             events: mpsc::unbounded_channel().0,
             provider_manager: Arc::new(crate::providers::ProviderManager::from_config(&config)),
             client: Client::with_config(OpenAIConfig::default()),

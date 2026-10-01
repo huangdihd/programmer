@@ -177,16 +177,20 @@ pub(crate) async fn run_tool_call(
             &call.arguments,
             questions,
             &crate::cancel::CancellationToken::new(),
-            0,
+            crate::cancel::OperationId::UNTAGGED,
         )
         .await
         .map(FunctionCallOutput::Text)
     } else if call.name == read_image::NAME {
         read_image::run(&call.arguments).await
     } else {
-        run_local_tool(&call.name, &call.arguments)
-            .await
-            .map(FunctionCallOutput::Text)
+        run_local_tool(
+            &crate::tasks::TaskManager::default(),
+            &call.name,
+            &call.arguments,
+        )
+        .await
+        .map(FunctionCallOutput::Text)
     };
 
     make_tool_output_for_call(call, result)
@@ -232,9 +236,13 @@ fn make_tool_output_named(
 
 /// Dispatch a local (non-MCP, non-`ask_user`) tool by name. Shared by the
 /// agent loop and the MCP server so both run tools the same way.
-pub(crate) async fn run_local_tool(name: &str, arguments: &str) -> Result<String, String> {
+pub(crate) async fn run_local_tool(
+    tasks: &crate::tasks::TaskManager,
+    name: &str,
+    arguments: &str,
+) -> Result<String, String> {
     match name {
-        command::NAME => command::run(arguments).await,
+        command::NAME => command::run(tasks, arguments).await,
         read_file::NAME => read_file::run(arguments).await,
         write_file::NAME => write_file::run(arguments).await,
         edit_file::NAME => edit_file::run(arguments).await,
@@ -248,12 +256,13 @@ pub(crate) async fn run_local_tool(name: &str, arguments: &str) -> Result<String
             "error: the todo tool requires a session and is unavailable in standalone MCP mode"
                 .to_string(),
         ),
-        task::NAME => task::run(arguments).await,
+        task::NAME => task::run(tasks, arguments).await,
         other => Err(format!("error: unknown tool '{other}'")),
     }
 }
 
 pub(crate) async fn run_local_tool_secure(
+    tasks: &crate::tasks::TaskManager,
     name: &str,
     arguments: &str,
     security: &crate::security::SecurityManager,
@@ -262,6 +271,7 @@ pub(crate) async fn run_local_tool_secure(
     match name {
         command::NAME => {
             command::run_with_live_secure(
+                tasks,
                 arguments,
                 "headless-command",
                 &crate::cancel::CancellationToken::new(),
@@ -272,8 +282,8 @@ pub(crate) async fn run_local_tool_secure(
         read_file::NAME => read_file::run_with_security(arguments, security).await,
         write_file::NAME => write_file::run_with_security(arguments, security).await,
         edit_file::NAME => edit_file::run_with_security(arguments, security).await,
-        task::NAME => task::run_with_security(arguments, security).await,
-        _ => run_local_tool(name, arguments).await,
+        task::NAME => task::run_with_security(tasks, arguments, security).await,
+        _ => run_local_tool(tasks, name, arguments).await,
     }
 }
 
@@ -479,9 +489,12 @@ mod tests {
 
     #[tokio::test]
     async fn command_runs_and_captures_output() {
-        let out = command::run(r#"{"command":"echo hello"}"#)
-            .await
-            .expect("echo should succeed");
+        let out = command::run(
+            &crate::tasks::TaskManager::default(),
+            r#"{"command":"echo hello"}"#,
+        )
+        .await
+        .expect("echo should succeed");
         assert!(out.contains("hello"), "unexpected output: {out}");
     }
 

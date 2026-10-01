@@ -45,6 +45,7 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 /// `auto`), whether the connected client supports elicitation (for `manual`),
 /// and a counter for server-initiated request ids.
 pub struct McpServer {
+    tasks: crate::tasks::TaskManager,
     mode: WorkMode,
     classifier: Option<(Client<OpenAIConfig>, String, u8)>,
     client_elicitation: bool,
@@ -78,6 +79,7 @@ impl McpServer {
         security: std::sync::Arc<crate::security::SecurityManager>,
     ) -> Self {
         McpServer {
+            tasks: crate::tasks::TaskManager::default(),
             mode,
             classifier,
             client_elicitation: false,
@@ -203,7 +205,9 @@ impl McpServer {
         }
 
         let (text, is_error) =
-            match crate::tools::run_local_tool_secure(name, &args_str, &self.security).await {
+            match crate::tools::run_local_tool_secure(&self.tasks, name, &args_str, &self.security)
+                .await
+            {
                 Ok(text) => (text, false),
                 Err(text) => (text, true),
             };
