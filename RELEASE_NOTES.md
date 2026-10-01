@@ -1,3 +1,18 @@
+### programmer v0.2.20
+
+- Preserve raw Responses API reasoning from `reasoning_text.done` events without
+  preceding deltas and from reasoning `content_part.done` events.
+- Add synthetic SSE regressions for mixed raw/summary reasoning, done-only
+  streams, dual-field serialization, invalid targets, and malformed events.
+- Add race-safe cancellation for peer delegations that have not started, with
+  durable source checks, terminal cancelled lifecycle records, and consent cleanup.
+- Let lightweight peer answers use the provider's normal output-token default
+  instead of imposing a 2,048-token cap.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.19...v0.2.20
+
+---
+
 ### programmer v0.2.19
 
 - Add cross-session search, questions, and durable delegation with local consent,

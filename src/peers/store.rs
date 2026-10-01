@@ -104,6 +104,10 @@ pub(crate) fn remove(session: &str, id: &str) -> Result<()> {
     Store::default_location()?.remove(session, id)
 }
 
+pub(crate) fn claim_delegation(session: &str, id: &str, source: &str) -> Result<PeerEnvelope> {
+    Store::default_location()?.claim_delegation(session, id, source)
+}
+
 pub(crate) struct Store {
     root: PathBuf,
 }
@@ -218,6 +222,66 @@ impl Store {
         messages
             .sort_by(|left, right| (left.created_at, &left.id).cmp(&(right.created_at, &right.id)));
         Ok(messages)
+    }
+
+    /// Remove a delegation only while its durable inbox entry is still pending.
+    /// The source check prevents one session from cancelling another's work.
+    pub(crate) fn cancel_delegation(
+        &self,
+        session: &str,
+        id: &str,
+        source: &str,
+    ) -> Result<PeerEnvelope> {
+        self.take_delegation(
+            session,
+            id,
+            source,
+            "Delegation is no longer pending and cannot be cancelled",
+        )
+    }
+
+    /// Atomically claim accepted work against source-side cancellation.
+    pub(crate) fn claim_delegation(
+        &self,
+        session: &str,
+        id: &str,
+        source: &str,
+    ) -> Result<PeerEnvelope> {
+        self.take_delegation(
+            session,
+            id,
+            source,
+            "Delegation was cancelled or already claimed",
+        )
+    }
+
+    fn take_delegation(
+        &self,
+        session: &str,
+        id: &str,
+        source: &str,
+        unavailable: &str,
+    ) -> Result<PeerEnvelope> {
+        validate_uuid(source)?;
+        validate_uuid(id)?;
+        let delegation = self
+            .pending(session)?
+            .into_iter()
+            .find(|message| message.id == id)
+            .ok_or(unavailable)?;
+        if delegation.kind != PeerKind::Delegation {
+            return Err("Peer message is not a delegation".into());
+        }
+        if delegation.from != source {
+            return Err("Only the source session can cancel a delegation".into());
+        }
+
+        let path = self.inbox(session, false)?.join(format!("{id}.json"));
+        match fs::remove_file(path) {
+            Ok(()) => Ok(delegation),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(unavailable.into()),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// Idempotent acknowledgement; an already removed message is successful.
@@ -379,6 +443,101 @@ mod tests {
         store.0.remove(&first.to, &first.id).unwrap();
         store.0.remove(&first.to, &first.id).unwrap();
         assert_eq!(store.0.pending(&first.to).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn only_source_can_cancel_a_pending_delegation() {
+        let store = TestStore::new();
+        let mut delegation = message();
+        delegation.kind = PeerKind::Delegation;
+        store.0.enqueue(&delegation).unwrap();
+
+        let other_source = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            store
+                .0
+                .cancel_delegation(&delegation.to, &delegation.id, &other_source)
+                .unwrap_err(),
+            "Only the source session can cancel a delegation"
+        );
+        assert_eq!(
+            store.0.pending(&delegation.to).unwrap(),
+            vec![delegation.clone()]
+        );
+
+        let cancelled = store
+            .0
+            .cancel_delegation(&delegation.to, &delegation.id, &delegation.from)
+            .unwrap();
+        assert_eq!(cancelled, delegation);
+        assert!(store.0.pending(&cancelled.to).unwrap().is_empty());
+        assert_eq!(
+            store
+                .0
+                .cancel_delegation(&cancelled.to, &cancelled.id, &cancelled.from)
+                .unwrap_err(),
+            "Delegation is no longer pending and cannot be cancelled"
+        );
+    }
+
+    #[test]
+    fn cancellation_and_execution_claim_are_mutually_exclusive() {
+        let store = TestStore::new();
+        let mut cancelled_first = message();
+        cancelled_first.kind = PeerKind::Delegation;
+        store.0.enqueue(&cancelled_first).unwrap();
+        store
+            .0
+            .cancel_delegation(
+                &cancelled_first.to,
+                &cancelled_first.id,
+                &cancelled_first.from,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .0
+                .claim_delegation(
+                    &cancelled_first.to,
+                    &cancelled_first.id,
+                    &cancelled_first.from,
+                )
+                .unwrap_err(),
+            "Delegation was cancelled or already claimed"
+        );
+
+        let mut claimed_first = message();
+        claimed_first.kind = PeerKind::Delegation;
+        store.0.enqueue(&claimed_first).unwrap();
+        assert_eq!(
+            store
+                .0
+                .claim_delegation(&claimed_first.to, &claimed_first.id, &claimed_first.from)
+                .unwrap(),
+            claimed_first
+        );
+        assert_eq!(
+            store
+                .0
+                .cancel_delegation(&claimed_first.to, &claimed_first.id, &claimed_first.from)
+                .unwrap_err(),
+            "Delegation is no longer pending and cannot be cancelled"
+        );
+    }
+
+    #[test]
+    fn non_delegation_peer_messages_cannot_be_cancelled() {
+        let store = TestStore::new();
+        let question = message();
+        store.0.enqueue(&question).unwrap();
+        assert_eq!(
+            store
+                .0
+                .cancel_delegation(&question.to, &question.id, &question.from)
+                .unwrap_err(),
+            "Peer message is not a delegation"
+        );
+        assert_eq!(store.0.pending(&question.to).unwrap(), vec![question]);
     }
 
     #[test]

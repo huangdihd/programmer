@@ -1,0 +1,7 @@
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reasoning_1","summary":[{"type":"summary_text","text":"Stored summary."}],"content":[{"type":"reasoning_text","text":"Stored raw text."}],"status":"completed"},"sequence_number":0}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"reasoning_1","summary":[{"type":"summary_text","text":"Stored summary."}],"content":[{"type":"reasoning_text","text":"Stored raw text."}],"status":"completed"},"sequence_number":1}
+
+data: {"type":"response.completed","response":{"created_at":0,"id":"resp_reasoning","model":"mock","object":"response","output":[],"status":"completed"},"sequence_number":2}
+
+: eof

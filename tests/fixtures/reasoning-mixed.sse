@@ -1,0 +1,21 @@
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reasoning_1","summary":[],"status":"in_progress"},"sequence_number":0}
+
+data: {"type":"response.reasoning_summary_part.added","item_id":"reasoning_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""},"sequence_number":1}
+
+data: {"type":"response.reasoning_text.delta","item_id":"reasoning_1","output_index":0,"content_index":0,"delta":"Raw ","sequence_number":2}
+
+data: {"type":"response.reasoning_summary_text.delta","item_id":"reasoning_1","output_index":0,"summary_index":0,"delta":"Brief ","sequence_number":3}
+
+data: {"type":"response.reasoning_text.delta","item_id":"reasoning_1","output_index":0,"content_index":0,"delta":"draft","sequence_number":4}
+
+data: {"type":"response.reasoning_summary_text.delta","item_id":"reasoning_1","output_index":0,"summary_index":0,"delta":"draft","sequence_number":5}
+
+data: {"type":"response.reasoning_text.done","item_id":"reasoning_1","output_index":0,"content_index":0,"text":"Raw final.","sequence_number":6}
+
+data: {"type":"response.reasoning_summary_text.done","item_id":"reasoning_1","output_index":0,"summary_index":0,"text":"Brief final.","sequence_number":7}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"reasoning_1","summary":[],"status":"completed"},"sequence_number":8}
+
+data: {"type":"response.completed","response":{"created_at":0,"id":"resp_reasoning","model":"mock","object":"response","output":[],"status":"completed"},"sequence_number":9}
+
+: eof

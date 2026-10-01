@@ -162,12 +162,15 @@ session a question, search saved conversation content, or delegate work:
   existing `workspace` and returns a `cd … && programmer --resume …` command.
   Nothing opens automatically. The target user must choose **Yes/No**; Yes
   while busy means accepted and queued, not completed.
+- **`cancel`** removes a delegation that has not started. Pass the target
+  `session_id` and the delegation `id` returned by `delegate`. Cancellation
+  dismisses an already-open consent prompt, but does not stop running work.
 - Peer questions and their lightweight replies appear as one persisted, purple
   `↔` row, collapsed by default. Click its disclosure to inspect the full source
   session, question, and answer; an arriving reply updates the same row.
 - Delegations have a persisted, task-first purple disclosure row plus a status
   explanation. The same entry updates through **pending**, **accepted · queued**,
-  **started**, or **rejected**; expand it for the source and full task. Started
+  **started**, **rejected**, or **cancelled**; expand it for the source and full task. Started
   is not completed. Reopening a still-pending inbox asks for consent again and
   resets the display to pending. Source-side accepted/rejected notifications use
   the original delegation ID; when task text is unavailable, it is labelled as

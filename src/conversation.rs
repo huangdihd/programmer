@@ -884,6 +884,7 @@ mod tests {
             crate::response::message_item::PeerDelegationState::AcceptedQueued,
             crate::response::message_item::PeerDelegationState::Started,
             crate::response::message_item::PeerDelegationState::Rejected,
+            crate::response::message_item::PeerDelegationState::Cancelled,
         ] {
             conversation.items.push(MessageItem::PeerDelegation {
                 id: "delegation".into(),

@@ -2235,9 +2235,9 @@ mod tests {
         assert!(panel.expanded_items.contains(&0));
         for (state, label) in [
             (AcceptedQueued, "accepted · queued"),
-            (Started, "started"),
-            (Rejected, "rejected"),
             (Pending, "pending"),
+            (AcceptedQueued, "accepted · queued"),
+            (Cancelled, "cancelled"),
         ] {
             panel.upsert_peer_delegation("id".into(), "source-session".into(), None, state);
             assert_eq!(panel.items_snapshot().len(), 1);
@@ -2246,6 +2246,10 @@ mod tests {
             assert!(rendered.contains(label), "{rendered}");
             assert!(rendered.contains("full-task-marker"), "{rendered}");
         }
+
+        panel.upsert_peer_delegation("id".into(), "source-session".into(), None, AcceptedQueued);
+        let rendered = render_text(&mut panel, area);
+        assert!(rendered.contains("cancelled"), "{rendered}");
     }
 
     #[test]

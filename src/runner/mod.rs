@@ -1103,6 +1103,149 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    /// Decode actual SDK SSE events rather than deserializing fixture JSON directly.
+    async fn reasoning_fixture_events(body: &str) -> Vec<Result<ResponseStreamEvent, OpenAIError>> {
+        use futures::StreamExt;
+
+        let (base_url, server) = spawn_mock_responses(vec![body.to_string()]).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let client = Client::with_config(
+                OpenAIConfig::new()
+                    .with_api_base(base_url)
+                    .with_api_key("synthetic-fixture-key"),
+            );
+            let request = serde_json::from_value(serde_json::json!({
+                "model": "mock", "input": "Synthetic regression", "stream": true
+            }))
+            .unwrap();
+            let mut stream = client.responses().create_stream(request).await.unwrap();
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                let terminal = event.is_err()
+                    || matches!(&event, Ok(ResponseStreamEvent::ResponseCompleted(_)));
+                events.push(event);
+                if terminal {
+                    break;
+                }
+            }
+            events
+        })
+        .await;
+        server.abort();
+        result.expect("reasoning fixture stream must terminate within five seconds")
+    }
+
+    async fn fold_reasoning_fixture(body: &str) -> PartialResponse {
+        let events = reasoning_fixture_events(body).await;
+        assert!(matches!(
+            events.last(),
+            Some(Ok(ResponseStreamEvent::ResponseCompleted(_)))
+        ));
+        let mut partial = PartialResponse::new(CancellationToken::new());
+        for event in events {
+            partial.handle_response_stream_event(event.expect("valid fixture event"));
+        }
+        partial
+    }
+
+    fn reasoning_fixture_item(partial: &PartialResponse) -> serde_json::Value {
+        assert_eq!(partial.items.len(), 1);
+        serde_json::to_value(partial.items[0].as_ref().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reasoning_sse_mixed_deltas_done_and_sparse_item_done_preserve_text() {
+        let events =
+            reasoning_fixture_events(include_str!("../../tests/fixtures/reasoning-mixed.sse"))
+                .await;
+        assert_eq!(events.len(), 10);
+        let mut partial = PartialResponse::new(CancellationToken::new());
+        for (index, event) in events.into_iter().enumerate() {
+            partial.handle_response_stream_event(event.unwrap());
+            if index == 5 {
+                let item = reasoning_fixture_item(&partial);
+                assert_eq!(item["content"][0]["text"], "Raw draft");
+                assert_eq!(item["summary"][0]["text"], "Brief draft");
+            }
+            if index >= 7 {
+                let item = reasoning_fixture_item(&partial);
+                assert_eq!(item["content"][0]["text"], "Raw final.");
+                assert_eq!(item["summary"][0]["text"], "Brief final.");
+            }
+        }
+        assert_eq!(reasoning_fixture_item(&partial)["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn reasoning_sse_done_only_initializes_missing_content_parts() {
+        let partial =
+            fold_reasoning_fixture(include_str!("../../tests/fixtures/reasoning-done-only.sse"))
+                .await;
+        let item = reasoning_fixture_item(&partial);
+        assert_eq!(item["content"].as_array().unwrap().len(), 2);
+        assert_eq!(item["content"][0]["text"], "Done without delta.");
+        assert_eq!(item["content"][1]["text"], "Second done-only part.");
+    }
+
+    #[tokio::test]
+    async fn reasoning_sse_content_and_summary_survive_serialization_roundtrip() {
+        let partial = fold_reasoning_fixture(include_str!(
+            "../../tests/fixtures/reasoning-both-fields.sse"
+        ))
+        .await;
+        let item = partial.items[0].as_ref().unwrap();
+        let serialized = serde_json::to_value(item).unwrap();
+        assert_eq!(serialized["content"][0]["text"], "Stored raw text.");
+        assert_eq!(serialized["summary"][0]["text"], "Stored summary.");
+        let restored: OutputItem = serde_json::from_value(serialized).unwrap();
+        assert_eq!(&restored, item);
+    }
+
+    #[tokio::test]
+    async fn reasoning_sse_huge_content_index_and_wrong_item_type_are_ignored() {
+        let events = reasoning_fixture_events(include_str!(
+            "../../tests/fixtures/reasoning-invalid-targets.sse"
+        ))
+        .await;
+        assert_eq!(events.len(), 7);
+        let mut partial = PartialResponse::new(CancellationToken::new());
+        let mut original_message = None;
+        for (index, event) in events.into_iter().enumerate() {
+            partial.handle_response_stream_event(event.unwrap());
+            let Some(OutputItem::Reasoning(reasoning)) = &partial.items[0] else {
+                panic!("expected reasoning item");
+            };
+            assert!(
+                reasoning.content.is_none(),
+                "invalid index allocated content"
+            );
+            assert!(reasoning.summary.is_empty());
+            if index == 3 {
+                original_message = partial.items[1].clone();
+            }
+            if index >= 3 {
+                assert_eq!(partial.items.len(), 2);
+                assert_eq!(partial.items[1], original_message);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_sse_missing_delta_is_a_stream_decode_error() {
+        let events =
+            reasoning_fixture_events(include_str!("../../tests/fixtures/reasoning-malformed.sse"))
+                .await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            Ok(ResponseStreamEvent::ResponseOutputItemAdded(_))
+        ));
+        let error = events[1]
+            .as_ref()
+            .expect_err("missing delta must be rejected");
+        assert!(error.to_string().contains("delta"), "{error}");
+    }
+
     fn engine_for(base_url: &str) -> TurnRunner {
         let client = Client::with_config(OpenAIConfig::new().with_api_base(base_url.to_string()));
         TurnRunner {

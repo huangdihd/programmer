@@ -105,7 +105,10 @@ fn assert_one_tool_free_request(requests: &[Value], question: &PeerEnvelope) {
     assert_eq!(request["model"], "mock-peer-model");
     assert_eq!(request["stream"], false);
     assert_eq!(request["store"], false);
-    assert_eq!(request["max_output_tokens"], 2048);
+    assert!(
+        request.get("max_output_tokens").is_none(),
+        "peer answers must use the normal Responses output-token default"
+    );
     // A text-only input cannot contain function calls or function-call results.
     let input: Value = serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
     assert_eq!(input["from_session"], question.from);

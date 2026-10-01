@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn peer_delegation_round_trips_all_states_and_missing_task() {
         use crate::response::message_item::PeerDelegationState::*;
-        for state in [Pending, AcceptedQueued, Started, Rejected] {
+        for state in [Pending, AcceptedQueued, Started, Rejected, Cancelled] {
             for body in [None, Some("任务\nfull task".to_owned())] {
                 let item = MessageItem::PeerDelegation {
                     id: "stable-id".into(),
