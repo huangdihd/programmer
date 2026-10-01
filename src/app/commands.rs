@@ -1173,7 +1173,7 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
         }),
         _ => {
             app.conversation_panel.add_warning_string(
-                "usage: /memory [list [global|project] | recall <query> | remember <global|project> <kind> <content> | update <id> <content> | forget <id> | dream [status|preview|apply] [global|project] | on | off]",
+                "usage: /memory [list [global|project] | recall <query> | remember <global|project> <kind> <content> | update <id> <content> | forget <id> | dream [status|preview|apply|history] [global|project] | on | off]",
             );
             return command_handlers::CommandOutcome::handled(false);
         }
@@ -1210,7 +1210,7 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
     command_handlers::CommandOutcome::handled(false)
 }
 
-/// `/memory dream [status|preview|apply] [global|project]`.
+/// `/memory dream [status|preview|apply|history] [global|project]`.
 ///
 /// Kept out of the `memory` tool on purpose: consolidating long-term memory is
 /// a user decision, so the agent can neither see nor invoke it.
@@ -1224,6 +1224,36 @@ async fn dream_command(
         .next()
         .filter(|part| !part.is_empty())
         .unwrap_or("status");
+    if mode == "recover" {
+        let confirmed = parts.next() == Some("confirm") && parts.next().is_none();
+        if !confirmed {
+            app.conversation_panel.add_warning_string(
+                "Recovery completes the recorded target of an interrupted Dream apply/rollback, including any remaining writes. It does NOT undo it. Run `/memory dream recover confirm` in the originating workspace to proceed.",
+            );
+            return command_handlers::CommandOutcome::handled(false);
+        }
+        match crate::memory::MemoryManager::for_current_dir()
+            .and_then(|manager| manager.dream_recover())
+        {
+            Ok(()) => app
+                .conversation_panel
+                .add_info_string("Dream transaction recovered."),
+            Err(error) => app
+                .conversation_panel
+                .add_warning_string(format!("Dream recovery failed: {error}")),
+        }
+        return command_handlers::CommandOutcome::handled(false);
+    }
+    if mode == "history" {
+        let filter = parts.next();
+        if !matches!(filter, None | Some("session")) || parts.next().is_some() {
+            app.conversation_panel
+                .add_warning_string("usage: /memory dream history [session]");
+            return command_handlers::CommandOutcome::handled(false);
+        }
+        super::activity::open_dream(app, filter.is_some());
+        return command_handlers::CommandOutcome::handled(false);
+    }
     let scope = match parts.next().filter(|part| !part.is_empty()) {
         Some("global") => Some(crate::memory::MemoryScope::Global),
         Some("project") => Some(crate::memory::MemoryScope::Project),
@@ -1272,7 +1302,7 @@ async fn dream_command(
         "apply" => dream::apply_saved_preview(&manager, scope).map(dream_report_line),
         other => {
             app.conversation_panel.add_warning_string(format!(
-                "usage: /memory dream [status|preview|apply] [global|project] \
+                "usage: /memory dream [status|preview|apply|history] [global|project] \
                  — '{other}' is not a Dream mode"
             ));
             return command_handlers::CommandOutcome::handled(false);
@@ -1309,7 +1339,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         command @ (Command::Quit
         | Command::Clear
         | Command::New
-        | Command::Session
+        | Command::Session(_)
         | Command::Title(_)
         | Command::Usage
         | Command::Rewind

@@ -54,6 +54,9 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
         Event::App(app_event) => handle_app_event(app, app_event).await,
     }
     super::peers::poll(app, peer_tick).await;
+    if peer_tick {
+        super::activity::tick(app);
+    }
     Ok(())
 }
 
@@ -79,6 +82,9 @@ async fn handle_crossterm(
                 || app.diagnostics_panel.is_some()
                 || app.security_panel.is_some()
                 || app.rewind_panel.is_some() => {}
+        crossterm::event::Event::Mouse(mouse) if app.activity_panel.is_some() => {
+            super::activity::handle_mouse(app, mouse);
+        }
         // The task viewer owns the whole screen. Interactive tasks can forward
         // mouse input to their PTY; read-only tasks use the wheel to scroll.
         crossterm::event::Event::Mouse(mouse) if app.terminal_pane.is_some() => {
@@ -735,6 +741,7 @@ pub(crate) fn has_blocking_surface(app: &App<'_>) -> bool {
         || app.rewind_panel.is_some()
         || app.terminal_pane.is_some()
         || app.agent_panel.is_some()
+        || app.activity_panel.is_some()
         || (app.work_mode == WorkMode::Plan
             && app.plan_phase == crate::classifier::PlanPhase::Reviewing)
 }
@@ -1479,6 +1486,80 @@ mod tests {
             "test".to_string(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn graph_mouse_and_escape_stay_inside_the_read_only_modal() {
+        use crate::ui::components::activity_panel::{ActivityEntry, ActivityMode, ActivityPanel};
+        use crossterm::event::{
+            Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        };
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut app = headless_test_app("graph-routing").await;
+        let entries = ["first", "second"].map(|id| ActivityEntry {
+            id: id.into(),
+            title: id.into(),
+            summary: String::new(),
+            details: String::new(),
+            from: Some(id.into()),
+            to: Some("graph-routing".into()),
+            rollback_allowed: false,
+        });
+        let mut panel = ActivityPanel::new(
+            "Graph".into(),
+            ActivityMode::SessionGraph,
+            "graph-routing".into(),
+            entries.to_vec(),
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        panel.render(area, &mut Buffer::empty(area));
+        app.activity_panel = Some(panel);
+        app.cancel.active_id = Some(crate::cancel::OperationId(42));
+        let original_input = app.input_panel.get_content();
+        super::handle_crossterm(
+            &mut app,
+            TerminalEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.activity_panel
+                .as_ref()
+                .unwrap()
+                .selected_entry()
+                .unwrap()
+                .id,
+            "second"
+        );
+        for code in [KeyCode::Enter, KeyCode::Enter, KeyCode::Esc, KeyCode::Esc] {
+            super::handle_crossterm(
+                &mut app,
+                TerminalEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            )
+            .await
+            .unwrap();
+            assert!(app.activity_panel.is_some());
+            assert!(super::has_blocking_surface(&app));
+        }
+        super::handle_crossterm(&mut app, TerminalEvent::Paste("blocked".into()))
+            .await
+            .unwrap();
+        assert_eq!(app.input_panel.get_content(), original_input);
+        super::handle_crossterm(
+            &mut app,
+            TerminalEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .await
+        .unwrap();
+        assert!(app.activity_panel.is_none());
+        assert_eq!(app.cancel.active_id, Some(crate::cancel::OperationId(42)));
+        assert!(!app.cancel.active.is_cancelled());
     }
 
     /// A proven-smaller compaction result whose usage numbers are enough to

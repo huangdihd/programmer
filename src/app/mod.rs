@@ -16,6 +16,7 @@
 //! Application core: struct definition, lifecycle, and method dispatch to
 //! focused submodules.
 
+pub(crate) mod activity;
 mod command_handlers;
 pub(crate) mod commands;
 pub(crate) mod diagnostics;
@@ -340,6 +341,8 @@ pub struct App<'a> {
     pub terminal_pane: Option<crate::ui::components::terminal_panel::TerminalPane>,
     /// Full-screen read-only child conversation, opened from the Agents sidebar.
     pub(crate) agent_panel: Option<crate::ui::components::agent_panel::AgentPanel>,
+    pub(crate) activity_panel: Option<crate::ui::components::activity_panel::ActivityPanel>,
+    pub(crate) activity_view: Option<activity::ActivityView>,
     /// Terminal task events waiting to be delivered to the agent.
     pub(crate) task_notifications: TaskNotificationState,
     /// Completed sub-agents waiting to be delivered to the parent agent.
@@ -572,6 +575,8 @@ impl App<'_> {
             rewind_panel: None,
             terminal_pane: None,
             agent_panel: None,
+            activity_panel: None,
+            activity_view: None,
             task_notifications: TaskNotificationState::new(),
             agent_notifications: AgentNotificationState::new(),
             agents,

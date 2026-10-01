@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_TEXT_BYTES: usize = 32 * 1024;
 // JSON escaping can expand each text byte into six bytes.
-const MAX_FILE_BYTES: u64 = (MAX_TEXT_BYTES * 2 * 6 + 4096) as u64;
+pub(super) const MAX_FILE_BYTES: u64 = (MAX_TEXT_BYTES * 2 * 6 + 4096) as u64;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -36,6 +36,8 @@ pub(crate) struct PeerEnvelope {
     pub(crate) body: String,
     pub(crate) answer: Option<String>,
     pub(crate) created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) related_delegation_id: Option<String>,
 }
 
 impl PeerEnvelope {
@@ -53,6 +55,7 @@ impl PeerEnvelope {
             kind,
             body,
             answer,
+            related_delegation_id: None,
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|error| error.to_string())?
@@ -62,10 +65,13 @@ impl PeerEnvelope {
         Ok(envelope)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         validate_uuid(&self.id)?;
         validate_uuid(&self.from)?;
         validate_uuid(&self.to)?;
+        if let Some(id) = &self.related_delegation_id {
+            validate_uuid(id)?;
+        }
         if self.body.len() > MAX_TEXT_BYTES
             || self.answer.as_deref().map_or(0, str::len) > MAX_TEXT_BYTES
         {
@@ -109,7 +115,7 @@ pub(crate) fn claim_delegation(session: &str, id: &str, source: &str) -> Result<
 }
 
 pub(crate) struct Store {
-    root: PathBuf,
+    pub(super) root: PathBuf,
 }
 
 impl Store {
@@ -305,7 +311,7 @@ impl Store {
 }
 
 /// Check each component rather than following a symlink hidden in an ancestor.
-fn check_directories(path: &Path, create: bool) -> Result<()> {
+pub(super) fn check_directories(path: &Path, create: bool) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         if matches!(component, Component::ParentDir) {

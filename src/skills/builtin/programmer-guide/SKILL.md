@@ -70,10 +70,24 @@ Important TUI commands include:
 - `/memory` for inspecting, consolidating, or managing long-term memory:
   `list`, `recall`, `remember`, `update`, `forget`, `dream`, and `on|off`.
   `/memory dream` reports the background-consolidation queue, `dream preview`
-  writes a reviewable plan, and `dream apply` commits that plan. `dream` exists
+  writes a reviewable plan, and `dream apply` commits that plan.
+  `dream history [session]` opens run audits with conflict-checked whole-run
+  rollback (`r` preview, `y` confirm); rollback preserves recall statistics and
+  does not requeue input excerpts. `dream recover confirm` explicitly rolls
+  forward an interrupted memory transaction in its originating workspace.
+  `dream` exists
   only here: the model's `memory` tool does not offer it. While a background
   consolidation pass runs, the title row shows a `💭` indicator at its right
   edge.
+- `/session graph` opens a read-only three-region view: related sessions above,
+  the selected peer's questions/delegations below, and event details at right.
+  Enter descends sessions → events → details; Esc returns one region and closes
+  from sessions. Tab/Shift+Tab cycle focus; arrows/jk navigate the focused region.
+  Mouse clicks focus/select and the wheel navigates or scrolls. `/` searches that
+  peer's events, `f` filters kind, Backspace resets event filters, `m` toggles full
+  record metadata, and `e` re-centers without activation. Peer selection is
+  remembered; narrow terminals show details full-width. Missing legacy routing
+  has an explicit unknown-peer group; answered/accepted/started are not completed.
 - `/todo`, `/terminal`, `/compact`, `/vision`, `/select`, `/session`, `/usage`,
   `/new`, `/clear`, `/help`, and `/quit` for session and UI workflows. `/select`
   temporarily gives mouse drags to the terminal for native text selection and

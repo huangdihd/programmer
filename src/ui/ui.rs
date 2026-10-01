@@ -383,6 +383,10 @@ impl App<'_> {
             terminal_panel::render(pane, area, buf);
             return;
         }
+        if let Some(panel) = &mut self.activity_panel {
+            panel.render(area, buf);
+            return;
+        }
         if let Some(panel) = &mut self.agent_panel {
             panel.render(area, buf);
             return;

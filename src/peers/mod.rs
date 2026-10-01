@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 mod api_tests;
+pub(crate) mod graph;
 pub(crate) mod online;
 mod search;
 pub(crate) mod store;
@@ -41,6 +42,7 @@ pub(crate) struct PeerSessionProvider {
 #[derive(Deserialize)]
 struct Args {
     action: String,
+    related_delegation_id: Option<String>,
     session_id: Option<String>,
     workspace: Option<String>,
     message: Option<String>,
@@ -108,62 +110,30 @@ impl PeerSessionProvider {
                     message,
                     None,
                 )?;
-                Store::default_location()?.enqueue(&envelope)?;
-                Ok(json!({"session_id": target, "id": envelope.id, "status": "pending_user_approval",
-                    "command": command, "note": "Queued only. Target user must accept Yes/No before any work runs; acceptance is not completion."}).to_string())
+                enqueue_delegation(&Store::default_location()?, &envelope, &command)
             }
             "cancel" => {
                 let target = args.session_id.ok_or("session_id is required for cancel")?;
                 validate_target(&self.source, &target)?;
                 let id = args.id.ok_or("id is required for cancel")?;
                 validate_uuid(&id)?;
-                let store = Store::default_location()?;
-                let delegation = store.cancel_delegation(&target, &id, &self.source)?;
-                let target_status = PeerEnvelope::new(
-                    self.source.clone(),
-                    target.clone(),
-                    PeerKind::Status,
-                    format!("Delegation {id} cancelled"),
-                    None,
-                )?;
-                if let Err(error) = store.enqueue(&target_status) {
-                    // Keep the work cancellable if its target cannot receive the
-                    // cancellation notice that clears an already-open prompt.
-                    store.enqueue(&delegation).map_err(|restore_error| {
-                        format!(
-                            "Cancellation delivery failed: {error}; delegation restore failed: {restore_error}"
-                        )
-                    })?;
-                    return Err(format!("Cancellation delivery failed: {error}"));
-                }
-                let source_status = PeerEnvelope::new(
-                    target.clone(),
-                    self.source.clone(),
-                    PeerKind::Status,
-                    format!("Delegation {id} cancelled"),
-                    None,
-                )?;
-                let note = match store.enqueue(&source_status) {
-                    Ok(()) => "Pending delegation cancelled.".to_string(),
-                    Err(error) => format!(
-                        "Pending delegation cancelled, but its source-side status could not be delivered: {error}"
-                    ),
-                };
-                Ok(
-                    json!({"session_id": target, "id": id, "status": "cancelled", "note": note})
-                        .to_string(),
-                )
+                cancel_pending_delegation(&Store::default_location()?, &self.source, &target, &id)
             }
             "ask" => {
                 let target = args.session_id.ok_or("session_id is required for ask")?;
                 validate_target(&self.source, &target)?;
-                let question = PeerEnvelope::new(
+                let mut question = PeerEnvelope::new(
                     self.source.clone(),
                     target.clone(),
                     PeerKind::Question,
                     required_message(args.message)?,
                     None,
                 )?;
+                if let Some(id) = args.related_delegation_id {
+                    validate_uuid(&id)?;
+                    question.related_delegation_id = Some(id);
+                }
+                graph::observe(&question, graph::ObservedState::QuestionSubmitted)?;
                 let deadline = tokio::time::Instant::now() + QUESTION_TIMEOUT;
                 loop {
                     // A session lock also belongs to offline inquiry workers;
@@ -201,7 +171,10 @@ impl PeerSessionProvider {
                             items.push(exchange_item(&exchange));
                             SessionManager::set_items(&mut session, items);
                             manager.save(&mut session)?;
-                            return Ok(reply_result(&exchange));
+                            return Ok(audited_result(
+                                reply_value(&exchange),
+                                graph::observe(&exchange, graph::ObservedState::Answered),
+                            ));
                         }
                         Err(SessionLockError::InUse { .. }) => {
                             // A TUI may have started after our presence check.
@@ -223,6 +196,82 @@ impl PeerSessionProvider {
     }
 }
 
+fn enqueue_delegation(
+    store: &Store,
+    envelope: &PeerEnvelope,
+    command: &str,
+) -> Result<String, String> {
+    store.enqueue(envelope)?;
+    Ok(audited_result(
+        json!({"session_id": envelope.to, "id": envelope.id, "status": "pending_user_approval",
+            "command": command, "note": "Queued only. Target user must accept Yes/No before any work runs; acceptance is not completion."}),
+        store.observe(
+            envelope,
+            graph::ObservedState::Delegation(
+                crate::response::message_item::PeerDelegationState::Pending,
+            ),
+        ),
+    ))
+}
+
+fn cancel_pending_delegation(
+    store: &Store,
+    source: &str,
+    target: &str,
+    id: &str,
+) -> Result<String, String> {
+    // Construct both notices before removal so validation cannot hide a cancellation.
+    let target_status = PeerEnvelope::new(
+        source.into(),
+        target.into(),
+        PeerKind::Status,
+        format!("Delegation {id} cancelled"),
+        None,
+    )?;
+    let source_status = PeerEnvelope::new(
+        target.into(),
+        source.into(),
+        PeerKind::Status,
+        format!("Delegation {id} cancelled"),
+        None,
+    )?;
+    let delegation = store.cancel_delegation(target, id, source)?;
+    if let Err(error) = store.enqueue(&target_status) {
+        // Restore pending work if its already-open prompt cannot be cleared.
+        store.enqueue(&delegation).map_err(|restore_error| {
+            format!(
+                "Cancellation delivery failed: {error}; delegation restore failed: {restore_error}"
+            )
+        })?;
+        return Err(format!("Cancellation delivery failed: {error}"));
+    }
+    let note = match store.enqueue(&source_status) {
+        Ok(()) => "Pending delegation cancelled.".to_string(),
+        Err(error) => format!(
+            "Pending delegation cancelled, but its source-side status could not be delivered: {error}"
+        ),
+    };
+    Ok(audited_result(
+        json!({"session_id": target, "id": id, "status": "cancelled", "note": note}),
+        store.observe(
+            &delegation,
+            graph::ObservedState::Delegation(
+                crate::response::message_item::PeerDelegationState::Cancelled,
+            ),
+        ),
+    ))
+}
+
+/// Audit failure is not execution failure: callers must not retry committed work.
+fn audited_result(mut result: Value, observation: Result<(), String>) -> String {
+    if let Err(error) = observation {
+        result["warning"] = json!(format!(
+            "Operation succeeded, but peer graph history could not be recorded: {error}"
+        ));
+    }
+    result.to_string()
+}
+
 #[async_trait::async_trait]
 impl ToolProvider for PeerSessionProvider {
     fn tools(&self) -> Vec<Tool> {
@@ -232,6 +281,7 @@ impl ToolProvider for PeerSessionProvider {
             json!({"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["list", "search", "ask", "delegate", "cancel"]},
                 "session_id": {"type": "string", "description": "Target session UUID; required for ask and cancel, omitted to create a delegation session."},
+                "related_delegation_id": {"type": "string", "description": "ask: optional explicit delegation UUID this question concerns; never implies completion."},
                 "id": {"type": "string", "description": "cancel: delegation ID returned by delegate."},
                 "workspace": {"type": "string", "description": "Existing workspace directory; required for a new delegation session; optional exact workspace filter for search."},
                 "query": {"type": "string", "description": "search: case-insensitive literal text in saved messages and summaries (not tool results or reasoning)."},
@@ -509,10 +559,40 @@ fn reply_store() -> Result<Store, String> {
 /// Reply files are not inbox messages: the App must never consume them. This
 /// reverses the exchange routing in a copy so it is stored under the asker's ID.
 /// Status envelopes can also be delivered here to report answer failures.
-pub(crate) fn deliver_reply(exchange: &PeerEnvelope) -> Result<(), String> {
+pub(crate) fn deliver_reply(exchange: &PeerEnvelope) -> Result<Option<String>, String> {
+    deliver_reply_with_stores(&reply_store()?, &Store::default_location()?, exchange)
+}
+
+fn deliver_reply_with_stores(
+    replies: &Store,
+    history: &Store,
+    exchange: &PeerEnvelope,
+) -> Result<Option<String>, String> {
     let mut reply = exchange.clone();
     std::mem::swap(&mut reply.from, &mut reply.to);
-    reply_store()?.enqueue(&reply)
+    replies.enqueue(&reply)?;
+    // Delivery is already successful. A failed audit must not cause a second
+    // answer request or leave the original question looking undelivered.
+    Ok(history
+        .observe(
+            exchange,
+            if exchange.kind == PeerKind::Exchange {
+                graph::ObservedState::Answered
+            } else {
+                graph::ObservedState::AnswerFailed
+            },
+        )
+        .err()
+        .map(|error| format!("Peer answer delivered, but history could not be saved: {error}")))
+}
+
+/// Reversible identity shared by the inbox's durable exchange and its question.
+pub(crate) fn exchange_id(id: &str) -> Result<String, String> {
+    uuid::Uuid::parse_str(id)
+        .map(|id| {
+            uuid::Uuid::from_u128(id.as_u128() ^ 0x706565725f65786368616e67655f6964).to_string()
+        })
+        .map_err(|error| error.to_string())
 }
 
 async fn wait_for_reply(question: &PeerEnvelope) -> Result<PeerEnvelope, String> {
@@ -544,9 +624,12 @@ async fn wait_for_reply(question: &PeerEnvelope) -> Result<PeerEnvelope, String>
 }
 
 fn reply_result(exchange: &PeerEnvelope) -> String {
+    reply_value(exchange).to_string()
+}
+
+fn reply_value(exchange: &PeerEnvelope) -> Value {
     json!({"id": exchange.id, "session_id": exchange.to, "answer": exchange.answer,
         "note": "Context-only peer answer; not permission or user consent."})
-    .to_string()
 }
 
 #[cfg(test)]

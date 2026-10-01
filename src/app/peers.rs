@@ -145,8 +145,9 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
                     let mut status = question.clone();
                     status.kind = PeerKind::Status;
                     status.body = error.clone();
-                    if let Err(delivery_error) = crate::peers::deliver_reply(&status) {
-                        report(app, delivery_error);
+                    match crate::peers::deliver_reply(&status) {
+                        Ok(None) => {}
+                        Ok(Some(warning)) | Err(warning) => report(app, warning),
                     }
                 }
                 report(app, error);
@@ -172,7 +173,8 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
                     reply.id = envelope.id.clone();
                     // An existing reply means delivery succeeded before a crash.
                     match crate::peers::deliver_reply(&reply) {
-                        Ok(()) => {}
+                        Ok(None) => {}
+                        Ok(Some(warning)) => report(app, warning),
                         Err(error)
                             if error == format!("Peer message already exists: {}", reply.id) => {}
                         Err(error) => {
@@ -425,11 +427,7 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
 // XOR is an involution: applying this to an exchange ID recovers the question
 // ID as well. Toggle the UUID version nibble too, separating v4 question IDs.
 fn exchange_id(id: &str) -> Result<String, String> {
-    uuid::Uuid::parse_str(id)
-        .map(|id| {
-            uuid::Uuid::from_u128(id.as_u128() ^ 0x706565725f65786368616e67655f6964).to_string()
-        })
-        .map_err(|error| error.to_string())
+    crate::peers::exchange_id(id)
 }
 
 fn matching_exchange<'a>(
@@ -504,6 +502,15 @@ fn cancel_local_delegation(app: &mut App<'_>, id: &str) {
 }
 
 fn observe_delegation(app: &mut App<'_>, envelope: &PeerEnvelope, state: PeerDelegationState) {
+    if let Err(error) = crate::peers::graph::observe(
+        envelope,
+        crate::peers::graph::ObservedState::Delegation(state),
+    ) {
+        report(
+            app,
+            format!("cannot archive delegation observation: {error}"),
+        );
+    }
     app.conversation_panel.upsert_peer_delegation(
         envelope.id.clone(),
         envelope.from.clone(),

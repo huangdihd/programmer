@@ -19,7 +19,18 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         }
         Command::Clear => clear(app),
         Command::New => new(app),
-        Command::Session => show_session(app),
+        Command::Session(arguments) => match arguments.trim() {
+            "" => show_session(app),
+            "graph" => {
+                crate::app::activity::open_graph(app);
+                CommandOutcome::handled(false)
+            }
+            _ => {
+                app.conversation_panel
+                    .add_warning_string("usage: /session [graph]");
+                CommandOutcome::handled(false)
+            }
+        },
         Command::Title(title) => {
             commands::set_or_regenerate_session_title(app, &title);
             CommandOutcome::handled(true)
