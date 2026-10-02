@@ -4,6 +4,7 @@
 //! Read-only, peer-scoped graph presentation. Unknown routes are a real group,
 //! not a sentinel session ID that could collide with an actual peer.
 //! Peers → Events → Details is the Enter/Escape hierarchy; Tab cycles all three.
+//! Selection backgrounds persist across focus changes; headings alone mark focus.
 //! Search and kind filters affect only the selected peer's events. `m` toggles
 //! separately supplied record metadata; no graph action accepts or starts work.
 //! Use neutral palette tokens here: global SUBTLE/BORDER roles intentionally
@@ -354,8 +355,8 @@ impl ActivityPanel {
     /// Mouse targets come only from the most recent render, including viewport
     /// offsets. Hidden narrow-layout panes and stale pre-resize rows are cleared.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ActivityAction {
-        if self.mode != ActivityMode::SessionGraph {
-            return ActivityAction::None;
+        if self.mode == ActivityMode::Dream {
+            return self.handle_dream_mouse(event);
         }
         let position = Position::new(event.column, event.row);
         let hits = &self.graph.hits;
@@ -516,10 +517,7 @@ impl ActivityPanel {
                         peer.questions,
                         peer.delegations
                     ))
-                    .style(row_style(
-                        index == selected,
-                        self.graph.focus == Focus::Peers,
-                    )),
+                    .style(row_style(index == selected)),
                     Line::default(),
                 ]
             })
@@ -530,14 +528,12 @@ impl ActivityPanel {
                 .render(body, buffer);
         } else {
             Paragraph::new(lines).render(body, buffer);
-            if self.graph.focus == Focus::Peers {
-                fill_selected_row(
-                    body,
-                    selected.saturating_sub(self.graph.peer_offset),
-                    PEER_ITEM_HEIGHT,
-                    buffer,
-                );
-            }
+            fill_selected_row(
+                body,
+                selected.saturating_sub(self.graph.peer_offset),
+                PEER_ITEM_HEIGHT,
+                buffer,
+            );
         }
     }
 
@@ -583,7 +579,7 @@ impl ActivityPanel {
             .skip(offset)
             .take(capacity)
             .flat_map(|(index, entry)| {
-                let style = row_style(index == self.selected, self.graph.focus == Focus::Events);
+                let style = row_style(index == self.selected);
                 let direction = if self.other_endpoint(entry).is_none() {
                     "? route unavailable"
                 } else if entry.from.as_deref() == Some(self.center.as_str()) {
@@ -623,14 +619,12 @@ impl ActivityPanel {
                 .render(rows[1], buffer);
         } else {
             Paragraph::new(lines).render(rows[1], buffer);
-            if self.graph.focus == Focus::Events {
-                fill_selected_row(
-                    rows[1],
-                    self.selected.saturating_sub(offset),
-                    EVENT_ITEM_HEIGHT,
-                    buffer,
-                );
-            }
+            fill_selected_row(
+                rows[1],
+                self.selected.saturating_sub(offset),
+                EVENT_ITEM_HEIGHT,
+                buffer,
+            );
         }
     }
 
@@ -746,17 +740,14 @@ fn fill_selected_row(area: Rect, visible_index: usize, height: u16, buffer: &mut
     }
 }
 
-fn row_style(selected: bool, focused: bool) -> Style {
-    match (selected, focused) {
-        (true, true) => Style::default()
+fn row_style(selected: bool) -> Style {
+    if selected {
+        return Style::default()
             .fg(palette::TEXT)
             .bg(palette::SURFACE)
-            .add_modifier(Modifier::BOLD),
-        (true, false) => Style::default()
-            .fg(palette::TEXT)
-            .add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(palette::TEXT),
+            .add_modifier(Modifier::BOLD);
     }
+    Style::default().fg(palette::TEXT)
 }
 
 fn region(
@@ -837,38 +828,140 @@ mod tests {
         }
     }
 
-    #[test]
-    fn selected_background_covers_blank_cells_across_the_whole_row() {
-        use crate::ui::theme::{self, Theme};
-        for theme in [Theme::Dark, Theme::Light] {
-            for focus in [Focus::Peers, Focus::Events] {
-                let mut panel = panel(ActivityMode::SessionGraph);
-                panel.graph.focus = focus;
-                let area = Rect::new(0, 0, 140, 25);
-                let mut buffer = Buffer::empty(area);
-                panel.render(area, &mut buffer);
-                let rows = if focus == Focus::Peers {
-                    panel.graph.hits.peer_rows
+    fn assert_persistent_selection(panel: &mut ActivityPanel, theme: crate::ui::theme::Theme) {
+        use crate::ui::theme;
+        let area = Rect::new(3, 2, 140, 32);
+        let mut buffer = Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        theme::apply(theme, area, &mut buffer);
+        let mut expected = Buffer::empty(Rect::new(0, 0, 2, 1));
+        expected[(0, 0)]
+            .set_bg(palette::SURFACE)
+            .set_fg(role::FOCUS);
+        expected[(1, 0)].set_fg(palette::MUTED);
+        theme::apply(theme, expected.area, &mut expected);
+        let selected_background = expected[(0, 0)].bg;
+        let default_background = expected[(1, 0)].bg;
+        assert_ne!(selected_background, default_background);
+        let peers = panel.graph_peers();
+        let selected_peer = peers
+            .iter()
+            .position(|peer| Some(&peer.key) == panel.current_graph_peer().as_ref())
+            .unwrap();
+        for (rows, height, selected, offset, count) in [
+            (
+                panel.graph.hits.peer_rows,
+                PEER_ITEM_HEIGHT,
+                selected_peer,
+                panel.graph.peer_offset,
+                peers.len(),
+            ),
+            (
+                panel.graph.hits.event_rows,
+                EVENT_ITEM_HEIGHT,
+                panel.selected,
+                panel.graph.event_offset,
+                panel.visible_entries().len(),
+            ),
+        ] {
+            for index in offset..count {
+                let top = rows.y + (index - offset) as u16 * height;
+                let background = if index == selected {
+                    selected_background
                 } else {
-                    panel.graph.hits.event_rows
+                    default_background
                 };
-                theme::apply(theme, area, &mut buffer);
-                let background = buffer[(rows.x, rows.y)].bg;
-                let height = if focus == Focus::Peers { 3 } else { 4 };
-                for y in rows.y..rows.y + height {
+                for y in top..top.saturating_add(height).min(rows.bottom()) {
                     for x in rows.x..rows.right() {
                         assert_eq!(
                             buffer[(x, y)].bg,
                             background,
-                            "selection gap at {x},{y}: {theme:?} {focus:?}"
+                            "row background at {x},{y}: {theme:?} {:?}",
+                            panel.graph.focus
                         );
                     }
                 }
-                assert_ne!(
-                    buffer[(rows.right(), rows.y)].bg,
-                    background,
-                    "selection must not bleed into details"
-                );
+            }
+            assert_eq!(
+                buffer[(rows.right(), rows.y)].bg,
+                default_background,
+                "selection must not bleed into details"
+            );
+        }
+        for (region, focus) in [
+            (panel.graph.hits.peers, Focus::Peers),
+            (panel.graph.hits.events, Focus::Events),
+            (panel.graph.hits.details, Focus::Details),
+        ] {
+            let foreground = if panel.graph.focus == focus {
+                expected[(0, 0)].fg
+            } else {
+                expected[(1, 0)].fg
+            };
+            assert_eq!(
+                buffer[(region.x + 1, region.y)].fg,
+                foreground,
+                "heading focus: {theme:?} {focus:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_background_covers_full_rows_after_enter_and_tab_focus_changes() {
+        use crate::ui::theme::Theme;
+        for theme in [Theme::Dark, Theme::Light] {
+            let mut panel = panel(ActivityMode::SessionGraph);
+            assert_persistent_selection(&mut panel, theme);
+            for (key, focus) in [
+                (KeyCode::Enter, Focus::Events),
+                (KeyCode::Down, Focus::Events),
+                (KeyCode::Enter, Focus::Details),
+                (KeyCode::Tab, Focus::Peers),
+                (KeyCode::Tab, Focus::Events),
+                (KeyCode::Tab, Focus::Details),
+                (KeyCode::BackTab, Focus::Events),
+                (KeyCode::Esc, Focus::Peers),
+            ] {
+                press(&mut panel, key);
+                assert_eq!(panel.graph.focus, focus);
+                assert_persistent_selection(&mut panel, theme);
+            }
+        }
+    }
+
+    #[test]
+    fn selected_background_covers_full_rows_after_mouse_focus_changes() {
+        use crate::ui::theme::Theme;
+        for theme in [Theme::Dark, Theme::Light] {
+            let mut panel = panel(ActivityMode::SessionGraph);
+            let mut other = entry("other");
+            other.from = Some("other-peer".into());
+            panel.entries.push(other);
+            assert_persistent_selection(&mut panel, theme);
+            for focus in [Focus::Events, Focus::Details, Focus::Peers, Focus::Details] {
+                let target = match focus {
+                    Focus::Peers => {
+                        let rows = panel.graph.hits.peer_rows;
+                        Rect::new(rows.x, rows.y + PEER_ITEM_HEIGHT, 1, 1)
+                    }
+                    Focus::Events => {
+                        let rows = panel.graph.hits.event_rows;
+                        Rect::new(rows.x, rows.y + EVENT_ITEM_HEIGHT, 1, 1)
+                    }
+                    Focus::Details => panel.graph.hits.details,
+                };
+                mouse(&mut panel, target, MouseEventKind::Down(MouseButton::Left));
+                assert_eq!(panel.graph.focus, focus);
+                if focus == Focus::Events {
+                    assert_eq!(panel.selected, 1);
+                }
+                if focus == Focus::Peers {
+                    assert_eq!(
+                        panel.current_graph_peer(),
+                        Some(PeerKey::Session("other-peer".into()))
+                    );
+                }
+                assert_persistent_selection(&mut panel, theme);
             }
         }
     }
@@ -905,8 +998,8 @@ mod tests {
                 expected[(2, 0)].fg,
                 "divider must be neutral in {theme:?}"
             );
-            assert_ne!(row_style(true, false).fg, Some(role::FOCUS));
-            assert_ne!(row_style(true, true).bg, Some(role::SELECTION_BG));
+            assert_ne!(row_style(true).fg, Some(role::FOCUS));
+            assert_ne!(row_style(true).bg, Some(role::SELECTION_BG));
         }
     }
 
@@ -1264,12 +1357,12 @@ mod tests {
             KeyEvent::new_with_kind(KeyCode::Tab, KeyModifiers::NONE, KeyEventKind::Release);
         assert_eq!(panel.handle_key(release), ActivityAction::None);
         assert_eq!(panel.graph.focus, Focus::Peers);
-        assert_eq!(row_style(true, true).bg, Some(palette::SURFACE));
-        assert_ne!(row_style(true, false).bg, Some(role::SELECTION_BG));
+        assert_eq!(row_style(true).bg, Some(palette::SURFACE));
+        assert_ne!(row_style(true).bg, Some(role::SELECTION_BG));
     }
 
     #[test]
-    fn metadata_is_opt_in_and_read_only_and_inactive_selection_is_distinct() {
+    fn metadata_is_opt_in_and_read_only() {
         let mut panel = panel(ActivityMode::SessionGraph);
         panel.entries[0].details = "Task body".into();
         panel.set_graph_record_metadata(BTreeMap::from([(
@@ -1290,6 +1383,7 @@ mod tests {
         assert!(!panel.graph.metadata_expanded);
         assert_eq!(press(&mut panel, KeyCode::Char('r')), ActivityAction::None);
         assert!(!panel.show_rollback_confirmation("alpha".into(), "preview".into()));
-        assert_ne!(row_style(true, true), row_style(true, false));
+        assert_eq!(row_style(true).bg, Some(palette::SURFACE));
+        assert_eq!(row_style(false).bg, None);
     }
 }

@@ -83,23 +83,14 @@ pub(crate) fn refresh_consent_models(app: &mut App<'_>) {
 
 /// Called after events; disk polling occurs only on ticks. Async answering never
 /// borrows App, and its results are discarded if the session identity changes.
-pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
+pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
     refresh_consent_models(app);
     sync_session(app);
     if !app.running || app.peers.presence.is_none() {
-        return;
+        return false;
     }
-    let was_consent = app.peers.consent.is_some();
     finish_consent(app);
     restore_runner_prompt(app);
-    if was_consent
-        && app.peers.consent.is_none()
-        && app.cancel.active_id.is_none()
-        && !super::events::has_blocking_surface(app)
-        && app.conversation_panel.pending_message.is_some()
-    {
-        super::events::start_queued_work(app).await;
-    }
 
     let completed: Vec<_> = app
         .peers
@@ -161,7 +152,7 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
             Ok(messages) => app.peers.pending = messages,
             Err(error) => {
                 report(app, error);
-                return;
+                return false;
             }
         }
     }
@@ -306,7 +297,7 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
                     Ok(message) => app.conversation_panel.add_input_message(message),
                     Err(error) => {
                         report(app, error.to_string());
-                        return;
+                        return false;
                     }
                 }
                 session::mark_dirty(app);
@@ -314,10 +305,18 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
         }
         if let Err(error) = session::save_session_checked(app) {
             report(app, error);
-            return;
+            return false;
         }
     }
 
+    true
+}
+
+/// Event settlement dispatches local queued work first, then accepted peer work.
+pub(crate) async fn start_ready_work(app: &mut App<'_>) {
+    if !app.running || app.peers.presence.is_none() {
+        return;
+    }
     let ready = ready_work(&app.peers.pending, &app.peers.accepted);
     if ready.is_empty() {
         return;
@@ -334,6 +333,7 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
         app.auto_compact.mandatory_waiting = true;
         if !commands::maybe_start_auto_compact(app, tokens) {
             app.auto_compact.mandatory_waiting = false;
+            app.auto_compact.retry_blocked = true;
             report(app, "Peer follow-up awaits mandatory compaction; compact manually or adjust the context limit.".into());
         }
         return;

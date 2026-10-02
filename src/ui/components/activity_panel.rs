@@ -18,7 +18,10 @@ use ratatui::{
 use super::panel_search::{PanelSearch, SearchKey};
 use crate::ui::theme::role;
 
+mod dream;
 mod graph;
+use dream::DreamState;
+pub use dream::{DreamPresentation, DreamStatusTone};
 use graph::GraphState;
 pub use graph::{GraphEventStatus, GraphStatusTone};
 
@@ -67,6 +70,7 @@ pub struct ActivityPanel {
     session_labels: BTreeMap<String, String>,
     kind_filter: Option<ActivityEntryKind>,
     graph: GraphState,
+    dream: DreamState,
     notice: Option<String>,
     selected: usize,
     search: PanelSearch,
@@ -93,6 +97,7 @@ impl ActivityPanel {
             session_labels: BTreeMap::new(),
             kind_filter: None,
             graph: GraphState::default(),
+            dream: DreamState::default(),
             notice: None,
             selected: 0,
             search: PanelSearch::default(),
@@ -273,7 +278,13 @@ impl ActivityPanel {
             }
             return ActivityAction::None;
         }
+        // Applied searches must not intercept Escape when ascending from details.
+        if self.details_focused && key.code == KeyCode::Esc {
+            self.details_focused = false;
+            return ActivityAction::None;
+        }
         if let SearchKey::Consumed { changed } = self.search.handle_key(key) {
+            self.details_focused = false;
             if changed {
                 self.selected = 0;
                 self.reset_details();
@@ -287,7 +298,14 @@ impl ActivityPanel {
                 self.pending_rollback = None;
                 return ActivityAction::Refresh;
             }
-            KeyCode::Tab | KeyCode::BackTab => self.details_focused = !self.details_focused,
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.search
+                    .handle_key(KeyEvent::new(KeyCode::Enter, key.modifiers));
+                self.details_focused = !self.details_focused;
+            }
+            KeyCode::Enter if self.selected_entry().is_some() => self.details_focused = true,
+            KeyCode::Char('m') => self.dream.metadata_expanded = !self.dream.metadata_expanded,
+            KeyCode::Char('s') => self.dream.sources_expanded = !self.dream.sources_expanded,
             KeyCode::Char('r')
                 if self.mode == ActivityMode::Dream && key.kind == KeyEventKind::Press =>
             {
@@ -320,165 +338,11 @@ impl ActivityPanel {
         ActivityAction::None
     }
 
-    fn block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(Style::default().fg(if focused { role::FOCUS } else { role::BORDER }))
-    }
-
     pub fn render(&mut self, area: Rect, buffer: &mut Buffer) {
-        if self.mode == ActivityMode::SessionGraph {
-            self.render_session_graph(area, buffer);
-            return;
+        match self.mode {
+            ActivityMode::SessionGraph => self.render_session_graph(area, buffer),
+            ActivityMode::Dream => self.render_dream(area, buffer),
         }
-        Clear.render(area, buffer);
-        let block = Self::block(format!(" {} ", self.title), true);
-        let inner = block.inner(area);
-        block.render(area, buffer);
-        if inner.is_empty() {
-            return;
-        }
-        let notice_height = u16::from(self.notice.is_some());
-        let sections = Layout::vertical([
-            Constraint::Length(notice_height),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-        if let Some(notice) = &self.notice {
-            Paragraph::new(format!("Notice: {notice}"))
-                .style(Style::default().fg(role::TOOL_PENDING))
-                .render(sections[0], buffer);
-        }
-        if let Some((id, details)) = &self.confirmation {
-            let title = format!(" Confirm rollback: {id} ");
-            let details = details.clone();
-            self.render_details(sections[1], buffer, title, details, true);
-            Paragraph::new("y confirm rollback · n/Esc cancel · ↑↓ scroll")
-                .style(Style::default().fg(role::TOOL_PENDING))
-                .render(sections[2], buffer);
-            return;
-        }
-        let content = sections[1];
-        // On small terminals Tab switches between full-width timeline and details.
-        if content.width < 70 || content.height < 6 {
-            if self.details_focused {
-                self.render_selected_details(content, buffer);
-            } else {
-                self.render_timeline(content, buffer);
-            }
-        } else {
-            let parts =
-                Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
-                    .split(content);
-            self.render_timeline(parts[0], buffer);
-            self.render_selected_details(parts[1], buffer);
-        }
-        let hint = "↑↓/jk move · Tab focus · / search · R refresh · r rollback · Esc close";
-        Paragraph::new(hint)
-            .style(Style::default().fg(role::SUBTLE))
-            .render(sections[2], buffer);
-    }
-
-    fn render_timeline(&self, area: Rect, buffer: &mut Buffer) {
-        let visible = self.visible_entries();
-        let title = self
-            .search
-            .block_title(visible.len(), self.entries.len())
-            .unwrap_or_else(|| {
-                Line::from(format!(
-                    " Timeline ({}/{}) ",
-                    if visible.is_empty() {
-                        0
-                    } else {
-                        self.selected + 1
-                    },
-                    visible.len()
-                ))
-            });
-        let block = Self::block(title, !self.details_focused);
-        let inner = block.inner(area);
-        block.render(area, buffer);
-        if visible.is_empty() {
-            Paragraph::new("No matching activity").render(inner, buffer);
-            return;
-        }
-        let offset = self
-            .selected
-            .saturating_sub(usize::from(inner.height).saturating_sub(1));
-        let lines: Vec<_> = visible
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(usize::from(inner.height))
-            .map(|(index, entry)| {
-                let line = Line::from(format!(
-                    "{} {} — {}",
-                    if index == self.selected { "❯" } else { " " },
-                    entry.title,
-                    entry.summary
-                ));
-                if index == self.selected {
-                    line.style(
-                        Style::default()
-                            .fg(role::SELECTION_TEXT)
-                            .bg(role::SELECTION_BG),
-                    )
-                } else {
-                    line
-                }
-            })
-            .collect();
-        Paragraph::new(lines).render(inner, buffer);
-    }
-
-    fn render_selected_details(&mut self, area: Rect, buffer: &mut Buffer) {
-        let details = self
-            .selected_entry()
-            .map(|entry| {
-                let route = match (&entry.from, &entry.to) {
-                    (Some(from), Some(to)) => format!("\n{from} → {to}"),
-                    _ => String::new(),
-                };
-                format!(
-                    "{}\n{}{}\n\n{}",
-                    entry.title, entry.summary, route, entry.details
-                )
-            })
-            .unwrap_or_else(|| "No activity selected".into());
-        self.render_details(
-            area,
-            buffer,
-            " Details ".into(),
-            details,
-            self.details_focused,
-        );
-    }
-
-    fn render_details(
-        &mut self,
-        area: Rect,
-        buffer: &mut Buffer,
-        title: String,
-        details: String,
-        focused: bool,
-    ) {
-        let block = Self::block(title, focused);
-        let inner = block.inner(area);
-        block.render(area, buffer);
-        if inner.is_empty() {
-            return;
-        }
-        let paragraph = Paragraph::new(details).wrap(Wrap { trim: false });
-        self.details_limit = paragraph
-            .line_count(inner.width)
-            .saturating_sub(usize::from(inner.height))
-            .min(usize::from(u16::MAX)) as u16;
-        self.details_scroll = self.details_scroll.min(self.details_limit);
-        paragraph
-            .scroll((self.details_scroll, 0))
-            .render(inner, buffer);
     }
 }
 

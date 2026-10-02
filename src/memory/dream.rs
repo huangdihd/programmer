@@ -492,7 +492,11 @@ impl DreamModel {
         manager: &MemoryManager,
         config: &DreamConfig,
         scope: Option<MemoryScope>,
+        cancellation: crate::cancel::CancellationToken,
     ) -> Result<DreamReport, String> {
+        if cancellation.is_cancelled() {
+            return Err("Dream preview cancelled".into());
+        }
         let Some(_lock) = manager.acquire_dream_lock()? else {
             return Ok(DreamReport::skipped(
                 manager.pending_count()?,
@@ -506,9 +510,10 @@ impl DreamModel {
         }
         let memories = manager.list_unlocked(None)?;
         let run_id = manager.record_generation_start(&pending)?;
-        let plan = match self
-            .generate_plan(&pending, &memories, config.timeout_secs)
+        let plan = match cancellation
+            .wait_or(self.generate_plan(&pending, &memories, config.timeout_secs))
             .await
+            .unwrap_or_else(|| Err("Dream preview cancelled".into()))
         {
             Ok(plan) => plan,
             Err(error) => {
@@ -1341,6 +1346,61 @@ mod tests {
         // The UI indicator must be down once the worker is stopped, even though
         // the pass failed.
         assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn manual_preview_cancels_a_stalled_provider_and_releases_the_store() {
+        let manager = manager();
+        manager
+            .enqueue_dream("session-1", "User: always run cargo test")
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (connected, connection) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            let _ = connected.send(());
+            std::future::pending::<()>().await;
+        });
+        let model = DreamModel {
+            client: Client::with_config(
+                OpenAIConfig::new().with_api_base(base).with_api_key("test"),
+            ),
+            model: "test-model".into(),
+        };
+        let configuration = DreamConfig {
+            enabled: true,
+            min_sessions: 1,
+            min_interval_hours: 0,
+            timeout_secs: 60,
+        };
+        let cancellation = crate::cancel::CancellationToken::new();
+        let task_manager = manager.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            model
+                .preview(&task_manager, &configuration, None, task_cancellation)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manager.list(None).unwrap_err().contains("busy"));
+        cancellation.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(manager.list(None).unwrap().is_empty());
+        assert_eq!(manager.load_pending().unwrap().len(), 1);
+        assert!(!manager.dream_dir().join(PREVIEW_FILE).exists());
+        let history = manager.dream_history_list().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, DreamRunStatus::GenerationFailed);
+        assert!(history[0].error.as_ref().unwrap().contains("cancelled"));
+        server.abort();
     }
 
     #[tokio::test]

@@ -739,8 +739,10 @@ and apply:
 /memory dream apply      # apply that plan, then retire the consumed sessions
 ```
 
-`preview` writes `.dream-preview.json` in the project memory directory and
-consumes nothing; `apply` performs no model call at all, so reviewing a plan
+`preview` runs as a cancellable foreground operation without blocking the UI;
+Esc cancels its model request, retains queued inputs, and does not apply memories.
+Another foreground operation cannot start a concurrent preview. It writes
+`.dream-preview.json` in the project memory directory and consumes nothing; `apply` performs no model call at all, so reviewing a plan
 costs one request. Both are slash commands only: `dream` is deliberately absent
 from the `memory` tool the model can call, so an agent can neither inspect the
 queue nor trigger consolidation — and a hand-written tool call naming it is
@@ -761,8 +763,16 @@ operation outcomes, errors, and memory before/after values. Old processed queue
 files are input excerpts, not historical change snapshots: their missing changes
 cannot be reconstructed or rolled back.
 
-Use arrows/`j`/`k` to select, `Tab` to switch to scrollable details, `/` to search,
-and `R`/F5 to refresh. In an applied run, `r` previews **whole-run rollback**;
+The timeline uses padded rows with persistent selection; moving focus into
+its details does not remove the selected run's background. Details show inline
+before/after changes first, then operation results. Status and diff colors come
+from recorded states and snapshots, not from transcript text. `s` discloses source
+excerpts; `m` discloses metadata and the recorded plan.
+
+Use arrows/`j`/`k` to select, `Enter` to enter details, and `Esc` to return to the
+timeline (then close). `Tab`/Shift+Tab switch regions; mouse clicks select/focus
+and the wheel navigates or scrolls. Narrow terminals show one region at a time.
+`/` searches and `R`/F5 refreshes. In an applied run, `r` previews **whole-run rollback**;
 `y` confirms and `n`/Esc cancels. Any subsequent semantic change to an affected
 memory blocks the entire rollback. Usage counts and last-recalled times, unrelated
 memories, and later independent changes are preserved. Rollback produces a
@@ -790,7 +800,9 @@ Use ↑/↓ or `j`/`k` in the focused region. `Enter` moves from sessions to eve
 then details; `Esc` moves back one region and closes from sessions. `Tab` and
 Shift+Tab cycle all three regions. Clicking a region focuses it; the mouse wheel
 navigates its list or scrolls details. Selection updates dependent regions without
-moving focus. Each peer remembers its selected event, and refresh preserves
+moving focus. Selected sessions and events retain their full-row backgrounds,
+including padding, when focus moves to another region; only the focus indicator
+moves. Each peer remembers its selected event, and refresh preserves
 selection and detail scrolling. Narrow terminals use full-width detail reading.
 
 `/` searches the selected peer's events, `f` cycles all/questions/delegations,

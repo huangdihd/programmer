@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crossterm::event::KeyEvent;
+use ratatui::style::{Color, Style};
+use ratatui::text::Line;
 
 use super::App;
 use crate::memory::dream::{DreamHistory, DreamRunStatus};
@@ -14,9 +16,10 @@ use crate::response::message_item::PeerDelegationState;
 use crate::session::SessionManager;
 use crate::ui::components::activity_panel::{
     ActivityAction, ActivityEntry, ActivityEntryKind, ActivityMode, ActivityPanel,
-    GraphEventStatus, GraphStatusTone,
+    DreamPresentation, DreamStatusTone, GraphEventStatus, GraphStatusTone,
 };
 use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
+use crate::ui::markdown_theme::palette;
 
 pub(crate) struct ActivityView {
     mode: ActivityMode,
@@ -80,6 +83,7 @@ fn refresh(app: &mut App<'_>) {
     let mut kinds = BTreeMap::new();
     let mut record_metadata = BTreeMap::new();
     let mut statuses = BTreeMap::new();
+    let mut dream_presentations = BTreeMap::new();
     let result = match view.mode {
         ActivityMode::Dream => {
             crate::memory::MemoryManager::for_current_dir().and_then(|manager| {
@@ -93,7 +97,11 @@ fn refresh(app: &mut App<'_>) {
                                 .iter()
                                 .any(|source| source.session_id == app.session.uuid)
                     })
-                    .map(dream_entry)
+                    .map(|record| {
+                        dream_presentations
+                            .insert(record.run_id.clone(), dream_presentation(&record));
+                        dream_entry(record)
+                    })
                     .collect())
             })
         }
@@ -114,6 +122,7 @@ fn refresh(app: &mut App<'_>) {
                 panel.set_session_labels(view.session_labels.clone());
                 panel.set_graph_record_metadata(record_metadata);
                 panel.set_graph_statuses(statuses);
+                panel.set_dream_presentations(dream_presentations);
             }
             Err(error) => panel.show_notice(format!("Unable to refresh activity: {error}")),
         }
@@ -368,6 +377,172 @@ fn dream_entry(record: DreamHistory) -> ActivityEntry {
         to: None,
         rollback_allowed: record.status == DreamRunStatus::Applied
             && record.rollback_run_id.is_none(),
+    }
+}
+
+fn dream_presentation(record: &DreamHistory) -> DreamPresentation {
+    let subsequently_rolled_back =
+        record.status == DreamRunStatus::Applied && record.rollback_run_id.is_some();
+    let status = if subsequently_rolled_back {
+        "Applied · subsequently rolled back".to_string()
+    } else {
+        format!("{:?}", record.status)
+    };
+    let tone = match record.status {
+        DreamRunStatus::Applied if subsequently_rolled_back => DreamStatusTone::Neutral,
+        DreamRunStatus::Applied => DreamStatusTone::Applied,
+        DreamRunStatus::Generating | DreamRunStatus::Preview => DreamStatusTone::Pending,
+        DreamRunStatus::ApplyFailed
+        | DreamRunStatus::Incomplete
+        | DreamRunStatus::GenerationFailed => DreamStatusTone::Failed,
+        DreamRunStatus::RolledBack => DreamStatusTone::Neutral,
+    };
+    let status_color = match &tone {
+        DreamStatusTone::Pending => palette::YELLOW,
+        DreamStatusTone::Applied => palette::GREEN,
+        DreamStatusTone::Failed => palette::RED,
+        DreamStatusTone::Neutral => palette::TEXT,
+    };
+    let mut detail_lines = Vec::new();
+    append_dream_lines(
+        &mut detail_lines,
+        &format!("Status: {status}"),
+        status_color,
+    );
+    if record.status == DreamRunStatus::Generating {
+        append_dream_lines(
+            &mut detail_lines,
+            "Generation was started; no final result is recorded yet. It may still be running or have been interrupted. This is not a liveness indicator.",
+            palette::TEXT,
+        );
+    }
+    if record.status == DreamRunStatus::Preview {
+        append_dream_lines(
+            &mut detail_lines,
+            "Preview only; this plan has not been applied.",
+            palette::TEXT,
+        );
+    }
+    if let Some(error) = &record.error {
+        append_dream_lines(
+            &mut detail_lines,
+            &format!("\nError: {error}"),
+            palette::RED,
+        );
+    }
+    append_dream_lines(&mut detail_lines, "\nMemory changes:", palette::TEXT);
+    append_dream_changes(&mut detail_lines, record);
+    append_dream_lines(&mut detail_lines, "\nOperation results:", palette::TEXT);
+    if record.outcomes.is_empty() {
+        append_dream_lines(
+            &mut detail_lines,
+            "No recorded operation results.",
+            palette::TEXT,
+        );
+    }
+    for outcome in &record.outcomes {
+        append_dream_lines(&mut detail_lines, &format!("• {outcome}"), palette::TEXT);
+    }
+
+    let policy = record
+        .plan
+        .as_ref()
+        .map(|plan| format!("{:?}", plan.policy))
+        .unwrap_or_else(|| "Unknown".into());
+    let mut metadata = format!(
+        "Run: {}\nTime: {}\nPolicy: {policy}\n",
+        record.run_id,
+        time_label(record.created_at),
+    );
+    if let Some(id) = &record.rollback_run_id {
+        metadata.push_str(&format!("Rollback audit: {id}\n"));
+    }
+    if let Some(id) = &record.original_run_id {
+        metadata.push_str(&format!("Linked original run: {id}\n"));
+    }
+    if let Some(plan) = &record.plan {
+        metadata.push_str("\nRecorded plan:\n");
+        match serde_json::to_string_pretty(plan) {
+            Ok(plan) => metadata.push_str(&plan),
+            Err(error) => metadata.push_str(&format!("Cannot render plan: {error}")),
+        }
+    }
+    let mut sources = String::from("Source excerpts (not complete conversations):\n");
+    if record.sources.is_empty() {
+        sources.push_str("No recorded source excerpts.\n");
+    }
+    for source in &record.sources {
+        sources.push_str(&format!(
+            "\nSession {} · {}\n{}\n",
+            source.session_id, source.id, source.transcript,
+        ));
+    }
+    DreamPresentation {
+        status,
+        tone,
+        detail_lines,
+        metadata,
+        sources,
+    }
+}
+
+fn append_dream_lines(lines: &mut Vec<Line<'static>>, text: &str, color: Color) {
+    lines.extend(
+        text.lines()
+            .map(|line| Line::styled(line.to_string(), Style::default().fg(color))),
+    );
+}
+
+fn append_dream_changes(lines: &mut Vec<Line<'static>>, record: &DreamHistory) {
+    let mut identifiers: Vec<_> = record
+        .before
+        .iter()
+        .chain(&record.after)
+        .map(|entry| entry.id.as_str())
+        .collect();
+    identifiers.sort_unstable();
+    identifiers.dedup();
+    let mut changed = false;
+    for id in identifiers {
+        let before = record.before.iter().find(|entry| entry.id == id);
+        let after = record.after.iter().find(|entry| entry.id == id);
+        if serde_json::to_value(before).expect("serializable memory")
+            == serde_json::to_value(after).expect("serializable memory")
+        {
+            continue;
+        }
+        changed = true;
+        append_dream_lines(lines, &format!("\n{id}"), palette::TEXT);
+        // Snapshot provenance, never text prefixes, determines diff colors.
+        for (label, entry, color) in [
+            ("- before", before, palette::RED),
+            ("+ after", after, palette::GREEN),
+        ] {
+            let Some(entry) = entry else {
+                append_dream_lines(lines, &format!("{label}: (absent)"), color);
+                continue;
+            };
+            append_dream_lines(
+                lines,
+                &format!(
+                    "{label}: [{:?}/{:?}] {}\n{}\nkind={:?} confidence={:?} description={}\ntags={:?} related={:?} supersedes={:?}",
+                    entry.scope,
+                    entry.status,
+                    entry.name,
+                    entry.content,
+                    entry.kind,
+                    entry.confidence,
+                    entry.description,
+                    entry.tags,
+                    entry.related_memories,
+                    entry.supersedes,
+                ),
+                color,
+            );
+        }
+    }
+    if !changed {
+        append_dream_lines(lines, "No recorded memory changes.", palette::TEXT);
     }
 }
 
@@ -696,6 +871,137 @@ mod tests {
         assert!(entry.details.contains("Original text unavailable"));
     }
 
+    fn dream_details(presentation: &DreamPresentation) -> String {
+        presentation
+            .detail_lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn dream_status_tones_follow_records_not_outcome_prose() {
+        let mut record = dream_record();
+        record.outcomes = vec!["Applied successfully\nError: failed\n+ green\n- red".into()];
+        for (status, expected_tone, expected_color) in [
+            (DreamRunStatus::Generating, "pending", palette::YELLOW),
+            (DreamRunStatus::Preview, "pending", palette::YELLOW),
+            (DreamRunStatus::Applied, "applied", palette::GREEN),
+            (DreamRunStatus::ApplyFailed, "failed", palette::RED),
+            (DreamRunStatus::GenerationFailed, "failed", palette::RED),
+            (DreamRunStatus::Incomplete, "failed", palette::RED),
+            (DreamRunStatus::RolledBack, "neutral", palette::TEXT),
+        ] {
+            record.status = status;
+            let presentation = dream_presentation(&record);
+            let tone = match presentation.tone {
+                DreamStatusTone::Pending => "pending",
+                DreamStatusTone::Applied => "applied",
+                DreamStatusTone::Failed => "failed",
+                DreamStatusTone::Neutral => "neutral",
+            };
+            assert_eq!(tone, expected_tone);
+            assert_eq!(presentation.status, format!("{status:?}"));
+            assert_eq!(presentation.detail_lines[0].style.fg, Some(expected_color));
+            for line in presentation.detail_lines.iter().rev().take(4) {
+                assert_eq!(line.style.fg, Some(palette::TEXT), "{line}");
+            }
+        }
+        record.status = DreamRunStatus::Applied;
+        record.rollback_run_id = Some("rollback-audit".into());
+        let presentation = dream_presentation(&record);
+        assert!(matches!(presentation.tone, DreamStatusTone::Neutral));
+        assert_eq!(presentation.status, "Applied · subsequently rolled back");
+        assert_eq!(presentation.detail_lines[0].style.fg, Some(palette::TEXT));
+    }
+
+    #[test]
+    fn dream_disclosures_separate_metadata_sources_and_visible_results() {
+        use crate::memory::dream::{DreamPlan, DreamPolicy, PendingDream};
+
+        let mut record = dream_record();
+        record.plan = Some(DreamPlan {
+            schema_version: 1,
+            run_id: "original-plan".into(),
+            generated_at: 123400,
+            policy: DreamPolicy::Preview,
+            source_pending_ids: vec!["pending-source".into()],
+            operations: Vec::new(),
+        });
+        record.sources = vec![PendingDream {
+            schema_version: 1,
+            id: "pending-source".into(),
+            session_id: "source-session".into(),
+            created_at: 123000,
+            transcript: "private source excerpt\n+ not a diff".into(),
+        }];
+        record.original_run_id = Some("linked-original".into());
+        record.rollback_run_id = Some("linked-rollback".into());
+        record.error = Some("failure detail\n+ still an error".into());
+        record.outcomes = vec!["operation outcome".into()];
+        let presentation = dream_presentation(&record);
+        let details = dream_details(&presentation);
+        assert!(
+            details.find("Memory changes:").unwrap() < details.find("Operation results:").unwrap()
+        );
+        assert!(details.contains("operation outcome"));
+        assert!(details.contains("Error: failure detail"));
+        for text in ["Error: failure detail", "+ still an error"] {
+            let line = presentation
+                .detail_lines
+                .iter()
+                .find(|line| line.to_string() == text)
+                .unwrap();
+            assert_eq!(line.style.fg, Some(palette::RED));
+        }
+        for text in [
+            "Run: dream-run",
+            "Unix 123456",
+            "Policy: Preview",
+            "linked-original",
+            "linked-rollback",
+            "original-plan",
+        ] {
+            assert!(presentation.metadata.contains(text), "{text}");
+            assert!(!details.contains(text), "{text}");
+            assert!(!presentation.sources.contains(text), "{text}");
+        }
+        let serialized_plan = presentation
+            .metadata
+            .split_once("Recorded plan:\n")
+            .unwrap()
+            .1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(serialized_plan).unwrap(),
+            serde_json::to_value(record.plan.as_ref().unwrap()).unwrap()
+        );
+        for text in [
+            "not complete conversations",
+            "source-session",
+            "private source excerpt",
+            "+ not a diff",
+        ] {
+            assert!(presentation.sources.contains(text), "{text}");
+            assert!(!presentation.metadata.contains(text), "{text}");
+            assert!(!details.contains(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn dream_pending_warnings_do_not_claim_liveness_or_application() {
+        let mut record = dream_record();
+        record.status = DreamRunStatus::Generating;
+        let details = dream_details(&dream_presentation(&record));
+        assert!(details.contains("not a liveness indicator"));
+        assert!(details.contains("interrupted"));
+        record.status = DreamRunStatus::Preview;
+        let details = dream_details(&dream_presentation(&record));
+        assert!(details.contains("has not been applied"));
+        assert!(details.contains("No recorded memory changes."));
+        assert!(details.contains("No recorded operation results."));
+    }
+
     #[test]
     fn rollback_is_disabled_after_original_run_was_rolled_back() {
         let mut record = dream_record();
@@ -782,6 +1088,69 @@ mod tests {
         let mut record = dream_record();
         record.before = vec![before];
         record.after = vec![after];
+        let presentation = dream_presentation(&record);
+        let details = dream_details(&presentation);
+        for (text, color) in [
+            ("- before: [Project/Active] Original name", palette::RED),
+            (
+                "kind=ProjectFact confidence=Inferred description=Original description",
+                palette::RED,
+            ),
+            (
+                "tags=[\"old-tag\"] related=[\"old-related\"] supersedes=None",
+                palette::RED,
+            ),
+            ("+ after: [Global/Archived] Updated name", palette::GREEN),
+            (
+                "kind=Decision confidence=Confirmed description=Updated description",
+                palette::GREEN,
+            ),
+            (
+                "tags=[\"new-tag\"] related=[\"new-related\"] supersedes=Some(\"older-memory\")",
+                palette::GREEN,
+            ),
+        ] {
+            let line = presentation
+                .detail_lines
+                .iter()
+                .find(|line| line.to_string() == text)
+                .unwrap();
+            assert_eq!(line.style.fg, Some(color), "{text}");
+        }
+        assert!(details.find("- before:").unwrap() < details.find("+ after:").unwrap());
+        assert!(details.find("+ after:").unwrap() < details.find("Operation results:").unwrap());
+        let mut multiline_record = record.clone();
+        multiline_record.before[0].content =
+            "+ old text is still before\nApplied successfully".into();
+        multiline_record.after[0].content =
+            "- new text is still after\nError: quoted content".into();
+        let presentation = dream_presentation(&multiline_record);
+        for (text, color) in [
+            ("+ old text is still before", palette::RED),
+            ("Applied successfully", palette::RED),
+            ("- new text is still after", palette::GREEN),
+            ("Error: quoted content", palette::GREEN),
+        ] {
+            let line = presentation
+                .detail_lines
+                .iter()
+                .find(|line| line.to_string() == text)
+                .unwrap();
+            assert_eq!(line.style.fg, Some(color), "{text}");
+        }
+        multiline_record.before.clear();
+        assert!(
+            dream_details(&dream_presentation(&multiline_record)).contains("- before: (absent)")
+        );
+        multiline_record.before = multiline_record.after.clone();
+        assert!(
+            dream_details(&dream_presentation(&multiline_record))
+                .contains("No recorded memory changes.")
+        );
+        multiline_record.after.clear();
+        assert!(
+            dream_details(&dream_presentation(&multiline_record)).contains("+ after: (absent)")
+        );
         for (reverse, old_prefix, new_prefix) in [(false, "-", "+"), (true, "+", "-")] {
             let preview = memory_changes(&record, reverse);
             for (prefix, lines) in [

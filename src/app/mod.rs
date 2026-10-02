@@ -203,6 +203,8 @@ pub(crate) struct AutoCompactState {
     pub(crate) last_completed_item_count: Option<usize>,
     /// A user/runtime request is queued behind a mandatory compaction.
     pub(crate) mandatory_waiting: bool,
+    /// Failed mandatory compaction requires explicit retry, never an idle-event loop.
+    pub(crate) retry_blocked: bool,
     pub(crate) mandatory_resume: Option<tokio::sync::oneshot::Sender<()>>,
 }
 

@@ -70,9 +70,14 @@ Important TUI commands include:
 - `/memory` for inspecting, consolidating, or managing long-term memory:
   `list`, `recall`, `remember`, `update`, `forget`, `dream`, and `on|off`.
   `/memory dream` reports the background-consolidation queue, `dream preview`
-  writes a reviewable plan, and `dream apply` commits that plan.
+  writes a reviewable plan without blocking the UI (Esc cancels; inputs are
+  retained and memories are not applied), and `dream apply` commits that plan.
   `dream history [session]` opens run audits with conflict-checked whole-run
-  rollback (`r` preview, `y` confirm); rollback preserves recall statistics and
+  rollback (`r` preview, `y` confirm). Enter opens details, Esc returns to the
+  timeline then closes, and Tab/Shift+Tab switch focus. Mouse selects/scrolls;
+  narrow terminals show one region at a time. Inline before/after changes precede
+  outcomes; `s` discloses source excerpts and `m` metadata/plan. Selected rows
+  retain their background when focus moves. Rollback preserves recall statistics and
   does not requeue input excerpts. `dream recover confirm` explicitly rolls
   forward an interrupted memory transaction in its originating workspace.
   `dream` exists
@@ -86,7 +91,8 @@ Important TUI commands include:
   Mouse clicks focus/select and the wheel navigates or scrolls. `/` searches that
   peer's events, `f` filters kind, Backspace resets event filters, `m` toggles full
   record metadata, and `e` re-centers without activation. Peer selection is
-  remembered; narrow terminals show details full-width. Missing legacy routing
+  remembered; selected sessions/events keep their full-row background as focus
+  descends. Narrow terminals show details full-width. Missing legacy routing
   has an explicit unknown-peer group; answered/accepted/started are not completed.
 - `/todo`, `/terminal`, `/compact`, `/vision`, `/select`, `/session`, `/usage`,
   `/new`, `/clear`, `/help`, and `/quit` for session and UI workflows. `/select`

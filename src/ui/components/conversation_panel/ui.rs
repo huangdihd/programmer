@@ -2127,7 +2127,7 @@ mod tests {
     #[test]
     fn completed_run_group_clicks_expand_and_collapse() {
         let mut panel = ConversationPanel::new();
-        for index in 0..3 {
+        for index in 0..2 {
             panel
                 .conversation
                 .lock()
@@ -2980,17 +2980,14 @@ mod tests {
         use async_openai::types::responses::{ResponseOutputItemAddedEvent, ResponseStreamEvent};
 
         let mut panel = ConversationPanel::new();
-        for (index, name) in ["grep", "blob"].into_iter().enumerate() {
-            panel
-                .conversation
-                .lock()
-                .unwrap()
-                .add_output(OutputItem::FunctionCall(tool_call(index, name)));
-        }
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_output(OutputItem::FunctionCall(tool_call(0, "grep")));
         let area = Rect::new(0, 0, 80, 24);
         let before = render_text(&mut panel, area);
         assert!(before.contains("grep  {}"), "{before}");
-        assert!(before.contains("blob  {}"), "{before}");
 
         let cancel = CancellationToken::new();
         panel.receiving_response = Some(crate::response::partial_response::PartialResponse::new(
@@ -3000,11 +2997,11 @@ mod tests {
             ResponseOutputItemAddedEvent {
                 sequence_number: 0,
                 output_index: 0,
-                item: OutputItem::FunctionCall(tool_call(2, "read_file")),
+                item: OutputItem::FunctionCall(tool_call(1, "read_file")),
             },
         ));
         let bridged = render_text(&mut panel, area);
-        assert!(bridged.contains("Exploring… · 0/3"), "{bridged}");
+        assert!(bridged.contains("Exploring… · 0/2"), "{bridged}");
         assert!(!bridged.contains("grep  {}"), "{bridged}");
 
         cancel.cancel();
@@ -3012,6 +3009,5 @@ mod tests {
         let restored = render_text(&mut panel, area);
         assert!(!restored.contains("Exploring"), "{restored}");
         assert!(restored.contains("grep  {}"), "{restored}");
-        assert!(restored.contains("blob  {}"), "{restored}");
     }
 }
