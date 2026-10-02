@@ -734,7 +734,7 @@ model's judgement alone. Those changes are proposed as a preview you can read
 and apply:
 
 ```
-/memory dream            # status: pending sessions, preview availability, last error
+/memory dream            # status: pending sessions, preview, relative last-run time, last error
 /memory dream preview    # write an auditable plan without touching memory
 /memory dream apply      # apply that plan, then retire the consumed sessions
 ```
@@ -763,11 +763,20 @@ operation outcomes, errors, and memory before/after values. Old processed queue
 files are input excerpts, not historical change snapshots: their missing changes
 cannot be reconstructed or rolled back.
 
+A recorded generation start is not a live progress indicator. The reader probes
+an existing root lock without waiting: if it obtains a shared lock before loading
+the record, an unfinished generation is displayed as `Interrupted`. If another
+writer holds the lock (or no lock file exists), it displays `Unconfirmed · generation
+started`, not a claim that this run is still active. This is a read-only projection:
+viewing history neither rewrites audits nor consumes or reruns queued inputs.
+
 The timeline uses padded rows with persistent selection; moving focus into
 its details does not remove the selected run's background. Details show inline
 before/after changes first, then operation results. Status and diff colors come
 from recorded states and snapshots, not from transcript text. `s` discloses source
-excerpts; `m` discloses metadata and the recorded plan.
+excerpts using the conversation's Markdown and code highlighting (without copy
+buttons); `m` discloses literal metadata and the recorded plan. Detail layouts are
+cached across scrolling and unchanged refreshes.
 
 Use arrows/`j`/`k` to select, `Enter` to enter details, and `Esc` to return to the
 timeline (then close). `Tab`/Shift+Tab switch regions; mouse clicks select/focus

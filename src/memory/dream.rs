@@ -101,15 +101,29 @@ impl From<&crate::config::programmer_config::MemoryConfig> for DreamConfig {
     }
 }
 
-/// One-line summary of the consolidation queue, shared by the slash command and
-/// the agent's `memory dream status` action.
+/// One-line summary of the consolidation queue for the user-only slash command.
 pub(crate) fn render_status(state: &DreamState, pending: usize, preview: bool) -> String {
+    render_status_at(state, pending, preview, now_secs())
+}
+
+fn render_status_at(state: &DreamState, pending: usize, preview: bool, now: u64) -> String {
     format!(
         "Dream status: queued={pending} transcript(s), preview={}, last_run={}, last_operations={}, last_error={}",
         if preview { "ready" } else { "none" },
         state
             .last_dream_at
-            .map(|timestamp| timestamp.to_string())
+            .map(|timestamp| {
+                if timestamp > now {
+                    return "unknown (clock mismatch)".into();
+                }
+                let age = now - timestamp;
+                match age {
+                    0..60 => "just now".into(),
+                    60..3600 => format!("{}m ago", age / 60),
+                    3600..86400 => format!("{}h {}m ago", age / 3600, age % 3600 / 60),
+                    _ => format!("{}d {}h ago", age / 86400, age % 86400 / 3600),
+                }
+            })
             .unwrap_or_else(|| "never".to_string()),
         state.last_operation_count,
         state.last_error.as_deref().unwrap_or("none")
@@ -1272,6 +1286,42 @@ mod tests {
         assert!(!manager.dream_dir().join(PREVIEW_FILE).exists());
         assert_eq!(manager.load_dream_state().unwrap().last_operation_count, 1);
         assert!(manager.dream_dir().join("processed").exists());
+    }
+
+    #[test]
+    fn dream_status_uses_readable_time_without_changing_other_fields() {
+        let now = 1_790_847_206;
+        for (timestamp, expected) in [
+            (None, "never"),
+            (Some(now), "just now"),
+            (Some(now - 59), "just now"),
+            (Some(now - 60), "1m ago"),
+            (Some(now - 3599), "59m ago"),
+            (Some(now - 3600), "1h 0m ago"),
+            (Some(now - 12000), "3h 20m ago"),
+            (Some(now - 86400), "1d 0h ago"),
+            (Some(now - 176400), "2d 1h ago"),
+            (Some(now + 1), "unknown (clock mismatch)"),
+            (Some(u64::MAX), "unknown (clock mismatch)"),
+        ] {
+            let state = DreamState {
+                last_dream_at: timestamp,
+                last_operation_count: 7,
+                last_error: Some("Dream timed out after 60s".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                render_status_at(&state, 17, false, now),
+                format!(
+                    "Dream status: queued=17 transcript(s), preview=none, last_run={expected}, last_operations=7, last_error=Dream timed out after 60s"
+                )
+            );
+            assert_eq!(state.last_dream_at, timestamp);
+        }
+        assert!(
+            render_status_at(&DreamState::default(), 0, true, now)
+                .contains("preview=ready, last_run=never, last_operations=0, last_error=none")
+        );
     }
 
     #[test]

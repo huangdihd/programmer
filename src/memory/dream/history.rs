@@ -7,6 +7,8 @@ use super::*;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DreamRunStatus {
     Generating,
+    /// Read-time projection: a shared lock proves the generating writer is gone.
+    Interrupted,
     Preview,
     ApplyFailed,
     Incomplete,
@@ -221,6 +223,40 @@ impl MemoryManager {
     }
 
     pub(crate) fn dream_history_detail(&self, run_id: &str) -> Result<DreamHistory, String> {
+        // Acquire before reading: a writer may finish or start between a read
+        // and a later probe. Keep the shared lock until the snapshot is loaded.
+        let lock_path = self
+            .global_path
+            .parent()
+            .expect("memory root")
+            .join(LOCK_FILE);
+        self.validate_storage_path(&lock_path)?;
+        let reader = match File::open(&lock_path) {
+            Ok(file) => match FileExt::try_lock_shared(&file) {
+                Ok(()) => Some(file),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || cfg!(windows) && error.raw_os_error() == Some(33) =>
+                {
+                    None
+                }
+                Err(error) => return Err(format!("inspect Dream writer lock: {error}")),
+            },
+            // Without an existing lock inode, absence alone is not a safe
+            // observation of concurrent writers. Preserve uncertainty.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("open Dream writer lock: {error}")),
+        };
+        let mut history = self.read_history_detail(run_id)?;
+        if history.status == DreamRunStatus::Generating && reader.is_some() {
+            history.status = DreamRunStatus::Interrupted;
+            history.error = Some("Generation ended without a recorded result; no Dream writer holds the lock. The cause of interruption is unknown. No plan was recorded; source inputs were not consumed by this generation.".into());
+        }
+        Ok(history)
+    }
+
+    /// Raw audit for transaction validation; display projections never authorize writes.
+    fn read_history_detail(&self, run_id: &str) -> Result<DreamHistory, String> {
         let path = self.history_path(run_id)?;
         if let Some(journal) = self.pending_journal()?
             && journal.history.run_id == run_id
@@ -388,7 +424,7 @@ impl MemoryManager {
         validate_plan(plan)?;
         let path = self.history_path(&plan.run_id)?;
         let previous = if path.exists() {
-            Some(self.dream_history_detail(&plan.run_id)?)
+            Some(self.read_history_detail(&plan.run_id)?)
         } else {
             None
         };
@@ -666,6 +702,76 @@ pub(super) fn sync_directory(path: &Path) -> Result<(), String> {
 mod tests {
     use super::super::tests::{create_operation, manager, plan};
     use super::*;
+
+    #[test]
+    fn abandoned_generation_is_interrupted_only_after_writer_lock_is_released() {
+        let manager = manager();
+        let source = manager
+            .enqueue_dream("session", "Use explicit error handling")
+            .unwrap();
+        let writer = manager.acquire_dream_lock().unwrap().unwrap();
+        let run_id = manager
+            .record_generation_start(&manager.load_pending().unwrap())
+            .unwrap();
+        let path = manager.history_path(&run_id).unwrap();
+        let audit = std::fs::read(&path).unwrap();
+        let reader = manager.clone();
+        assert_eq!(
+            reader.dream_history_detail(&run_id).unwrap().status,
+            DreamRunStatus::Generating
+        );
+        assert_eq!(
+            reader.dream_history_list().unwrap()[0].status,
+            DreamRunStatus::Generating
+        );
+        drop(writer); // Also models process exit: the OS releases its writer lock.
+        let interrupted = reader.dream_history_detail(&run_id).unwrap();
+        assert_eq!(interrupted.status, DreamRunStatus::Interrupted);
+        assert!(
+            interrupted
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("cause of interruption is unknown")
+        );
+        assert_eq!(
+            reader.dream_history_list().unwrap()[0].status,
+            DreamRunStatus::Interrupted
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            audit,
+            "viewing must not rewrite audit evidence"
+        );
+        assert_eq!(reader.load_pending().unwrap()[0].1.id, source.id);
+        assert!(reader.list(None).unwrap().is_empty());
+        assert!(reader.dream_rollback_preview(&run_id).is_err());
+        let unrelated_writer = manager.acquire_dream_lock().unwrap().unwrap();
+        assert_eq!(
+            reader.dream_history_detail(&run_id).unwrap().status,
+            DreamRunStatus::Generating,
+            "a busy root lock cannot identify the owner of an old run"
+        );
+        drop(unrelated_writer);
+    }
+
+    #[test]
+    fn finalized_generation_is_not_reclassified_after_unlock() {
+        let manager = manager();
+        manager
+            .enqueue_dream("session", "Use explicit error handling")
+            .unwrap();
+        let writer = manager.acquire_dream_lock().unwrap().unwrap();
+        let pending = manager.load_pending().unwrap();
+        let run_id = manager.record_generation_start(&pending).unwrap();
+        manager
+            .record_generation_failure(&run_id, &pending, "provider timed out")
+            .unwrap();
+        drop(writer);
+        let history = manager.dream_history_detail(&run_id).unwrap();
+        assert_eq!(history.status, DreamRunStatus::GenerationFailed);
+        assert_eq!(history.error.as_deref(), Some("provider timed out"));
+    }
 
     #[test]
     fn cross_scope_rollback_retains_audit_sources_and_never_requeues() {

@@ -322,7 +322,7 @@ fn dream_entry(record: DreamHistory) -> ActivityEntry {
     let status = if record.rollback_run_id.is_some() {
         "Applied · subsequently rolled back".to_string()
     } else {
-        format!("{:?}", record.status)
+        dream_status_label(record.status)
     };
     let policy = record
         .plan
@@ -380,19 +380,27 @@ fn dream_entry(record: DreamHistory) -> ActivityEntry {
     }
 }
 
+fn dream_status_label(status: DreamRunStatus) -> String {
+    match status {
+        DreamRunStatus::Generating => "Unconfirmed · generation started".into(),
+        _ => format!("{status:?}"),
+    }
+}
+
 fn dream_presentation(record: &DreamHistory) -> DreamPresentation {
     let subsequently_rolled_back =
         record.status == DreamRunStatus::Applied && record.rollback_run_id.is_some();
     let status = if subsequently_rolled_back {
         "Applied · subsequently rolled back".to_string()
     } else {
-        format!("{:?}", record.status)
+        dream_status_label(record.status)
     };
     let tone = match record.status {
         DreamRunStatus::Applied if subsequently_rolled_back => DreamStatusTone::Neutral,
         DreamRunStatus::Applied => DreamStatusTone::Applied,
         DreamRunStatus::Generating | DreamRunStatus::Preview => DreamStatusTone::Pending,
         DreamRunStatus::ApplyFailed
+        | DreamRunStatus::Interrupted
         | DreamRunStatus::Incomplete
         | DreamRunStatus::GenerationFailed => DreamStatusTone::Failed,
         DreamRunStatus::RolledBack => DreamStatusTone::Neutral,
@@ -889,6 +897,7 @@ mod tests {
             (DreamRunStatus::Preview, "pending", palette::YELLOW),
             (DreamRunStatus::Applied, "applied", palette::GREEN),
             (DreamRunStatus::ApplyFailed, "failed", palette::RED),
+            (DreamRunStatus::Interrupted, "failed", palette::RED),
             (DreamRunStatus::GenerationFailed, "failed", palette::RED),
             (DreamRunStatus::Incomplete, "failed", palette::RED),
             (DreamRunStatus::RolledBack, "neutral", palette::TEXT),
@@ -902,7 +911,12 @@ mod tests {
                 DreamStatusTone::Neutral => "neutral",
             };
             assert_eq!(tone, expected_tone);
-            assert_eq!(presentation.status, format!("{status:?}"));
+            let expected_status = if status == DreamRunStatus::Generating {
+                "Unconfirmed · generation started".into()
+            } else {
+                format!("{status:?}")
+            };
+            assert_eq!(presentation.status, expected_status);
             assert_eq!(presentation.detail_lines[0].style.fg, Some(expected_color));
             for line in presentation.detail_lines.iter().rev().take(4) {
                 assert_eq!(line.style.fg, Some(palette::TEXT), "{line}");
@@ -992,6 +1006,11 @@ mod tests {
     fn dream_pending_warnings_do_not_claim_liveness_or_application() {
         let mut record = dream_record();
         record.status = DreamRunStatus::Generating;
+        assert_eq!(
+            dream_presentation(&record).status,
+            "Unconfirmed · generation started"
+        );
+        assert!(dream_entry(record.clone()).title.starts_with("Unconfirmed"));
         let details = dream_details(&dream_presentation(&record));
         assert!(details.contains("not a liveness indicator"));
         assert!(details.contains("interrupted"));

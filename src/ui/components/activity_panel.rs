@@ -38,7 +38,7 @@ pub enum ActivityEntryKind {
     Delegation,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityEntry {
     pub id: String,
     pub title: String,
@@ -156,6 +156,9 @@ impl ActivityPanel {
     /// Preserve the selected identity across refresh/reordering, not its old index.
     /// Any outstanding rollback preview is invalidated by new backend data.
     pub fn replace_entries(&mut self, entries: Vec<ActivityEntry>) {
+        if self.mode == ActivityMode::Dream && self.entries != entries {
+            self.invalidate_dream_details();
+        }
         let selected_id = self.selected_entry().map(|entry| entry.id.clone());
         if self.mode == ActivityMode::SessionGraph {
             self.remember_graph_event();

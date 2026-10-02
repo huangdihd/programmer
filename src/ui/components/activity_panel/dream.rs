@@ -4,7 +4,8 @@
 //! Dream presentation only. The adapter owns typed audit data; the application
 //! still owns conflict checking and rollback authorization.
 use super::*;
-use crate::ui::markdown_theme::{AppTheme, palette};
+use crate::ui::components::messages::assistant::text::render_read_only_markdown;
+use crate::ui::markdown_theme::palette;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Position,
@@ -12,11 +13,9 @@ use ratatui::{
     text::{Span, Text},
 };
 
-use ratatui_markdown::markdown::MarkdownRenderer;
-
 const ITEM_HEIGHT: u16 = 4;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DreamStatusTone {
     Pending,
     Applied,
@@ -35,7 +34,7 @@ impl DreamStatusTone {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DreamPresentation {
     pub status: String,
     pub tone: DreamStatusTone,
@@ -55,11 +54,87 @@ pub(super) struct DreamState {
     details: Rect,
     metadata: Rect,
     sources: Rect,
+    cached_details: Option<DreamDetailsCache>,
+    #[cfg(test)]
+    detail_builds: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DreamDetailsKey {
+    id: String,
+    width: u16,
+    sources: bool,
+    metadata: bool,
+}
+
+#[derive(Debug)]
+struct DreamDetailsCache {
+    key: DreamDetailsKey,
+    // Each logical line keeps Ratatui's word wrapping, style and alignment.
+    // Prefix offsets let scrolling skip off-screen lines without reflowing them.
+    paragraphs: Vec<(usize, u16, Paragraph<'static>)>,
+    height: usize,
+}
+
+impl DreamDetailsCache {
+    fn new(key: DreamDetailsKey, lines: Vec<Line<'static>>) -> Self {
+        let mut height = 0;
+        let paragraphs = lines
+            .into_iter()
+            .map(|line| {
+                let paragraph = Paragraph::new(line)
+                    .style(Style::default().fg(palette::TEXT))
+                    .wrap(Wrap { trim: false });
+                let line_height = paragraph.line_count(key.width).min(usize::from(u16::MAX)) as u16;
+                let start = height;
+                height += usize::from(line_height);
+                (start, line_height, paragraph)
+            })
+            .collect();
+        Self {
+            key,
+            paragraphs,
+            height,
+        }
+    }
+
+    fn render(&self, area: Rect, buffer: &mut Buffer, scroll: u16) {
+        let start = usize::from(scroll);
+        let end = start + usize::from(area.height);
+        let first = self
+            .paragraphs
+            .partition_point(|(top, height, _)| top + usize::from(*height) <= start);
+        for (top, height, paragraph) in &self.paragraphs[first..] {
+            if *top >= end {
+                break;
+            }
+            let offset = start.saturating_sub(*top) as u16;
+            let row = top.saturating_sub(start) as u16;
+            let target = Rect::new(
+                area.x,
+                area.y + row,
+                area.width,
+                height.saturating_sub(offset).min(area.height - row),
+            );
+            if offset == 0 {
+                paragraph.render(target, buffer);
+            } else {
+                paragraph.clone().scroll((offset, 0)).render(target, buffer);
+            }
+        }
+    }
 }
 
 impl ActivityPanel {
     pub fn set_dream_presentations(&mut self, presentations: BTreeMap<String, DreamPresentation>) {
-        self.dream.presentations = presentations;
+        if self.dream.presentations != presentations {
+            self.invalidate_dream_details();
+            self.dream.presentations = presentations;
+        }
+    }
+
+    pub(super) fn invalidate_dream_details(&mut self) {
+        self.dream.cached_details = None;
     }
 
     pub(super) fn handle_dream_mouse(&mut self, event: MouseEvent) -> ActivityAction {
@@ -284,43 +359,72 @@ impl ActivityPanel {
                 .render(sections[0], buffer);
             return;
         };
-        let presentation = self.dream.presentations.get(&entry.id);
-        let mut lines = vec![
-            Line::default(),
-            Line::from(entry.title.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
-            Line::from(entry.summary.clone()).style(Style::default().fg(palette::MUTED)),
-            Line::default(),
-        ];
-        if let Some(presentation) = presentation {
-            lines.extend(presentation.detail_lines.clone());
-            if self.dream.sources_expanded {
-                lines.push(Line::default());
-                lines.push(Line::from("Source excerpts (not full conversations):"));
-                lines.extend(dream_markdown(&presentation.sources, sections[0].width));
-            }
-            if self.dream.metadata_expanded {
-                lines.push(Line::default());
-                lines.push(Line::from("Metadata / recorded plan:"));
-                lines.extend(
-                    presentation
-                        .metadata
-                        .lines()
-                        .map(|line| Line::from(line.to_owned())),
-                );
-            }
-        } else {
-            lines.extend(dream_markdown(&entry.details, sections[0].width));
-        }
-        lines.push(Line::default());
-        lines.push(
-            Line::from(if entry.rollback_allowed {
-                "r · Preview whole-run rollback (conflict checked)"
+        let key = DreamDetailsKey {
+            id: entry.id.clone(),
+            width: sections[0].width.max(1),
+            sources: self.dream.sources_expanded,
+            metadata: self.dream.metadata_expanded,
+        };
+        if self
+            .dream
+            .cached_details
+            .as_ref()
+            .is_none_or(|cache| cache.key != key)
+        {
+            let presentation = self.dream.presentations.get(&entry.id);
+            let mut lines = vec![
+                Line::default(),
+                Line::from(entry.title.clone())
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                Line::from(entry.summary.clone()).style(Style::default().fg(palette::MUTED)),
+                Line::default(),
+            ];
+            if let Some(presentation) = presentation {
+                lines.extend(presentation.detail_lines.clone());
+                if self.dream.sources_expanded {
+                    lines.push(Line::default());
+                    lines.push(Line::from("Source excerpts (not full conversations):"));
+                    lines.extend(dream_markdown(&presentation.sources, sections[0].width));
+                }
+                if self.dream.metadata_expanded {
+                    lines.push(Line::default());
+                    lines.push(Line::from("Metadata / recorded plan:"));
+                    lines.extend(
+                        presentation
+                            .metadata
+                            .lines()
+                            .map(|line| Line::from(line.to_owned())),
+                    );
+                }
             } else {
-                "Rollback unavailable for this record."
-            })
-            .style(Style::default().fg(palette::MUTED)),
-        );
-        self.render_dream_text(sections[0], buffer, Text::from(lines));
+                lines.extend(dream_markdown(&entry.details, sections[0].width));
+            }
+            lines.push(Line::default());
+            lines.push(
+                Line::from(if entry.rollback_allowed {
+                    "r · Preview whole-run rollback (conflict checked)"
+                } else {
+                    "Rollback unavailable for this record."
+                })
+                .style(Style::default().fg(palette::MUTED)),
+            );
+            self.dream.cached_details = Some(DreamDetailsCache::new(key, lines));
+            #[cfg(test)]
+            {
+                self.dream.detail_builds += 1;
+            }
+        }
+        let cache = self
+            .dream
+            .cached_details
+            .as_ref()
+            .expect("details prepared");
+        self.details_limit = cache
+            .height
+            .saturating_sub(usize::from(sections[0].height))
+            .min(usize::from(u16::MAX)) as u16;
+        self.details_scroll = self.details_scroll.min(self.details_limit);
+        cache.render(sections[0], buffer, self.details_scroll);
         self.dream.sources = sections[1];
         self.dream.metadata = sections[2];
         for (area, expanded, label) in [
@@ -361,9 +465,7 @@ impl ActivityPanel {
 }
 
 fn dream_markdown(source: &str, width: u16) -> Vec<Line<'static>> {
-    // No conversation code-block hooks: this read-only panel has no copy handlers.
-    let renderer = MarkdownRenderer::new(usize::from(width.max(1)));
-    renderer.render(&renderer.parse(source), &AppTheme)
+    render_read_only_markdown(source, width.max(1)).lines
 }
 
 fn region(area: Rect, title: String, focused: bool, buffer: &mut Buffer) -> Rect {
@@ -485,6 +587,122 @@ mod tests {
             }
         }
         panic!("missing rendered word: {word}");
+    }
+
+    #[test]
+    fn cached_details_reuse_layout_across_scrolling_and_unchanged_refreshes() {
+        let mut panel = markdown_panel();
+        let source = "## Heading\n\nA **bold** item with 中文 and `code`.\n\n- one\n- two\n\n```rust\nlet answer = 42;\n```\n\n".repeat(500);
+        panel.dream.presentations.get_mut("alpha").unwrap().sources = source;
+        render(&mut panel, 120, 24);
+        assert_eq!(panel.dream.detail_builds, 1);
+        for _ in 0..25 {
+            press(&mut panel, KeyCode::End);
+            render(&mut panel, 120, 24);
+            press(&mut panel, KeyCode::Home);
+            render(&mut panel, 120, 24);
+        }
+        panel.replace_entries(panel.entries.clone());
+        panel.set_dream_presentations(panel.dream.presentations.clone());
+        render(&mut panel, 120, 30);
+        assert_eq!(
+            panel.dream.detail_builds, 1,
+            "scrolling, height and unchanged refresh must not rebuild"
+        );
+        render(&mut panel, 100, 30);
+        assert_eq!(panel.dream.detail_builds, 2, "width must reflow");
+        let mut presentations = panel.dream.presentations.clone();
+        presentations
+            .get_mut("alpha")
+            .unwrap()
+            .sources
+            .push_str("\nChanged source");
+        panel.set_dream_presentations(presentations);
+        render(&mut panel, 100, 30);
+        assert_eq!(
+            panel.dream.detail_builds, 3,
+            "changed records invalidate cache"
+        );
+        press(&mut panel, KeyCode::Char('s'));
+        render(&mut panel, 100, 30);
+        assert_eq!(panel.dream.detail_builds, 4);
+    }
+
+    #[test]
+    #[ignore = "manual timing probe; correctness uses deterministic cache-build assertions"]
+    fn dream_details_render_timing() {
+        let mut panel = markdown_panel();
+        panel.dream.presentations.get_mut("alpha").unwrap().sources =
+            "## Heading\n\nA **bold** item with 中文 and `code`.\n\n- one\n- two\n\n```rust\nlet answer = 42;\n```\n\n".repeat(500);
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buffer = Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            panel.invalidate_dream_details();
+            buffer.reset();
+            panel.render(area, &mut buffer);
+        }
+        let rebuild = start.elapsed() / 10;
+        let start = std::time::Instant::now();
+        for index in 0..100 {
+            press(
+                &mut panel,
+                if index % 2 == 0 {
+                    KeyCode::End
+                } else {
+                    KeyCode::Home
+                },
+            );
+            buffer.reset();
+            panel.render(area, &mut buffer);
+        }
+        eprintln!(
+            "Dream details, 500 Markdown sections, 120x30: rebuild/frame={rebuild:?}, cached scroll/frame={:?}",
+            start.elapsed() / 100
+        );
+    }
+
+    #[test]
+    fn cached_viewport_matches_full_paragraph_wrapping_and_styles() {
+        let mut lines = dream_markdown(
+            "# Heading\n\nText **bold** 中文中文 and `code`.\n\n> quote\n\n- first\n- second\n\n```rust\nlet x = 42;\n```",
+            30,
+        );
+        lines.push(Line::styled(
+            "长文本 e\u{301} 👩‍💻 and words repeated repeatedly until they wrap around",
+            Style::default().fg(palette::RED),
+        ));
+        for width in [1, 8, 30, 60] {
+            let key = DreamDetailsKey {
+                id: "test".into(),
+                width,
+                sources: true,
+                metadata: false,
+            };
+            let cache = DreamDetailsCache::new(key, lines.clone());
+            let paragraph = Paragraph::new(lines.clone())
+                .style(Style::default().fg(palette::TEXT))
+                .wrap(Wrap { trim: false });
+            assert_eq!(cache.height, paragraph.line_count(width));
+            for scroll in [0, 1, 5, 10] {
+                let area = Rect::new(0, 0, width, 8);
+                let mut expected = Buffer::empty(area);
+                paragraph
+                    .clone()
+                    .scroll((scroll, 0))
+                    .render(area, &mut expected);
+                let mut actual = Buffer::empty(area);
+                cache.render(area, &mut actual, scroll);
+                // Paragraph paints base style into empty rows too.
+                for cell in &mut actual.content {
+                    if cell.fg == Color::Reset {
+                        cell.set_fg(palette::TEXT);
+                    }
+                }
+                assert_eq!(actual, expected, "width={width}, scroll={scroll}");
+            }
+        }
     }
 
     #[test]

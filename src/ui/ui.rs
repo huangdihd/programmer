@@ -67,6 +67,12 @@ impl App<'_> {
         if let Some(status) = status_for_waiting_subagents(self.waiting_for_subagents) {
             return status;
         }
+        // At a mandatory safe point the runner has finished its tools and is
+        // waiting for compaction; its last phase is no longer current work.
+        // A concurrent background pass must not mask foreground activity.
+        if self.auto_compact.mandatory_waiting && self.auto_compact.active_id.is_some() {
+            return StatusState::Compacting;
+        }
         let cp = &self.conversation_panel;
         match cp.phase {
             ActivePhase::Classifying => StatusState::Classifying,

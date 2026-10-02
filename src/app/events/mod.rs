@@ -2048,6 +2048,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mandatory_safe_point_displays_compaction_instead_of_finished_tools() {
+        use crate::ui::components::status_bar::status_bar::StatusState;
+
+        let mut app = cancellation_test_app().await;
+        app.config.mandatory_compact_tokens = 100_000;
+        app.conversation_panel.phase = ActivePhase::ToolRunning;
+        app.auto_compact.active_id = Some(1);
+        // Background compaction alone must not hide actual foreground tools.
+        assert_eq!(app.resolve_status(), StatusState::ToolRunning);
+
+        let (resume, mut receiver) = tokio::sync::oneshot::channel();
+        handle_app_event(
+            &mut app,
+            AppEvent::UsageSafePoint(OperationId(7), 200_000, resume),
+        )
+        .await;
+        assert!(app.auto_compact.mandatory_waiting);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(app.resolve_status(), StatusState::Compacting);
+
+        handle_cancel(&mut app).await;
+        assert_eq!(app.resolve_status(), StatusState::Cancelling);
+        super::finish_mandatory_compaction(&mut app).await;
+        receiver.await.unwrap();
+        assert_eq!(app.resolve_status(), StatusState::Cancelling);
+    }
+
+    #[tokio::test]
     async fn cancelled_safe_point_does_not_strand_queued_input_after_compaction() {
         use async_openai::types::responses::{InputContent, InputMessage, InputRole, OutputStatus};
         let mut app = cancellation_test_app().await;
