@@ -42,7 +42,7 @@ pub enum Command {
     /// configure the diagnostics profile.
     Init,
     Help,
-    Session,
+    Session(String),
     /// `/title [text]` — regenerate the current session title, or set it manually.
     Title(String),
     Usage,
@@ -172,7 +172,7 @@ impl CommandKind {
             Self::Classifier => Command::Classifier(args),
             Self::Init => Command::Init,
             Self::Help => Command::Help,
-            Self::Session => Command::Session,
+            Self::Session => Command::Session(args),
             Self::Title => Command::Title(args),
             Self::Usage => Command::Usage,
             Self::Rewind => Command::Rewind,
@@ -261,11 +261,11 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         kind: CommandKind::Session,
         name: "session",
         aliases: &["s"],
-        completion: CompletionKind::None,
+        completion: CompletionKind::Fixed(&["graph"]),
         help: &[HelpEntry {
             order: 27,
-            usage: "/session | /s",
-            description: "Show current session info",
+            usage: "/session [graph] | /s",
+            description: "Show session info or cross-session activity graph",
         }],
     },
     CommandSpec {
@@ -350,7 +350,20 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         name: "memory",
         aliases: &[],
         completion: CompletionKind::Fixed(&[
-            "list", "recall", "remember", "update", "forget", "dream", "on", "off",
+            "list",
+            "recall",
+            "remember",
+            "update",
+            "forget",
+            "dream",
+            "on",
+            "off",
+            "dream status",
+            "dream preview",
+            "dream apply",
+            "dream history",
+            "dream history session",
+            "dream recover",
         ]),
         help: &[HelpEntry {
             order: 34,
@@ -1779,6 +1792,34 @@ mod tests {
     }
 
     #[test]
+    fn session_graph_and_dream_history_parse_and_complete() {
+        assert_eq!(
+            Command::parse("/session graph"),
+            Some(Command::Session("graph".into()))
+        );
+        assert_eq!(Command::parse("/s"), Some(Command::Session(String::new())));
+        assert_eq!(
+            Command::parse("/memory dream history session"),
+            Some(Command::Memory("dream history session".into()))
+        );
+        let memory = COMMAND_SPECS
+            .iter()
+            .find(|spec| spec.name == "memory")
+            .unwrap();
+        let CompletionKind::Fixed(values) = memory.completion else {
+            panic!("memory completion")
+        };
+        let completed =
+            CompletionEngine::complete_subcommand("memory dream h", "memory", values).unwrap();
+        assert!(
+            completed
+                .candidates
+                .iter()
+                .any(|candidate| candidate.value == "dream history")
+        );
+    }
+
+    #[test]
     fn unknown_slash_commands_still_fall_through() {
         assert_eq!(Command::parse("/not-a-programmer-command value"), None);
         assert_eq!(Command::parse("not a slash command"), None);
@@ -1873,7 +1914,10 @@ mod tests {
                 "/providers refresh [provider]",
                 "Refetch auto-discovered provider models",
             ),
-            ("/session | /s", "Show current session info"),
+            (
+                "/session [graph] | /s",
+                "Show session info or cross-session activity graph",
+            ),
             (
                 "/title [text]",
                 "Regenerate the session title, or set it manually",

@@ -26,6 +26,7 @@ pub(crate) enum StartDecision {
 
 #[derive(Default, Clone, Copy)]
 pub(crate) struct StartupState {
+    pub(crate) retry_blocked: bool,
     pub(crate) active_turn: bool,
     pub(crate) blocking_surface: bool,
     pub(crate) text_draft: bool,
@@ -39,6 +40,7 @@ pub(crate) struct StartupState {
 impl StartupState {
     pub(crate) fn from_app(app: &App<'_>) -> Self {
         Self {
+            retry_blocked: app.auto_compact.retry_blocked,
             active_turn: app.cancel.active_id.is_some(),
             blocking_surface: super::events::has_blocking_surface(app)
                 || app.peers.consent.is_some(),
@@ -56,12 +58,17 @@ impl StartupState {
     }
 
     pub(crate) fn decide(self, source: WorkSource) -> StartDecision {
-        if self.active_turn || self.blocking_surface || self.text_draft {
+        if self.retry_blocked
+            || self.mandatory_waiting
+            || self.active_turn
+            || self.blocking_surface
+            || self.text_draft
+        {
             return StartDecision::Wait;
         }
         // Queued images belong to the user request, not an independent draft.
-        // Its command path retains responsibility for mandatory compaction;
-        // runtime updates retain their existing developer-role startup path.
+        // The central dispatcher checks the hard limit before consuming either
+        // user input or runtime updates; failure requires explicit retry.
         if source == WorkSource::Queued {
             return StartDecision::Start;
         }
@@ -72,9 +79,6 @@ impl StartupState {
         if self.mandatory_compaction_due {
             return StartDecision::CompactPeer;
         }
-        if self.mandatory_waiting {
-            return StartDecision::Wait;
-        }
         StartDecision::Start
     }
 }
@@ -84,9 +88,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startup_policy_preserves_all_legacy_blocker_combinations() {
-        for bits in 0..256 {
+    fn startup_policy_covers_all_blocker_combinations() {
+        for bits in 0..512 {
             let state = StartupState {
+                retry_blocked: bits & 256 != 0,
                 active_turn: bits & 1 != 0,
                 blocking_surface: bits & 2 != 0,
                 text_draft: bits & 4 != 0,
@@ -96,7 +101,11 @@ mod tests {
                 mandatory_waiting: bits & 64 != 0,
                 mandatory_compaction_due: bits & 128 != 0,
             };
-            let queued_ready = !state.active_turn && !state.blocking_surface && !state.text_draft;
+            let queued_ready = !state.active_turn
+                && !state.blocking_surface
+                && !state.text_draft
+                && !state.mandatory_waiting
+                && !state.retry_blocked;
             assert_eq!(
                 state.decide(WorkSource::Queued) == StartDecision::Start,
                 queued_ready

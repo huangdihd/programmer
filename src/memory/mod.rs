@@ -240,7 +240,7 @@ pub(crate) struct MemoryEntry {
     pub(crate) supersedes: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemoryFile {
     schema_version: u32,
     #[serde(default)]
@@ -291,6 +291,11 @@ impl MemoryManager {
     }
 
     pub(crate) fn list(&self, scope: Option<MemoryScope>) -> Result<Vec<MemoryEntry>, String> {
+        let _lock = self.acquire_memory_lock()?;
+        self.list_unlocked(scope)
+    }
+
+    fn list_unlocked(&self, scope: Option<MemoryScope>) -> Result<Vec<MemoryEntry>, String> {
         let mut entries = Vec::new();
         if scope.is_none() || scope == Some(MemoryScope::Global) {
             entries.extend(self.load(MemoryScope::Global)?.entries);
@@ -310,6 +315,7 @@ impl MemoryManager {
         content: String,
         tags: Vec<String>,
     ) -> Result<MemoryEntry, String> {
+        let _lock = self.acquire_memory_lock()?;
         validate_content(&content)?;
         let content = content.trim().to_string();
         let mut file = self.load(scope)?;
@@ -351,6 +357,7 @@ impl MemoryManager {
         kind: Option<MemoryKind>,
         tags: Option<Vec<String>>,
     ) -> Result<MemoryEntry, String> {
+        let _lock = self.acquire_memory_lock()?;
         for scope in [MemoryScope::Global, MemoryScope::Project] {
             let mut file = self.load(scope)?;
             if let Some(entry) = file
@@ -381,6 +388,7 @@ impl MemoryManager {
     /// reinforced. Failures are ignored by callers: recall must never break a
     /// turn because a memory file could not be rewritten.
     pub(crate) fn touch(&self, ids: &[String]) -> Result<(), String> {
+        let _lock = self.acquire_memory_lock()?;
         if ids.is_empty() {
             return Ok(());
         }
@@ -403,6 +411,7 @@ impl MemoryManager {
     }
 
     pub(crate) fn forget(&self, id: &str) -> Result<(), String> {
+        let _lock = self.acquire_memory_lock()?;
         for scope in [MemoryScope::Global, MemoryScope::Project] {
             let mut file = self.load(scope)?;
             let original_len = file.entries.len();
@@ -434,6 +443,7 @@ impl MemoryManager {
         if !config.enabled || query.trim().is_empty() {
             return Ok(Vec::new());
         }
+        let _lock = self.acquire_memory_lock()?;
         let now = now_secs();
         let mut scored = Vec::new();
         let rank = |left: &(f32, MemoryEntry), right: &(f32, MemoryEntry)| {
@@ -505,8 +515,10 @@ impl MemoryManager {
     }
 
     fn load(&self, scope: MemoryScope) -> Result<MemoryFile, String> {
+        self.ensure_no_dream_transaction()?;
         let dir = self.directory(scope);
         let index = dir.join("MEMORY.md");
+        self.validate_storage_path(&index)?;
         if index.exists() {
             let mut entries = Vec::new();
             for line in std::fs::read_to_string(&index)
@@ -517,7 +529,14 @@ impl MemoryManager {
                     .strip_prefix("- ")
                     .and_then(|s| s.split_whitespace().next())
                 {
+                    let id = name
+                        .strip_suffix(".md")
+                        .ok_or("invalid memory index filename")?;
+                    if !dream::safe_id(id) {
+                        return Err("invalid memory index ID".into());
+                    }
                     let p = dir.join(name);
+                    self.validate_storage_path(&p)?;
                     if p.extension().and_then(|x| x.to_str()) == Some("md") && p.exists() {
                         let text = std::fs::read_to_string(&p)
                             .map_err(|e| format!("read {}: {e}", p.display()))?;
@@ -528,6 +547,9 @@ impl MemoryManager {
                         {
                             let mut entry: MemoryEntry = serde_json::from_str(metadata)
                                 .map_err(|e| format!("parse {}: {e}", p.display()))?;
+                            if entry.id != id || entry.scope != scope {
+                                return Err("memory index and entry metadata disagree".into());
+                            }
                             normalize_legacy_entry(&mut entry);
                             entries.push(entry);
                         }
@@ -540,8 +562,9 @@ impl MemoryManager {
                 entries,
             });
         }
-        // One-time, lossless migration from the legacy JSON store.
+        // Lossless legacy reads; a locked writer performs migration on save.
         let old = self.path(scope);
+        self.validate_storage_path(old)?;
         if old.exists() {
             let mut file: MemoryFile = serde_json::from_slice(
                 &std::fs::read(old).map_err(|e| format!("read {}: {e}", old.display()))?,
@@ -550,13 +573,34 @@ impl MemoryManager {
             for entry in &mut file.entries {
                 normalize_legacy_entry(entry);
             }
-            self.save(scope, &file)?;
+            // Reads never migrate on disk: migration is committed by the next
+            // locked writer, avoiding an otherwise uncoordinated write.
             return Ok(file);
         }
         Ok(MemoryFile::empty(self.workspace_path(scope)))
     }
 
+    fn validate_memory_file(&self, scope: MemoryScope, file: &MemoryFile) -> Result<(), String> {
+        if file.schema_version != SCHEMA_VERSION {
+            return Err("unsupported memory file schema".into());
+        }
+        dream::validate_entry_ids(&file.entries)?;
+        let directory = self.directory(scope);
+        self.validate_storage_path(&directory.join("MEMORY.md"))?;
+        for entry in &file.entries {
+            if entry.scope != scope {
+                return Err("memory scope does not match storage scope".into());
+            }
+            if entry.name.contains(['\n', '\r']) || entry.description.contains(['\n', '\r']) {
+                return Err("memory name and description must be single-line".into());
+            }
+            self.validate_storage_path(&directory.join(format!("{}.md", entry.id)))?;
+        }
+        Ok(())
+    }
+
     fn save(&self, scope: MemoryScope, file: &MemoryFile) -> Result<(), String> {
+        self.validate_memory_file(scope, file)?;
         let dir = self.directory(scope);
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let mut index = String::from("# Memory\n\n");
@@ -621,7 +665,12 @@ fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
                 path.display(),
                 temporary.display()
             )
-        })
+        })?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -1074,6 +1123,32 @@ mod tests {
         assert!(stored[0].last_used_at.is_some());
         // Unknown ids are ignored rather than failing the recall.
         manager.touch(&["mem_missing".into()]).unwrap();
+    }
+
+    #[test]
+    fn legacy_reads_are_lossless_and_only_a_locked_write_migrates() {
+        let manager = manager();
+        let entry = entry_with_age(MemoryKind::Convention, 0, 0);
+        let mut file = MemoryFile::empty(manager.workspace_path(entry.scope));
+        file.entries.push(entry.clone());
+        let legacy_path = manager.path(entry.scope);
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let bytes = serde_json::to_vec(&file).unwrap();
+        std::fs::write(legacy_path, &bytes).unwrap();
+        assert_eq!(manager.list(Some(entry.scope)).unwrap()[0].id, entry.id);
+        let index = manager.directory(entry.scope).join("MEMORY.md");
+        assert!(
+            !index.exists(),
+            "a read must not perform an unlocked migration"
+        );
+        assert_eq!(std::fs::read(legacy_path).unwrap(), bytes);
+        manager.touch(std::slice::from_ref(&entry.id)).unwrap();
+        assert!(index.exists());
+        assert_eq!(
+            manager.list(Some(entry.scope)).unwrap()[0].use_count,
+            entry.use_count + 1
+        );
+        assert_eq!(std::fs::read(legacy_path).unwrap(), bytes);
     }
 
     #[test]

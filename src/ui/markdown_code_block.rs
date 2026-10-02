@@ -61,6 +61,7 @@ fn highlighter() -> Arc<dyn CodeHighlighter> {
 /// instead of the library default (a left `│` gutter with corner brackets).
 pub struct CodeBlockHooks {
     width: usize,
+    show_copy_label: bool,
     /// Raw content of every rendered code block, in render order. Shared with
     /// the caller so copy buttons can be wired up after rendering.
     codes: Arc<Mutex<Vec<String>>>,
@@ -70,8 +71,15 @@ impl CodeBlockHooks {
     pub fn new(width: usize) -> Self {
         Self {
             width,
+            show_copy_label: true,
             codes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Read-only surfaces cannot wire up a copy action, but retain the same panel.
+    pub(crate) fn without_copy_label(mut self) -> Self {
+        self.show_copy_label = false;
+        self
     }
 
     /// Handle to the collected code block contents.
@@ -80,7 +88,7 @@ impl CodeBlockHooks {
     }
 
     /// The block's top padding row: a dim language label on the left and the
-    /// clickable copy label on the right.
+    /// optional clickable copy label on the right.
     fn label_line(&self, lang: &str) -> Line<'static> {
         let base = Style::default().fg(palette::TEXT).bg(CODE_BG);
         let label_style = Style::default().fg(LABEL_FG).bg(CODE_BG);
@@ -93,7 +101,7 @@ impl CodeBlockHooks {
 
         let button = Span::styled(COPY_LABEL, label_style);
         let button_width = button.width();
-        if self.width > used + button_width + RIGHT_PAD {
+        if self.show_copy_label && self.width > used + button_width + RIGHT_PAD {
             spans.push(Span::styled(
                 " ".repeat(self.width - used - button_width - RIGHT_PAD),
                 base,
@@ -101,7 +109,7 @@ impl CodeBlockHooks {
             spans.push(button);
             spans.push(Span::styled(" ".repeat(RIGHT_PAD), base));
         } else if used < self.width {
-            // Too narrow for the button; just pad the row out.
+            // Copy is hidden or the row is too narrow; keep the panel filled.
             spans.push(Span::styled(" ".repeat(self.width - used), base));
         }
         Line::from(spans)
@@ -150,7 +158,7 @@ impl RenderHooks for CodeBlockHooks {
 
         let mut lines = Vec::with_capacity(code_lines.len() + 2);
 
-        // Top padding row: dim language label plus the clickable copy label.
+        // Top padding row: dim language label plus the optional copy label.
         lines.push(self.label_line(lang));
         lines.extend(code_lines.into_iter().map(|line| self.shade(line)));
         lines.push(self.blank());
@@ -189,6 +197,44 @@ mod tests {
 
         // A top label row, the two code rows, and a bottom padding row.
         assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn hiding_copy_label_preserves_language_shading_and_code_body() {
+        for language in ["rust", ""] {
+            let conversation = CodeBlockHooks::new(40)
+                .render_code_block(language, "let value = 1;")
+                .expect("hooks always render a block");
+            let read_only = CodeBlockHooks::new(40)
+                .without_copy_label()
+                .render_code_block(language, "let value = 1;")
+                .expect("hooks always render a block");
+
+            assert!(
+                conversation[0]
+                    .spans
+                    .iter()
+                    .any(|span| span.content == COPY_LABEL)
+            );
+            assert!(
+                !read_only[0]
+                    .spans
+                    .iter()
+                    .any(|span| span.content == COPY_LABEL)
+            );
+            assert_eq!(read_only[0].to_string().trim(), language);
+            assert_eq!(read_only[0].width(), 40);
+            assert!(
+                read_only[0]
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg == Some(CODE_BG))
+            );
+            if !language.is_empty() {
+                assert_eq!(read_only[0].spans[1], conversation[0].spans[1]);
+            }
+            assert_eq!(read_only[1..], conversation[1..]);
+        }
     }
 
     #[test]

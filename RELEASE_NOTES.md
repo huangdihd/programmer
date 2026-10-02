@@ -1,3 +1,26 @@
+### programmer v0.2.22
+
+- Add browsable Dream audits with source excerpts, inline before/after changes,
+  conflict-checked whole-run rollback, and explicit interrupted-transaction recovery.
+- Add a read-only session relationship graph and event timeline with persistent
+  ancestor selection, padded rows, keyboard/mouse navigation, and narrow layouts.
+- Keep Dream preview responsive and cancellable without consuming queued inputs;
+  distinguish abandoned generation records from unconfirmed activity without
+  rewriting audits, and show readable relative times in Dream status.
+- Cache Dream detail layouts, render only visible content, and share conversation
+  Markdown and code-block styling for source excerpts.
+- Centralize ready-work dispatch so cancellation and compaction cannot strand
+  queued input, while preserving draft, approval, and mandatory-compaction gates.
+- Show mandatory compaction waits instead of stale Running tools status, group
+  consecutive tools starting at two calls, and restore accepted input suggestions
+  when the draft is deleted.
+- Expand lifecycle, rendering, rollback, scheduling, and input regression coverage
+  and update usage and architecture documentation.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.21...v0.2.22
+
+---
+
 ### programmer v0.2.21
 
 - Make operation ownership explicit and preserve queued requests until cancellation

@@ -54,6 +54,11 @@ pub(crate) async fn handle_key_events(
         return Ok(());
     }
 
+    if app.activity_panel.is_some() {
+        super::super::activity::handle_key(app, key_event);
+        return Ok(());
+    }
+
     if let Some(panel) = app.agent_panel.as_mut() {
         if panel.handle_key(key_event) {
             app.agent_panel = None;
@@ -435,6 +440,7 @@ pub(crate) async fn handle_key_events(
 fn independent_overlay_owns_escape(app: &App<'_>) -> bool {
     app.terminal_pane.is_some()
         || app.agent_panel.is_some()
+        || app.activity_panel.is_some()
         || app.rewind_panel.is_some()
         || app.todo_panel.is_some()
         || app.provider_panel.is_some()
@@ -820,7 +826,7 @@ pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
         return;
     }
     let data = data.replace("\r\n", "\n").replace('\r', "\n");
-    if app.rewind_panel.is_some() {
+    if app.rewind_panel.is_some() || app.activity_panel.is_some() {
         return;
     }
     if let Some(panel) = app.question_panel.as_mut() {
@@ -1062,6 +1068,43 @@ mod tests {
             .unwrap();
 
         assert!(app.mcp_panel.is_none());
+        assert_eq!(app.cancel.active_id, Some(crate::cancel::OperationId(42)));
+        assert!(!app.cancel.active.is_cancelled());
+    }
+    #[tokio::test]
+    async fn activity_view_owns_escape_and_paste_without_cancelling_active_turn() {
+        let mut config = crate::config::programmer_config::ProgrammerConfig::default();
+        config.providers.clear();
+        config.memory.dream_enabled = false;
+        let mut app = crate::app::App::new(
+            config,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            crate::tasks::TaskManager::default(),
+            "activity-routing-test".into(),
+            None,
+            Vec::new(),
+            false,
+            "test".into(),
+        )
+        .await;
+        app.cancel.active_id = Some(crate::cancel::OperationId(42));
+        app.activity_panel = Some(crate::ui::components::activity_panel::ActivityPanel::new(
+            "History".into(),
+            crate::ui::components::activity_panel::ActivityMode::Dream,
+            app.session.uuid.clone(),
+            Vec::new(),
+        ));
+        assert!(super::super::has_blocking_surface(&app));
+        let original = app.input_panel.get_content();
+        super::handle_paste(&mut app, "must not reach input".into());
+        assert_eq!(app.input_panel.get_content(), original);
+        handle_key_events(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.activity_panel.is_none());
         assert_eq!(app.cancel.active_id, Some(crate::cancel::OperationId(42)));
         assert!(!app.cancel.active.is_cancelled());
     }

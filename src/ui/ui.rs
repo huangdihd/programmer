@@ -67,6 +67,12 @@ impl App<'_> {
         if let Some(status) = status_for_waiting_subagents(self.waiting_for_subagents) {
             return status;
         }
+        // At a mandatory safe point the runner has finished its tools and is
+        // waiting for compaction; its last phase is no longer current work.
+        // A concurrent background pass must not mask foreground activity.
+        if self.auto_compact.mandatory_waiting && self.auto_compact.active_id.is_some() {
+            return StatusState::Compacting;
+        }
         let cp = &self.conversation_panel;
         match cp.phase {
             ActivePhase::Classifying => StatusState::Classifying,
@@ -381,6 +387,10 @@ impl App<'_> {
             pane.grid = Some(grid);
             pane.maybe_resize(grid.height.max(1), grid.width.max(1));
             terminal_panel::render(pane, area, buf);
+            return;
+        }
+        if let Some(panel) = &mut self.activity_panel {
+            panel.render(area, buf);
             return;
         }
         if let Some(panel) = &mut self.agent_panel {

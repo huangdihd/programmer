@@ -106,6 +106,8 @@ pub enum AppEvent {
         Result<CompactionResult, String>,
         CancellationToken,
     ),
+    /// Manual Dream planning finished; only the current operation may release ownership.
+    DreamPreviewFinished(OperationId, Result<String, String>),
     /// A seamless background compaction finished. The job id and history
     /// epoch make stale summaries harmless after clear/rewind/session changes.
     AutoCompactFinished {
@@ -268,6 +270,11 @@ impl std::fmt::Debug for AppEvent {
                 .debug_tuple("TurnFinished")
                 .field(id)
                 .field(&r.as_ref().map(|_| "..").map_err(|e| e.to_string()))
+                .finish(),
+            Self::DreamPreviewFinished(id, result) => f
+                .debug_tuple("DreamPreviewFinished")
+                .field(id)
+                .field(&result.as_ref().map(|_| ".."))
                 .finish(),
             Self::CompactFinished(id, cutoff, r, _) => f
                 .debug_tuple("CompactFinished")

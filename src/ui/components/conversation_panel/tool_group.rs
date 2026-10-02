@@ -51,8 +51,8 @@ use crate::ui::components::messages::assistant_message::EXPANDED_BG;
 use crate::ui::markdown_theme::palette;
 use async_openai::types::responses::ReasoningItem;
 
-/// Small sequences stay easier to scan as ordinary calls.
-pub(crate) const MIN_TOOL_GROUP_SIZE: usize = 3;
+/// Without absorbed reasoning, group consecutive pairs and longer runs.
+pub(crate) const MIN_TOOL_GROUP_SIZE: usize = 2;
 
 /// How many tool names the collapsed summary shows before abbreviating with
 /// `…`, keeping the muted detail line short enough to rarely wrap.
@@ -860,22 +860,29 @@ mod tests {
     }
 
     #[test]
-    fn groups_three_contiguous_calls_but_not_two() {
-        let items = vec![
-            call(0, "grep"),
-            call(1, "blob"),
-            call(2, "read_file"),
-            MessageItem::Info("boundary".into()),
-            call(3, "grep"),
-            call(4, "read_file"),
-        ];
+    fn contiguous_call_grouping_boundary_for_open_and_closed_runs() {
+        for count in 1..=3 {
+            for closed in [false, true] {
+                let mut items: Vec<_> = (0..count).map(|index| call(index, "grep")).collect();
+                if closed {
+                    items.push(MessageItem::Info("boundary".into()));
+                }
 
-        let groups = discover_tool_groups(&items);
+                let groups = discover_tool_groups(&items);
 
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, "call-0");
-        assert_eq!(groups[0].member_indices, [0, 1, 2]);
-        assert_eq!(groups[0].title(3, 0), "Explored");
+                assert_eq!(
+                    groups.len(),
+                    usize::from(count >= 2),
+                    "count={count}, closed={closed}"
+                );
+                if count >= 2 {
+                    assert_eq!(groups[0].key, "call-0");
+                    assert_eq!(groups[0].member_indices, (0..count).collect::<Vec<_>>());
+                    assert_eq!(groups[0].open, !closed);
+                    assert_eq!(groups[0].title(count, 0), "Explored");
+                }
+            }
+        }
     }
 
     #[test]
@@ -992,17 +999,37 @@ mod tests {
     }
 
     #[test]
-    fn open_run_without_reasoning_still_needs_three_calls() {
-        // Bare calls (no interleaved reasoning) keep the size threshold even
-        // while the run is open, so a lone call never gets a group header.
-        let two_calls = vec![call(0, "grep"), call(1, "blob")];
-        assert!(discover_tool_groups(&two_calls).is_empty());
+    fn live_call_grouping_boundary_matches_committed_runs() {
+        for count in 1..=3 {
+            let items: Vec<_> = (0..count).map(|index| call(index, "grep")).collect();
+            let outputs: Vec<_> = items
+                .iter()
+                .map(|item| match item {
+                    MessageItem::Output(output) => output,
+                    _ => unreachable!("test calls are output items"),
+                })
+                .collect();
 
-        let three_calls = vec![call(0, "grep"), call(1, "blob"), call(2, "read_file")];
-        let groups = discover_tool_groups(&three_calls);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].member_indices, [0, 1, 2]);
-        assert!(groups[0].open);
+            let groups = discover_live_tool_groups(&outputs);
+
+            assert_eq!(groups.len(), usize::from(count >= 2), "count={count}");
+            assert_eq!(groups, discover_tool_groups(&items));
+        }
+    }
+
+    #[test]
+    fn two_calls_bridge_committed_and_live_runs() {
+        let committed = vec![MessageItem::Info("boundary".into()), call(0, "grep")];
+        let live = call(1, "blob");
+        let MessageItem::Output(output) = &live else {
+            unreachable!("test calls are output items");
+        };
+
+        let group = discover_tool_group_bridge_outputs(&committed, &[output]).unwrap();
+
+        assert_eq!(group.key, "call-0");
+        assert_eq!(group.member_indices, [1, 2]);
+        assert!(group.open);
     }
 
     #[test]
@@ -1074,8 +1101,9 @@ mod tests {
 
         let groups = discover_tool_groups(&items);
 
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].member_indices, [3, 4, 5]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].member_indices, [0, 1]);
+        assert_eq!(groups[1].member_indices, [3, 4, 5]);
     }
 
     #[test]

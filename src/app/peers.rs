@@ -83,23 +83,14 @@ pub(crate) fn refresh_consent_models(app: &mut App<'_>) {
 
 /// Called after events; disk polling occurs only on ticks. Async answering never
 /// borrows App, and its results are discarded if the session identity changes.
-pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
+pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
     refresh_consent_models(app);
     sync_session(app);
     if !app.running || app.peers.presence.is_none() {
-        return;
+        return false;
     }
-    let was_consent = app.peers.consent.is_some();
     finish_consent(app);
     restore_runner_prompt(app);
-    if was_consent
-        && app.peers.consent.is_none()
-        && app.cancel.active_id.is_none()
-        && !super::events::has_blocking_surface(app)
-        && app.conversation_panel.pending_message.is_some()
-    {
-        super::events::start_queued_work(app).await;
-    }
 
     let completed: Vec<_> = app
         .peers
@@ -145,8 +136,9 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
                     let mut status = question.clone();
                     status.kind = PeerKind::Status;
                     status.body = error.clone();
-                    if let Err(delivery_error) = crate::peers::deliver_reply(&status) {
-                        report(app, delivery_error);
+                    match crate::peers::deliver_reply(&status) {
+                        Ok(None) => {}
+                        Ok(Some(warning)) | Err(warning) => report(app, warning),
                     }
                 }
                 report(app, error);
@@ -160,7 +152,7 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
             Ok(messages) => app.peers.pending = messages,
             Err(error) => {
                 report(app, error);
-                return;
+                return false;
             }
         }
     }
@@ -172,7 +164,8 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
                     reply.id = envelope.id.clone();
                     // An existing reply means delivery succeeded before a crash.
                     match crate::peers::deliver_reply(&reply) {
-                        Ok(()) => {}
+                        Ok(None) => {}
+                        Ok(Some(warning)) => report(app, warning),
                         Err(error)
                             if error == format!("Peer message already exists: {}", reply.id) => {}
                         Err(error) => {
@@ -304,7 +297,7 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
                     Ok(message) => app.conversation_panel.add_input_message(message),
                     Err(error) => {
                         report(app, error.to_string());
-                        return;
+                        return false;
                     }
                 }
                 session::mark_dirty(app);
@@ -312,10 +305,18 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
         }
         if let Err(error) = session::save_session_checked(app) {
             report(app, error);
-            return;
+            return false;
         }
     }
 
+    true
+}
+
+/// Event settlement dispatches local queued work first, then accepted peer work.
+pub(crate) async fn start_ready_work(app: &mut App<'_>) {
+    if !app.running || app.peers.presence.is_none() {
+        return;
+    }
     let ready = ready_work(&app.peers.pending, &app.peers.accepted);
     if ready.is_empty() {
         return;
@@ -332,6 +333,7 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
         app.auto_compact.mandatory_waiting = true;
         if !commands::maybe_start_auto_compact(app, tokens) {
             app.auto_compact.mandatory_waiting = false;
+            app.auto_compact.retry_blocked = true;
             report(app, "Peer follow-up awaits mandatory compaction; compact manually or adjust the context limit.".into());
         }
         return;
@@ -425,11 +427,7 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) {
 // XOR is an involution: applying this to an exchange ID recovers the question
 // ID as well. Toggle the UUID version nibble too, separating v4 question IDs.
 fn exchange_id(id: &str) -> Result<String, String> {
-    uuid::Uuid::parse_str(id)
-        .map(|id| {
-            uuid::Uuid::from_u128(id.as_u128() ^ 0x706565725f65786368616e67655f6964).to_string()
-        })
-        .map_err(|error| error.to_string())
+    crate::peers::exchange_id(id)
 }
 
 fn matching_exchange<'a>(
@@ -504,6 +502,15 @@ fn cancel_local_delegation(app: &mut App<'_>, id: &str) {
 }
 
 fn observe_delegation(app: &mut App<'_>, envelope: &PeerEnvelope, state: PeerDelegationState) {
+    if let Err(error) = crate::peers::graph::observe(
+        envelope,
+        crate::peers::graph::ObservedState::Delegation(state),
+    ) {
+        report(
+            app,
+            format!("cannot archive delegation observation: {error}"),
+        );
+    }
     app.conversation_panel.upsert_peer_delegation(
         envelope.id.clone(),
         envelope.from.clone(),

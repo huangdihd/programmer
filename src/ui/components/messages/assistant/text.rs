@@ -66,9 +66,80 @@ pub(crate) fn markdown_width(width: u16) -> u16 {
 pub(crate) fn render_markdown(md: &str, render_width: u16) -> (Text<'static>, Vec<String>) {
     let hooks = CodeBlockHooks::new(render_width as usize);
     let codes = hooks.codes();
-    let renderer = MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
-    let blocks = renderer.parse(md);
-    let text = Text::from(renderer.render(&blocks, &AppTheme));
+    let text = render_markdown_with_hooks(md, render_width, hooks);
     let codes = codes.lock().map(|c| c.clone()).unwrap_or_default();
     (text, codes)
+}
+
+/// Render conversation-styled Markdown without an unwired copy control.
+/// `render_width` is the available content width; callers own outer padding.
+pub(crate) fn render_read_only_markdown(md: &str, render_width: u16) -> Text<'static> {
+    let hooks = CodeBlockHooks::new(render_width as usize).without_copy_label();
+    render_markdown_with_hooks(md, render_width, hooks)
+}
+
+fn render_markdown_with_hooks(md: &str, render_width: u16, hooks: CodeBlockHooks) -> Text<'static> {
+    let renderer = MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
+    let blocks = renderer.parse(md);
+    Text::from(renderer.render(&blocks, &AppTheme))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::markdown_code_block::COPY_LABEL;
+
+    #[test]
+    fn read_only_markdown_matches_conversation_lines_spans_and_styles() {
+        let documents = [
+            "# Heading\n\n## Subheading",
+            "- First item\n- Second item\n\n1. Ordered item\n2. Another item",
+            "| Name | Value |\n| --- | --- |\n| alpha | **bold** |\n| beta | `code` |",
+            "> Quoted text\n>\n> Another paragraph",
+            "Plain **bold**, *italic*, ~~strike~~, `inline code`, and [link](https://example.com).",
+        ];
+
+        for width in [16, 40, 80] {
+            for document in documents {
+                let (conversation, codes) = render_markdown(document, width);
+                let read_only = render_read_only_markdown(document, width);
+                assert!(codes.is_empty());
+                assert!(!conversation.lines.is_empty());
+                assert_eq!(read_only, conversation, "width {width}, {document:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_fenced_code_matches_conversation_except_copy_label_rows() {
+        let document = "Before **code**.\n\n```rust\nfn main() {\n\tprintln!(\"hello\");\n}\n```\n\nBetween blocks.\n\n```\nplain text\n```\n\nAfter code.";
+
+        for width in [8, 40, 80] {
+            let (conversation, codes) = render_markdown(document, width);
+            let read_only = render_read_only_markdown(document, width);
+            assert_eq!(codes.len(), 2);
+            assert_eq!(read_only.style, conversation.style);
+            assert_eq!(read_only.alignment, conversation.alignment);
+            assert_eq!(read_only.lines.len(), conversation.lines.len());
+
+            let mut copy_rows = 0;
+            for (actual, expected) in read_only.lines.iter().zip(&conversation.lines) {
+                assert!(!actual.spans.iter().any(|span| span.content == COPY_LABEL));
+                if expected.spans.iter().any(|span| span.content == COPY_LABEL) {
+                    copy_rows += 1;
+                    assert_eq!(actual.width(), expected.width());
+                    assert_eq!(actual.style, expected.style);
+                    assert_eq!(actual.alignment, expected.alignment);
+                    assert_eq!(actual.spans[0], expected.spans[0]);
+                    if expected.spans[1].content == "rust" {
+                        assert_eq!(actual.spans[1], expected.spans[1]);
+                    }
+                    continue;
+                }
+                // Includes highlighted code bodies, padding, and surrounding Markdown.
+                assert_eq!(actual, expected, "width {width}");
+            }
+            assert_eq!(copy_rows, if width == 8 { 0 } else { 2 });
+        }
+    }
 }

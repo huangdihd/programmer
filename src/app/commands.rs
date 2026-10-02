@@ -157,6 +157,8 @@ async fn start_request_as_with_images(
         return;
     }
 
+    // An explicit submission may retry a previously failed mandatory pass.
+    app.auto_compact.retry_blocked = false;
     if app.mandatory_compact_tokens().is_some_and(|limit| {
         app.auto_compact
             .last_input_tokens
@@ -177,6 +179,7 @@ async fn start_request_as_with_images(
         let input_tokens = app.auto_compact.last_input_tokens.unwrap_or_default();
         if !maybe_start_auto_compact(app, input_tokens) {
             app.auto_compact.mandatory_waiting = false;
+            app.auto_compact.retry_blocked = true;
             app.conversation_panel.add_error_string(
                 "mandatory context compaction could not start; request remains queued".to_string(),
             );
@@ -1054,6 +1057,7 @@ pub(crate) fn invalidate_auto_compaction(app: &mut App<'_>) {
     app.auto_compact.last_cutoff = None;
     app.auto_compact.last_completed_item_count = None;
     app.auto_compact.mandatory_waiting = false;
+    app.auto_compact.retry_blocked = false;
     if app.auto_compact.mandatory_resume.is_some() {
         app.cancel.active.cancel();
     }
@@ -1173,7 +1177,7 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
         }),
         _ => {
             app.conversation_panel.add_warning_string(
-                "usage: /memory [list [global|project] | recall <query> | remember <global|project> <kind> <content> | update <id> <content> | forget <id> | dream [status|preview|apply] [global|project] | on | off]",
+                "usage: /memory [list [global|project] | recall <query> | remember <global|project> <kind> <content> | update <id> <content> | forget <id> | dream [status|preview|apply|history] [global|project] | on | off]",
             );
             return command_handlers::CommandOutcome::handled(false);
         }
@@ -1210,7 +1214,7 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
     command_handlers::CommandOutcome::handled(false)
 }
 
-/// `/memory dream [status|preview|apply] [global|project]`.
+/// `/memory dream [status|preview|apply|history] [global|project]`.
 ///
 /// Kept out of the `memory` tool on purpose: consolidating long-term memory is
 /// a user decision, so the agent can neither see nor invoke it.
@@ -1224,6 +1228,36 @@ async fn dream_command(
         .next()
         .filter(|part| !part.is_empty())
         .unwrap_or("status");
+    if mode == "recover" {
+        let confirmed = parts.next() == Some("confirm") && parts.next().is_none();
+        if !confirmed {
+            app.conversation_panel.add_warning_string(
+                "Recovery completes the recorded target of an interrupted Dream apply/rollback, including any remaining writes. It does NOT undo it. Run `/memory dream recover confirm` in the originating workspace to proceed.",
+            );
+            return command_handlers::CommandOutcome::handled(false);
+        }
+        match crate::memory::MemoryManager::for_current_dir()
+            .and_then(|manager| manager.dream_recover())
+        {
+            Ok(()) => app
+                .conversation_panel
+                .add_info_string("Dream transaction recovered."),
+            Err(error) => app
+                .conversation_panel
+                .add_warning_string(format!("Dream recovery failed: {error}")),
+        }
+        return command_handlers::CommandOutcome::handled(false);
+    }
+    if mode == "history" {
+        let filter = parts.next();
+        if !matches!(filter, None | Some("session")) || parts.next().is_some() {
+            app.conversation_panel
+                .add_warning_string("usage: /memory dream history [session]");
+            return command_handlers::CommandOutcome::handled(false);
+        }
+        super::activity::open_dream(app, filter.is_some());
+        return command_handlers::CommandOutcome::handled(false);
+    }
     let scope = match parts.next().filter(|part| !part.is_empty()) {
         Some("global") => Some(crate::memory::MemoryScope::Global),
         Some("project") => Some(crate::memory::MemoryScope::Project),
@@ -1251,8 +1285,12 @@ async fn dream_command(
             line
         }),
         "preview" => {
-            // Planning is a real request, so show the phase the same way recall
-            // does and let it be cancelled with Esc.
+            if app.cancel.active_id.is_some() {
+                app.conversation_panel.add_warning_string(
+                    "cannot preview Dream while another operation is in flight",
+                );
+                return command_handlers::CommandOutcome::handled(false);
+            }
             let Some(model) = app.effective_memory_model() else {
                 app.conversation_panel
                     .add_warning_string("error: Dream preview requires a configured memory model");
@@ -1262,17 +1300,18 @@ async fn dream_command(
                 client: model.client,
                 model: model.model,
             };
-            app.conversation_panel.phase =
-                crate::ui::components::conversation_panel::conversation_panel::ActivePhase::Associating;
-            let result = model.preview(&manager, &config, scope).await;
-            app.conversation_panel.phase =
-                crate::ui::components::conversation_panel::conversation_panel::ActivePhase::None;
-            result.map(dream_report_line)
+            start_dream_preview(app, move |cancellation| async move {
+                model
+                    .preview(&manager, &config, scope, cancellation)
+                    .await
+                    .map(dream_report_line)
+            });
+            return command_handlers::CommandOutcome::handled(false);
         }
         "apply" => dream::apply_saved_preview(&manager, scope).map(dream_report_line),
         other => {
             app.conversation_panel.add_warning_string(format!(
-                "usage: /memory dream [status|preview|apply] [global|project] \
+                "usage: /memory dream [status|preview|apply|history] [global|project] \
                  — '{other}' is not a Dream mode"
             ));
             return command_handlers::CommandOutcome::handled(false);
@@ -1286,6 +1325,35 @@ async fn dream_command(
             .add_warning_string(format!("error: {error}")),
     }
     command_handlers::CommandOutcome::handled(false)
+}
+
+/// Keep network work outside the UI event handler. The terminal event releases
+/// ownership even after cancellation, before any queued successor may start.
+pub(crate) fn start_dream_preview<F, Fut>(app: &mut App<'_>, preview: F)
+where
+    F: FnOnce(crate::cancel::CancellationToken) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+{
+    if app.cancel.active_id.is_some() {
+        app.conversation_panel
+            .add_warning_string("cannot preview Dream while another operation is in flight");
+        return;
+    }
+    let operation_id = app.cancel.begin(None);
+    let cancellation = app.cancel.active.child();
+    app.cancel.activity = Some("Dream preview".into());
+    app.conversation_panel.phase =
+        crate::ui::components::conversation_panel::conversation_panel::ActivePhase::Associating;
+    app.conversation_panel
+        .add_info_string("Generating Dream preview · Esc cancels; memories will not be applied.");
+    let sender = app.events.sender.clone();
+    tokio::spawn(async move {
+        let result = preview(cancellation).await;
+        let _ = sender.send(Event::App(AppEvent::DreamPreviewFinished(
+            operation_id,
+            result,
+        )));
+    });
 }
 
 fn dream_report_line(report: crate::memory::dream::DreamReport) -> String {
@@ -1309,7 +1377,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         command @ (Command::Quit
         | Command::Clear
         | Command::New
-        | Command::Session
+        | Command::Session(_)
         | Command::Title(_)
         | Command::Usage
         | Command::Rewind

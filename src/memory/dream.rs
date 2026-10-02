@@ -21,7 +21,8 @@
 //!
 //! Queue files are only retired after every memory file and the scheduler state
 //! have been committed, so a crash, cancellation, or provider outage loses no
-//! work: the same pending sessions are simply picked up next time.
+//! work. An interrupted commit blocks memory access until explicit
+//! `/memory dream recover` rolls its journal forward.
 
 use super::{
     MemoryConfidence, MemoryEntry, MemoryFile, MemoryKind, MemoryManager, MemoryScope,
@@ -38,6 +39,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+mod history;
+pub(super) use history::validate_entry_ids;
+pub(crate) use history::{DreamHistory, DreamRunStatus};
 
 const DREAM_SCHEMA_VERSION: u32 = 1;
 const MAX_PENDING_TRANSCRIPT_CHARS: usize = 12_000;
@@ -96,15 +101,29 @@ impl From<&crate::config::programmer_config::MemoryConfig> for DreamConfig {
     }
 }
 
-/// One-line summary of the consolidation queue, shared by the slash command and
-/// the agent's `memory dream status` action.
+/// One-line summary of the consolidation queue for the user-only slash command.
 pub(crate) fn render_status(state: &DreamState, pending: usize, preview: bool) -> String {
+    render_status_at(state, pending, preview, now_secs())
+}
+
+fn render_status_at(state: &DreamState, pending: usize, preview: bool, now: u64) -> String {
     format!(
         "Dream status: queued={pending} transcript(s), preview={}, last_run={}, last_operations={}, last_error={}",
         if preview { "ready" } else { "none" },
         state
             .last_dream_at
-            .map(|timestamp| timestamp.to_string())
+            .map(|timestamp| {
+                if timestamp > now {
+                    return "unknown (clock mismatch)".into();
+                }
+                let age = now - timestamp;
+                match age {
+                    0..60 => "just now".into(),
+                    60..3600 => format!("{}m ago", age / 60),
+                    3600..86400 => format!("{}h {}m ago", age / 3600, age % 3600 / 60),
+                    _ => format!("{}d {}h ago", age / 86400, age % 86400 / 3600),
+                }
+            })
             .unwrap_or_else(|| "never".to_string()),
         state.last_operation_count,
         state.last_error.as_deref().unwrap_or("none")
@@ -123,6 +142,8 @@ pub(crate) struct DreamRuntime {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DreamPlan {
     pub(crate) schema_version: u32,
+    #[serde(default = "new_run_id")]
+    pub(crate) run_id: String,
     pub(crate) generated_at: u64,
     /// How this plan may be applied. An automatic pass is model-only; a
     /// preview is reviewed by a human before it is applied.
@@ -232,6 +253,10 @@ impl MemoryManager {
         session_id: &str,
         transcript: &str,
     ) -> Result<PendingDream, String> {
+        // Queue inputs are content-addressed and independent of memory commits.
+        // A running model must not make session-close enqueue silently fail.
+        self.validate_storage_path(&self.pending_dir())?;
+        self.validate_storage_path(&self.dream_dir().join("processed"))?;
         let transcript = transcript.trim();
         if transcript.is_empty() {
             return Err("dream transcript must not be empty".to_string());
@@ -276,6 +301,7 @@ impl MemoryManager {
     /// [`MAX_PENDING_BATCH`] sessions, but the queue may legitimately be longer.
     fn pending_count(&self) -> Result<usize, String> {
         let dir = self.pending_dir();
+        self.validate_storage_path(&dir)?;
         if !dir.exists() {
             return Ok(0);
         }
@@ -290,6 +316,7 @@ impl MemoryManager {
 
     fn load_dream_state(&self) -> Result<DreamState, String> {
         let path = self.dream_dir().join(STATE_FILE);
+        self.validate_storage_path(&path)?;
         if !path.exists() {
             return Ok(DreamState {
                 schema_version: DREAM_SCHEMA_VERSION,
@@ -308,6 +335,7 @@ impl MemoryManager {
 
     fn load_pending(&self) -> Result<Vec<(PathBuf, PendingDream)>, String> {
         let dir = self.pending_dir();
+        self.validate_storage_path(&dir)?;
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -320,6 +348,7 @@ impl MemoryManager {
         paths.sort();
         let mut pending = Vec::new();
         for path in paths.into_iter().take(MAX_PENDING_BATCH) {
+            self.validate_storage_path(&path)?;
             // A queue file that cannot be read or parsed is skipped rather than
             // failing the whole pass: one corrupt entry must not block every
             // other session from being consolidated.
@@ -329,12 +358,25 @@ impl MemoryManager {
             let Ok(item) = serde_json::from_slice::<PendingDream>(&bytes) else {
                 continue;
             };
+            if item.schema_version != DREAM_SCHEMA_VERSION
+                || !safe_id(&item.id)
+                || path.file_stem().and_then(|value| value.to_str()) != Some(item.id.as_str())
+            {
+                return Err("invalid Dream queue schema or ID".into());
+            }
             pending.push((path, item));
         }
         Ok(pending)
     }
 
-    fn acquire_dream_lock(&self) -> Result<Option<File>, String> {
+    pub(super) fn acquire_dream_lock(&self) -> Result<Option<File>, String> {
+        let lock = self.acquire_transaction_lock()?;
+        self.ensure_no_dream_transaction()?;
+        Ok(lock)
+    }
+
+    fn acquire_transaction_lock(&self) -> Result<Option<File>, String> {
+        self.validate_storage_path(&self.dream_dir())?;
         std::fs::create_dir_all(self.dream_dir())
             .map_err(|error| format!("create dream directory: {error}"))?;
         // Lock the whole memory root, not only this project: a Dream pass may
@@ -345,6 +387,7 @@ impl MemoryManager {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.dream_dir());
         let path = memory_root.join(LOCK_FILE);
+        self.validate_storage_path(&path)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -369,26 +412,7 @@ impl MemoryManager {
         plan: &DreamPlan,
         scope_filter: Option<MemoryScope>,
     ) -> Result<usize, String> {
-        if plan.operations.len() > MAX_OPERATIONS {
-            return Err(format!("dream plan exceeds {MAX_OPERATIONS} operations"));
-        }
-        let mut global = self.load(MemoryScope::Global)?;
-        let mut project = self.load(MemoryScope::Project)?;
-        let mut applied = 0;
-        for operation in &plan.operations {
-            // The policy is re-checked at apply time, not only when the plan was
-            // generated: a plan found on disk must not be able to bypass the
-            // unattended rules just because its `policy` field says automatic.
-            if plan.policy == DreamPolicy::Automatic && !automatic_operation_allowed(operation) {
-                continue;
-            }
-            if apply_operation(operation, scope_filter, &mut global, &mut project)? {
-                applied += 1;
-            }
-        }
-        self.save(MemoryScope::Global, &global)?;
-        self.save(MemoryScope::Project, &project)?;
-        Ok(applied)
+        self.apply_plan_with_history(plan, scope_filter)
     }
 }
 
@@ -441,7 +465,8 @@ impl DreamModel {
             ));
         }
 
-        let memories = manager.list(None)?;
+        let memories = manager.list_unlocked(None)?;
+        let run_id = manager.record_generation_start(&pending)?;
         let mut plan = match self
             .generate_plan(&pending, &memories, config.timeout_secs)
             .await
@@ -450,15 +475,17 @@ impl DreamModel {
             Err(error) => {
                 // Keep the queue: the sessions are still unprocessed, and the
                 // failure is visible in `dream status`.
+                manager.record_generation_failure(&run_id, &pending, &error)?;
                 state.last_error = Some(error.clone());
-                let _ = manager.save_dream_state(&state);
+                manager.save_dream_state(&state).map_err(|state_error| {
+                    format!("{error}; also failed to record Dream state: {state_error}")
+                })?;
                 return Err(error);
             }
         };
+        plan.run_id = run_id;
         plan.policy = DreamPolicy::Automatic;
-        plan.operations.retain(automatic_operation_allowed);
         let applied = manager.apply_plan(&plan, None)?;
-        finish_applied_plan(manager, &plan, &mut state, applied)?;
         Ok(DreamReport {
             pending: manager.pending_count()?,
             operations: applied,
@@ -479,7 +506,11 @@ impl DreamModel {
         manager: &MemoryManager,
         config: &DreamConfig,
         scope: Option<MemoryScope>,
+        cancellation: crate::cancel::CancellationToken,
     ) -> Result<DreamReport, String> {
+        if cancellation.is_cancelled() {
+            return Err("Dream preview cancelled".into());
+        }
         let Some(_lock) = manager.acquire_dream_lock()? else {
             return Ok(DreamReport::skipped(
                 manager.pending_count()?,
@@ -491,24 +522,31 @@ impl DreamModel {
         if pending.is_empty() {
             return Ok(DreamReport::skipped(0, "no pending sessions"));
         }
-        let memories = manager.list(None)?;
-        let plan = match self
-            .generate_plan(&pending, &memories, config.timeout_secs)
+        let memories = manager.list_unlocked(None)?;
+        let run_id = manager.record_generation_start(&pending)?;
+        let plan = match cancellation
+            .wait_or(self.generate_plan(&pending, &memories, config.timeout_secs))
             .await
+            .unwrap_or_else(|| Err("Dream preview cancelled".into()))
         {
             Ok(plan) => plan,
             Err(error) => {
+                manager.record_generation_failure(&run_id, &pending, &error)?;
                 state.last_error = Some(error.clone());
-                let _ = manager.save_dream_state(&state);
+                manager.save_dream_state(&state).map_err(|state_error| {
+                    format!("{error}; also failed to record Dream state: {state_error}")
+                })?;
                 return Err(error);
             }
         };
         let mut plan = plan;
+        plan.run_id = run_id;
         plan.policy = DreamPolicy::Preview;
         if let Some(scope) = scope {
             plan.operations
                 .retain(|operation| operation.scope.is_none_or(|value| value == scope));
         }
+        manager.record_preview(&plan, &pending)?;
         atomic_write_json(&manager.dream_dir().join(PREVIEW_FILE), &plan)?;
         Ok(DreamReport {
             pending: manager.pending_count()?,
@@ -592,6 +630,7 @@ impl DreamModel {
         let operations = parsed.operations.into_iter().take(MAX_OPERATIONS).collect();
         Ok(DreamPlan {
             schema_version: DREAM_SCHEMA_VERSION,
+            run_id: new_run_id(),
             generated_at: now_secs(),
             // Overwritten by the caller: generation never decides how its own
             // plan may be applied.
@@ -624,8 +663,6 @@ pub(crate) fn apply_saved_preview(
     )
     .map_err(|error| format!("parse {}: {error}", path.display()))?;
     let applied = manager.apply_plan(&plan, scope)?;
-    let mut state = manager.load_dream_state()?;
-    finish_applied_plan(manager, &plan, &mut state, applied)?;
     Ok(DreamReport {
         pending: manager.pending_count()?,
         operations: applied,
@@ -636,7 +673,11 @@ pub(crate) fn apply_saved_preview(
 
 /// Whether a queue id is safe to use as a file name: Dream ids are generated
 /// locally, but a preview applied from disk is untrusted input.
-fn safe_id(id: &str) -> bool {
+fn new_run_id() -> String {
+    format!("dream_{}", uuid::Uuid::new_v4().simple())
+}
+
+pub(super) fn safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id.chars().all(|character| {
@@ -657,7 +698,7 @@ fn finish_applied_plan(
         // The preview file is user-writable, so an id is only ever used as a
         // file name after it is confirmed to be one.
         if !safe_id(id) {
-            continue;
+            return Err("invalid Dream source ID".into());
         }
         let source = manager.pending_dir().join(format!("{id}.json"));
         if source.exists() {
@@ -666,6 +707,10 @@ fn finish_applied_plan(
                 format!("move {} to {}: {error}", source.display(), target.display())
             })?;
         }
+    }
+    history::sync_directory(&processed_dir)?;
+    if manager.pending_dir().exists() {
+        history::sync_directory(&manager.pending_dir())?;
     }
     state.schema_version = DREAM_SCHEMA_VERSION;
     state.last_dream_at = Some(now_secs());
@@ -678,7 +723,7 @@ fn finish_applied_plan(
         std::fs::remove_file(&preview)
             .map_err(|error| format!("remove {}: {error}", preview.display()))?;
     }
-    Ok(())
+    history::sync_directory(&manager.dream_dir())
 }
 
 /// How often the background worker re-examines the pending queue while the
@@ -750,10 +795,9 @@ impl DreamWorker {
 }
 
 /// Stop the worker. An in-flight pass is dropped at its next await point, so a
-/// half-finished pass costs one wasted request at most: memory is only written
-/// in synchronous sections (which always complete), and the pending queue is
-/// only consumed after those writes, so anything already applied is re-derived
-/// idempotently on the next pass.
+/// cancelled model call leaves its sources queued. Writes are synchronous and
+/// journaled; an I/O failure or process crash requires explicit roll-forward
+/// recovery rather than silently reapplying a partially committed plan.
 pub(crate) fn shutdown(worker: &mut Option<DreamWorker>) {
     if let Some(worker) = worker.take() {
         // Lower the indicator first: the abort below can land before the pass
@@ -972,7 +1016,15 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), String> 
     ));
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     let result = (|| {
-        let mut file = File::create(&temporary)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
             .map_err(|error| format!("create {}: {error}", temporary.display()))?;
         file.write_all(&bytes)
             .map_err(|error| format!("write {}: {error}", temporary.display()))?;
@@ -984,7 +1036,12 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), String> 
                 path.display(),
                 temporary.display()
             )
-        })
+        })?;
+        #[cfg(unix)]
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -996,13 +1053,13 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), String> 
 mod tests {
     use super::*;
 
-    fn manager() -> MemoryManager {
+    pub(super) fn manager() -> MemoryManager {
         let root =
             std::env::temp_dir().join(format!("programmer-dream-test-{}", uuid::Uuid::new_v4()));
         MemoryManager::new(root.join("config"), root.join("workspace"))
     }
 
-    fn create_operation(content: &str) -> DreamOperation {
+    pub(super) fn create_operation(content: &str) -> DreamOperation {
         DreamOperation {
             action: DreamAction::Create,
             id: None,
@@ -1018,9 +1075,10 @@ mod tests {
         }
     }
 
-    fn plan(operations: Vec<DreamOperation>) -> DreamPlan {
+    pub(super) fn plan(operations: Vec<DreamOperation>) -> DreamPlan {
         DreamPlan {
             schema_version: DREAM_SCHEMA_VERSION,
+            run_id: new_run_id(),
             generated_at: now_secs(),
             policy: DreamPolicy::Preview,
             source_pending_ids: Vec::new(),
@@ -1042,6 +1100,16 @@ mod tests {
             confidence: None,
             supersedes: None,
         }
+    }
+
+    #[test]
+    fn enqueue_remains_available_while_dream_holds_the_memory_lock() {
+        let manager = manager();
+        let _lock = manager.acquire_dream_lock().unwrap().unwrap();
+        let pending = manager
+            .enqueue_dream("another-session", "Keep regression tests")
+            .unwrap();
+        assert_eq!(manager.load_pending().unwrap()[0].1.id, pending.id);
     }
 
     #[test]
@@ -1113,7 +1181,15 @@ mod tests {
         let manager = manager();
         let plan = plan(vec![create_operation("Use JSON for session persistence")]);
         assert_eq!(manager.apply_plan(&plan, None).unwrap(), 1);
-        assert_eq!(manager.apply_plan(&plan, None).unwrap(), 0);
+        assert!(
+            manager
+                .apply_plan(&plan, None)
+                .unwrap_err()
+                .contains("already been applied")
+        );
+        let mut duplicate = plan.clone();
+        duplicate.run_id = new_run_id();
+        assert_eq!(manager.apply_plan(&duplicate, None).unwrap(), 0);
     }
 
     #[test]
@@ -1213,6 +1289,42 @@ mod tests {
     }
 
     #[test]
+    fn dream_status_uses_readable_time_without_changing_other_fields() {
+        let now = 1_790_847_206;
+        for (timestamp, expected) in [
+            (None, "never"),
+            (Some(now), "just now"),
+            (Some(now - 59), "just now"),
+            (Some(now - 60), "1m ago"),
+            (Some(now - 3599), "59m ago"),
+            (Some(now - 3600), "1h 0m ago"),
+            (Some(now - 12000), "3h 20m ago"),
+            (Some(now - 86400), "1d 0h ago"),
+            (Some(now - 176400), "2d 1h ago"),
+            (Some(now + 1), "unknown (clock mismatch)"),
+            (Some(u64::MAX), "unknown (clock mismatch)"),
+        ] {
+            let state = DreamState {
+                last_dream_at: timestamp,
+                last_operation_count: 7,
+                last_error: Some("Dream timed out after 60s".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                render_status_at(&state, 17, false, now),
+                format!(
+                    "Dream status: queued=17 transcript(s), preview=none, last_run={expected}, last_operations=7, last_error=Dream timed out after 60s"
+                )
+            );
+            assert_eq!(state.last_dream_at, timestamp);
+        }
+        assert!(
+            render_status_at(&DreamState::default(), 0, true, now)
+                .contains("preview=ready, last_run=never, last_operations=0, last_error=none")
+        );
+    }
+
+    #[test]
     fn dream_state_survives_a_restart() {
         let manager = manager();
         let state = DreamState {
@@ -1287,6 +1399,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_preview_cancels_a_stalled_provider_and_releases_the_store() {
+        let manager = manager();
+        manager
+            .enqueue_dream("session-1", "User: always run cargo test")
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (connected, connection) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            let _ = connected.send(());
+            std::future::pending::<()>().await;
+        });
+        let model = DreamModel {
+            client: Client::with_config(
+                OpenAIConfig::new().with_api_base(base).with_api_key("test"),
+            ),
+            model: "test-model".into(),
+        };
+        let configuration = DreamConfig {
+            enabled: true,
+            min_sessions: 1,
+            min_interval_hours: 0,
+            timeout_secs: 60,
+        };
+        let cancellation = crate::cancel::CancellationToken::new();
+        let task_manager = manager.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            model
+                .preview(&task_manager, &configuration, None, task_cancellation)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manager.list(None).unwrap_err().contains("busy"));
+        cancellation.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(manager.list(None).unwrap().is_empty());
+        assert_eq!(manager.load_pending().unwrap().len(), 1);
+        assert!(!manager.dream_dir().join(PREVIEW_FILE).exists());
+        let history = manager.dream_history_list().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, DreamRunStatus::GenerationFailed);
+        assert!(history[0].error.as_ref().unwrap().contains("cancelled"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn the_worker_raises_the_indicator_while_a_pass_is_in_flight() {
         let manager = manager();
         manager
@@ -1330,8 +1497,15 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(raised, "the indicator must be up during a pass");
-        // Nothing is written by a pass that never got a plan back.
-        assert_eq!(manager.list(None).unwrap().len(), 0);
+        // The in-flight model call owns the store lock; reads fail closed.
+        assert!(manager.list(None).unwrap_err().contains("busy"));
+        assert!(
+            manager
+                .dream_history_list()
+                .unwrap()
+                .iter()
+                .any(|history| history.status == DreamRunStatus::Generating)
+        );
 
         shutdown(&mut worker);
         assert!(!active.load(std::sync::atomic::Ordering::Relaxed));

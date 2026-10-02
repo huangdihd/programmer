@@ -95,11 +95,11 @@ impl InputPanel<'_> {
         if !self.get_content().is_empty() {
             return false;
         }
-        let Some(suggestion) = self.suggestion.take() else {
+        let Some(suggestion) = self.suggestion.clone() else {
             return false;
         };
-        self.text_area.set_placeholder_text(DEFAULT_PLACEHOLDER);
-        self.set_content(&suggestion);
+        // Accepting fills the draft without consuming its empty-input hint.
+        self.insert_str(&suggestion);
         true
     }
 
@@ -433,6 +433,39 @@ mod tests {
             "emptying the draft restores the hint"
         );
         assert_eq!(panel.get_content(), "删除草稿后恢复");
+    }
+
+    #[test]
+    fn accepted_suggestion_reappears_after_deleting_the_draft() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        let mut panel = InputPanel::new();
+        let suggestion = "继续修复测试";
+        panel.set_suggestion(suggestion.into());
+        for _ in 0..2 {
+            assert!(panel.accept_suggestion());
+            assert_eq!(panel.get_content(), suggestion);
+            assert!(!panel.accept_suggestion());
+            for _ in suggestion.chars() {
+                panel.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            }
+            assert!(panel.get_content().is_empty());
+            let area = Rect::new(0, 0, 60, 3);
+            let mut buffer = Buffer::empty(area);
+            (&panel).render(area, &mut buffer);
+            // Ignore blank continuation cells of double-width CJK glyphs.
+            let rendered: String = (0..area.width)
+                .map(|x| buffer[(x, 1)].symbol())
+                .filter(|symbol| !symbol.trim().is_empty())
+                .collect();
+            assert!(rendered.contains(suggestion), "{rendered}");
+            assert_eq!(panel.suggestion(), Some(suggestion));
+        }
+        // Submission/session reset still discards the old suggestion.
+        panel.clear();
+        assert!(panel.suggestion().is_none());
+        assert!(!panel.accept_suggestion());
     }
 
     #[test]

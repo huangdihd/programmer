@@ -543,7 +543,7 @@ Zero input-token reports do not erase the last known positive context-size count
 | Key | Action |
 |---|---|
 | `Enter` | Send message |
-| `Right` | Accept the model-generated next-message suggestion when the input is empty; typing hides it, and deleting the draft reveals it again |
+| `Right` | Accept the model-generated next-message suggestion when the input is empty; typing hides it, and deleting the draft reveals it again—even after accepting with Right. Sending clears the old suggestion. |
 | `Up` | Move a queued message back into the empty input for editing |
 | `Esc` | Cancel only the active request; after it stops, automatically continue queued work (unless an unsent draft or approval blocks it). Before any model output, restore the original draft only when the input is empty and no user request is queued |
 | `Ctrl+T` | Cycle work mode (Manual → Auto → Plan → optional YOLO) |
@@ -630,6 +630,8 @@ Embedded task terminals retain their own ANSI colors.
 | `/memory update <id> <content>` | Correct an existing memory |
 | `/memory forget <id>` | Permanently remove a memory |
 | `/memory dream [status\|preview\|apply] [global\|project]` | Show, plan, or apply background consolidation |
+| `/memory dream history [session]` | Browse Dream audits and preview whole-run rollback (`r`, then `y` to confirm) |
+| `/memory dream recover [confirm]` | Explain or explicitly complete an interrupted Dream transaction |
 | `/memory <on\|off>` | Enable or disable memory for this run |
 | `/skill <name\|list\|off>` | Activate, list, or clear skills |
 | `/skill manage` | Open the skills management panel |
@@ -640,6 +642,7 @@ Embedded task terminals retain their own ANSI colors.
 | `/usage` | Show cumulative token usage and the latest model request's input-token count |
 | `/new` `/n` | Start a new session (auto-saves current) |
 | `/session` `/s` | Show current session UUID and info |
+| `/session graph` | Read-only cross-session question/delegation graph, timeline, and details |
 | `/title [text]` | Regenerate the current session title, or set it manually when text is provided |
 | `/providers show` | List all configured providers and models |
 | `/providers manage` | Open the provider management panel |
@@ -731,13 +734,15 @@ model's judgement alone. Those changes are proposed as a preview you can read
 and apply:
 
 ```
-/memory dream            # status: pending sessions, preview availability, last error
+/memory dream            # status: pending sessions, preview, relative last-run time, last error
 /memory dream preview    # write an auditable plan without touching memory
 /memory dream apply      # apply that plan, then retire the consumed sessions
 ```
 
-`preview` writes `.dream-preview.json` in the project memory directory and
-consumes nothing; `apply` performs no model call at all, so reviewing a plan
+`preview` runs as a cancellable foreground operation without blocking the UI;
+Esc cancels its model request, retains queued inputs, and does not apply memories.
+Another foreground operation cannot start a concurrent preview. It writes
+`.dream-preview.json` in the project memory directory and consumes nothing; `apply` performs no model call at all, so reviewing a plan
 costs one request. Both are slash commands only: `dream` is deliberately absent
 from the `memory` tool the model can call, so an agent can neither inspect the
 queue nor trigger consolidation — and a hand-written tool call naming it is
@@ -748,6 +753,83 @@ cross-process lock over the memory root, so two Programmer instances, or an
 explicit `apply` racing the background worker, can never interleave their writes;
 memory files and their `MEMORY.md` index are still replaced atomically through a
 temporary file and rename.
+
+### Dream history and rollback
+
+`/memory dream history` opens the current workspace's run history; append
+`session` to include only runs whose input excerpts came from the current session.
+The viewer shows recorded plans, source excerpts (not full conversations),
+operation outcomes, errors, and memory before/after values. Old processed queue
+files are input excerpts, not historical change snapshots: their missing changes
+cannot be reconstructed or rolled back.
+
+A recorded generation start is not a live progress indicator. The reader probes
+an existing root lock without waiting: if it obtains a shared lock before loading
+the record, an unfinished generation is displayed as `Interrupted`. If another
+writer holds the lock (or no lock file exists), it displays `Unconfirmed · generation
+started`, not a claim that this run is still active. This is a read-only projection:
+viewing history neither rewrites audits nor consumes or reruns queued inputs.
+
+The timeline uses padded rows with persistent selection; moving focus into
+its details does not remove the selected run's background. Details show inline
+before/after changes first, then operation results. Status and diff colors come
+from recorded states and snapshots, not from transcript text. `s` discloses source
+excerpts using the conversation's Markdown and code highlighting (without copy
+buttons); `m` discloses literal metadata and the recorded plan. Detail layouts are
+cached across scrolling and unchanged refreshes.
+
+Use arrows/`j`/`k` to select, `Enter` to enter details, and `Esc` to return to the
+timeline (then close). `Tab`/Shift+Tab switch regions; mouse clicks select/focus
+and the wheel navigates or scrolls. Narrow terminals show one region at a time.
+`/` searches and `R`/F5 refreshes. In an applied run, `r` previews **whole-run rollback**;
+`y` confirms and `n`/Esc cancels. Any subsequent semantic change to an affected
+memory blocks the entire rollback. Usage counts and last-recalled times, unrelated
+memories, and later independent changes are preserved. Rollback produces a
+separate linked audit; it never requeues the source excerpts. There is no force
+rollback or selective per-operation undo.
+
+Dream commits and rollbacks use a recoverable journal shared by all memory
+writers. An interrupted commit is shown as incomplete and blocks memory access;
+`/memory dream recover` explains recovery, and `/memory dream recover confirm`
+explicitly **rolls forward the recorded target**, rather than undoing it. Run it
+in the originating workspace. Recovery never repeats a model request. History is
+stored in the project memory directory's `history/`; `.dream-transaction.json`
+lives at the shared memory root. These records contain local source excerpts and
+memory snapshots; they are not sent to a visualization service.
+
+### Session activity graph
+
+`/session graph` opens a read-only three-region view: related sessions at upper
+left, the selected session's questions/delegations below, and event details at
+right. Each peer appears once, with direction and question/delegation counts;
+records with unavailable routing remain accessible in an explicit unknown-peer
+group. Event titles prioritize the task text rather than identifiers.
+
+Use ↑/↓ or `j`/`k` in the focused region. `Enter` moves from sessions to events,
+then details; `Esc` moves back one region and closes from sessions. `Tab` and
+Shift+Tab cycle all three regions. Clicking a region focuses it; the mouse wheel
+navigates its list or scrolls details. Selection updates dependent regions without
+moving focus. Selected sessions and events retain their full-row backgrounds,
+including padding, when focus moves to another region; only the focus indicator
+moves. Each peer remembers its selected event, and refresh preserves
+selection and detail scrolling. Narrow terminals use full-width detail reading.
+
+`/` searches the selected peer's events, `f` cycles all/questions/delegations,
+and Backspace resets event filters without changing the peer. `m` toggles record
+metadata (full identifiers, session/workspace information); `R` refreshes and `q`
+closes. `e` re-centers on the selected peer without opening or activating it;
+reopen `/session graph` to return to the active session. Dream rollback
+confirmations still suspend automatic refresh.
+
+Graph history survives inbox consumption in `peer-inboxes/.history/`. Existing
+typed conversation records supplement it where available; missing timestamps or
+transitions are marked incomplete. History is observational: accepted means
+queued, started does not mean completed, and an answered question does not prove
+a delegated task finished. Session presence is not inferred from these events.
+`peer_session ask` accepts an optional `related_delegation_id` for an explicitly
+associated question/report; it grants no permission and implies no completion.
+The graph never accepts work, executes it, or wakes a peer. History currently uses
+local file scans, not a persistent query index.
 
 While the background worker is consolidating, its title row shows a `💭`
 indicator at the far right, so a pass is never invisible; it disappears as soon

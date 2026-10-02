@@ -45,6 +45,11 @@ use crossterm::event::KeyEventKind;
 
 pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre::Result<()> {
     super::peers::sync_session(app);
+    let was_ready = queue_ready(app);
+    let suggestion_owner = match &event {
+        Event::App(AppEvent::TurnFinished(id, Ok(_))) if app.cancel.is_current(*id) => Some(*id),
+        _ => None,
+    };
     let peer_tick = matches!(&event, Event::Tick);
     match event {
         Event::Tick => app.tick(),
@@ -53,7 +58,24 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
         Event::Crossterm(event) => handle_crossterm(app, event).await?,
         Event::App(app_event) => handle_app_event(app, app_event).await,
     }
-    super::peers::poll(app, peer_tick).await;
+    let peers_ready = super::peers::poll(app, peer_tick).await;
+    // One handoff boundary for every event, including closing a panel or
+    // clearing a draft. Ready is scheduling eligibility, not a painted label.
+    if app.running {
+        dispatch_ready_work(app, !was_ready).await;
+        if peers_ready {
+            super::peers::start_ready_work(app).await;
+        }
+        if let Some(owner) = suggestion_owner
+            && app.cancel.active_id.is_none()
+            && app.conversation_panel.pending_message.is_none()
+        {
+            commands::maybe_start_input_suggestion(app, owner);
+        }
+    }
+    if peer_tick {
+        super::activity::tick(app);
+    }
     Ok(())
 }
 
@@ -79,6 +101,9 @@ async fn handle_crossterm(
                 || app.diagnostics_panel.is_some()
                 || app.security_panel.is_some()
                 || app.rewind_panel.is_some() => {}
+        crossterm::event::Event::Mouse(mouse) if app.activity_panel.is_some() => {
+            super::activity::handle_mouse(app, mouse);
+        }
         // The task viewer owns the whole screen. Interactive tasks can forward
         // mouse input to their PTY; read-only tasks use the wheel to scroll.
         crossterm::event::Event::Mouse(mouse) if app.terminal_pane.is_some() => {
@@ -292,10 +317,6 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             // External commands may alter mouse capture. Restore the user's
             // current TUI/native-selection choice.
             let _ = crate::terminal::set_mouse_capture(!app.native_selection_mode);
-            start_queued_work(app).await;
-            if was_ok && app.cancel.active_id.is_none() {
-                commands::maybe_start_input_suggestion(app, op_id);
-            }
         }
         AppEvent::Start => {
             diagnostics::maybe_seed_diagnostics_baseline(app);
@@ -324,15 +345,31 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
         AppEvent::FlushAgentNotifications(token) => {
             flush_agent_notifications(app, token).await;
         }
+        AppEvent::DreamPreviewFinished(operation_id, result) => {
+            if !app.cancel.is_current(operation_id) {
+                return;
+            }
+            let cancelled = app.cancel.active.is_cancelled();
+            app.cancel.finish(operation_id);
+            app.conversation_panel.phase = ActivePhase::None;
+            if cancelled {
+                app.conversation_panel
+                    .add_info_string("Dream preview cancelled; memories were not applied.");
+            } else {
+                match result {
+                    Ok(message) => app.conversation_panel.add_info_string(message),
+                    Err(error) => app
+                        .conversation_panel
+                        .add_warning_string(format!("Dream preview failed: {error}")),
+                }
+            }
+            session::mark_dirty(app);
+        }
         AppEvent::CompactFinished(op_id, cutoff, result, cancel_token) => {
             if !app.cancel.finish(op_id) {
                 return;
             }
             handle_compact_finished(app, cutoff, result, cancel_token);
-            // Finishing releases ownership and resets the phase
-            // back to idle. If the user queued a message while compacting,
-            // start it now — just like TurnFinished does for normal turns.
-            start_queued_work(app).await;
         }
         AppEvent::AutoCompactFinished {
             job_id,
@@ -417,6 +454,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             let estimated_tokens =
                 estimated_tokens_after_compaction(previous_tokens, input_tokens, output_tokens);
             app.auto_compact.last_input_tokens = Some(estimated_tokens);
+            app.auto_compact.retry_blocked = false;
 
             if app.auto_compact.mandatory_waiting
                 && app
@@ -616,7 +654,49 @@ fn take_pending_request(
         })
 }
 
-pub(crate) async fn start_queued_work(app: &mut App<'_>) {
+fn queue_ready(app: &App<'_>) -> bool {
+    use super::scheduling::{StartDecision, StartupState, WorkSource};
+    app.running && StartupState::from_app(app).decide(WorkSource::Queued) == StartDecision::Start
+}
+
+async fn dispatch_ready_work(app: &mut App<'_>, became_ready: bool) {
+    if !queue_ready(app) {
+        return;
+    }
+    app.task_notifications.discard_consumed();
+    app.agent_notifications.discard_consumed(&app.agents);
+    let now = std::time::Instant::now();
+    let notifications_due = [
+        app.task_notifications.ready_at,
+        app.agent_notifications.ready_at,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|deadline| now >= deadline);
+    let has_notifications =
+        !app.task_notifications.pending.is_empty() || !app.agent_notifications.pending.is_empty();
+    if app.conversation_panel.pending_message.is_none()
+        && !(has_notifications && (became_ready || notifications_due))
+    {
+        return;
+    }
+    // Runtime notifications share the same hard-limit gate as user input.
+    if app.mandatory_compact_tokens().is_some_and(|limit| {
+        app.auto_compact
+            .last_input_tokens
+            .is_some_and(|tokens| tokens >= limit)
+    }) {
+        app.auto_compact.mandatory_waiting = true;
+        let tokens = app.auto_compact.last_input_tokens.expect("checked usage");
+        if !commands::maybe_start_auto_compact(app, tokens) {
+            fail_mandatory_compaction(app, "mandatory context compaction could not start".into());
+        }
+        return;
+    }
+    start_queued_work(app).await;
+}
+
+async fn start_queued_work(app: &mut App<'_>) {
     use super::scheduling::{StartDecision, StartupState, WorkSource};
 
     if StartupState::from_app(app).decide(WorkSource::Queued) != StartDecision::Start {
@@ -700,13 +780,6 @@ async fn flush_task_notifications(app: &mut App<'_>, token: u64) {
         return;
     }
     app.task_notifications.flush_requested = false;
-    if app.cancel.active_id.is_some()
-        || app.task_notifications.pending.is_empty()
-        || has_blocking_surface(app)
-    {
-        return;
-    }
-    start_queued_work(app).await;
 }
 
 async fn flush_agent_notifications(app: &mut App<'_>, token: u64) {
@@ -714,13 +787,6 @@ async fn flush_agent_notifications(app: &mut App<'_>, token: u64) {
         return;
     }
     app.agent_notifications.flush_requested = false;
-    if app.cancel.active_id.is_some()
-        || app.agent_notifications.pending.is_empty()
-        || has_blocking_surface(app)
-    {
-        return;
-    }
-    start_queued_work(app).await;
 }
 
 pub(crate) fn has_blocking_surface(app: &App<'_>) -> bool {
@@ -735,6 +801,7 @@ pub(crate) fn has_blocking_surface(app: &App<'_>) -> bool {
         || app.rewind_panel.is_some()
         || app.terminal_pane.is_some()
         || app.agent_panel.is_some()
+        || app.activity_panel.is_some()
         || (app.work_mode == WorkMode::Plan
             && app.plan_phase == crate::classifier::PlanPhase::Reviewing)
 }
@@ -911,6 +978,7 @@ fn fail_mandatory_compaction(app: &mut App<'_>, message: String) {
         return;
     }
     app.auto_compact.mandatory_waiting = false;
+    app.auto_compact.retry_blocked = true;
     app.conversation_panel.add_warning_string(
         "Context compaction is blocked; queued input has not been sent. Retry with /compact or edit and resend the queued input with Up then Enter."
             .to_string(),
@@ -929,9 +997,8 @@ async fn finish_mandatory_compaction(app: &mut App<'_>) {
     app.auto_compact.mandatory_waiting = false;
     if let Some(resume) = app.auto_compact.mandatory_resume.take() {
         let _ = resume.send(());
-    } else {
-        start_queued_work(app).await;
     }
+    app.auto_compact.retry_blocked = false;
 }
 
 fn compaction_details(turns: usize, compaction: &crate::ui::event::CompactionResult) -> String {
@@ -968,6 +1035,7 @@ fn handle_compact_finished(
                 return;
             };
             app.auto_compact.last_input_tokens = Some(output_tokens);
+            app.auto_compact.retry_blocked = false;
             if app
                 .conversation_panel
                 .apply_compaction_at(cutoff, compaction.summary)
@@ -1291,13 +1359,71 @@ mod tests {
         ActivePhase, ConversationPanel, QUIT_CONFIRM_TIMEOUT, QUIT_CONFIRM_WARNING,
         estimated_tokens_after_compaction, handle_app_event, handle_cancel, handle_event,
         is_current_turn_id, is_live_turn_id, quit_confirmation_expired, quit_is_confirmed,
-        reducing_compaction_usage, remove_quit_confirmation_warning, start_queued_work,
-        take_pending_request,
+        reducing_compaction_usage, remove_quit_confirmation_warning, take_pending_request,
     };
     use crate::cancel::OperationId;
     use crate::response::message_item::MessageItem;
     use crate::ui::event::{AppEvent, Event};
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn dream_preview_yields_to_ui_and_cancellation_releases_only_its_owner() {
+        use crate::app::commands::start_dream_preview;
+        use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
+        let mut app = headless_test_app("dream-preview-lifecycle").await;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        start_dream_preview(&mut app, |cancellation| async move {
+            let _ = started.send(());
+            cancellation.wait().await;
+            Err("cancelled test preview".into())
+        });
+        let operation = app.cancel.active_id.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(app.conversation_panel.phase, ActivePhase::Associating);
+        start_dream_preview(&mut app, |_| async {
+            panic!("must not replace active preview")
+        });
+        assert_eq!(app.cancel.active_id, Some(operation));
+        // The event loop remains usable while the fake provider never completes.
+        handle_app_event(
+            &mut app,
+            AppEvent::DreamPreviewFinished(OperationId(operation.0 + 1), Ok("stale".into())),
+        )
+        .await;
+        assert_eq!(app.cancel.active_id, Some(operation));
+        handle_cancel(&mut app).await;
+        assert_eq!(app.conversation_panel.phase, ActivePhase::Cancelling);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = app.events.next().await.unwrap();
+                if let Event::App(AppEvent::DreamPreviewFinished(id, result)) = event {
+                    assert_eq!(id, operation);
+                    handle_app_event(&mut app, AppEvent::DreamPreviewFinished(id, result)).await;
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.cancel.active_id, None);
+        assert_eq!(app.conversation_panel.phase, ActivePhase::None);
+        for result in [Ok("preview ready".into()), Err("provider failed".into())] {
+            let successor = app.cancel.begin(None);
+            app.conversation_panel.phase = ActivePhase::Associating;
+            handle_app_event(
+                &mut app,
+                AppEvent::DreamPreviewFinished(operation, Ok("late".into())),
+            )
+            .await;
+            assert_eq!(app.cancel.active_id, Some(successor));
+            handle_app_event(&mut app, AppEvent::DreamPreviewFinished(successor, result)).await;
+            assert_eq!(app.cancel.active_id, None);
+            assert_eq!(app.conversation_panel.phase, ActivePhase::None);
+        }
+    }
 
     #[test]
     fn compaction_usage_requires_proven_reduction() {
@@ -1481,6 +1607,80 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    async fn graph_mouse_and_escape_stay_inside_the_read_only_modal() {
+        use crate::ui::components::activity_panel::{ActivityEntry, ActivityMode, ActivityPanel};
+        use crossterm::event::{
+            Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        };
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut app = headless_test_app("graph-routing").await;
+        let entries = ["first", "second"].map(|id| ActivityEntry {
+            id: id.into(),
+            title: id.into(),
+            summary: String::new(),
+            details: String::new(),
+            from: Some(id.into()),
+            to: Some("graph-routing".into()),
+            rollback_allowed: false,
+        });
+        let mut panel = ActivityPanel::new(
+            "Graph".into(),
+            ActivityMode::SessionGraph,
+            "graph-routing".into(),
+            entries.to_vec(),
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        panel.render(area, &mut Buffer::empty(area));
+        app.activity_panel = Some(panel);
+        app.cancel.active_id = Some(crate::cancel::OperationId(42));
+        let original_input = app.input_panel.get_content();
+        super::handle_crossterm(
+            &mut app,
+            TerminalEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.activity_panel
+                .as_ref()
+                .unwrap()
+                .selected_entry()
+                .unwrap()
+                .id,
+            "second"
+        );
+        for code in [KeyCode::Enter, KeyCode::Enter, KeyCode::Esc, KeyCode::Esc] {
+            super::handle_crossterm(
+                &mut app,
+                TerminalEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            )
+            .await
+            .unwrap();
+            assert!(app.activity_panel.is_some());
+            assert!(super::has_blocking_surface(&app));
+        }
+        super::handle_crossterm(&mut app, TerminalEvent::Paste("blocked".into()))
+            .await
+            .unwrap();
+        assert_eq!(app.input_panel.get_content(), original_input);
+        super::handle_crossterm(
+            &mut app,
+            TerminalEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .await
+        .unwrap();
+        assert!(app.activity_panel.is_none());
+        assert_eq!(app.cancel.active_id, Some(crate::cancel::OperationId(42)));
+        assert!(!app.cancel.active.is_cancelled());
+    }
+
     /// A proven-smaller compaction result whose usage numbers are enough to
     /// pass every validity check the event handler applies.
     fn compaction_result() -> crate::ui::event::CompactionResult {
@@ -1563,11 +1763,29 @@ mod tests {
         assert!(!app.auto_compact.mandatory_waiting);
         assert!(app.auto_compact.active_id.is_none());
         assert_eq!(app.auto_compact.last_cutoff, Some(42));
+        assert!(app.auto_compact.retry_blocked);
+        for _ in 0..3 {
+            handle_event(&mut app, Event::Redraw).await.unwrap();
+            assert_eq!(app.auto_compact.last_cutoff, Some(42));
+            assert_eq!(
+                app.conversation_panel.pending_message.as_deref(),
+                Some("111")
+            );
+        }
         // No historical prefix exists in this fixture, so no API call starts,
         // but the explicit request must clear the failed-prefix dedup marker.
         crate::app::commands::start_request_with_images(&mut app, "retry".into(), Vec::new()).await;
         assert_eq!(app.auto_compact.last_cutoff, None);
         assert!(app.conversation_panel.pending_message.is_some());
+        assert!(
+            app.auto_compact.retry_blocked,
+            "synchronous startup failure also blocks automatic retry"
+        );
+        let retained = app.conversation_panel.pending_message.clone();
+        for _ in 0..3 {
+            handle_event(&mut app, Event::Redraw).await.unwrap();
+            assert_eq!(app.conversation_panel.pending_message, retained);
+        }
     }
 
     #[tokio::test]
@@ -1762,6 +1980,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_settlement_dispatches_ready_queue_without_a_completion_callback() {
+        for blocker in ["draft", "approval", "shutdown"] {
+            let mut app = headless_test_app("central-queue").await;
+            app.conversation_panel.pending_message = Some("queued request".into());
+            if blocker == "draft" {
+                app.input_panel.set_content("unfinished draft");
+            } else if blocker == "approval" {
+                let (reply, _) = tokio::sync::oneshot::channel();
+                app.pending_review = Some(crate::app::PendingReview {
+                    call: serde_json::from_value(serde_json::json!({"type":"function_call", "name":"command", "arguments":"{}", "call_id":"approval"})).unwrap(),
+                    reason: "approval".into(), position: (1, 1), reply: crate::ui::event::ReplyTx(reply), selected: 0,
+                    operation_id: OperationId::UNTAGGED, agent_id: None, agent_generation: None,
+                });
+            } else {
+                app.running = false;
+            }
+            handle_event(&mut app, Event::Redraw).await.unwrap();
+            assert!(app.conversation_panel.pending_message.is_some());
+            assert_eq!(app.cancel.next_id, 0);
+            app.input_panel.clear();
+            app.pending_review = None;
+            if blocker == "shutdown" {
+                continue;
+            }
+            handle_event(&mut app, Event::Redraw).await.unwrap();
+            assert!(app.conversation_panel.pending_message.is_none());
+            assert_eq!(app.cancel.next_id, 1);
+            handle_event(&mut app, Event::Redraw).await.unwrap();
+            assert_eq!(app.cancel.next_id, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn central_dispatch_respects_notification_deadline_and_stale_flushes() {
+        let mut app = headless_test_app("central-notifications").await;
+        app.task_notifications
+            .push(crate::tasks::TaskLifecycleEvent {
+                sequence: 1,
+                generation: app.tasks.current_generation(),
+                task_id: 1,
+                origin: crate::tasks::TaskOrigin::TaskTool,
+                old_status: crate::tasks::TaskStatus::Running,
+                new_status: crate::tasks::TaskStatus::Completed,
+                name: "finished task".into(),
+                command: "true".into(),
+                exit_code: Some(0),
+                elapsed: Duration::ZERO,
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                transcript_tail: String::new(),
+                notify_agent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            });
+        app.task_notifications.ready_at = Some(Instant::now() + Duration::from_secs(60));
+        handle_event(&mut app, Event::App(AppEvent::FlushTaskNotifications(0)))
+            .await
+            .unwrap();
+        handle_event(&mut app, Event::Redraw).await.unwrap();
+        assert_eq!(app.task_notifications.pending.len(), 1);
+        assert_eq!(app.cancel.next_id, 0);
+        app.task_notifications.ready_at = Some(Instant::now());
+        handle_event(&mut app, Event::Redraw).await.unwrap();
+        assert!(app.task_notifications.pending.is_empty());
+        assert_eq!(app.cancel.next_id, 1);
+        handle_event(&mut app, Event::Redraw).await.unwrap();
+        assert_eq!(app.cancel.next_id, 1);
+    }
+
+    #[tokio::test]
+    async fn mandatory_safe_point_displays_compaction_instead_of_finished_tools() {
+        use crate::ui::components::status_bar::status_bar::StatusState;
+
+        let mut app = cancellation_test_app().await;
+        app.config.mandatory_compact_tokens = 100_000;
+        app.conversation_panel.phase = ActivePhase::ToolRunning;
+        app.auto_compact.active_id = Some(1);
+        // Background compaction alone must not hide actual foreground tools.
+        assert_eq!(app.resolve_status(), StatusState::ToolRunning);
+
+        let (resume, mut receiver) = tokio::sync::oneshot::channel();
+        handle_app_event(
+            &mut app,
+            AppEvent::UsageSafePoint(OperationId(7), 200_000, resume),
+        )
+        .await;
+        assert!(app.auto_compact.mandatory_waiting);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(app.resolve_status(), StatusState::Compacting);
+
+        handle_cancel(&mut app).await;
+        assert_eq!(app.resolve_status(), StatusState::Cancelling);
+        super::finish_mandatory_compaction(&mut app).await;
+        receiver.await.unwrap();
+        assert_eq!(app.resolve_status(), StatusState::Cancelling);
+    }
+
+    #[tokio::test]
+    async fn cancelled_safe_point_does_not_strand_queued_input_after_compaction() {
+        use async_openai::types::responses::{InputContent, InputMessage, InputRole, OutputStatus};
+        let mut app = cancellation_test_app().await;
+        app.config.mandatory_compact_tokens = 100_000;
+        for turn in 0..2 {
+            app.conversation_panel.add_input_message(
+                async_openai::types::responses::MessageItem::Input(InputMessage {
+                    content: vec![InputContent::InputText(format!("turn {turn}").into())],
+                    role: InputRole::User,
+                    status: Some(OutputStatus::Completed),
+                }),
+            );
+            app.conversation_panel
+                .add_info_string(format!("reply {turn}"));
+        }
+        app.auto_compact.active_id = Some(1);
+        app.auto_compact.last_input_tokens = Some(200_000);
+        app.auto_compact.mandatory_waiting = true;
+        let (resume, receiver) = tokio::sync::oneshot::channel();
+        app.auto_compact.mandatory_resume = Some(resume);
+        app.conversation_panel.pending_message = Some("queued successor".into());
+        handle_cancel(&mut app).await;
+        drop(receiver); // The cancelled runner no longer owns the safe-point wait.
+        cancelled_terminal(&mut app, 7).await;
+        assert!(app.cancel.active_id.is_none());
+        assert!(app.conversation_panel.pending_message.is_some());
+        finish_auto_compaction(&mut app, 4).await;
+        assert!(
+            app.conversation_panel.pending_message.is_none(),
+            "completed compaction must hand off the queued successor, not a dead runner"
+        );
+        assert_eq!(app.cancel.next_id, 8);
+        assert!(app.auto_compact.mandatory_resume.is_none());
+    }
+
+    #[tokio::test]
+    async fn compaction_before_cancelled_terminal_preserves_the_owner_until_handoff() {
+        let mut app = cancellation_test_app().await;
+        app.conversation_panel.pending_message = Some("queued successor".into());
+        app.auto_compact.mandatory_waiting = true;
+        let (resume, receiver) = tokio::sync::oneshot::channel();
+        app.auto_compact.mandatory_resume = Some(resume);
+        handle_cancel(&mut app).await;
+        super::finish_mandatory_compaction(&mut app).await;
+        receiver.await.unwrap();
+        assert_eq!(app.cancel.active_id, Some(OperationId(7)));
+        assert_eq!(app.cancel.next_id, 7);
+        assert!(app.conversation_panel.pending_message.is_some());
+        cancelled_terminal(&mut app, 7).await;
+        assert_eq!(app.cancel.next_id, 8);
+        assert!(app.conversation_panel.pending_message.is_none());
+    }
+
+    #[tokio::test]
     async fn cancel_queue_waits_for_matching_terminal_then_dispatches_once() {
         let mut app = cancellation_test_app().await;
         app.conversation_panel.pending_message = Some("queued successor".into());
@@ -1771,7 +2142,7 @@ mod tests {
         assert!(app.cancel.active.is_cancelled());
         assert_eq!(app.cancel.active_id, Some(OperationId(7)));
         assert!(app.input_panel.get_content().is_empty());
-        start_queued_work(&mut app).await;
+        handle_event(&mut app, Event::Redraw).await.unwrap();
         cancelled_terminal(&mut app, 6).await;
         assert_eq!(app.cancel.next_id, 7);
         assert_eq!(
@@ -1789,9 +2160,11 @@ mod tests {
             matches!(item, MessageItem::Input(input)
                 if serde_json::to_string(input).unwrap().contains("queued successor"))
         }));
+        // Keep a real successor owner: stale terminal events cannot release it.
+        let successor = app.cancel.begin(None);
         app.conversation_panel.pending_message = Some("later".into());
         cancelled_terminal(&mut app, 7).await;
-        assert_eq!(app.cancel.next_id, 8);
+        assert_eq!(app.cancel.active_id, Some(successor));
         assert_eq!(
             app.conversation_panel.pending_message.as_deref(),
             Some("later")
@@ -1828,7 +2201,7 @@ mod tests {
         assert_eq!(app.cancel.next_id, 8);
         assert!(app.task_notifications.pending.is_empty());
         super::flush_task_notifications(&mut app, token).await;
-        start_queued_work(&mut app).await;
+        handle_event(&mut app, Event::Redraw).await.unwrap();
         assert_eq!(app.cancel.next_id, 8);
     }
 
@@ -1843,7 +2216,7 @@ mod tests {
         assert_eq!(app.cancel.next_id, 7);
         assert!(app.conversation_panel.pending_message.is_some());
         app.input_panel.clear();
-        start_queued_work(&mut app).await;
+        handle_event(&mut app, Event::Redraw).await.unwrap();
         assert_eq!(app.cancel.next_id, 8);
     }
 
@@ -1854,7 +2227,7 @@ mod tests {
             app.input_panel.set_content(draft);
             handle_cancel(&mut app).await;
             cancelled_terminal(&mut app, 7).await;
-            start_queued_work(&mut app).await;
+            handle_event(&mut app, Event::Redraw).await.unwrap();
             assert_eq!(app.cancel.next_id, 7);
             assert!(app.cancel.active_id.is_none());
             assert_eq!(
@@ -1909,7 +2282,7 @@ mod tests {
             assert!(app.conversation_panel.pending_message.is_some());
             app.pending_review = None;
             app.peers.consent = None;
-            start_queued_work(&mut app).await;
+            handle_event(&mut app, Event::Redraw).await.unwrap();
             assert_eq!(app.cancel.next_id, 8);
         }
     }
