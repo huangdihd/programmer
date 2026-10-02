@@ -543,7 +543,7 @@ Zero input-token reports do not erase the last known positive context-size count
 | Key | Action |
 |---|---|
 | `Enter` | Send message |
-| `Right` | Accept the model-generated next-message suggestion when the input is empty; typing hides it, and deleting the draft reveals it again |
+| `Right` | Accept the model-generated next-message suggestion when the input is empty; typing hides it, and deleting the draft reveals it again—even after accepting with Right. Sending clears the old suggestion. |
 | `Up` | Move a queued message back into the empty input for editing |
 | `Esc` | Cancel only the active request; after it stops, automatically continue queued work (unless an unsent draft or approval blocks it). Before any model output, restore the original draft only when the input is empty and no user request is queued |
 | `Ctrl+T` | Cycle work mode (Manual → Auto → Plan → optional YOLO) |
