@@ -734,6 +734,91 @@ async fn shutdown_joins_pty_waiter_and_reader() {
 }
 
 #[tokio::test]
+async fn pty_exit_releases_handles_and_preserves_final_screen() {
+    let manager = TaskManager::default();
+    let id = manager
+        .spawn_interactive(echo_cmd(), None, None, 24, 80)
+        .unwrap();
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), manager.wait_until_finished(id))
+        .await
+        .expect("PTY EOF must not depend on removing the registry entry")
+        .unwrap();
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert!(
+        manager
+            .screen_snapshot(id)
+            .unwrap()
+            .text
+            .contains("task-out")
+    );
+    assert!(manager.transcript(id).unwrap().contains("task-out"));
+    {
+        let registry = manager.state.registry.lock().unwrap();
+        let pty = registry
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap()
+            .pty
+            .as_ref()
+            .unwrap();
+        assert!(pty.master.lock().unwrap().is_none());
+        assert!(pty.writer.lock().unwrap().is_none());
+    }
+    manager.resize(id, 30, 100).unwrap();
+    assert_eq!(manager.screen_snapshot(id).unwrap().rows, 30);
+    assert!(manager.write_bytes(id, b"ignored").is_err());
+    manager.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_joins_pty_after_registry_is_cleared() {
+    let manager = TaskManager::default();
+    manager
+        .spawn_interactive(stdin_reader_cmd(), None, None, 24, 80)
+        .unwrap();
+    assert_eq!(manager.kill_all(), 1);
+    manager.shutdown(Duration::from_secs(5)).await.unwrap();
+    assert!(manager.state.lifecycle.lock().unwrap().workers.is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_joins_started_pty_descendant_and_preserves_screen() {
+    let manager = TaskManager::default();
+    let command = format!("echo descendant-ready & {}", stdin_reader_cmd());
+    let id = manager
+        .spawn_interactive(&command, None, None, 24, 80)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if manager
+                .screen_snapshot(id)
+                .unwrap()
+                .text
+                .contains("descendant-ready")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("PTY child must start before shutdown");
+    manager.shutdown(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        manager.wait_until_finished(id).await.unwrap().status,
+        TaskStatus::Killed
+    );
+    assert!(
+        manager
+            .screen_snapshot(id)
+            .unwrap()
+            .text
+            .contains("descendant-ready")
+    );
+    assert!(manager.state.lifecycle.lock().unwrap().workers.is_empty());
+}
+
+#[tokio::test]
 async fn cancelled_shutdown_keeps_thread_ownership_until_retry() {
     let manager = TaskManager::default();
     let (release, wait) = std::sync::mpsc::channel();

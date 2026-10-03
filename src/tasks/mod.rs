@@ -198,11 +198,12 @@ struct PtyState {
     /// Writes bytes (keystrokes, mouse sequences) to the child. Shared with
     /// the reader thread, which answers cursor-position queries (`ESC[6n`)
     /// on the child's behalf — see `spawn_interactive`.
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     /// The screen grid, fed by a background reader thread.
     parser: Arc<Mutex<vt100::Parser>>,
-    /// Kept for `resize`.
-    master: Box<dyn MasterPty + Send>,
+    /// Shared with the waiter so closing the registry cannot close ConPTY while
+    /// holding its lock. The screen survives after these live handles are taken.
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     /// Terminates the child (the waiter thread records the exit).
     killer: PtyKiller,
     /// Set by [`TaskManager::kill`] so the waiter records `Killed` instead of the signal
@@ -977,7 +978,8 @@ impl TaskManager {
         #[cfg(windows)]
         let killer = PtyKiller::new(child.as_ref())
             .map_err(|error| format!("error: failed to duplicate PTY process handle: {error}"))?;
-        let writer = Arc::new(Mutex::new(writer));
+        let writer = Arc::new(Mutex::new(Some(writer)));
+        let master = Arc::new(Mutex::new(Some(pair.master)));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, PTY_SCROLLBACK)));
         let killed = Arc::new(AtomicBool::new(false));
 
@@ -1012,7 +1014,7 @@ impl TaskManager {
                 pty: Some(PtyState {
                     writer: Arc::clone(&writer),
                     parser: Arc::clone(&parser),
-                    master: pair.master,
+                    master: Arc::clone(&master),
                     killer,
                     killed: Arc::clone(&killed),
                     rows,
@@ -1059,9 +1061,11 @@ impl TaskManager {
                                 // in a single pipe write — write! would split it
                                 // per format fragment and the child never starts.
                                 let reply = format!("\x1b[{};{}R", row + 1, col + 1);
-                                if let Ok(mut w) = writer.lock() {
-                                    let _ = w.write_all(reply.as_bytes());
-                                    let _ = w.flush();
+                                if let Ok(mut writer) = writer.lock()
+                                    && let Some(writer) = writer.as_mut()
+                                {
+                                    let _ = writer.write_all(reply.as_bytes());
+                                    let _ = writer.flush();
                                 }
                                 window.clear();
                             } else if window.len() > 3 {
@@ -1092,6 +1096,14 @@ impl TaskManager {
                     }
                     Err(_) => (TaskStatus::Failed, None),
                 };
+                // ConPTY owns the output pipe and can outlive the shell (and its
+                // descendants). Close it before joining the reader, not after EOF.
+                // ClosePseudoConsole can block while flushing output, so keep the
+                // reader running and drop handles outside every shared lock.
+                let input = writer.lock().unwrap().take();
+                let terminal = master.lock().unwrap().take();
+                drop(input);
+                drop(terminal);
                 // PTY output is read on a separate blocking thread. Wait for EOF so
                 // the lifecycle event includes the final screen/transcript tail.
                 let drained = reader_worker
@@ -1139,6 +1151,9 @@ impl TaskManager {
             ));
         }
         let mut writer = pty.writer.lock().unwrap();
+        let writer = writer
+            .as_mut()
+            .ok_or_else(|| format!("error: task {id} PTY is closed"))?;
         writer
             .write_all(bytes)
             .and_then(|()| writer.flush())
@@ -1223,14 +1238,16 @@ impl TaskManager {
             .pty
             .as_mut()
             .ok_or_else(|| format!("error: task {id} is not interactive"))?;
-        pty.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("error: failed to resize task {id}: {e}"))?;
+        if let Some(master) = pty.master.lock().unwrap().as_ref() {
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| format!("error: failed to resize task {id}: {e}"))?;
+        }
         pty.parser.lock().unwrap().set_size(rows, cols);
         pty.rows = rows;
         pty.cols = cols;
