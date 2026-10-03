@@ -3,3 +3,16 @@
 /.idea/*
 .codegraph/
 /.programmer/outputs/
+
+# Local architecture prototypes and acceptance notes (not release sources).
+/design-demos/app-loop-workbench.html
+/design-demos/app-loop-workbench.md
+/design-demos/app-loop-workbench.test.cjs
+/design-demos/architecture-boundary-acceptance.md
+/design-demos/architecture-implementation.md
+/design-demos/architecture-ownership.html
+/design-demos/architecture-ownership.md
+/design-demos/architecture-ownership.test.cjs
+/design-demos/architecture-review.html
+/design-demos/architecture-review.md
+/design-demos/architecture-review.test.cjs
