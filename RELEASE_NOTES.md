@@ -1,4 +1,20 @@
-### programmer v0.2.23
+### programmer v0.2.24
+
+Includes the ownership and argument-generation changes listed below for the
+withheld v0.2.23 draft, plus:
+
+- Fix Windows PTY termination by owning a duplicate process handle and correctly
+  interpreting Win32 termination results; tolerate only confirmed process exit,
+  while preserving genuine termination errors.
+- Add Windows regressions for independent handle ownership, repeated termination,
+  already-exited children, and invalid handles. Keep the PTY shutdown regression.
+- Allow the large (8 MiB) synthetic SSE regression sufficient time on loaded hosts.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.22...v0.2.24
+
+---
+
+### programmer v0.2.23 (withheld draft)
 
 - Separate UI, execution-loop, and session ownership; preserve interrupted
   responses and isolate task, agent, todo, and checkpoint state across sessions.

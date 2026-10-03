@@ -2911,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "programmer"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "arboard",
  "async-openai",

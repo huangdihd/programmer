@@ -28,7 +28,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+#[cfg(windows)]
+mod pty_killer;
+#[cfg(windows)]
+use pty_killer::PtyKiller;
+#[cfg(not(windows))]
+type PtyKiller = Box<dyn portable_pty::ChildKiller + Send + Sync>;
 
 /// Scrollback lines vt100 retains behind the visible screen.
 const PTY_SCROLLBACK: usize = 1000;
@@ -197,7 +204,7 @@ struct PtyState {
     /// Kept for `resize`.
     master: Box<dyn MasterPty + Send>,
     /// Terminates the child (the waiter thread records the exit).
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    killer: PtyKiller,
     /// Set by [`TaskManager::kill`] so the waiter records `Killed` instead of the signal
     /// exit `Failed`.
     killed: Arc<AtomicBool>,
@@ -965,7 +972,11 @@ impl TaskManager {
         // The parent doesn't need the slave once the child owns it.
         drop(pair.slave);
 
+        #[cfg(not(windows))]
         let killer = child.clone_killer();
+        #[cfg(windows)]
+        let killer = PtyKiller::new(child.as_ref())
+            .map_err(|error| format!("error: failed to duplicate PTY process handle: {error}"))?;
         let writer = Arc::new(Mutex::new(writer));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, PTY_SCROLLBACK)));
         let killed = Arc::new(AtomicBool::new(false));
