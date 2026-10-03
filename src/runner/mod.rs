@@ -19,6 +19,7 @@
 //! `app` event handlers so the TUI keeps working unchanged while the same logic
 //! becomes reusable for headless CLI commands and, later, in-process sub-agents.
 
+mod argument_guard;
 pub(crate) mod classify;
 pub(crate) mod hooks;
 pub(crate) mod request;
@@ -182,6 +183,12 @@ pub(crate) enum RunnerEvent<'a> {
     /// conversation; a live renderer should now drop its in-progress view so
     /// the same content isn't shown twice.
     ResponseCommitted,
+    /// Interrupted output was archived by the runner. Indices address the
+    /// compact live items retained at the given absolute history boundary.
+    ResponseAborted {
+        start: usize,
+        retained_indices: Vec<usize>,
+    },
     /// The model produced assistant text this iteration.
     Assistant(&'a str),
     /// A tool call is about to run.
@@ -311,6 +318,55 @@ fn ensure_tool_output_pairing(conversation: &Mutex<Conversation>) {
     }
 }
 
+/// Archive interrupted output before notifying any renderer. The UI copy is
+/// never a source of conversation data, including when cancellation races a chunk.
+fn commit_aborted_response(
+    conversation: &Mutex<Conversation>,
+    partial: PartialResponse,
+    cancelled: bool,
+    surface: &dyn AgentSurface,
+) {
+    let retained_indices = partial
+        .message_item_refs()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (item, in_progress))| {
+            (!matches!(item, OutputItem::FunctionCall(_)) || (!cancelled && !in_progress))
+                .then_some(index)
+        })
+        .collect();
+    let usage = partial.usage;
+    let items = if cancelled {
+        partial
+            .items
+            .into_iter()
+            .flatten()
+            .filter(|item| !matches!(item, OutputItem::FunctionCall(_)))
+            .collect()
+    } else {
+        partial.into_aborted_items()
+    };
+    let start = {
+        let mut conversation = conversation.lock().unwrap();
+        let start = conversation.items.len();
+        // No output and no usage means there is no model response to account for.
+        if !items.is_empty() || usage.is_some() {
+            conversation.record_response_usage(usage);
+        }
+        for item in items {
+            conversation.add_output(item);
+        }
+        start
+    };
+    // Retained completed calls were not executed. Pair them before another
+    // request can observe this history, just as on cancellation after a commit.
+    ensure_tool_output_pairing(conversation);
+    surface.on_event(RunnerEvent::ResponseAborted {
+        start,
+        retained_indices,
+    });
+}
+
 impl TurnRunner {
     /// Run a full turn: stream a response, run any tool calls it requests, and
     /// loop until the model answers with no tool calls (returning its text) or
@@ -325,6 +381,7 @@ impl TurnRunner {
         conversation.lock().unwrap().recalled_memories = Some(0);
         let retrying = &self.stream_retrying;
         let mut steps = 0usize;
+        let mut argument_failures = 0usize;
         let mut post_edit_reminder_added = false;
         let mut programmer_md_edited = false;
         let mut association_grace_used = false;
@@ -407,7 +464,9 @@ impl TurnRunner {
             surface.on_event(RunnerEvent::Phase(RunnerPhase::Streaming));
             let mut partial = PartialResponse::new(cancel.child());
             let mut stream_err: Option<OpenAIError> = None;
-            stream::stream_with_retries(
+            let mut argument_guard = argument_guard::ArgumentGuard::default();
+            let mut argument_failed = false;
+            stream::stream_until(
                 &self.client,
                 &req,
                 cancel,
@@ -416,6 +475,10 @@ impl TurnRunner {
                 |result| {
                     match result {
                         Ok(ev) => {
+                            if !argument_guard.accept(&ev) {
+                                argument_failed = true;
+                                return std::ops::ControlFlow::Break(());
+                            }
                             // Forward each chunk for live rendering, then fold it
                             // into our own partial to extract the committed items.
                             surface.on_event(RunnerEvent::StreamChunk(Box::new(ev.clone())));
@@ -423,30 +486,98 @@ impl TurnRunner {
                         }
                         Err(e) => stream_err = Some(e),
                     }
+                    std::ops::ControlFlow::Continue(())
                 },
             )
             .await;
 
+            if argument_failed {
+                // Discard the entire response, including completed parallel calls.
+                // Only synthetic empty calls and paired failures enter history.
+                let start = conversation.lock().unwrap().items.len();
+                surface.on_event(RunnerEvent::ResponseAborted {
+                    start,
+                    retained_indices: Vec::new(),
+                });
+                let identities_complete = argument_guard.identities_complete();
+                let calls = argument_guard.calls.into_values().collect::<Vec<_>>();
+                let mut call_ids = HashSet::new();
+                let valid = identities_complete
+                    && !calls.is_empty()
+                    && calls.iter().all(|call| {
+                        !call.name.trim().is_empty()
+                            && !call.call_id.trim().is_empty()
+                            && call_ids.insert(call.call_id.as_str())
+                    });
+                if !valid {
+                    return Err(RunnerError::Api {
+                        code: Some("tool_argument_generation".into()),
+                        message: argument_guard::FAILURE.into(),
+                    });
+                }
+                {
+                    let mut conversation = conversation.lock().unwrap();
+                    for call in calls {
+                        let call_id = call.call_id.clone();
+                        conversation.add_output(OutputItem::FunctionCall(call));
+                        conversation.add_tool_output(crate::tools::ToolOutput {
+                            param: async_openai::types::responses::FunctionCallOutputItemParam {
+                                call_id,
+                                output: async_openai::types::responses::FunctionCallOutput::Text(
+                                    argument_guard::FAILURE.into(),
+                                ),
+                                id: None,
+                                status: None,
+                            },
+                            failed: true,
+                            approval_label: None,
+                        });
+                    }
+                }
+                argument_failures += 1;
+                if argument_failures >= argument_guard::MAX_CONSECUTIVE_FAILURES {
+                    return Err(RunnerError::Api {
+                        code: Some("tool_argument_generation".into()),
+                        message: argument_guard::FAILURE.into(),
+                    });
+                }
+                continue;
+            }
+            argument_failures = 0;
+
             if cancel.is_cancelled() {
-                ensure_tool_output_pairing(conversation);
+                commit_aborted_response(conversation, partial, true, surface);
                 return Err(RunnerError::Cancelled);
             }
-            if let Some(e) = stream_err {
-                return Err(RunnerError::Stream(e));
+            if let Some(error) = stream_err {
+                commit_aborted_response(conversation, partial, false, surface);
+                return Err(RunnerError::Stream(error));
             }
 
-            let usage = partial.usage;
-            let (finish_reason, items) = partial.into_parts();
-            match finish_reason {
+            let error = match partial.take_finish_reason() {
                 Some(ResponseFinishReason::ApiError { code, message, .. }) => {
-                    return Err(RunnerError::Api { code, message });
+                    Some(RunnerError::Api { code, message })
                 }
-                Some(ResponseFinishReason::StreamError(e)) => {
-                    return Err(RunnerError::Stream(e));
-                }
-                None => return Err(RunnerError::EmptyResponse),
-                _ => {}
+                Some(ResponseFinishReason::Failed(response)) => Some(RunnerError::Api {
+                    code: response
+                        .error
+                        .as_ref()
+                        .map(|error| format!("{:?}", error.code)),
+                    message: response
+                        .error
+                        .map(|error| error.message)
+                        .unwrap_or_else(|| "model response failed".to_string()),
+                }),
+                Some(ResponseFinishReason::StreamError(error)) => Some(RunnerError::Stream(error)),
+                None => Some(RunnerError::EmptyResponse),
+                _ => None,
+            };
+            if let Some(error) = error {
+                commit_aborted_response(conversation, partial, false, surface);
+                return Err(error);
             }
+            let usage = partial.usage;
+            let (_, items) = partial.into_parts();
 
             // ---- commit outputs to the conversation ----
             let calls: Vec<FunctionToolCall> = items
@@ -1001,6 +1132,172 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct ArchiveSurface {
+        cancel: Option<CancellationToken>,
+        boundaries: Mutex<Vec<(usize, Vec<usize>)>>,
+        commits: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSurface for ArchiveSurface {
+        fn on_event(&self, event: RunnerEvent<'_>) {
+            match event {
+                RunnerEvent::StreamChunk(_) => {
+                    if let Some(cancel) = &self.cancel {
+                        cancel.cancel();
+                    }
+                }
+                RunnerEvent::ResponseAborted {
+                    start,
+                    retained_indices,
+                } => {
+                    self.boundaries
+                        .lock()
+                        .unwrap()
+                        .push((start, retained_indices));
+                }
+                RunnerEvent::ResponseCommitted => {
+                    self.commits.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+        async fn review(&self, _: &FunctionToolCall, _: &str, _: (usize, usize)) -> ReviewDecision {
+            panic!("interrupted calls must not execute")
+        }
+    }
+
+    fn archive_surface(cancel: Option<CancellationToken>) -> ArchiveSurface {
+        ArchiveSurface {
+            cancel,
+            boundaries: Mutex::new(Vec::new()),
+            commits: AtomicUsize::new(0),
+        }
+    }
+
+    #[test]
+    fn interrupted_archive_filters_calls_and_records_usage_once() {
+        use async_openai::types::responses::{ReasoningItem, ResponseOutputItemDoneEvent};
+        for cancelled in [false, true] {
+            let conversation = Mutex::new(Conversation::new());
+            let mut partial = PartialResponse::new(CancellationToken::new());
+            partial.items = vec![
+                Some(call_item("unfinished", "grep", "{")),
+                None,
+                Some(message_item("partial text")),
+                Some(OutputItem::Reasoning(ReasoningItem {
+                    id: Some("reasoning".into()),
+                    summary: vec![],
+                    content: None,
+                    encrypted_content: None,
+                    status: None,
+                })),
+            ];
+            partial.handle_response_stream_event(ResponseStreamEvent::ResponseOutputItemDone(
+                ResponseOutputItemDoneEvent {
+                    sequence_number: 1,
+                    output_index: 4,
+                    item: call_item("finished", "grep", "{}"),
+                },
+            ));
+            partial.usage = Some((100, 20, 30));
+            let surface = archive_surface(None);
+            commit_aborted_response(&conversation, partial, cancelled, &surface);
+            let conversation = conversation.lock().unwrap();
+            assert_eq!(conversation.usage_summary().total_tokens(), 120);
+            assert_eq!(conversation.usage_summary().cached_input_tokens, 30);
+            assert_eq!(
+                conversation
+                    .items()
+                    .filter(|item| matches!(item, MessageItem::Output(_)))
+                    .count(),
+                if cancelled { 2 } else { 3 }
+            );
+            assert_eq!(
+                conversation
+                    .items()
+                    .filter(|item| matches!(item, MessageItem::ToolOutput { .. }))
+                    .count(),
+                if cancelled { 0 } else { 1 }
+            );
+            assert_eq!(
+                *surface.boundaries.lock().unwrap(),
+                vec![(0, if cancelled { vec![1, 2] } else { vec![1, 2, 3] })]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_interruption_is_archived_without_a_ui() {
+        for cancelled in [false, true] {
+            let body = item_added_frame(1, 0, &message_item("saved partial"));
+            let (base_url, server) = spawn_mock_responses(vec![body]).await;
+            let mut runner = engine_for(&base_url);
+            runner.stream_retry_limit = 0;
+            let conversation = Mutex::new(Conversation::new());
+            let cancel = CancellationToken::new();
+            let surface = archive_surface(cancelled.then(|| cancel.clone()));
+            let result = runner.run_turn(&conversation, &cancel, &surface).await;
+            server.abort();
+            assert!(result.is_err());
+            assert_eq!(matches!(result, Err(RunnerError::Cancelled)), cancelled);
+            assert_eq!(conversation.lock().unwrap().items().count(), 1);
+            assert_eq!(surface.boundaries.lock().unwrap().len(), 1);
+            assert_eq!(surface.commits.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_api_response_archives_output_and_usage() {
+        let body = format!(
+            "{}{}",
+            item_added_frame(1, 0, &message_item("partial")),
+            frame(serde_json::json!({
+                "type": "response.failed", "sequence_number": 2,
+                "response": { "created_at": 0, "id": "failed", "model": "mock", "object": "response",
+                    "output": [], "status": "failed", "error": { "code": "server_error", "message": "failed upstream" },
+                    "usage": { "input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                        "input_tokens_details": { "cached_tokens": 30 }, "output_tokens_details": { "reasoning_tokens": 0 } }
+                }
+            }))
+        );
+        let (base_url, server) = spawn_mock_responses(vec![body]).await;
+        let conversation = Mutex::new(Conversation::new());
+        let surface = archive_surface(None);
+        let result = engine_for(&base_url)
+            .run_turn(&conversation, &CancellationToken::new(), &surface)
+            .await;
+        server.abort();
+        assert!(matches!(result, Err(RunnerError::Api { .. })));
+        assert_eq!(conversation.lock().unwrap().items().count(), 1);
+        assert_eq!(
+            conversation.lock().unwrap().usage_summary().total_tokens(),
+            120
+        );
+        assert_eq!(surface.boundaries.lock().unwrap().len(), 1);
+        assert_eq!(surface.commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn normal_response_commits_once_without_abort_archive() {
+        let body = format!(
+            "{}{}",
+            item_added_frame(1, 0, &message_item("done")),
+            completed_frame(2)
+        );
+        let (base_url, server) = spawn_mock_responses(vec![body]).await;
+        let conversation = Mutex::new(Conversation::new());
+        let surface = archive_surface(None);
+        let result = engine_for(&base_url)
+            .run_turn(&conversation, &CancellationToken::new(), &surface)
+            .await;
+        server.abort();
+        assert_eq!(result.unwrap().final_text, "done");
+        assert_eq!(conversation.lock().unwrap().items().count(), 1);
+        assert!(surface.boundaries.lock().unwrap().is_empty());
+        assert_eq!(surface.commits.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn only_file_edit_tools_trigger_the_post_edit_reminder() {
         assert!(is_file_edit_tool(crate::tools::write_file::NAME));
@@ -1081,6 +1378,13 @@ mod tests {
     /// Mock `/responses` server that serves `bodies[n]` for the n-th request,
     /// clamping at the last body for any request beyond the list.
     async fn spawn_mock_responses(bodies: Vec<String>) -> (String, tokio::task::JoinHandle<()>) {
+        spawn_recorded_responses(bodies, Arc::new(Mutex::new(Vec::new()))).await
+    }
+
+    async fn spawn_recorded_responses(
+        bodies: Vec<String>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let bodies = Arc::new(bodies);
@@ -1092,6 +1396,7 @@ mod tests {
                 };
                 let bodies = bodies.clone();
                 let counter = counter.clone();
+                let requests = requests.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf: Vec<u8> = Vec::new();
@@ -1111,6 +1416,12 @@ mod tests {
                             if buf.len() < body_start + content_length {
                                 break;
                             }
+                            requests.lock().unwrap().push(
+                                serde_json::from_slice(
+                                    &buf[body_start..body_start + content_length],
+                                )
+                                .unwrap(),
+                            );
                             buf.drain(..body_start + content_length);
                             let n = counter.fetch_add(1, Ordering::SeqCst);
                             let body = &bodies[n.min(bodies.len() - 1)];
@@ -1271,6 +1582,261 @@ mod tests {
             .as_ref()
             .expect_err("missing delta must be rejected");
         assert!(error.to_string().contains("delta"), "{error}");
+    }
+
+    fn runaway_body(call_id: &str, name: &str, parallel: Option<&OutputItem>) -> String {
+        let mut body = String::new();
+        if let Some(item) = parallel {
+            body.push_str(&frame(serde_json::json!({
+                "type": "response.output_item.done", "sequence_number": 0,
+                "output_index": 1, "item": item,
+            })));
+        }
+        body.push_str(&item_added_frame(1, 0, &call_item(call_id, name, "")));
+        for sequence in 2..80 {
+            body.push_str(&frame(serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": sequence, "output_index": 0, "item_id": "fc_1",
+                "delta": "RUNAWAY维拉".repeat(64),
+            })));
+        }
+        // Deliberately no completed event: recovery must drop the stream,
+        // rather than wait for the SDK to reconnect an incomplete response.
+        body
+    }
+
+    #[tokio::test]
+    async fn runaway_sse_pairs_parallel_calls_without_executing_or_replaying_garbage() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(format!("runaway-must-not-write-{}", uuid::Uuid::new_v4()));
+        let parallel = call_item(
+            "parallel",
+            "write_file",
+            &serde_json::json!({"path": path, "content": "must not run"}).to_string(),
+        );
+        let bodies = vec![
+            runaway_body("runaway", "write_file", Some(&parallel)),
+            format!(
+                "{}{}",
+                item_added_frame(1, 0, &message_item("recovered")),
+                completed_frame(2)
+            ),
+        ];
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base, server) = spawn_recorded_responses(bodies, requests.clone()).await;
+        let conversation = Mutex::new(Conversation::new());
+        let cancel = CancellationToken::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine_for(&base).run_turn(&conversation, &cancel, &HeadlessSurface),
+        )
+        .await;
+        server.abort();
+        assert_eq!(result.unwrap().unwrap().final_text, "recovered");
+        assert!(!cancel.is_cancelled());
+        assert!(
+            !path.exists(),
+            "completed parallel write must never execute"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let next = requests[1].to_string();
+        assert!(!next.contains("RUNAWAY"));
+        assert!(!next.contains("must not run"));
+        let input = requests[1]["input"].as_array().unwrap();
+        for call_id in ["runaway", "parallel"] {
+            let call = input
+                .iter()
+                .find(|item| item["type"] == "function_call" && item["call_id"] == call_id)
+                .unwrap();
+            assert_eq!(call["arguments"], "{}");
+            let outputs: Vec<_> = input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+                .collect();
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0]["output"], argument_guard::FAILURE);
+        }
+        for item in conversation.lock().unwrap().items() {
+            if let MessageItem::ToolOutput { failed, .. } = item {
+                assert!(failed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runaway_sse_missing_identity_fails_without_retry_or_history() {
+        for (call_id, name) in [("", "write_file"), ("call", "")] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let (base, server) =
+                spawn_recorded_responses(vec![runaway_body(call_id, name, None)], requests.clone())
+                    .await;
+            let conversation = Mutex::new(Conversation::new());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine_for(&base).run_turn(
+                    &conversation,
+                    &CancellationToken::new(),
+                    &HeadlessSurface,
+                ),
+            )
+            .await;
+            server.abort();
+            assert!(matches!(result.unwrap(), Err(RunnerError::Api { .. })));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(conversation.lock().unwrap().items().count(), 0);
+        }
+    }
+
+    fn terminal_output_frame(status: &str, output: Vec<OutputItem>) -> String {
+        frame(serde_json::json!({
+            "type": format!("response.{status}"), "sequence_number": 3,
+            "response": {
+                "created_at": 0, "id": "resp_1", "model": "mock",
+                "object": "response", "output": output, "status": status
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn runaway_terminal_output_is_checked_and_all_calls_are_paired() {
+        for status in ["completed", "failed", "incomplete"] {
+            for arguments in ["RUNAWAY".repeat(3000), "x".repeat(8 * 1024 * 1024 + 1)] {
+                let body = terminal_output_frame(
+                    status,
+                    vec![
+                        call_item("runaway", "write_file", &arguments),
+                        call_item("parallel", "write_file", "{}"),
+                    ],
+                );
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let (base, server) = spawn_recorded_responses(
+                    vec![
+                        body,
+                        format!(
+                            "{}{}",
+                            item_added_frame(1, 0, &message_item("recovered")),
+                            completed_frame(2)
+                        ),
+                    ],
+                    requests.clone(),
+                )
+                .await;
+                let conversation = Mutex::new(Conversation::new());
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    engine_for(&base).run_turn(
+                        &conversation,
+                        &CancellationToken::new(),
+                        &HeadlessSurface,
+                    ),
+                )
+                .await;
+                server.abort();
+                assert_eq!(result.unwrap().unwrap().final_text, "recovered", "{status}");
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                let input = requests[1]["input"].as_array().unwrap();
+                for call_id in ["runaway", "parallel"] {
+                    let calls: Vec<_> = input
+                        .iter()
+                        .filter(|item| {
+                            item["type"] == "function_call" && item["call_id"] == call_id
+                        })
+                        .collect();
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0]["arguments"], "{}");
+                    let outputs: Vec<_> = input
+                        .iter()
+                        .filter(|item| {
+                            item["type"] == "function_call_output" && item["call_id"] == call_id
+                        })
+                        .collect();
+                    assert_eq!(outputs.len(), 1);
+                    assert_eq!(outputs[0]["output"], argument_guard::FAILURE);
+                }
+                assert!(!requests[1].to_string().contains("RUNAWAY"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runaway_ambiguous_identities_fail_before_any_history_is_written() {
+        let mut bodies = vec![runaway_body(
+            "duplicate",
+            "write_file",
+            Some(&call_item("duplicate", "read_file", "{}")),
+        )];
+        for status in ["completed", "failed", "incomplete"] {
+            bodies.push(terminal_output_frame(
+                status,
+                vec![
+                    call_item("duplicate", "write_file", &"RUNAWAY".repeat(3000)),
+                    call_item("duplicate", "read_file", "{}"),
+                ],
+            ));
+        }
+        for (call_id, name) in [("changed", "write_file"), ("original", "read_file")] {
+            let initial = item_added_frame(1, 0, &call_item("original", "write_file", ""));
+            bodies.push(format!(
+                "{initial}{}",
+                frame(serde_json::json!({
+                    "type": "response.output_item.done", "sequence_number": 2,
+                    "output_index": 0, "item": call_item(call_id, name, "{}")
+                }))
+            ));
+            for status in ["completed", "failed", "incomplete"] {
+                bodies.push(format!(
+                    "{initial}{}",
+                    terminal_output_frame(status, vec![call_item(call_id, name, "{}")])
+                ));
+            }
+        }
+        for body in bodies {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let (base, server) = spawn_recorded_responses(vec![body], requests.clone()).await;
+            let conversation = Mutex::new(Conversation::new());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine_for(&base).run_turn(
+                    &conversation,
+                    &CancellationToken::new(),
+                    &HeadlessSurface,
+                ),
+            )
+            .await;
+            server.abort();
+            assert!(matches!(result.unwrap(), Err(RunnerError::Api { .. })));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(conversation.lock().unwrap().items().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn runaway_sse_repeated_failures_are_bounded_and_paired() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let bodies = (0..3)
+            .map(|index| runaway_body(&format!("call_{index}"), "write_file", None))
+            .collect();
+        let (base, server) = spawn_recorded_responses(bodies, requests.clone()).await;
+        let conversation = Mutex::new(Conversation::new());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine_for(&base).run_turn(&conversation, &CancellationToken::new(), &HeadlessSurface),
+        )
+        .await;
+        server.abort();
+        assert!(matches!(result.unwrap(), Err(RunnerError::Api { .. })));
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert_eq!(conversation.lock().unwrap().items().count(), 6);
+        assert!(
+            !format!(
+                "{:?}",
+                conversation.lock().unwrap().items().collect::<Vec<_>>()
+            )
+            .contains("RUNAWAY")
+        );
     }
 
     fn engine_for(base_url: &str) -> TurnRunner {
@@ -1903,6 +2469,7 @@ mod tests {
                 // Ephemeral progress events aren't asserted on in these tests.
                 RunnerEvent::StreamChunk(_)
                 | RunnerEvent::ResponseCommitted
+                | RunnerEvent::ResponseAborted { .. }
                 | RunnerEvent::Phase(_)
                 | RunnerEvent::Activity(_)
                 | RunnerEvent::UsageSafePoint { .. }

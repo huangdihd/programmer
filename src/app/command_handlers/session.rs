@@ -10,15 +10,15 @@ use crate::app::{App, commands, diagnostics, session};
 use crate::commands::Command;
 use crate::ui::components::todo_panel::TodoPanel;
 
-pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOutcome {
-    app.input_panel.clear();
+pub(in crate::app) async fn execute(app: &mut App<'_>, command: Command) -> CommandOutcome {
+    app.ui.input_panel.clear();
     match command {
         Command::Quit => {
             app.quit();
             CommandOutcome::handled(false)
         }
-        Command::Clear => clear(app),
-        Command::New => new(app),
+        Command::Clear => clear(app).await,
+        Command::New => new(app).await,
         Command::Session(arguments) => match arguments.trim() {
             "" => show_session(app),
             "graph" => {
@@ -26,8 +26,13 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
                 CommandOutcome::handled(false)
             }
             _ => {
-                app.conversation_panel
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
                     .add_warning_string("usage: /session [graph]");
+                app.ui.conversation_panel.scroll_to_bottom();
                 CommandOutcome::handled(false)
             }
         },
@@ -39,7 +44,7 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
         Command::Rewind => rewind(app),
         Command::Todo => {
             app.sync_todos_from_store();
-            app.todo_panel = Some(TodoPanel::new(app.todo_list.clone()));
+            app.ui.todo_panel = Some(TodoPanel::new(app.ui.todo_list.clone()));
             CommandOutcome::handled(false)
         }
         Command::Terminal(arg) => {
@@ -52,42 +57,75 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
 }
 
 fn rewind(app: &mut App<'_>) -> CommandOutcome {
-    if app.cancel.active_id.is_some() {
-        app.conversation_panel
+    if app.agent_loop.cancel.active_id.is_some() {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_warning_string("cannot rewind while a turn is in flight");
+        app.ui.conversation_panel.scroll_to_bottom();
         return CommandOutcome::handled(false);
     }
-    let Some(store) = &app.checkpoint_store else {
-        app.conversation_panel
+    let Some(store) = &app.agent_loop.session.checkpoint_store else {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_warning_string("rewind checkpoints are unavailable");
+        app.ui.conversation_panel.scroll_to_bottom();
         return CommandOutcome::handled(false);
     };
     let panel =
         crate::ui::components::rewind_panel::RewindPanel::new(store.lock().unwrap().checkpoints());
     if panel.is_empty() {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_info_string("no user prompt checkpoints to rewind to");
+        app.ui.conversation_panel.scroll_to_bottom();
     } else {
-        app.rewind_panel = Some(panel);
+        app.ui.rewind_panel = Some(panel);
     }
     CommandOutcome::handled(false)
 }
 
 fn show_session(app: &mut App<'_>) -> CommandOutcome {
-    let item_count = app.conversation_panel.items_snapshot().len();
-    let message = match &app.session.mgr {
+    let item_count = app
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .items
+        .len();
+    let message = match &app.agent_loop.session.mgr {
         Some(manager) => {
-            let path = manager.session_path(&app.session.uuid);
+            let path = manager.session_path(&app.agent_loop.session.uuid);
             format_session_info(
                 item_count,
-                &app.session.uuid,
-                &app.session.title,
+                &app.agent_loop.session.uuid,
+                &app.agent_loop.session.title,
                 Some((&path, path.exists())),
             )
         }
-        None => format_session_info(item_count, &app.session.uuid, &app.session.title, None),
+        None => format_session_info(
+            item_count,
+            &app.agent_loop.session.uuid,
+            &app.agent_loop.session.title,
+            None,
+        ),
     };
-    app.conversation_panel.add_info_string(message);
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .add_info_string(message);
+    app.ui.conversation_panel.scroll_to_bottom();
     CommandOutcome::handled(true)
 }
 
@@ -121,9 +159,20 @@ fn format_session_info(
 }
 
 fn usage(app: &mut App<'_>) -> CommandOutcome {
-    let summary = app.conversation_panel.usage_summary();
-    app.conversation_panel
+    let summary = app
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .usage_summary();
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
         .add_info_string(format_usage(summary));
+    app.ui.conversation_panel.scroll_to_bottom();
     CommandOutcome::handled(true)
 }
 
@@ -159,59 +208,137 @@ fn format_usage(summary: crate::conversation::UsageSummary) -> String {
     }
 }
 
-fn clear(app: &mut App<'_>) -> CommandOutcome {
-    commands::invalidate_auto_compaction(app);
-    app.conversation_panel.clear_messages();
+async fn clear(app: &mut App<'_>) -> CommandOutcome {
+    if app.agent_loop.cancel.active_id.is_some() {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_warning_string(
+                "Cannot clear while a turn is in flight; cancel it and wait for completion first.",
+            );
+        app.ui.conversation_panel.scroll_to_bottom();
+        return CommandOutcome::handled(false);
+    }
+    if let Err(error) = app.close_session().await {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_error_string(format!("Cannot clear session: {error}"));
+        app.ui.conversation_panel.scroll_to_bottom();
+        return CommandOutcome::handled(false);
+    }
+    app.agent_loop.session.tasks = crate::tasks::TaskManager::default();
+    app.connect_task_events();
+    app.agent_loop.task_notifications.clear();
+    app.agent_loop.session.agents = crate::agents::AgentManager::default();
+    app.agent_loop.agent_notifications = crate::app::AgentNotificationState::new();
+    app.agent_loop.session.conversation = Default::default();
+    app.ui.conversation_panel = crate::ui::components::conversation_panel::conversation_panel::ConversationPanel::from_shared(
+        app.agent_loop.session.conversation.clone(),
+    );
+    app.ui.conversation_panel.tasks = app.agent_loop.session.tasks.clone();
+    app.agent_loop.session.todo_store = Default::default();
     diagnostics::reset_diagnostics_state(app);
-    app.pending_images.clear();
+    app.agent_loop.pending_request = None;
     session::delete_session(app);
-    app.todo_list = crate::todos::TodoList::default();
-    app.sync_todos_to_store();
+    app.sync_todos_from_store();
+    app.agent_loop.session.lifecycle = crate::app::SessionLifecycle::Running;
     CommandOutcome::handled(true)
 }
 
-fn new(app: &mut App<'_>) -> CommandOutcome {
+async fn new(app: &mut App<'_>) -> CommandOutcome {
     commands::invalidate_auto_compaction(app);
-    app.active_suggestion_operation_id = None;
-    if let Some(cancel) = app.input_suggestion_cancel.take() {
+    app.ui.active_suggestion_operation_id = None;
+    if let Some(cancel) = app.ui.input_suggestion_cancel.take() {
         cancel.cancel();
     }
-    app.input_panel.clear_suggestion();
-    session::save_session(app);
+    app.ui.input_panel.clear_suggestion();
+    if let Err(error) = app.close_session().await {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_error_string(format!("Cannot start a new session: {error}"));
+        app.ui.conversation_panel.scroll_to_bottom();
+        return CommandOutcome::handled(false);
+    }
+    let saved = match session::persist_session(app) {
+        Ok(saved) => saved,
+        Err(error) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(format!("Cannot start a new session: session save: {error}"));
+            app.ui.conversation_panel.scroll_to_bottom();
+            return CommandOutcome::handled(false);
+        }
+    };
     // The session that is ending is queued for consolidation before its
     // conversation is cleared, exactly as it would be on quit.
-    app.queue_current_session_for_dream();
-    app.conversation_panel.clear_messages();
+    if saved {
+        app.queue_current_session_for_dream();
+    }
+    let conversation = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::conversation::Conversation::new(),
+    ));
+    app.agent_loop.session.conversation = conversation.clone();
+    app.ui.conversation_panel.conversation = conversation;
+    app.agent_loop.session.conversation.lock().unwrap().clear();
+    app.ui.conversation_panel.clear_view();
+    app.agent_loop.session.todo_store = Default::default();
     diagnostics::reset_diagnostics_state(app);
-    app.pending_images.clear();
-    let killed = app.tasks.kill_all();
-    app.task_notifications.clear();
-    app.agents.cancel_all();
-    app.agents = crate::agents::AgentManager::default();
-    app.agent_notifications = crate::app::AgentNotificationState::new();
-    if let Some(manager) = &app.session.mgr {
+    app.agent_loop.pending_request = None;
+    app.agent_loop.session.tasks = crate::tasks::TaskManager::default();
+    app.connect_task_events();
+    app.agent_loop.task_notifications.clear();
+    app.agent_loop.session.agents = crate::agents::AgentManager::default();
+    app.agent_loop.agent_notifications = crate::app::AgentNotificationState::new();
+    if let Some(manager) = &app.agent_loop.session.mgr {
         let new_session = manager.create();
-        app.session.uuid = new_session.uuid;
+        app.agent_loop.session.uuid = new_session.uuid;
+    } else {
+        app.agent_loop.session.uuid = uuid::Uuid::new_v4().to_string();
     }
-    app.checkpoint_store = crate::checkpoint::CheckpointStore::for_session(&app.session.uuid)
-        .map(|store| std::sync::Arc::new(std::sync::Mutex::new(store)));
-    app.current_checkpoint_id = None;
-    app.session.title.clear();
-    app.session.title_generation_started = false;
-    app.session.title_generation_id = app.session.title_generation_id.wrapping_add(1);
-    app.todo_list = crate::todos::TodoList::default();
-    app.sync_todos_to_store();
-    app.vision_enabled = app.config.vision_enabled;
-    app.session.classifier_model_override = crate::session::ModelOverride::Inherit;
-    app.session.compact_model_override = crate::session::ModelOverride::Inherit;
-    app.session.auto_compact_override = crate::session::AutoCompactOverride::Inherit;
-    app.session.compact_keep_recent_turns_override = None;
+    app.agent_loop.session.checkpoint_store =
+        crate::checkpoint::CheckpointStore::for_session(&app.agent_loop.session.uuid)
+            .map(|store| std::sync::Arc::new(std::sync::Mutex::new(store)));
+    app.agent_loop.current_checkpoint_id = None;
+    app.agent_loop.session.did_save = false;
+    app.agent_loop.session.dirty = false;
+    app.agent_loop.session.persistence = session::PersistenceState::default();
+    app.agent_loop.session.title.clear();
+    app.agent_loop.session.title_generation_started = false;
+    app.agent_loop.session.title_generation_id =
+        app.agent_loop.session.title_generation_id.wrapping_add(1);
+    *app.agent_loop.session.todo_store.lock().unwrap() = crate::todos::TodoList::default();
+    app.sync_todos_from_store();
+    app.agent_loop.session.vision_enabled = app.config.vision_enabled;
+    app.agent_loop.session.classifier_model_override = crate::session::ModelOverride::Inherit;
+    app.agent_loop.session.compact_model_override = crate::session::ModelOverride::Inherit;
+    app.agent_loop.session.auto_compact_override = crate::session::AutoCompactOverride::Inherit;
+    app.agent_loop.session.compact_keep_recent_turns_override = None;
 
-    let mut message = "Started a new session. Previous session saved.".to_string();
-    if killed > 0 {
-        message.push_str(&format!(" Killed {killed} background task(s)."));
+    app.agent_loop.session.lifecycle = crate::app::SessionLifecycle::Running;
+    let message = if saved {
+        "Started a new session. Previous session saved."
+    } else {
+        "Started a new session. Previous session was empty; nothing to save."
     }
-    app.conversation_panel.add_info_string(message);
+    .to_string();
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .add_info_string(message);
+    app.ui.conversation_panel.scroll_to_bottom();
     CommandOutcome::handled(true)
 }
 
@@ -221,7 +348,13 @@ fn help(app: &mut App<'_>) -> CommandOutcome {
         .map(|(command, description)| format!("  {command:35} {description}"))
         .collect();
     lines.insert(0, "Available commands:".to_string());
-    app.conversation_panel.add_info_string(lines.join("\n"));
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .add_info_string(lines.join("\n"));
+    app.ui.conversation_panel.scroll_to_bottom();
     CommandOutcome::handled(true)
 }
 

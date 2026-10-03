@@ -3,7 +3,7 @@
 
 //! Tick-driven peer transport. Questions use a tool-free snapshot; only idle,
 //! explicitly permitted scheduling may enter the ordinary tool-capable runner.
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use async_openai::types::responses::InputRole;
 use tokio::sync::oneshot;
@@ -15,19 +15,37 @@ use crate::ui::components::question_panel::QuestionPanel;
 use crate::ui::event::AnswerTx;
 
 #[derive(Default)]
-pub(crate) struct PeerState {
+pub(crate) struct PeerInbox {
     session: String,
     presence: Option<crate::peers::online::Presence>,
-    pub(crate) consent: Option<(PeerEnvelope, oneshot::Receiver<String>)>,
-    pub(crate) runner_prompts: VecDeque<(crate::cancel::OperationId, QuestionPanel)>,
     answering: HashMap<String, tokio::task::JoinHandle<Result<PeerEnvelope, String>>>,
     previewed: HashSet<String>,
-    accepted: HashSet<String>,
     pending: Vec<PeerEnvelope>,
     last_error: Option<String>,
 }
 
-impl Drop for PeerState {
+/// An envelope and its local approval state form one fact, not an ID set
+/// whose meaning depends on a second collection. Neither state is persisted.
+pub(crate) enum DelegationState {
+    PendingApproval(PeerEnvelope),
+    Accepted(PeerEnvelope),
+}
+
+impl PeerInbox {
+    /// Abort and join snapshot-only answers without consuming durable mail.
+    pub(crate) async fn close(&mut self) {
+        for task in self.answering.values() {
+            task.abort();
+        }
+        for (_, task) in self.answering.drain() {
+            let _ = task.await;
+        }
+        self.presence = None;
+        self.session.clear();
+    }
+}
+
+impl Drop for PeerInbox {
     fn drop(&mut self) {
         for task in self.answering.values() {
             task.abort();
@@ -36,28 +54,38 @@ impl Drop for PeerState {
 }
 
 fn report(app: &mut App<'_>, error: String) {
-    if app.peers.last_error.as_ref() != Some(&error) {
-        app.conversation_panel
+    if app.agent_loop.peer_inbox.last_error.as_ref() != Some(&error) {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_error_string(format!("Peer inbox: {error}"));
-        app.peers.last_error = Some(error);
+        app.ui.conversation_panel.scroll_to_bottom();
+        app.agent_loop.peer_inbox.last_error = Some(error);
     }
 }
 
 fn has_draft(app: &App<'_>) -> bool {
-    !app.input_panel.get_content().is_empty()
-        || !app.pending_images.is_empty()
-        || app.conversation_panel.pending_message.is_some()
+    !app.ui.input_panel.get_content().is_empty() || app.agent_loop.pending_request.is_some()
 }
 
-pub(crate) fn sync_session(app: &mut App<'_>) {
-    if app.peers.session != app.session.uuid {
-        if app.peers.consent.is_some() {
-            app.question_panel = None;
+pub(crate) async fn sync_session(app: &mut App<'_>) {
+    if !app.session_accepts_work() {
+        return;
+    }
+    if app.agent_loop.peer_inbox.session != app.agent_loop.session.uuid {
+        if app.agent_loop.peer_consent.is_some() {
+            app.ui.question_panel = None;
         }
-        app.peers = PeerState::default();
-        app.peers.session = app.session.uuid.clone();
-        match crate::peers::online::Presence::register(&app.session.uuid) {
-            Ok(presence) => app.peers.presence = Some(presence),
+        app.agent_loop.peer_inbox.close().await;
+        app.agent_loop.peer_inbox = PeerInbox::default();
+        app.agent_loop.peer_consent = None;
+        app.agent_loop.peer_delegations.clear();
+        app.ui.runner_prompts.clear();
+        app.agent_loop.peer_inbox.session = app.agent_loop.session.uuid.clone();
+        match crate::peers::online::Presence::register(&app.agent_loop.session.uuid) {
+            Ok(presence) => app.agent_loop.peer_inbox.presence = Some(presence),
             Err(error) => report(app, error),
         }
     }
@@ -65,35 +93,39 @@ pub(crate) fn sync_session(app: &mut App<'_>) {
 
 /// Refresh picker choices after asynchronous provider discovery, without fetching anew.
 pub(crate) fn refresh_consent_models(app: &mut App<'_>) {
-    if app.peers.consent.is_none() {
+    if app.agent_loop.peer_consent.is_none() {
         return;
     }
     let models = crate::commands::CompletionEngine::complete(
-        &app.tasks,
+        &app.agent_loop.session.tasks,
         "/model ",
         &app.provider_manager,
-        &app.skill_registry,
+        &app.agent_loop.skill_registry,
     )
     .map(|state| state.candidates)
     .unwrap_or_default();
-    if let Some(panel) = &mut app.question_panel {
-        panel.set_delegation_models(&app.current_model, models);
+    if let Some(panel) = &mut app.ui.question_panel {
+        panel.set_delegation_models(&app.agent_loop.session.current_model, models);
     }
 }
 
 /// Called after events; disk polling occurs only on ticks. Async answering never
 /// borrows App, and its results are discarded if the session identity changes.
 pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
+    if !app.session_accepts_work() {
+        return false;
+    }
     refresh_consent_models(app);
-    sync_session(app);
-    if !app.running || app.peers.presence.is_none() {
+    sync_session(app).await;
+    if !app.running || app.agent_loop.peer_inbox.presence.is_none() {
         return false;
     }
     finish_consent(app);
     restore_runner_prompt(app);
 
     let completed: Vec<_> = app
-        .peers
+        .agent_loop
+        .peer_inbox
         .answering
         .iter()
         .filter(|(_, task)| task.is_finished())
@@ -101,7 +133,8 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
         .collect();
     for id in completed {
         let task = app
-            .peers
+            .agent_loop
+            .peer_inbox
             .answering
             .remove(&id)
             .expect("tracked peer answer");
@@ -117,20 +150,27 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
                     }
                 }
                 match store::enqueue(&exchange) {
-                    Ok(()) => app.peers.pending.push(exchange),
+                    Ok(()) => app.agent_loop.peer_inbox.pending.push(exchange),
                     Err(error) => report(app, error),
                 }
             }
             Ok(Err(error)) => {
                 // Report the failed lightweight answer without silently losing
                 // the online follow-up or repeatedly calling the model.
-                if let Some(question) = app.peers.pending.iter().find(|m| m.id == id).cloned() {
+                if let Some(question) = app
+                    .agent_loop
+                    .peer_inbox
+                    .pending
+                    .iter()
+                    .find(|m| m.id == id)
+                    .cloned()
+                {
                     let mut failed_exchange = question.clone();
                     failed_exchange.kind = PeerKind::Exchange;
                     failed_exchange.id = exchange_id(&question.id).expect("validated inbox UUID");
                     failed_exchange.answer = Some(format!("Lightweight answer failed: {error}"));
                     match store::enqueue(&failed_exchange) {
-                        Ok(()) => app.peers.pending.push(failed_exchange),
+                        Ok(()) => app.agent_loop.peer_inbox.pending.push(failed_exchange),
                         Err(delivery_error) => report(app, delivery_error),
                     }
                     let mut status = question.clone();
@@ -148,18 +188,20 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
     }
 
     if tick {
-        match store::pending(&app.session.uuid) {
-            Ok(messages) => app.peers.pending = messages,
+        match store::pending(&app.agent_loop.session.uuid) {
+            Ok(messages) => app.agent_loop.peer_inbox.pending = messages,
             Err(error) => {
                 report(app, error);
                 return false;
             }
         }
     }
-    for envelope in app.peers.pending.clone() {
+    for envelope in app.agent_loop.peer_inbox.pending.clone() {
         match envelope.kind {
             PeerKind::Question => {
-                if let Some(exchange) = matching_exchange(&envelope, &app.peers.pending).cloned() {
+                if let Some(exchange) =
+                    matching_exchange(&envelope, &app.agent_loop.peer_inbox.pending).cloned()
+                {
                     let mut reply = exchange;
                     reply.id = envelope.id.clone();
                     // An existing reply means delivery succeeded before a crash.
@@ -173,30 +215,56 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
                             continue;
                         }
                     }
-                    match store::remove(&app.session.uuid, &envelope.id) {
-                        Ok(()) => app.peers.pending.retain(|m| m.id != envelope.id),
+                    match store::remove(&app.agent_loop.session.uuid, &envelope.id) {
+                        Ok(()) => app
+                            .agent_loop
+                            .peer_inbox
+                            .pending
+                            .retain(|m| m.id != envelope.id),
                         Err(error) => report(app, error),
                     }
                     continue;
                 }
-                if app.peers.answering.contains_key(&envelope.id)
-                    || app.peers.previewed.contains(&envelope.id)
+                if app
+                    .agent_loop
+                    .peer_inbox
+                    .answering
+                    .contains_key(&envelope.id)
+                    || app.agent_loop.peer_inbox.previewed.contains(&envelope.id)
                 {
                     continue;
                 }
-                let Some((client, model)) = app.provider_manager.resolve(&app.current_model) else {
+                let Some((client, model)) = app
+                    .provider_manager
+                    .resolve(&app.agent_loop.session.current_model)
+                else {
                     continue;
                 };
                 let client = client.clone();
-                let items = app.conversation_panel.items_snapshot();
-                app.peers.previewed.insert(envelope.id.clone());
-                app.conversation_panel.upsert_peer_exchange(
-                    exchange_id(&envelope.id).expect("validated inbox UUID"),
-                    envelope.from.clone(),
-                    envelope.body.clone(),
-                    None,
-                );
-                app.peers.answering.insert(
+                let items = app
+                    .agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .items
+                    .clone();
+                app.agent_loop
+                    .peer_inbox
+                    .previewed
+                    .insert(envelope.id.clone());
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .upsert_peer_exchange(
+                        exchange_id(&envelope.id).expect("validated inbox UUID"),
+                        envelope.from.clone(),
+                        envelope.body.clone(),
+                        None,
+                    );
+                app.agent_loop.peer_inbox.answering.insert(
                     envelope.id.clone(),
                     tokio::spawn(async move {
                         crate::peers::answer_question(&envelope, &items, &client, &model).await
@@ -204,82 +272,135 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
                 );
             }
             PeerKind::Status => {
-                if app.peers.previewed.insert(envelope.id.clone()) {
-                    if let Some((id, state)) = delegation_status(&envelope.body) {
-                        if state == PeerDelegationState::Cancelled {
-                            cancel_local_delegation(app, id);
+                let delegation = match store::Store::default_location()
+                    .and_then(|store| resolve_delegation_status(&store, &envelope))
+                {
+                    Ok(delegation) => delegation,
+                    Err(error) => {
+                        report(app, error);
+                        continue;
+                    }
+                };
+                if app
+                    .agent_loop
+                    .peer_inbox
+                    .previewed
+                    .insert(envelope.id.clone())
+                {
+                    if let Some((original, state)) = delegation {
+                        if state == PeerDelegationState::Cancelled
+                            && original.to == app.agent_loop.session.uuid
+                        {
+                            cancel_local_delegation(app, &original.id);
                         }
-                        app.conversation_panel.upsert_peer_delegation(
-                            id.to_owned(),
-                            envelope.from.clone(),
-                            None,
-                            state,
-                        );
+                        app.agent_loop
+                            .session
+                            .conversation
+                            .lock()
+                            .unwrap()
+                            .upsert_peer_delegation(
+                                original.id,
+                                envelope.from.clone(),
+                                Some(original.body),
+                                state,
+                            );
                         session::mark_dirty(app);
                     } else {
-                        app.conversation_panel.add_info_string(format!(
-                            "Peer status from {}: {}",
-                            envelope.from, envelope.body
-                        ));
+                        app.agent_loop
+                            .session
+                            .conversation
+                            .lock()
+                            .unwrap()
+                            .add_info_string(format!(
+                                "Peer status from {}: {}",
+                                envelope.from, envelope.body
+                            ));
+                        app.ui.conversation_panel.scroll_to_bottom();
                     }
                 }
-                let _ = store::remove(&app.session.uuid, &envelope.id);
-                app.peers
+                let _ = store::remove(&app.agent_loop.session.uuid, &envelope.id);
+                app.agent_loop
+                    .peer_inbox
                     .pending
                     .retain(|message| message.id != envelope.id);
             }
             PeerKind::Exchange => {
-                if app.peers.previewed.insert(envelope.id.clone()) {
-                    app.conversation_panel.upsert_peer_exchange(
-                        envelope.id.clone(),
-                        envelope.from.clone(),
-                        envelope.body.clone(),
-                        envelope.answer.clone(),
-                    );
+                if app
+                    .agent_loop
+                    .peer_inbox
+                    .previewed
+                    .insert(envelope.id.clone())
+                {
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .upsert_peer_exchange(
+                            envelope.id.clone(),
+                            envelope.from.clone(),
+                            envelope.body.clone(),
+                            envelope.answer.clone(),
+                        );
                 }
             }
             PeerKind::Delegation => {
                 // Consent is deliberately not persisted. Reopening a durable
                 // inbox must reset the UI as well as ask for consent again.
-                if app.peers.previewed.insert(envelope.id.clone()) {
+                app.agent_loop
+                    .peer_delegations
+                    .entry(envelope.id.clone())
+                    .or_insert_with(|| DelegationState::PendingApproval(envelope.clone()));
+                if app
+                    .agent_loop
+                    .peer_inbox
+                    .previewed
+                    .insert(envelope.id.clone())
+                {
                     observe_delegation(app, &envelope, PeerDelegationState::Pending);
                 }
             }
         }
     }
 
-    if app.peers.consent.is_none()
+    if app.agent_loop.peer_consent.is_none()
         && !has_draft(app)
         && !super::events::has_blocking_surface(app)
         && let Some(envelope) = app
-            .peers
+            .agent_loop
+            .peer_inbox
             .pending
             .iter()
-            .find(|m| m.kind == PeerKind::Delegation && !app.peers.accepted.contains(&m.id))
-            .cloned()
+            .find_map(
+                |message| match app.agent_loop.peer_delegations.get(&message.id) {
+                    Some(DelegationState::PendingApproval(envelope)) => Some(envelope.clone()),
+                    _ => None,
+                },
+            )
     {
         let (tx, rx) = oneshot::channel();
-        app.question_panel = Some(QuestionPanel::delegation(
+        app.ui.question_panel = Some(QuestionPanel::delegation(
             envelope.from.clone(),
             envelope.body.clone(),
-            app.cancel.active_id.is_some(),
+            app.agent_loop.cancel.active_id.is_some(),
             AnswerTx(tx),
         ));
-        app.peers.consent = Some((envelope, rx));
+        app.agent_loop.peer_consent = Some((envelope, rx));
         refresh_consent_models(app);
     }
 
     // Archive only at a stable boundary: never insert developer input between
     // a tool call and its result. Drafts and Stop block execution, not archiving.
-    if app.cancel.active_id.is_none()
-        && app.auto_compact.active_id.is_none()
+    if app.agent_loop.cancel.active_id.is_none()
+        && app.agent_loop.auto_compact.active_id.is_none()
         && app
-            .peers
+            .agent_loop
+            .peer_inbox
             .pending
             .iter()
             .any(|m| m.kind == PeerKind::Exchange)
     {
-        for envelope in app.peers.pending.clone() {
+        for envelope in app.agent_loop.peer_inbox.pending.clone() {
             if envelope.kind != PeerKind::Exchange {
                 continue;
             }
@@ -289,12 +410,30 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
                 continue;
             };
             let serialized = serde_json::to_value(&input).expect("serializable peer input");
-            if !app.conversation_panel.items_snapshot().iter().any(|saved| {
-                matches!(saved, crate::response::message_item::MessageItem::Input(saved)
+            if !app
+                .agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .items
+                .clone()
+                .iter()
+                .any(|saved| {
+                    matches!(saved, crate::response::message_item::MessageItem::Input(saved)
                     if serde_json::to_value(saved).ok().as_ref() == Some(&serialized))
-            }) {
+                })
+            {
                 match serde_json::from_value(serialized) {
-                    Ok(message) => app.conversation_panel.add_input_message(message),
+                    Ok(message) => {
+                        app.agent_loop
+                            .session
+                            .conversation
+                            .lock()
+                            .unwrap()
+                            .add_input_message(message);
+                        app.ui.conversation_panel.scroll_to_bottom();
+                    }
                     Err(error) => {
                         report(app, error.to_string());
                         return false;
@@ -314,10 +453,13 @@ pub(crate) async fn poll(app: &mut App<'_>, tick: bool) -> bool {
 
 /// Event settlement dispatches local queued work first, then accepted peer work.
 pub(crate) async fn start_ready_work(app: &mut App<'_>) {
-    if !app.running || app.peers.presence.is_none() {
+    if !app.running || app.agent_loop.peer_inbox.presence.is_none() {
         return;
     }
-    let ready = ready_work(&app.peers.pending, &app.peers.accepted);
+    let ready = ready_work(
+        &app.agent_loop.peer_inbox.pending,
+        &app.agent_loop.peer_delegations,
+    );
     if ready.is_empty() {
         return;
     }
@@ -325,15 +467,16 @@ pub(crate) async fn start_ready_work(app: &mut App<'_>) {
         super::scheduling::StartupState::from_app(app).decide(super::scheduling::WorkSource::Peer);
     if decision == super::scheduling::StartDecision::CompactPeer {
         let tokens = app
+            .agent_loop
             .auto_compact
             .last_input_tokens
             .expect("compaction threshold requires tokens");
         // Keep peer input out of the user-role mandatory queue. Force mandatory
         // threshold/cooldown semantics, but leave the durable inbox untouched.
-        app.auto_compact.mandatory_waiting = true;
+        app.agent_loop.auto_compact.mandatory_waiting = true;
         if !commands::maybe_start_auto_compact(app, tokens) {
-            app.auto_compact.mandatory_waiting = false;
-            app.auto_compact.retry_blocked = true;
+            app.agent_loop.auto_compact.mandatory_waiting = false;
+            app.agent_loop.auto_compact.retry_blocked = true;
             report(app, "Peer follow-up awaits mandatory compaction; compact manually or adjust the context limit.".into());
         }
         return;
@@ -341,7 +484,14 @@ pub(crate) async fn start_ready_work(app: &mut App<'_>) {
     if decision != super::scheduling::StartDecision::Start {
         return;
     }
-    let snapshot = app.conversation_panel.items_snapshot();
+    let snapshot = app
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .items
+        .clone();
     let fresh: Vec<_> = ready
         .iter()
         .filter(|envelope| {
@@ -360,7 +510,11 @@ pub(crate) async fn start_ready_work(app: &mut App<'_>) {
             .iter()
             .find(|envelope| envelope.kind == PeerKind::Delegation)
         {
-            match store::claim_delegation(&app.session.uuid, &delegation.id, &delegation.from) {
+            match store::claim_delegation(
+                &app.agent_loop.session.uuid,
+                &delegation.id,
+                &delegation.from,
+            ) {
                 Ok(claimed) => Some(claimed),
                 Err(error) if error == "Delegation was cancelled or already claimed" => {
                     cancel_local_delegation(app, &delegation.id);
@@ -391,11 +545,11 @@ pub(crate) async fn start_ready_work(app: &mut App<'_>) {
             ));
         }
         commands::start_request_as(app, text, InputRole::Developer).await;
-        if app.cancel.active_id.is_none() {
+        if app.agent_loop.cancel.active_id.is_none() {
             if let Some(delegation) = claimed_delegation
                 && let Err(error) = store::enqueue(&delegation)
             {
-                app.peers.accepted.remove(&delegation.id);
+                app.agent_loop.peer_delegations.remove(&delegation.id);
                 report(
                     app,
                     format!("Could not restore unstarted delegation: {error}"),
@@ -407,16 +561,28 @@ pub(crate) async fn start_ready_work(app: &mut App<'_>) {
     for envelope in &ready {
         if envelope.kind == PeerKind::Delegation {
             observe_delegation(app, envelope, PeerDelegationState::Started);
+            if let Err(error) =
+                delegation_started_status(envelope).and_then(|status| store::enqueue(&status))
+            {
+                report(
+                    app,
+                    format!("Could not deliver delegation started status: {error}"),
+                );
+            }
         }
     }
     session::mark_dirty(app);
     match session::save_session_checked(app) {
         Ok(()) => {
             for envelope in ready {
-                if let Err(error) = store::remove(&app.session.uuid, &envelope.id) {
+                if let Err(error) = store::remove(&app.agent_loop.session.uuid, &envelope.id) {
                     report(app, error);
                 } else {
-                    app.peers.pending.retain(|m| m.id != envelope.id);
+                    app.agent_loop
+                        .peer_inbox
+                        .pending
+                        .retain(|m| m.id != envelope.id);
+                    app.agent_loop.peer_delegations.remove(&envelope.id);
                 }
             }
         }
@@ -445,10 +611,17 @@ fn matching_exchange<'a>(
     })
 }
 
-fn ready_work(pending: &[PeerEnvelope], accepted: &HashSet<String>) -> Vec<PeerEnvelope> {
-    if let Some(delegation) = pending
-        .iter()
-        .find(|m| m.kind == PeerKind::Delegation && accepted.contains(&m.id))
+fn ready_work(
+    pending: &[PeerEnvelope],
+    delegations: &HashMap<String, DelegationState>,
+) -> Vec<PeerEnvelope> {
+    if let Some(delegation) =
+        pending
+            .iter()
+            .find_map(|message| match delegations.get(&message.id) {
+                Some(DelegationState::Accepted(envelope)) => Some(envelope),
+                _ => None,
+            })
     {
         return vec![delegation.clone()];
     }
@@ -479,24 +652,48 @@ fn delegation_status(body: &str) -> Option<(&str, PeerDelegationState)> {
     let state = match status {
         "accepted" => PeerDelegationState::AcceptedQueued,
         "rejected" => PeerDelegationState::Rejected,
+        "started" => PeerDelegationState::Started,
         "cancelled" => PeerDelegationState::Cancelled,
         _ => return None,
     };
     Some((id, state))
 }
 
+fn delegation_started_status(envelope: &PeerEnvelope) -> Result<PeerEnvelope, String> {
+    PeerEnvelope::new(
+        envelope.to.clone(),
+        envelope.from.clone(),
+        PeerKind::Status,
+        format!("Delegation {} started", envelope.id),
+        None,
+    )
+}
+
+fn resolve_delegation_status(
+    store: &store::Store,
+    status: &PeerEnvelope,
+) -> Result<Option<(PeerEnvelope, PeerDelegationState)>, String> {
+    let Some((id, state)) = delegation_status(&status.body) else {
+        return Ok(None);
+    };
+    Ok(store
+        .delegation_for_status(status, id, state == PeerDelegationState::Cancelled)?
+        .map(|original| (original, state)))
+}
+
 fn cancel_local_delegation(app: &mut App<'_>, id: &str) {
     if app
-        .peers
-        .consent
+        .agent_loop
+        .peer_consent
         .as_ref()
         .is_some_and(|(envelope, _)| envelope.id == id)
     {
-        app.peers.consent = None;
-        app.question_panel = None;
+        app.agent_loop.peer_consent = None;
+        app.ui.question_panel = None;
     }
-    app.peers.accepted.remove(id);
-    app.peers
+    app.agent_loop.peer_delegations.remove(id);
+    app.agent_loop
+        .peer_inbox
         .pending
         .retain(|message| !(message.kind == PeerKind::Delegation && message.id == id));
 }
@@ -511,17 +708,22 @@ fn observe_delegation(app: &mut App<'_>, envelope: &PeerEnvelope, state: PeerDel
             format!("cannot archive delegation observation: {error}"),
         );
     }
-    app.conversation_panel.upsert_peer_delegation(
-        envelope.id.clone(),
-        envelope.from.clone(),
-        Some(envelope.body.clone()),
-        state,
-    );
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .upsert_peer_delegation(
+            envelope.id.clone(),
+            envelope.from.clone(),
+            Some(envelope.body.clone()),
+            state,
+        );
     session::mark_dirty(app);
 }
 
 fn finish_consent(app: &mut App<'_>) {
-    let Some((_, receiver)) = app.peers.consent.as_mut() else {
+    let Some((_, receiver)) = app.agent_loop.peer_consent.as_mut() else {
         return;
     };
     let answer = match receiver.try_recv() {
@@ -529,13 +731,16 @@ fn finish_consent(app: &mut App<'_>) {
         Err(oneshot::error::TryRecvError::Empty) => return,
         Err(oneshot::error::TryRecvError::Closed) => "No".into(),
     };
-    let (envelope, _) = app.peers.consent.take().expect("active consent");
-    app.question_panel = None;
+    let (envelope, _) = app.agent_loop.peer_consent.take().expect("active consent");
+    app.ui.question_panel = None;
     let accepted = answer.eq_ignore_ascii_case("yes");
     if accepted {
         // Consent is local-only state, never inferred from a wire field. The
         // original stays durable until execution; after restart ask again.
-        app.peers.accepted.insert(envelope.id.clone());
+        app.agent_loop.peer_delegations.insert(
+            envelope.id.clone(),
+            DelegationState::Accepted(envelope.clone()),
+        );
     }
     observe_delegation(
         app,
@@ -547,7 +752,7 @@ fn finish_consent(app: &mut App<'_>) {
         },
     );
     if let Ok(status) = PeerEnvelope::new(
-        app.session.uuid.clone(),
+        app.agent_loop.session.uuid.clone(),
         envelope.from.clone(),
         PeerKind::Status,
         format!(
@@ -561,22 +766,26 @@ fn finish_consent(app: &mut App<'_>) {
         report(app, error);
     }
     if !accepted {
-        if let Err(error) = store::remove(&app.session.uuid, &envelope.id) {
+        app.agent_loop.peer_delegations.remove(&envelope.id);
+        if let Err(error) = store::remove(&app.agent_loop.session.uuid, &envelope.id) {
             report(app, error);
         }
-        app.peers
+        app.agent_loop
+            .peer_inbox
             .pending
             .retain(|message| message.id != envelope.id);
     }
 }
 
 fn restore_runner_prompt(app: &mut App<'_>) {
-    if app.peers.consent.is_some() || app.question_panel.is_some() {
+    if app.agent_loop.peer_consent.is_some() || app.ui.question_panel.is_some() {
         return;
     }
-    while let Some((operation, panel)) = app.peers.runner_prompts.pop_front() {
-        if app.cancel.active_id == Some(operation) && !app.cancel.active.is_cancelled() {
-            app.question_panel = Some(panel);
+    while let Some((operation, panel)) = app.ui.runner_prompts.pop_front() {
+        if app.agent_loop.cancel.active_id == Some(operation)
+            && !app.agent_loop.cancel.active.is_cancelled()
+        {
+            app.ui.question_panel = Some(panel);
             break;
         }
     }
@@ -584,6 +793,253 @@ fn restore_runner_prompt(app: &mut App<'_>) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stopped_session_sync_never_recreates_presence() {
+        let mut app = crate::app::commands::tests::command_test_app().await;
+        app.close_session().await.unwrap();
+        super::sync_session(&mut app).await;
+        assert!(!super::poll(&mut app, true).await);
+        assert!(app.agent_loop.peer_inbox.session.is_empty());
+        assert!(app.agent_loop.peer_inbox.presence.is_none());
+    }
+
+    #[test]
+    fn approval_is_explicit_and_does_not_survive_restart() {
+        let delegation = message(PeerKind::Delegation);
+        let pending = vec![delegation.clone()];
+        let mut states = HashMap::from([(
+            delegation.id.clone(),
+            DelegationState::PendingApproval(delegation.clone()),
+        )]);
+        assert!(ready_work(&pending, &states).is_empty());
+        states.insert(delegation.id.clone(), DelegationState::Accepted(delegation));
+        assert_eq!(ready_work(&pending, &states).len(), 1);
+        assert!(ready_work(&pending, &HashMap::new()).is_empty());
+        assert!(ready_work(&[], &states).is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_close_joins_answers_and_preserves_pending_mail() {
+        struct Finished(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Finished(finished.clone());
+        let (started, receiver) = oneshot::channel();
+        let question = message(PeerKind::Question);
+        let disk = store::tests::TestStore::new();
+        disk.0.enqueue(&question).unwrap();
+        let mut inbox = PeerInbox::default();
+        inbox.session = question.to.clone();
+        inbox.pending = disk.0.pending(&question.to).unwrap();
+        assert_eq!(inbox.pending.as_slice(), std::slice::from_ref(&question));
+        inbox.answering.insert(
+            question.id.clone(),
+            tokio::spawn(async move {
+                let _guard = guard;
+                started.send(()).unwrap();
+                std::future::pending::<Result<PeerEnvelope, String>>().await
+            }),
+        );
+        receiver.await.unwrap();
+        inbox.close().await;
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(inbox.answering.is_empty());
+        assert!(inbox.session.is_empty());
+        assert_eq!(inbox.pending[0].id, question.id);
+        inbox.close().await;
+        drop(inbox);
+        assert_eq!(disk.0.pending(&question.to).unwrap(), [question]);
+    }
+
+    #[tokio::test]
+    async fn approved_delegation_requires_new_approval_after_inbox_reconstruction() {
+        let disk = store::tests::TestStore::new();
+        let delegation = message(PeerKind::Delegation);
+        disk.0.enqueue(&delegation).unwrap();
+        let mut inbox = PeerInbox::default();
+        inbox.session = delegation.to.clone();
+        inbox.pending = disk.0.pending(&delegation.to).unwrap();
+        let states = HashMap::from([(
+            delegation.id.clone(),
+            DelegationState::Accepted(delegation.clone()),
+        )]);
+        assert_eq!(
+            ready_work(&inbox.pending, &states).as_slice(),
+            std::slice::from_ref(&delegation)
+        );
+        inbox.close().await;
+        drop(inbox);
+        drop(states);
+
+        // Reconstruct local state from durable mail, not a real process restart.
+        let mut rebuilt = PeerInbox::default();
+        rebuilt.session = delegation.to.clone();
+        rebuilt.pending = disk.0.pending(&delegation.to).unwrap();
+        assert_eq!(
+            rebuilt.pending.as_slice(),
+            std::slice::from_ref(&delegation)
+        );
+        let mut states = HashMap::new();
+        assert!(ready_work(&rebuilt.pending, &states).is_empty());
+        states.insert(
+            delegation.id.clone(),
+            DelegationState::PendingApproval(delegation.clone()),
+        );
+        assert!(ready_work(&rebuilt.pending, &states).is_empty());
+        states.insert(
+            delegation.id.clone(),
+            DelegationState::Accepted(delegation.clone()),
+        );
+        assert_eq!(
+            ready_work(&rebuilt.pending, &states).as_slice(),
+            std::slice::from_ref(&delegation)
+        );
+        assert_eq!(disk.0.pending(&delegation.to).unwrap(), [delegation]);
+    }
+
+    #[test]
+    fn source_status_recovers_sent_task_without_granting_execution() {
+        use crate::conversation::Conversation;
+        use crate::peers::graph::ObservedState;
+        use crate::response::message_item::MessageItem;
+
+        for state in [
+            PeerDelegationState::AcceptedQueued,
+            PeerDelegationState::Rejected,
+        ] {
+            let disk = store::tests::TestStore::new();
+            let delegation = message(PeerKind::Delegation);
+            disk.0.enqueue(&delegation).unwrap();
+            disk.0
+                .observe(
+                    &delegation,
+                    ObservedState::Delegation(PeerDelegationState::Pending),
+                )
+                .unwrap();
+            // Rejection/claim consumes the original inbox file; history must survive it.
+            disk.0.remove(&delegation.to, &delegation.id).unwrap();
+            let mut status = super::delegation_started_status(&delegation).unwrap();
+            status.body = format!(
+                "Delegation {} {}",
+                delegation.id,
+                if state == PeerDelegationState::Rejected {
+                    "rejected"
+                } else {
+                    "accepted"
+                }
+            );
+            disk.0.enqueue(&status).unwrap();
+            let received = disk.0.pending(&delegation.from).unwrap().remove(0);
+            let (original, observed) = super::resolve_delegation_status(&disk.0, &received)
+                .unwrap()
+                .unwrap();
+            let mut conversation = Conversation::new();
+            conversation.upsert_peer_delegation(
+                original.id,
+                received.from,
+                Some(original.body),
+                observed,
+            );
+            assert!(
+                matches!(&conversation.items[0], MessageItem::PeerDelegation { body: Some(body), state: saved, .. }
+                if body == &delegation.body && *saved == state)
+            );
+            assert!(ready_work(&[delegation], &HashMap::new()).is_empty());
+        }
+    }
+
+    #[test]
+    fn started_status_is_routed_and_cannot_regress_with_delayed_acceptance() {
+        use crate::conversation::Conversation;
+        use crate::peers::graph::ObservedState;
+        use crate::response::message_item::MessageItem;
+        let disk = store::tests::TestStore::new();
+        let delegation = message(PeerKind::Delegation);
+        disk.0
+            .observe(
+                &delegation,
+                ObservedState::Delegation(PeerDelegationState::Pending),
+            )
+            .unwrap();
+        let started = super::delegation_started_status(&delegation).unwrap();
+        assert_eq!(started.to, delegation.from);
+        assert_eq!(started.from, delegation.to);
+        disk.0.enqueue(&started).unwrap();
+        let mut conversation = Conversation::new();
+        for word in ["started", "accepted", "rejected", "cancelled"] {
+            let mut status = started.clone();
+            status.body = format!("Delegation {} {word}", delegation.id);
+            let (original, state) = super::resolve_delegation_status(&disk.0, &status)
+                .unwrap()
+                .unwrap();
+            conversation.upsert_peer_delegation(
+                original.id,
+                status.from,
+                Some(original.body),
+                state,
+            );
+        }
+        assert!(
+            matches!(&conversation.items[0], MessageItem::PeerDelegation { state: PeerDelegationState::Started, body: Some(body), .. }
+            if body == &delegation.body)
+        );
+        assert_eq!(conversation.items.len(), 1);
+        assert_eq!(disk.0.pending(&delegation.from).unwrap(), [started]);
+    }
+
+    #[test]
+    fn lifecycle_status_requires_original_id_and_both_endpoints() {
+        let disk = store::tests::TestStore::new();
+        let delegation = message(PeerKind::Delegation);
+        disk.0.enqueue(&delegation).unwrap(); // Inbox fallback when history is unavailable.
+        let status = super::delegation_started_status(&delegation).unwrap();
+        assert!(
+            super::resolve_delegation_status(&disk.0, &status)
+                .unwrap()
+                .is_some()
+        );
+        for field in ["from", "to", "id", "reverse"] {
+            let mut forged = status.clone();
+            match field {
+                "from" => forged.from = uuid::Uuid::new_v4().to_string(),
+                "to" => forged.to = uuid::Uuid::new_v4().to_string(),
+                "id" => forged.body = format!("Delegation {} started", uuid::Uuid::new_v4()),
+                _ => std::mem::swap(&mut forged.from, &mut forged.to),
+            }
+            assert!(
+                super::resolve_delegation_status(&disk.0, &forged)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut cancellation = status;
+        std::mem::swap(&mut cancellation.from, &mut cancellation.to);
+        cancellation.body = format!("Delegation {} cancelled", delegation.id);
+        assert!(
+            super::resolve_delegation_status(&disk.0, &cancellation)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn conflicting_durable_identity_does_not_select_a_task_body() {
+        use crate::peers::graph::ObservedState;
+        let disk = store::tests::TestStore::new();
+        let delegation = message(PeerKind::Delegation);
+        let state = ObservedState::Delegation(PeerDelegationState::Pending);
+        disk.0.observe(&delegation, state).unwrap();
+        let mut conflicting = delegation.clone();
+        conflicting.from = uuid::Uuid::new_v4().to_string();
+        disk.0.observe(&conflicting, state).unwrap();
+        let status = super::delegation_started_status(&delegation).unwrap();
+        assert!(super::resolve_delegation_status(&disk.0, &status).is_err());
+    }
+
     #[test]
     fn delegation_status_requires_exact_wire_format() {
         let id = uuid::Uuid::new_v4().to_string();
@@ -599,7 +1055,14 @@ mod tests {
             super::delegation_status(&format!("Delegation {id} cancelled")),
             Some((id.as_str(), super::PeerDelegationState::Cancelled))
         );
+        assert_eq!(
+            super::delegation_status(&format!("Delegation {id} started")),
+            Some((id.as_str(), super::PeerDelegationState::Started))
+        );
         for body in [
+            format!("Delegation {id} started\n"),
+            format!("Delegation {id} Started"),
+            format!("Delegation {id} started extra"),
             format!("Delegation {id} completed"),
             format!("Delegation {id} cancel"),
             format!("Delegation {id} cancelled\n"),
@@ -640,20 +1103,26 @@ mod tests {
             matching_exchange(&question, &pending).unwrap().id,
             exchange.id
         );
-        assert!(ready_work(&pending, &HashSet::new()).is_empty());
-        assert_eq!(ready_work(&[exchange], &HashSet::new()).len(), 1);
+        assert!(ready_work(&pending, &HashMap::new()).is_empty());
+        assert_eq!(ready_work(&[exchange], &HashMap::new()).len(), 1);
         assert!(exchange_id("invalid").is_err());
     }
 
     #[test]
     fn exchanges_coalesce_but_accepted_delegation_has_priority() {
         let exchanges = vec![message(PeerKind::Exchange), message(PeerKind::Exchange)];
-        assert_eq!(ready_work(&exchanges, &HashSet::new()).len(), 2);
+        assert_eq!(ready_work(&exchanges, &HashMap::new()).len(), 2);
         let delegation = message(PeerKind::Delegation);
         let mut pending = exchanges;
         pending.push(delegation.clone());
-        assert_eq!(ready_work(&pending, &HashSet::new()).len(), 2);
-        let ready = ready_work(&pending, &HashSet::from([delegation.id.clone()]));
+        assert_eq!(ready_work(&pending, &HashMap::new()).len(), 2);
+        let ready = ready_work(
+            &pending,
+            &HashMap::from([(
+                delegation.id.clone(),
+                DelegationState::Accepted(delegation.clone()),
+            )]),
+        );
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, delegation.id);
     }
@@ -681,14 +1150,14 @@ mod tests {
         use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
         let question = message(PeerKind::Question);
         let id = exchange_id(&question.id).unwrap();
-        let mut panel = ConversationPanel::new();
-        panel.upsert_peer_exchange(
+        let panel = ConversationPanel::new();
+        panel.conversation.lock().unwrap().upsert_peer_exchange(
             id.clone(),
             question.from.clone(),
             question.body.clone(),
             None,
         );
-        panel.upsert_peer_exchange(
+        panel.conversation.lock().unwrap().upsert_peer_exchange(
             id.clone(),
             question.from.clone(),
             question.body.clone(),
@@ -704,7 +1173,7 @@ mod tests {
 
     #[test]
     fn empty_peer_inbox_is_not_work() {
-        assert!(ready_work(&[], &HashSet::new()).is_empty());
+        assert!(ready_work(&[], &HashMap::new()).is_empty());
     }
 
     #[test]

@@ -37,7 +37,7 @@ use async_openai::types::responses::{
 use std::collections::{HashMap, HashSet};
 
 /// The conversation history and turn-usage counter, free of any UI state.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Conversation {
     /// Every message in the conversation, in order. Rendered by the panel and
     /// mapped to API input items by [`Conversation::to_input_param`].
@@ -166,6 +166,86 @@ impl Conversation {
 
     pub fn add_info_string(&mut self, message: impl Into<String>) {
         self.items.push(MessageItem::Info(message.into()));
+    }
+
+    /// Update an exchange in its original slot, or append a new exchange.
+    pub fn upsert_peer_exchange(
+        &mut self,
+        id: impl Into<String>,
+        from: impl Into<String>,
+        question: impl Into<String>,
+        answer: Option<String>,
+    ) {
+        let id = id.into();
+        let index = self.items.iter().position(|item| {
+            matches!(item, MessageItem::PeerExchange { id: existing, .. } if existing == &id)
+        });
+        let item = MessageItem::PeerExchange {
+            id,
+            from: from.into(),
+            question: question.into(),
+            answer,
+        };
+        if let Some(index) = index {
+            self.items[index] = item;
+            self.mutation_version = self.mutation_version.wrapping_add(1);
+        } else {
+            self.items.push(item);
+        }
+    }
+
+    /// Update a lifecycle observation in place, preserving a known task body.
+    /// Conflicting identities/bodies and changes away from terminal states are ignored.
+    pub fn upsert_peer_delegation(
+        &mut self,
+        id: String,
+        from: String,
+        body: Option<String>,
+        state: crate::response::message_item::PeerDelegationState,
+    ) {
+        use crate::response::message_item::PeerDelegationState;
+
+        let Some(MessageItem::PeerDelegation {
+            from: saved_from,
+            body: saved_body,
+            state: saved_state,
+            ..
+        }) = self.items.iter_mut().find(|item| {
+            matches!(item, MessageItem::PeerDelegation { id: existing, .. } if existing == &id)
+        }) else {
+            self.items.push(MessageItem::PeerDelegation {
+                id,
+                from,
+                body,
+                state,
+            });
+            return;
+        };
+        if *saved_from != from
+            || body
+                .as_ref()
+                .zip(saved_body.as_ref())
+                .is_some_and(|(new_body, existing_body)| new_body != existing_body)
+        {
+            return;
+        }
+        if matches!(
+            *saved_state,
+            PeerDelegationState::Started
+                | PeerDelegationState::Rejected
+                | PeerDelegationState::Cancelled
+        ) && *saved_state != state
+        {
+            return;
+        }
+        if (body.is_none() || *saved_body == body) && *saved_state == state {
+            return;
+        }
+        if body.is_some() {
+            *saved_body = body;
+        }
+        *saved_state = state;
+        self.mutation_version = self.mutation_version.wrapping_add(1);
     }
 
     /// Insert UI-only information at a stable conversation boundary.
@@ -1126,6 +1206,154 @@ mod tests {
             format!("<!-- programmer-associated-memory-ids: [\"{MEMORY_B}\"] -->"),
         ));
         assert_eq!(conv.context_memory_ids(), HashSet::from([MEMORY_B.into()]));
+    }
+
+    #[test]
+    fn peer_exchange_updates_original_slot_and_invalidates_existing_items_only() {
+        let mut conversation = Conversation::new();
+        conversation.upsert_peer_exchange("exchange", "source", "question", None);
+        conversation.add_info_string("later");
+        conversation.upsert_peer_exchange("other", "source", "other question", None);
+        assert_eq!(conversation.mutation_version, 0);
+
+        conversation.upsert_peer_exchange(
+            "exchange",
+            "updated source",
+            "updated question",
+            Some("answer".into()),
+        );
+
+        assert_eq!(conversation.items.len(), 3);
+        assert_eq!(conversation.mutation_version, 1);
+        assert!(
+            matches!(&conversation.items[0], MessageItem::PeerExchange { id, from, question, answer }
+            if id == "exchange" && from == "updated source" && question == "updated question"
+                && answer.as_deref() == Some("answer"))
+        );
+        assert!(matches!(&conversation.items[1], MessageItem::Info(text) if text == "later"));
+        assert!(
+            matches!(&conversation.items[2], MessageItem::PeerExchange { id, .. } if id == "other")
+        );
+
+        conversation.upsert_peer_exchange("exchange", "updated source", "updated question", None);
+        assert_eq!(conversation.mutation_version, 2);
+        assert!(matches!(
+            &conversation.items[0],
+            MessageItem::PeerExchange { answer: None, .. }
+        ));
+    }
+
+    #[test]
+    fn peer_delegation_preserves_body_and_slot_across_status_updates() {
+        use crate::response::message_item::PeerDelegationState::{
+            AcceptedQueued, Pending, Started,
+        };
+
+        let mut conversation = Conversation::new();
+        conversation.upsert_peer_delegation(
+            "task".into(),
+            "source".into(),
+            Some("original task".into()),
+            Pending,
+        );
+        conversation.add_info_string("later");
+        assert_eq!(conversation.mutation_version, 0);
+
+        conversation.upsert_peer_delegation("task".into(), "source".into(), None, AcceptedQueued);
+        assert_eq!(conversation.mutation_version, 1);
+        assert_eq!(conversation.items.len(), 2);
+        assert!(
+            matches!(&conversation.items[0], MessageItem::PeerDelegation { body, state: AcceptedQueued, .. }
+            if body.as_deref() == Some("original task"))
+        );
+        assert!(matches!(&conversation.items[1], MessageItem::Info(text) if text == "later"));
+
+        for body in [None, Some("original task".into())] {
+            conversation.upsert_peer_delegation(
+                "task".into(),
+                "source".into(),
+                body,
+                AcceptedQueued,
+            );
+            assert_eq!(conversation.mutation_version, 1);
+        }
+        conversation.upsert_peer_delegation("task".into(), "source".into(), None, Started);
+        assert_eq!(conversation.mutation_version, 2);
+    }
+
+    #[test]
+    fn peer_delegation_ignores_conflicting_source_or_body() {
+        use crate::response::message_item::PeerDelegationState::{AcceptedQueued, Pending};
+
+        let mut conversation = Conversation::new();
+        conversation.upsert_peer_delegation(
+            "task".into(),
+            "source".into(),
+            Some("original task".into()),
+            Pending,
+        );
+        for (source, body) in [
+            ("other source", None),
+            ("source", Some("different task".into())),
+        ] {
+            conversation.upsert_peer_delegation("task".into(), source.into(), body, AcceptedQueued);
+        }
+        assert_eq!(conversation.mutation_version, 0);
+        assert_eq!(conversation.items.len(), 1);
+        assert!(
+            matches!(&conversation.items[0], MessageItem::PeerDelegation { from, body, state: Pending, .. }
+            if from == "source" && body.as_deref() == Some("original task"))
+        );
+    }
+
+    #[test]
+    fn peer_delegation_terminal_states_reject_transitions_but_accept_missing_body() {
+        use crate::response::message_item::PeerDelegationState::{
+            AcceptedQueued, Cancelled, Pending, Rejected, Started,
+        };
+
+        for terminal in [Started, Rejected, Cancelled] {
+            let mut conversation = Conversation::new();
+            conversation.upsert_peer_delegation("task".into(), "source".into(), None, terminal);
+            for state in [Pending, AcceptedQueued, Started, Rejected, Cancelled] {
+                if state == terminal {
+                    continue;
+                }
+                conversation.upsert_peer_delegation(
+                    "task".into(),
+                    "source".into(),
+                    Some("ignored body".into()),
+                    state,
+                );
+            }
+            assert_eq!(conversation.mutation_version, 0);
+            assert!(
+                matches!(&conversation.items[0], MessageItem::PeerDelegation { body: None, state, .. } if *state == terminal)
+            );
+
+            conversation.upsert_peer_delegation(
+                "task".into(),
+                "source".into(),
+                Some("original task".into()),
+                terminal,
+            );
+            assert_eq!(conversation.mutation_version, 1);
+            assert!(
+                matches!(&conversation.items[0], MessageItem::PeerDelegation { body, state, .. }
+                if *state == terminal && body.as_deref() == Some("original task"))
+            );
+        }
+    }
+
+    #[test]
+    fn info_insertion_clamps_out_of_bounds_index_and_invalidates_layout() {
+        let mut conversation = Conversation::new();
+        conversation.insert_info_string(usize::MAX, "first");
+        conversation.insert_info_string(usize::MAX, "last");
+        assert_eq!(conversation.mutation_version, 2);
+        assert_eq!(conversation.items.len(), 2);
+        assert!(matches!(&conversation.items[0], MessageItem::Info(text) if text == "first"));
+        assert!(matches!(&conversation.items[1], MessageItem::Info(text) if text == "last"));
     }
 
     #[test]

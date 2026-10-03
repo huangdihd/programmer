@@ -44,10 +44,21 @@ pub(crate) fn save_profile(profile: &crate::diagnostics::DiagnosticsProfile) -> 
 /// Re-run the configured checkers without blocking the TUI and update the
 /// shared sidebar snapshot when the matching result arrives.
 pub(crate) fn start_update(app: &mut App<'_>, notify_started: bool) {
-    let generation = app.diagnostics_state.lock().unwrap().begin_update();
+    let generation = app
+        .agent_loop
+        .session
+        .diagnostics_state
+        .lock()
+        .unwrap()
+        .begin_update();
     if notify_started {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_info_string("Updating diagnostics in the background…");
+        app.ui.conversation_panel.scroll_to_bottom();
     }
     let sender = app.events.sender.clone();
     tokio::spawn(async move {
@@ -69,7 +80,7 @@ pub(crate) fn start_update(app: &mut App<'_>, notify_started: bool) {
 /// [`crate::runner::DiagnosticsState`] (accessible to both the runner and the UI).
 pub(crate) fn maybe_seed_diagnostics_baseline(app: &mut App<'_>) {
     {
-        let state = app.diagnostics_state.lock().unwrap();
+        let state = app.agent_loop.session.diagnostics_state.lock().unwrap();
         if state.baseline.is_some() {
             return;
         }
@@ -77,7 +88,7 @@ pub(crate) fn maybe_seed_diagnostics_baseline(app: &mut App<'_>) {
     if !std::path::Path::new(crate::diagnostics::PROFILE_PATH).exists() {
         return;
     }
-    let state = app.diagnostics_state.clone();
+    let state = app.agent_loop.session.diagnostics_state.clone();
     let generation = state.lock().unwrap().begin_update();
     tokio::spawn(async move {
         let cwd =
@@ -90,6 +101,6 @@ pub(crate) fn maybe_seed_diagnostics_baseline(app: &mut App<'_>) {
 
 /// Forget the diagnostics baseline and edit counter in the shared state.
 pub(crate) fn reset_diagnostics_state(app: &mut App<'_>) {
-    let mut state = app.diagnostics_state.lock().unwrap();
+    let mut state = app.agent_loop.session.diagnostics_state.lock().unwrap();
     state.reset();
 }

@@ -17,7 +17,7 @@ use crate::ui::components::security_panel::SecurityPanel;
 use std::path::PathBuf;
 
 pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOutcome {
-    app.input_panel.clear();
+    app.ui.input_panel.clear();
     match command {
         Command::Model(name) => model(app, name),
         Command::Vision(arg) => vision(app, &arg),
@@ -35,22 +35,40 @@ pub(in crate::app) fn execute(app: &mut App<'_>, command: Command) -> CommandOut
 fn theme(app: &mut App<'_>, arg: &str) -> CommandOutcome {
     if !arg.trim().is_empty() {
         let Some(theme) = crate::ui::theme::Theme::parse(arg) else {
-            app.conversation_panel
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
                 .add_error_string("usage: /theme [auto|light|dark]");
+            app.ui.conversation_panel.scroll_to_bottom();
             return CommandOutcome::handled(false);
         };
         app.config.theme = theme;
         session::persist_config(app);
     }
-    app.conversation_panel
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
         .add_info_string(app.config.theme.status());
+    app.ui.conversation_panel.scroll_to_bottom();
     CommandOutcome::handled(false)
 }
 
 fn keep_retry(app: &mut App<'_>, arg: &str) -> CommandOutcome {
     match parse_keep_retry_mode(arg) {
         Ok(mode) => commands::start_keep_retry(app, mode),
-        Err(error) => app.conversation_panel.add_error_string(error),
+        Err(error) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(error);
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
     }
     CommandOutcome::handled(false)
 }
@@ -92,26 +110,43 @@ fn parse_retry_duration(value: &str) -> Result<std::time::Duration, String> {
 }
 
 fn select(app: &mut App<'_>, arg: &str) -> CommandOutcome {
-    let enabled = match selection_mode_target(app.native_selection_mode, arg) {
+    let enabled = match selection_mode_target(app.ui.native_selection_mode, arg) {
         Ok(enabled) => enabled,
         Err(error) => {
-            app.conversation_panel.add_error_string(error);
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(error);
+            app.ui.conversation_panel.scroll_to_bottom();
             return CommandOutcome::handled(false);
         }
     };
     if let Err(error) = crate::terminal::set_mouse_capture(!enabled) {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_error_string(format!("could not change terminal selection mode: {error}"));
+        app.ui.conversation_panel.scroll_to_bottom();
         return CommandOutcome::handled(false);
     }
 
-    app.native_selection_mode = enabled;
+    app.ui.native_selection_mode = enabled;
     let message = if enabled {
         "Selection mode enabled. Drag to select text and use your terminal's copy shortcut; mouse scrolling and clicks are paused. Run /select off to restore them."
     } else {
         "Selection mode disabled. Mouse scrolling and clicks are restored."
     };
-    app.conversation_panel.add_info_string(message);
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .add_info_string(message);
+    app.ui.conversation_panel.scroll_to_bottom();
     CommandOutcome::handled(false)
 }
 
@@ -129,7 +164,7 @@ fn selection_mode_target(current: bool, argument: &str) -> Result<bool, String> 
 fn permission(app: &mut App<'_>, arg: &str) -> CommandOutcome {
     let parts = arg.split_whitespace().collect::<Vec<_>>();
     if matches!(parts.as_slice(), ["manage"]) {
-        app.security_panel = Some(SecurityPanel::new());
+        app.ui.security_panel = Some(SecurityPanel::new());
         return CommandOutcome::handled(false);
     }
     if matches!(parts.first(), Some(&"profile") | Some(&"profiles")) {
@@ -141,11 +176,17 @@ fn permission(app: &mut App<'_>, arg: &str) -> CommandOutcome {
     let mut updated = app.config.security.clone();
     match update_security_config(&mut updated, arg) {
         Ok(SecurityUpdate::Show) => {
-            app.conversation_panel.add_info_string(format!(
-                "Active security profile: {}\n{}",
-                app.config.active_security_profile,
-                app.security.status_text()
-            ));
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_info_string(format!(
+                    "Active security profile: {}\n{}",
+                    app.config.active_security_profile,
+                    app.security.status_text()
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
         }
         Ok(SecurityUpdate::Changed(message)) => {
             app.config
@@ -153,19 +194,38 @@ fn permission(app: &mut App<'_>, arg: &str) -> CommandOutcome {
             match app.install_active_security() {
                 Ok(()) => {
                     session::persist_config(app);
-                    app.conversation_panel.add_info_string(format!(
-                        "{message} in profile '{}'",
-                        app.config.active_security_profile
-                    ));
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .add_info_string(format!(
+                            "{message} in profile '{}'",
+                            app.config.active_security_profile
+                        ));
+                    app.ui.conversation_panel.scroll_to_bottom();
                 }
                 Err(error) => {
                     restore_active_security(&mut app.config, previous_profile, previous_security);
-                    app.conversation_panel
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
                         .add_error_string(format!("invalid security configuration: {error}"));
+                    app.ui.conversation_panel.scroll_to_bottom();
                 }
             }
         }
-        Err(error) => app.conversation_panel.add_error_string(error),
+        Err(error) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(error);
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
     }
     CommandOutcome::handled(true)
 }
@@ -175,24 +235,55 @@ fn permission_profile(app: &mut App<'_>, args: &[&str]) -> CommandOutcome {
     let previous_security = app.config.security.clone();
     let result = update_security_profiles(&mut app.config, args);
     match result {
-        Ok(ProfileUpdate::Show(message)) => app.conversation_panel.add_info_string(message),
+        Ok(ProfileUpdate::Show(message)) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_info_string(message);
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
         Ok(ProfileUpdate::Saved(message)) => {
             session::persist_config(app);
-            app.conversation_panel.add_info_string(message);
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_info_string(message);
+            app.ui.conversation_panel.scroll_to_bottom();
         }
         Ok(ProfileUpdate::Apply(message)) => match app.install_active_security() {
             Ok(()) => {
                 session::persist_config(app);
-                app.conversation_panel.add_info_string(message);
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .add_info_string(message);
+                app.ui.conversation_panel.scroll_to_bottom();
             }
             Err(error) => {
                 restore_active_security(&mut app.config, previous_profile, previous_security);
-                app.conversation_panel
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
                     .add_error_string(format!("invalid security configuration: {error}"));
+                app.ui.conversation_panel.scroll_to_bottom();
             }
         },
         Err(error) => {
-            app.conversation_panel.add_error_string(error);
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(error);
+            app.ui.conversation_panel.scroll_to_bottom();
         }
     }
     CommandOutcome::handled(true)
@@ -455,17 +546,38 @@ fn permission_usage() -> String {
 fn model(app: &mut App<'_>, model: String) -> CommandOutcome {
     let model = model.trim().to_string();
     if model.is_empty() {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_info_string("usage: /model <provider/model> — e.g. /model openai/gpt-4o");
+        app.ui.conversation_panel.scroll_to_bottom();
         return CommandOutcome::without_history(true);
     }
 
     match switch_model(app, &model) {
         Ok(()) => {
-            app.conversation_panel
-                .add_info_string(format!("switched to model: {}", app.current_model));
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_info_string(format!(
+                    "switched to model: {}",
+                    app.agent_loop.session.current_model
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
         }
-        Err(error) => app.conversation_panel.add_error_string(error),
+        Err(error) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(error);
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
     }
     CommandOutcome::handled(true)
 }
@@ -477,7 +589,7 @@ pub(in crate::app) fn switch_model(app: &mut App<'_>, model: &str) -> Result<(),
             "unknown provider/model: {model} — use /providers to list available"
         ));
     }
-    app.current_model = model.to_string();
+    app.agent_loop.session.current_model = model.to_string();
     super::super::session::mark_dirty(app);
     Ok(())
 }
@@ -517,24 +629,40 @@ fn vision(app: &mut App<'_>, arg: &str) -> CommandOutcome {
     let Some((enabled, scope)) = (match parse_vision_args(arg) {
         Ok(setting) => setting,
         Err(error) => {
-            app.conversation_panel.add_error_string(error);
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(error);
+            app.ui.conversation_panel.scroll_to_bottom();
             return CommandOutcome::handled(true);
         }
     }) else {
-        let session_state = if app.vision_enabled { "on" } else { "off" };
+        let session_state = if app.agent_loop.session.vision_enabled {
+            "on"
+        } else {
+            "off"
+        };
         let global_state = if app.config.vision_enabled {
             "on"
         } else {
             "off"
         };
-        app.conversation_panel.add_info_string(format!(
-            "Vision is {session_state} for this session; global default is {global_state}. \
-             Usage: /vision <on|off> [global|session]"
-        ));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_info_string(format!(
+                "Vision is {session_state} for this session; global default is {global_state}. \
+         Usage: /vision <on|off> [global|session]"
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
         return CommandOutcome::handled(true);
     };
 
-    app.vision_enabled = enabled;
+    app.agent_loop.session.vision_enabled = enabled;
     session::mark_dirty(app);
     if scope == VisionScope::Global {
         app.config.vision_enabled = enabled;
@@ -546,11 +674,23 @@ fn vision(app: &mut App<'_>, arg: &str) -> CommandOutcome {
         VisionScope::Global => "for this session and by default for new sessions",
     };
     if enabled {
-        app.conversation_panel.add_info_string(format!(
-            "Vision enabled {scope_description}. Reference images with @path."
-        ));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_info_string(format!(
+                "Vision enabled {scope_description}. Reference images with @path."
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
     } else {
-        let count = app.conversation_panel.image_count();
+        let count = app
+            .agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .image_count();
         let suffix = if count == 0 {
             String::new()
         } else {
@@ -558,42 +698,74 @@ fn vision(app: &mut App<'_>, arg: &str) -> CommandOutcome {
                 " {count} stored image(s) will be omitted from future requests until vision is enabled again."
             )
         };
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_info_string(format!("Vision disabled {scope_description}.{suffix}"));
+        app.ui.conversation_panel.scroll_to_bottom();
     }
     CommandOutcome::handled(true)
 }
 
 fn mode(app: &mut App<'_>, arg: &str) -> CommandOutcome {
-    let previous = app.work_mode;
+    let previous = app.agent_loop.session.work_mode;
     match arg.trim().to_lowercase().as_str() {
-        "manual" => app.work_mode = WorkMode::Manual,
-        "auto" => app.work_mode = WorkMode::Auto,
-        "plan" => app.work_mode = WorkMode::Plan,
-        "yolo" if app.config.allow_yolo => app.work_mode = WorkMode::Yolo,
+        "manual" => app.agent_loop.session.work_mode = WorkMode::Manual,
+        "auto" => app.agent_loop.session.work_mode = WorkMode::Auto,
+        "plan" => app.agent_loop.session.work_mode = WorkMode::Plan,
+        "yolo" if app.config.allow_yolo => app.agent_loop.session.work_mode = WorkMode::Yolo,
         "yolo" => {
-            app.conversation_panel.add_error_string(
-                "YOLO mode runs every tool call unchecked and is \
-                 disabled by default — set `allow_yolo = true` in \
-                 config to enable it"
-                    .to_string(),
-            );
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(
+                    "YOLO mode runs every tool call unchecked and is \
+             disabled by default — set `allow_yolo = true` in \
+             config to enable it"
+                        .to_string(),
+                );
+            app.ui.conversation_panel.scroll_to_bottom();
             return CommandOutcome::without_history(false);
         }
-        "" => app.work_mode = app.work_mode.next(app.config.allow_yolo),
+        "" => {
+            app.agent_loop.session.work_mode =
+                app.agent_loop.session.work_mode.next(app.config.allow_yolo)
+        }
         other => {
-            app.conversation_panel.add_error_string(format!(
-                "unknown mode '{other}' — use manual, auto, plan, or yolo"
-            ));
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(format!(
+                    "unknown mode '{other}' — use manual, auto, plan, or yolo"
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
             return CommandOutcome::without_history(false);
         }
     }
-    let message = if app.work_mode == previous {
-        format!("work mode unchanged: {}", app.work_mode.label())
+    let message = if app.agent_loop.session.work_mode == previous {
+        format!(
+            "work mode unchanged: {}",
+            app.agent_loop.session.work_mode.label()
+        )
     } else {
-        format!("work mode set to: {}", app.work_mode.label())
+        format!(
+            "work mode set to: {}",
+            app.agent_loop.session.work_mode.label()
+        )
     };
-    app.conversation_panel.add_info_string(message);
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .add_info_string(message);
+    app.ui.conversation_panel.scroll_to_bottom();
     CommandOutcome::handled(true)
 }
 
@@ -601,73 +773,140 @@ fn classifier(app: &mut App<'_>, arg: &str) -> CommandOutcome {
     let parts = arg.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
         [] | ["show"] => {
-            let source = match &app.session.classifier_model_override {
+            let source = match &app.agent_loop.session.classifier_model_override {
                 crate::session::ModelOverride::Inherit => "global",
                 crate::session::ModelOverride::Current => "session: current chat model",
                 crate::session::ModelOverride::Model(_) => "session",
             };
-            app.conversation_panel.add_info_string(format!(
-                "classifier model: {} ({source})\n\
-                 classifier top logprobs: {} (global)\n\
-                 usage: /classifier <provider/model|current|default>, \
-                 /classifier logprobs <0-20|default>",
-                app.effective_classifier_model(),
-                app.config.classifier_top_logprobs
-            ));
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_info_string(format!(
+                    "classifier model: {} ({source})\n\
+             classifier top logprobs: {} (global)\n\
+             usage: /classifier <provider/model|current|default>, \
+             /classifier logprobs <0-20|default>",
+                    app.effective_classifier_model(),
+                    app.config.classifier_top_logprobs
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
         }
         ["clear" | "default" | "reset"] => {
-            app.session.classifier_model_override = crate::session::ModelOverride::Inherit;
-            app.conversation_panel
+            app.agent_loop.session.classifier_model_override =
+                crate::session::ModelOverride::Inherit;
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
                 .add_info_string("classifier model now inherits the global setting");
+            app.ui.conversation_panel.scroll_to_bottom();
             session::mark_dirty(app);
         }
         ["current"] => {
-            app.session.classifier_model_override = crate::session::ModelOverride::Current;
-            app.conversation_panel
+            app.agent_loop.session.classifier_model_override =
+                crate::session::ModelOverride::Current;
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
                 .add_info_string("classifier model set to the current chat model for this session");
+            app.ui.conversation_panel.scroll_to_bottom();
             session::mark_dirty(app);
         }
         ["logprobs" | "top-logprobs" | "top_logprobs", "default"] => {
-            app.config.classifier_top_logprobs =
-                crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS;
-            app.classifier_no_logprobs.lock().unwrap().clear();
+            app.config.classifier_top_logprobs = crate::consts::DEFAULT_CLASSIFIER_TOP_LOGPROBS;
+            app.agent_loop
+                .classifier_no_logprobs
+                .lock()
+                .unwrap()
+                .clear();
             session::persist_config(app);
-            app.conversation_panel.add_info_string(format!(
-                "global classifier top logprobs reset to {}",
-                app.config.classifier_top_logprobs
-            ));
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_info_string(format!(
+                    "global classifier top logprobs reset to {}",
+                    app.config.classifier_top_logprobs
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
         }
         ["logprobs" | "top-logprobs" | "top_logprobs", value] => {
             match parse_classifier_top_logprobs(value) {
                 Ok(top_logprobs) => {
                     app.config.classifier_top_logprobs = top_logprobs;
-                    app.classifier_no_logprobs.lock().unwrap().clear();
+                    app.agent_loop
+                        .classifier_no_logprobs
+                        .lock()
+                        .unwrap()
+                        .clear();
                     session::persist_config(app);
-                    app.conversation_panel.add_info_string(format!(
-                        "global classifier top logprobs set to {top_logprobs}"
-                    ));
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .add_info_string(format!(
+                            "global classifier top logprobs set to {top_logprobs}"
+                        ));
+                    app.ui.conversation_panel.scroll_to_bottom();
                 }
-                Err(error) => app.conversation_panel.add_error_string(error),
+                Err(error) => {
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .add_error_string(error);
+                    app.ui.conversation_panel.scroll_to_bottom();
+                }
             }
         }
-        ["logprobs" | "top-logprobs" | "top_logprobs"] => app
-            .conversation_panel
-            .add_error_string("usage: /classifier logprobs <0-20|default>".to_string()),
+        ["logprobs" | "top-logprobs" | "top_logprobs"] => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string("usage: /classifier logprobs <0-20|default>".to_string());
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
         [model] => match app.provider_manager.resolve(model) {
             Some(_) => {
-                app.session.classifier_model_override =
+                app.agent_loop.session.classifier_model_override =
                     crate::session::ModelOverride::Model((*model).to_string());
-                app.conversation_panel
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
                     .add_info_string(format!("classifier model set to {model} for this session"));
+                app.ui.conversation_panel.scroll_to_bottom();
                 session::mark_dirty(app);
             }
-            None => app.conversation_panel.add_error_string(format!(
-                "unknown provider/model: {model} — use /providers to list available"
-            )),
+            None => {
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .add_error_string(format!(
+                        "unknown provider/model: {model} — use /providers to list available"
+                    ));
+                app.ui.conversation_panel.scroll_to_bottom();
+            }
         },
-        _ => app.conversation_panel.add_error_string(
+        _ => {
+            app.agent_loop.session.conversation.lock().unwrap().add_error_string(
             "usage: /classifier [show | provider/model | current | default | logprobs <0-20|default>]",
-        ),
+        );
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
     }
     CommandOutcome::handled(true)
 }
@@ -688,27 +927,45 @@ fn parse_classifier_top_logprobs(value: &str) -> Result<u8, String> {
 fn thinking(app: &mut App<'_>, arg: &str) -> CommandOutcome {
     let arg = arg.trim();
     if arg.is_empty() {
-        app.conversation_panel.add_info_string(format!(
-            "thinking level: {}\nusage: /thinking <{}>",
-            app.thinking_level.label(),
-            ThinkingLevel::VALUES
-        ));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_info_string(format!(
+                "thinking level: {}\nusage: /thinking <{}>",
+                app.agent_loop.session.thinking_level.label(),
+                ThinkingLevel::VALUES
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
     } else if let Some(level) = ThinkingLevel::parse(arg) {
-        app.thinking_level = level;
+        app.agent_loop.session.thinking_level = level;
         let detail = if level == ThinkingLevel::Auto {
             "provider/model default; reasoning.effort is omitted"
         } else {
             "sent explicitly as reasoning.effort"
         };
-        app.conversation_panel.add_info_string(format!(
-            "thinking level set to: {} ({detail})",
-            level.label()
-        ));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_info_string(format!(
+                "thinking level set to: {} ({detail})",
+                level.label()
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
     } else {
-        app.conversation_panel.add_error_string(format!(
-            "unknown thinking level '{arg}' — use {}",
-            ThinkingLevel::VALUES
-        ));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_error_string(format!(
+                "unknown thinking level '{arg}' — use {}",
+                ThinkingLevel::VALUES
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
     }
     CommandOutcome::handled(true)
 }

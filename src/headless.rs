@@ -408,6 +408,7 @@ impl AgentSurface for CliSurface {
         }
         let event = match event {
             RunnerEvent::StreamChunk(_) | RunnerEvent::Activity(_) => return,
+            RunnerEvent::ResponseAborted { .. } => return,
             RunnerEvent::ResponseCommitted => json!({
                 "schema_version": OUTPUT_SCHEMA_VERSION,
                 "type": "response_committed",

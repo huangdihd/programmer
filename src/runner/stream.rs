@@ -82,6 +82,23 @@ pub(crate) async fn stream_with_retries(
     max_retries: u32,
     mut sink: impl FnMut(Result<ResponseStreamEvent, OpenAIError>),
 ) {
+    stream_until(client, request, cancel, retrying, max_retries, |event| {
+        sink(event);
+        std::ops::ControlFlow::Continue(())
+    })
+    .await;
+}
+
+/// Like `stream_with_retries`, but dropping the stream on a sink break does
+/// not cancel the turn or retry an already-started response.
+pub(crate) async fn stream_until(
+    client: &Client<OpenAIConfig>,
+    request: &CreateResponse,
+    cancel: &CancellationToken,
+    retrying: &AtomicBool,
+    max_retries: u32,
+    mut sink: impl FnMut(Result<ResponseStreamEvent, OpenAIError>) -> std::ops::ControlFlow<()>,
+) {
     retrying.store(false, Ordering::Relaxed);
     let mut attempt: u32 = 0;
     let stream = loop {
@@ -125,11 +142,13 @@ pub(crate) async fn stream_with_retries(
             let Some(response_stream_event) = next_event else {
                 break;
             };
-            sink(response_stream_event);
+            if sink(response_stream_event).is_break() {
+                return;
+            }
         },
         Err(openai_error) => {
             if !cancel.is_cancelled() {
-                sink(Err(openai_error));
+                let _ = sink(Err(openai_error));
             }
         }
     }

@@ -140,6 +140,46 @@ impl Store {
         result
     }
 
+    /// Recover task text from durable delegation evidence, never from status prose.
+    /// Conflicting records for an ID are ambiguous and must not select a peer.
+    pub(crate) fn delegation_for_status(
+        &self,
+        status: &PeerEnvelope,
+        id: &str,
+        incoming_cancellation: bool,
+    ) -> Result<Option<PeerEnvelope>> {
+        status.validate()?;
+        validate_uuid(id)?;
+        if status.kind != PeerKind::Status {
+            return Ok(None);
+        }
+        let mut candidates: Vec<_> = self
+            .history_events()?
+            .into_iter()
+            .map(|(_, event)| event.envelope)
+            .filter(|envelope| envelope.id == id && envelope.kind == PeerKind::Delegation)
+            .collect();
+        if candidates.is_empty() {
+            for session in [&status.from, &status.to] {
+                candidates.extend(
+                    self.pending(session)?.into_iter().filter(|envelope| {
+                        envelope.id == id && envelope.kind == PeerKind::Delegation
+                    }),
+                );
+            }
+        }
+        let Some(original) = candidates.first() else {
+            return Ok(None);
+        };
+        if candidates.iter().any(|envelope| envelope != original) {
+            return Err(format!("Conflicting durable delegation evidence for {id}"));
+        }
+        let outgoing = original.from == status.to && original.to == status.from;
+        let incoming =
+            incoming_cancellation && original.from == status.from && original.to == status.to;
+        Ok((outgoing || incoming).then(|| original.clone()))
+    }
+
     fn history_events(&self) -> Result<Vec<(String, Event)>> {
         let directory = self.root.join(".history");
         store::check_directories(&directory, false)?;

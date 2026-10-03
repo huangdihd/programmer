@@ -63,6 +63,8 @@ pub enum AppEvent {
     /// conversation: drop the live in-progress view (the committed copy renders
     /// from the conversation now). Tagged with the operation id.
     ResponseCommitted(OperationId),
+    /// Runner-owned interrupted archive; the UI only transfers display caches.
+    ResponseAborted(OperationId, usize, Vec<usize>),
     /// A `/keepretry` attempt failed and a fresh attempt will start after its delay.
     /// The front-end drops any uncommitted partial response from the failed attempt.
     KeepRetryAttempt(OperationId),
@@ -172,9 +174,10 @@ pub enum AppEvent {
     /// Background model discovery finished: apply the fresh model lists and
     /// errors to the provider manager without blocking the event loop.
     ProviderModelsRefreshed {
+        generation: u64,
         requested_providers: Vec<String>,
         models: std::collections::HashMap<String, Vec<String>>,
-        startup_errors: Vec<String>,
+        startup_errors: std::collections::HashMap<String, String>,
         notify: bool,
     },
     /// MCP server config changed (via the management panel): re-spawn the
@@ -242,6 +245,12 @@ impl std::fmt::Debug for AppEvent {
                 .field(&"..")
                 .finish(),
             Self::ResponseCommitted(id) => f.debug_tuple("ResponseCommitted").field(id).finish(),
+            Self::ResponseAborted(id, start, indices) => f
+                .debug_tuple("ResponseAborted")
+                .field(id)
+                .field(start)
+                .field(indices)
+                .finish(),
             Self::KeepRetryAttempt(id) => f.debug_tuple("KeepRetryAttempt").field(id).finish(),
             Self::RunnerActivity(id, detail) => f
                 .debug_tuple("RunnerActivity")
@@ -412,7 +421,11 @@ impl EventHandler {
         let status_tick_queued = Arc::new(AtomicBool::new(false));
         let selection_scroll_queued = Arc::new(AtomicBool::new(false));
         let _task = tokio::spawn(async move {
+            #[cfg(not(test))]
             let mut reader = crossterm::event::EventStream::new();
+            // Unit tests inject events through the channel and have no terminal reader.
+            #[cfg(test)]
+            let mut reader = futures::stream::pending::<std::io::Result<CrosstermEvent>>();
             loop {
                 let crossterm_event = reader.next().fuse();
                 tokio::select! {
@@ -534,5 +547,24 @@ impl EventHandler {
             Event::SelectionScroll => self.selection_scroll_queued.store(false, Ordering::Release),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Event, EventHandler};
+
+    #[tokio::test]
+    async fn channel_only_handler_delivers_events_and_joins_without_panicking() {
+        let mut handler = EventHandler::new();
+        tokio::task::yield_now().await;
+        assert!(!handler._task.is_finished());
+        handler.sender.send(Event::Redraw).unwrap();
+        assert!(matches!(handler.next().await.unwrap(), Event::Redraw));
+        handler.receiver.close();
+        tokio::time::timeout(std::time::Duration::from_secs(1), handler._task)
+            .await
+            .expect("event reader task should stop when the receiver closes")
+            .expect("event reader task must not panic");
     }
 }

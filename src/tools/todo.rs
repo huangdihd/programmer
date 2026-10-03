@@ -145,6 +145,37 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn listed_id_can_update_and_delete_a_ui_created_todo() {
+        let store = Mutex::new(TodoList::default());
+        let expected_id = store
+            .lock()
+            .unwrap()
+            .add("smoke item".into(), None)
+            .id
+            .clone();
+        let table = run(r#"{"action":"list"}"#, &store).await.unwrap();
+        let listed_id = table
+            .lines()
+            .nth(2)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert_eq!(listed_id, expected_id);
+
+        let update = json!({"action": "update", "id": listed_id, "status": "completed"});
+        run(&update.to_string(), &store).await.unwrap();
+        assert_eq!(
+            store.lock().unwrap().todos[0].status,
+            crate::todos::TodoStatus::Completed
+        );
+
+        let delete = json!({"action": "delete", "id": listed_id});
+        run(&delete.to_string(), &store).await.unwrap();
+        assert!(store.lock().unwrap().todos.is_empty());
+    }
+
+    #[tokio::test]
     async fn stores_are_isolated_per_session() {
         let first = Mutex::new(TodoList::default());
         let second = Mutex::new(TodoList::default());

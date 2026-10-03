@@ -22,11 +22,21 @@ pub mod ui;
 use crate::todos::TodoList;
 use crossterm::event::{KeyCode, KeyEvent};
 
-/// What the panel should do after handling a key event.
+/// Interaction intent submitted to the session owner; the panel never mutates its snapshot.
 #[derive(Debug, PartialEq)]
 pub enum PanelAction {
     None,
     Close,
+    Add {
+        title: String,
+        description: Option<String>,
+    },
+    Toggle {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
 }
 
 /// Input mode when adding a new todo.
@@ -58,6 +68,12 @@ impl TodoPanel {
         }
     }
 
+    pub(crate) fn replace_snapshot(&mut self, list: TodoList) {
+        self.list = list;
+        self.selected = self.selected.min(self.list.todos.len().saturating_sub(1));
+        self.scroll_offset = self.scroll_offset.min(self.selected);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> PanelAction {
         match &mut self.add_mode {
             AddMode::Title { input } => match key.code {
@@ -86,9 +102,12 @@ impl TodoPanel {
             AddMode::Description { title, input } => match key.code {
                 KeyCode::Esc => {
                     let title = std::mem::take(title);
-                    self.list.add(title, None);
-                    self.selected = self.list.todos.len().saturating_sub(1);
+                    self.selected = self.list.todos.len();
                     self.add_mode = AddMode::Hidden;
+                    return PanelAction::Add {
+                        title,
+                        description: None,
+                    };
                 }
                 KeyCode::Enter => {
                     let title = std::mem::take(title);
@@ -97,9 +116,12 @@ impl TodoPanel {
                     } else {
                         Some(std::mem::take(input))
                     };
-                    self.list.add(title, desc);
-                    self.selected = self.list.todos.len().saturating_sub(1);
+                    self.selected = self.list.todos.len();
                     self.add_mode = AddMode::Hidden;
+                    return PanelAction::Add {
+                        title,
+                        description: desc,
+                    };
                 }
                 KeyCode::Backspace => {
                     input.pop();
@@ -129,16 +151,16 @@ impl TodoPanel {
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     if let Some(todo) = self.list.todos.get(self.selected) {
                         let id = todo.id.clone();
-                        let _ = self.list.toggle_status(&id);
+                        return PanelAction::Toggle { id };
                     }
                 }
                 KeyCode::Char('d') => {
-                    if !self.list.todos.is_empty() {
-                        let id = self.list.todos[self.selected].id.clone();
-                        let _ = self.list.delete(&id);
-                        if self.selected >= self.list.todos.len() && self.selected > 0 {
+                    if let Some(todo) = self.list.todos.get(self.selected) {
+                        let id = todo.id.clone();
+                        if self.selected + 1 >= self.list.todos.len() && self.selected > 0 {
                             self.selected -= 1;
                         }
+                        return PanelAction::Delete { id };
                     }
                 }
                 KeyCode::Char('a') => {
@@ -163,5 +185,63 @@ impl TodoPanel {
             }
             _ => 5,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn shrinking_snapshot_keeps_selection_and_deletion_in_bounds() {
+        let mut list = TodoList::default();
+        for title in ["first", "second", "third"] {
+            list.add(title.into(), None);
+        }
+        let mut panel = TodoPanel::new(list.clone());
+        panel.handle_key(key(KeyCode::Down));
+        panel.handle_key(key(KeyCode::Down));
+        list.todos.truncate(1);
+        let id = list.todos[0].id.clone();
+        panel.replace_snapshot(list);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char('d'))),
+            PanelAction::Delete { id }
+        );
+        panel.replace_snapshot(TodoList::default());
+        assert_eq!(panel.handle_key(key(KeyCode::Char('d'))), PanelAction::None);
+    }
+
+    #[test]
+    fn editing_emits_intent_without_mutating_the_snapshot() {
+        let mut list = TodoList::default();
+        list.add("existing".into(), None);
+        let id = list.todos[0].id.clone();
+        let mut panel = TodoPanel::new(list);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter)),
+            PanelAction::Toggle { id: id.clone() }
+        );
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char('d'))),
+            PanelAction::Delete { id }
+        );
+        assert_eq!(panel.list.todos.len(), 1);
+        panel.handle_key(key(KeyCode::Char('a')));
+        panel.handle_key(key(KeyCode::Char('N')));
+        panel.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Esc)),
+            PanelAction::Add {
+                title: "N".into(),
+                description: None
+            }
+        );
+        assert_eq!(panel.list.todos.len(), 1);
     }
 }

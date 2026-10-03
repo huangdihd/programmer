@@ -176,9 +176,10 @@ session a question, search saved conversation content, or delegate work:
   explanation. The same entry updates through **pending**, **accepted · queued**,
   **started**, **rejected**, or **cancelled**; expand it for the source and full task. Started
   is not completed. Reopening a still-pending inbox asks for consent again and
-  resets the display to pending. Source-side accepted/rejected notifications use
-  the original delegation ID; when task text is unavailable, it is labelled as
-  unavailable rather than reconstructed. These UI records are excluded from
+  resets the display to pending. Source-side accepted/rejected/started notifications
+  recover the original task from durable delegation history (or its pending envelope),
+  matching the original ID and both sessions. Unmatched notices remain informational;
+  statuses never grant execution permission or infer completion. These UI records are excluded from
   model context (the existing untrusted developer wrappers remain separate).
 - Delegation consent uses a compact bottom panel, defaulting to **No**.
   Use **Left/Right** then **Enter**, or **Esc** to reject. **D** expands the
@@ -398,6 +399,18 @@ implement only part of the protocol.
 | Response usage with `input_tokens` | Optional. Without it, `/usage` may be incomplete and token-triggered automatic compaction will not run; manual `/compact` still works. |
 | Image input in the Responses format | Optional. Keep `/vision off` when the selected model or provider does not accept image content. |
 | Output logprobs | Optional for chat, but used by the Auto classifier's fast probe. Missing or inconclusive logprobs fall back to the full classifier pass. Provider-specific limits may require a lower global `classifier_top_logprobs` value. |
+
+### Tool argument generation failures
+
+Programmer stops a response if tool arguments develop a long exact repetitive
+suffix (16 KiB, repeating units up to 1 KiB), or exceed 8 MiB in aggregate.
+No tools from that response execute. When call identities are unambiguous,
+Programmer records paired tool failures with sanitized empty arguments and lets
+the model correct them through the normal agent loop; the generated garbage is
+not returned to the model. Missing or ambiguous identities fail the response
+instead. Three consecutive generation-limit failures stop the turn.
+Legitimate highly repetitive or oversized payloads may also hit these limits;
+split such changes into smaller calls.
 
 ### DeepSeek official API
 
@@ -640,16 +653,18 @@ Embedded task terminals retain their own ANSI colors.
 | `/terminal [id]` | Open a running or completed task's terminal viewer |
 | `/terminal clear` | Remove completed, failed, and killed tasks |
 | `/usage` | Show cumulative token usage and the latest model request's input-token count |
-| `/new` `/n` | Start a new session (auto-saves current) |
+| `/new` `/n` | Stop and await the current session's work, save it, then start a new session |
 | `/session` `/s` | Show current session UUID and info |
 | `/session graph` | Read-only cross-session question/delegation graph, timeline, and details |
 | `/title [text]` | Regenerate the current session title, or set it manually when text is provided |
 | `/providers show` | List all configured providers and models |
 | `/providers manage` | Open the provider management panel |
 | `/providers refresh [provider]` | Refetch auto-discovered model lists (optionally for one provider) |
-| `/clear` `/c` | Delete the current session and reset its chat, todos, images, and diagnostics |
+| `/clear` `/c` | Delete the current session and reset its chat, todos, images, and diagnostics (refused while a turn is active) |
 | `/quit` `/q` | Exit the application |
 | `/help` `/?` | Show all commands |
+
+Session switches, `/clear`, and TUI exit stop and await session-owned tasks and sub-agents. `/clear` refuses an active foreground turn; when idle, it also closes background work before resetting session resources. A failed shutdown or save is reported; `/new` does not silently replace the old session, and stopped sessions cannot accept new execution until the transition is retried successfully. **Esc remains turn-local**: it cancels the current request, then queued work resumes when drafts and approvals permit it.
 
 Memory is stored as inspectable Markdown under the platform config directory:
 global memories use `programmer/memory/global/`, and project memories use
@@ -704,6 +719,13 @@ returned, so a manual recall counts toward a memory's freshness exactly like an
 automatic one. `memory list`, `update`, and `forget` behave as before, except
 that `list` also shows each entry's age.
 
+Session replacement (`/new` or a rewind fork) first stops and joins the source
+session's work, then saves it before switching identities. If closing or saving
+fails, that session remains stopped: no user, notification, peer, init, or retry
+turn can start. Use `/new` to retry, or quit. Ordinary Esc only cancels the current
+turn; it does not close the session. Rewind forks use fresh task/agent registries,
+conversation storage, and todo storage; background work is not transferred.
+
 ### Background consolidation (Dream)
 
 Dream is the part of memory that works while you are not looking at it: it reads
@@ -748,7 +770,12 @@ from the `memory` tool the model can call, so an agent can neither inspect the
 queue nor trigger consolidation — and a hand-written tool call naming it is
 refused. A pass that is
 cancelled, times out, or loses its provider keeps its pending sessions for the
-next attempt and records the reason in the status line. All passes take one
+next attempt and records the reason in the status line. New planning failures
+include the available underlying error chain in the audit and error output;
+HTTP connection failures, client timeouts, and response-body failures are labeled
+separately. Request URLs are omitted from HTTP errors to avoid exposing URL
+credentials. Earlier audits cannot recover causes that were not recorded.
+All passes take one
 cross-process lock over the memory root, so two Programmer instances, or an
 explicit `apply` racing the background worker, can never interleave their writes;
 memory files and their `MEMORY.md` index are still replaced atomically through a

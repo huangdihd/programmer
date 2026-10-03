@@ -56,10 +56,49 @@ impl std::fmt::Debug for TaskManager {
 
 struct TaskManagerState {
     registry: Mutex<Vec<TaskEntry>>,
+    lifecycle: Mutex<TaskManagerLifecycle>,
     event_sink: Mutex<Option<tokio::sync::mpsc::UnboundedSender<TaskLifecycleEvent>>>,
     next_id: AtomicU64,
     next_event_sequence: AtomicU64,
     generation: AtomicU64,
+}
+
+// Independent of the UI registry: kill_all/clear_finished must not detach workers.
+#[derive(Default)]
+struct TaskManagerLifecycle {
+    closed: bool,
+    workers: Vec<TaskWorker>,
+    failures: Vec<String>,
+}
+
+enum TaskWorker {
+    Async(tokio::task::JoinHandle<Result<(), String>>),
+    Thread(std::thread::JoinHandle<Result<(), String>>),
+}
+
+impl TaskWorker {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Async(worker) => worker.is_finished(),
+            Self::Thread(worker) => worker.is_finished(),
+        }
+    }
+
+    // Called only after is_finished; never blocks the runtime on a live worker.
+    fn join(self) -> Result<(), String> {
+        match self {
+            Self::Async(worker) => {
+                use futures::FutureExt;
+                worker
+                    .now_or_never()
+                    .expect("finished worker is ready")
+                    .map_err(|error| format!("task worker failed: {error}"))?
+            }
+            Self::Thread(worker) => worker
+                .join()
+                .map_err(|_| "task worker panicked".to_string())?,
+        }
+    }
 }
 
 impl Default for TaskManager {
@@ -67,6 +106,7 @@ impl Default for TaskManager {
         Self {
             state: Arc::new(TaskManagerState {
                 registry: Mutex::new(Vec::new()),
+                lifecycle: Mutex::new(TaskManagerLifecycle::default()),
                 event_sink: Mutex::new(None),
                 next_id: AtomicU64::new(1),
                 next_event_sequence: AtomicU64::new(1),
@@ -482,6 +522,10 @@ impl TaskManager {
         keep_stdin_open: bool,
         security: Option<&crate::security::SecurityManager>,
     ) -> Result<u64, String> {
+        let mut lifecycle = self.state.lifecycle.lock().unwrap();
+        if lifecycle.closed {
+            return Err("error: task manager is shut down".to_string());
+        }
         let sandbox = security
             .map(|security| security.sandbox_invocation(command, dir))
             .transpose()?
@@ -541,10 +585,11 @@ impl TaskManager {
         // `write_stdin` stays synchronous (no lock held across an await). When the
         // channel closes — `eof`, task finish, or a write error — stdin drops and
         // the child sees EOF.
+        let mut stdin_worker = None;
         let stdin_tx = if keep_stdin_open {
             let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let child_stdin = child.stdin.take();
-            tokio::spawn(async move {
+            stdin_worker = Some(tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 let Some(mut stdin) = child_stdin else {
                     return;
@@ -556,7 +601,7 @@ impl TaskManager {
                         break;
                     }
                 }
-            });
+            }));
             Some(stdin_tx)
         } else {
             None
@@ -605,35 +650,56 @@ impl TaskManager {
         let out_task = tokio::spawn(self.clone().drain_stream(child.stdout.take(), id, false));
         let err_task = tokio::spawn(self.clone().drain_stream(child.stderr.take(), id, true));
         let manager = self.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                result = child.wait() => {
-                    // Flush whatever is still buffered in the pipes before
-                    // marking the task finished.
-                    let _ = tokio::join!(out_task, err_task);
-                    let (status, code) = match result {
-                        Ok(exit) => {
-                            let code = exit.code();
-                            if exit.success() {
-                                (TaskStatus::Completed, code)
-                            } else {
-                                (TaskStatus::Failed, code)
-                            }
-                        }
-                        Err(e) => {
-                            manager.append_output(id, &format!("\n[task error: {e}]"));
-                            (TaskStatus::Failed, None)
-                        }
-                    };
-                    manager.finish(id, status, code);
-                }
-                _ = kill_rx => {
-                    kill_process_tree(&mut child).await;
-                    let _ = tokio::join!(out_task, err_task);
-                    manager.finish(id, TaskStatus::Killed, None);
-                }
-            }
+        let process_id = child.id();
+        let worker = tokio::spawn(async move {
+            let mut kill_rx = kill_rx;
+            let mut killed = false;
+            let result = tokio::select! {
+                result = child.wait() => result,
+                _ = &mut kill_rx => {
+                    killed = true;
+                    kill_process_tree(&mut child, process_id).await;
+                    child.wait().await
+                },
+            };
+            // Keep the kill receiver live after shell exit: descendants may
+            // still own pipes. Pin the join so cancellation cannot lose a result.
+            let drains = async { tokio::join!(out_task, err_task) };
+            tokio::pin!(drains);
+            let (stdout, stderr) = tokio::select! {
+                drained = &mut drains => drained,
+                _ = &mut kill_rx, if !killed => {
+                    killed = true;
+                    kill_process_tree(&mut child, process_id).await;
+                    drains.await
+                },
+            };
+            let status = if killed {
+                TaskStatus::Killed
+            } else if result.as_ref().is_ok_and(|exit| exit.success()) {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Failed
+            };
+            manager.finish(
+                id,
+                status,
+                result.as_ref().ok().and_then(|exit| exit.code()),
+            );
+            let stdin_result = if let Some(stdin_worker) = stdin_worker {
+                stdin_worker
+                    .await
+                    .map_err(|error| format!("task {id} stdin failed: {error}"))
+            } else {
+                Ok(())
+            };
+            result.map_err(|error| format!("task {id} wait failed: {error}"))?;
+            stdout
+                .and(stderr)
+                .map_err(|error| format!("task {id} drain failed: {error}"))?;
+            stdin_result
         });
+        lifecycle.workers.push(TaskWorker::Async(worker));
 
         Ok(id)
     }
@@ -693,9 +759,9 @@ impl TaskManager {
     }
 }
 
-async fn kill_process_tree(child: &mut tokio::process::Child) {
+async fn kill_process_tree(child: &mut tokio::process::Child, process_id: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = process_id {
         unsafe extern "C" {
             fn kill(pid: i32, signal: i32) -> i32;
         }
@@ -707,7 +773,7 @@ async fn kill_process_tree(child: &mut tokio::process::Child) {
     }
 
     #[cfg(windows)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = process_id {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let pid = pid.to_string();
         let _ = tokio::process::Command::new("taskkill")
@@ -841,6 +907,10 @@ impl TaskManager {
         origin: TaskOrigin,
         security: Option<&crate::security::SecurityManager>,
     ) -> Result<u64, String> {
+        let mut lifecycle = self.state.lifecycle.lock().unwrap();
+        if lifecycle.closed {
+            return Err("error: task manager is shut down".to_string());
+        }
         #[cfg(windows)]
         harden_dll_search();
         let pty_system = native_pty_system();
@@ -880,14 +950,6 @@ impl TaskManager {
             cmd
         };
 
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("error: failed to spawn task: {e}"))?;
-        // The parent doesn't need the slave once the child owns it.
-        drop(pair.slave);
-
-        let killer = child.clone_killer();
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -896,6 +958,14 @@ impl TaskManager {
             .master
             .take_writer()
             .map_err(|e| format!("error: failed to write pty: {e}"))?;
+        let mut child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| format!("error: failed to spawn task: {e}"))?;
+        // The parent doesn't need the slave once the child owns it.
+        drop(pair.slave);
+
+        let killer = child.clone_killer();
         let writer = Arc::new(Mutex::new(writer));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, PTY_SCROLLBACK)));
         let killed = Arc::new(AtomicBool::new(false));
@@ -949,8 +1019,7 @@ impl TaskManager {
         // (`ESC[6n`) are answered here from the vt100 grid. Windows ConPTY makes
         // this load-bearing: it is created with INHERIT_CURSOR and blocks the
         // child's startup on exactly that query until a report arrives.
-        let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
-        {
+        let reader_worker = {
             let parser = Arc::clone(&parser);
             let writer = Arc::clone(&writer);
             let manager = self.clone();
@@ -990,16 +1059,17 @@ impl TaskManager {
                         }
                     }
                 }
-                let _ = reader_done_tx.send(());
-            });
-        }
+                Ok(())
+            })
+        };
 
         // Waiter thread: record the exit status when the child finishes.
         {
             let killed = Arc::clone(&killed);
             let manager = self.clone();
-            std::thread::spawn(move || {
-                let (status, code) = match child.wait() {
+            let worker = std::thread::spawn(move || {
+                let result = child.wait();
+                let (status, code) = match &result {
                     _ if killed.load(Ordering::Relaxed) => (TaskStatus::Killed, None),
                     Ok(exit) => {
                         let code = exit.exit_code() as i32;
@@ -1013,9 +1083,14 @@ impl TaskManager {
                 };
                 // PTY output is read on a separate blocking thread. Wait for EOF so
                 // the lifecycle event includes the final screen/transcript tail.
-                let _ = reader_done_rx.recv_timeout(Duration::from_secs(1));
+                let drained = reader_worker
+                    .join()
+                    .map_err(|_| format!("task {id} PTY reader panicked"))?;
                 manager.finish(id, status, code);
+                result.map_err(|error| format!("task {id} PTY wait failed: {error}"))?;
+                drained
             });
+            lifecycle.workers.push(TaskWorker::Thread(worker));
         }
 
         Ok(id)
@@ -1456,6 +1531,7 @@ impl TaskManager {
     /// Kill every running task and clear the registry so the next session starts
     /// clean.
     pub fn kill_all(&self) -> usize {
+        let _lifecycle = self.state.lifecycle.lock().unwrap();
         self.state.generation.fetch_add(1, Ordering::Relaxed);
         let mut reg = self.state.registry.lock().unwrap();
         let mut count = 0;
@@ -1475,6 +1551,62 @@ impl TaskManager {
         }
         reg.clear();
         count
+    }
+
+    /// Permanently close admission, kill active processes, and join every worker,
+    /// including workers removed from the visible registry by `kill_all`.
+    /// Timeout/cancellation leaves ownership intact; callers may retry. A new
+    /// session must use a new manager. This is not single-command cancellation.
+    pub async fn shutdown(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                // Spawn holds this lock through worker registration, so no child
+                // can fall between the admission gate and the shutdown snapshot.
+                let mut lifecycle = self.state.lifecycle.lock().unwrap();
+                lifecycle.closed = true;
+                let mut registry = self.state.registry.lock().unwrap();
+                for entry in registry.iter_mut() {
+                    if entry.status != TaskStatus::Running {
+                        continue;
+                    }
+                    entry.stdin_tx = None;
+                    if let Some(pty) = entry.pty.as_mut() {
+                        pty.killed.store(true, Ordering::Relaxed);
+                        if let Err(error) = pty.killer.kill() {
+                            return Err(format!(
+                                "error: task {} PTY kill failed: {error}",
+                                entry.id
+                            ));
+                        }
+                    } else if let Some(kill) = entry.kill.take() {
+                        let _ = kill.send(());
+                    }
+                }
+                drop(registry);
+                let mut index = 0;
+                while index < lifecycle.workers.len() {
+                    if !lifecycle.workers[index].is_finished() {
+                        index += 1;
+                        continue;
+                    }
+                    if let Err(error) = lifecycle.workers.swap_remove(index).join() {
+                        lifecycle.failures.push(error);
+                    }
+                }
+                if lifecycle.workers.is_empty() {
+                    return if lifecycle.failures.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(lifecycle.failures.join("; "))
+                    };
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("error: task shutdown timed out; workers are still pending".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Wait until the task finishes or `timeout` elapses. Returns the final

@@ -703,6 +703,10 @@ impl PartialResponse {
         self.render_revision
     }
 
+    pub(crate) fn take_finish_reason(&mut self) -> Option<ResponseFinishReason> {
+        self.finish_reason.take()
+    }
+
     pub fn into_parts(self) -> (Option<ResponseFinishReason>, Vec<OutputItem>) {
         let PartialResponse {
             items,

@@ -1,3 +1,23 @@
+### programmer v0.2.23
+
+- Separate UI, execution-loop, and session ownership; preserve interrupted
+  responses and isolate task, agent, todo, and checkpoint state across sessions.
+- Seal, cancel, and join session work before replacement or shutdown; retain
+  retryable state on close/save failures without stranding queued input.
+- Keep in-flight MCP connection snapshots valid during reload and reject stale
+  provider refresh results, including outdated errors and notification counts.
+- Recover delegated task text from durable identity-checked evidence and return
+  Started status to the source without inferring completion or persisting consent.
+- Return full Todo IDs and distinguish cancelled approvals from classifier denials.
+- Stop runaway tool-argument generation before execution, return sanitized paired
+  tool failures through the normal agent loop, and bound consecutive failures.
+- Expand protocol, lifecycle, shutdown, persistence, and local MCP regressions;
+  document actual TUI/process boundary acceptance and current ownership diagrams.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.22...v0.2.23
+
+---
+
 ### programmer v0.2.22
 
 - Add browsable Dream audits with source excerpts, inline before/after changes,

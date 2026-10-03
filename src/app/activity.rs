@@ -18,10 +18,35 @@ use crate::ui::components::activity_panel::{
     ActivityAction, ActivityEntry, ActivityEntryKind, ActivityMode, ActivityPanel,
     DreamPresentation, DreamStatusTone, GraphEventStatus, GraphStatusTone,
 };
-use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
 use crate::ui::markdown_theme::palette;
 
-pub(crate) struct ActivityView {
+pub(crate) struct ActivityPage {
+    browser_state: ActivityBrowserState,
+    pub(crate) panel: ActivityPanel,
+}
+
+impl ActivityPage {
+    pub(crate) fn new(
+        mode: ActivityMode,
+        session_only: bool,
+        center: String,
+        panel: ActivityPanel,
+    ) -> Self {
+        Self {
+            browser_state: ActivityBrowserState {
+                mode,
+                session_only,
+                center,
+                last_refresh: Instant::now(),
+                session_labels: BTreeMap::new(),
+                session_details: BTreeMap::new(),
+            },
+            panel,
+        }
+    }
+}
+
+pub(crate) struct ActivityBrowserState {
     mode: ActivityMode,
     session_only: bool,
     center: String,
@@ -44,41 +69,34 @@ fn open(app: &mut App<'_>, mode: ActivityMode, session_only: bool) {
         ActivityMode::Dream => "Dream history · current workspace",
         ActivityMode::SessionGraph => "Session graph · direct relationships",
     };
-    app.activity_view = Some(ActivityView {
+    app.ui.activity_page = Some(ActivityPage::new(
         mode,
         session_only,
-        center: app.session.uuid.clone(),
-        last_refresh: Instant::now(),
-        session_labels: BTreeMap::new(),
-        session_details: BTreeMap::new(),
-    });
-    app.activity_panel = Some(ActivityPanel::new(
-        title.into(),
-        mode,
-        app.session.uuid.clone(),
-        Vec::new(),
+        app.agent_loop.session.uuid.clone(),
+        ActivityPanel::new(
+            title.into(),
+            mode,
+            app.agent_loop.session.uuid.clone(),
+            Vec::new(),
+        ),
     ));
     refresh(app);
 }
 
 pub(crate) fn tick(app: &mut App<'_>) {
-    if app
-        .activity_panel
-        .as_ref()
-        .is_some_and(|panel| !panel.is_confirming())
-        && app
-            .activity_view
-            .as_ref()
-            .is_some_and(|view| view.last_refresh.elapsed() >= Duration::from_secs(2))
-    {
+    if app.ui.activity_page.as_ref().is_some_and(|page| {
+        !page.panel.is_confirming()
+            && page.browser_state.last_refresh.elapsed() >= Duration::from_secs(2)
+    }) {
         refresh(app);
     }
 }
 
 fn refresh(app: &mut App<'_>) {
-    let Some(view) = app.activity_view.as_mut() else {
+    let Some(page) = app.ui.activity_page.as_mut() else {
         return;
     };
+    let view = &mut page.browser_state;
     view.last_refresh = Instant::now();
     let mut kinds = BTreeMap::new();
     let mut record_metadata = BTreeMap::new();
@@ -95,7 +113,7 @@ fn refresh(app: &mut App<'_>) {
                             || record
                                 .sources
                                 .iter()
-                                .any(|source| source.session_id == app.session.uuid)
+                                .any(|source| source.session_id == app.agent_loop.session.uuid)
                     })
                     .map(|record| {
                         dream_presentations
@@ -107,38 +125,37 @@ fn refresh(app: &mut App<'_>) {
         }
         ActivityMode::SessionGraph => load_graph_entries(
             view,
-            &app.session.uuid,
-            &app.conversation_panel,
+            &app.agent_loop.session.uuid,
+            &app.agent_loop.session.conversation,
             &mut kinds,
             &mut record_metadata,
             &mut statuses,
         ),
     };
-    if let Some(panel) = app.activity_panel.as_mut() {
-        match result {
-            Ok(entries) => {
-                panel.replace_entries(entries);
-                panel.set_entry_kinds(kinds);
-                panel.set_session_labels(view.session_labels.clone());
-                panel.set_graph_record_metadata(record_metadata);
-                panel.set_graph_statuses(statuses);
-                panel.set_dream_presentations(dream_presentations);
-            }
-            Err(error) => panel.show_notice(format!("Unable to refresh activity: {error}")),
+    let panel = &mut page.panel;
+    match result {
+        Ok(entries) => {
+            panel.replace_entries(entries);
+            panel.set_entry_kinds(kinds);
+            panel.set_session_labels(view.session_labels.clone());
+            panel.set_graph_record_metadata(record_metadata);
+            panel.set_graph_statuses(statuses);
+            panel.set_dream_presentations(dream_presentations);
         }
+        Err(error) => panel.show_notice(format!("Unable to refresh activity: {error}")),
     }
 }
 
 fn load_graph_entries(
-    view: &mut ActivityView,
+    view: &mut ActivityBrowserState,
     current_session_id: &str,
-    conversation_panel: &ConversationPanel,
+    conversation: &std::sync::Mutex<crate::conversation::Conversation>,
     kinds: &mut BTreeMap<String, ActivityEntryKind>,
     record_metadata: &mut BTreeMap<String, String>,
     statuses: &mut BTreeMap<String, GraphEventStatus>,
 ) -> Result<Vec<ActivityEntry>, String> {
     let items = if view.center == current_session_id {
-        conversation_panel.items_snapshot()
+        conversation.lock().unwrap().items.clone()
     } else {
         let manager =
             SessionManager::new().ok_or_else(|| "Session store unavailable".to_string())?;
@@ -182,7 +199,7 @@ fn load_graph_entries(
     Ok(entries)
 }
 
-fn cache_session_metadata(view: &mut ActivityView, id: &str) {
+fn cache_session_metadata(view: &mut ActivityBrowserState, id: &str) {
     if view.session_labels.contains_key(id) {
         return;
     }
@@ -216,7 +233,7 @@ fn cache_session_metadata(view: &mut ActivityView, id: &str) {
 }
 
 pub(crate) fn handle_key(app: &mut App<'_>, key: KeyEvent) {
-    let Some(panel) = app.activity_panel.as_mut() else {
+    let Some(panel) = app.ui.activity_page.as_mut().map(|page| &mut page.panel) else {
         return;
     };
     let action = panel.handle_key(key);
@@ -224,7 +241,7 @@ pub(crate) fn handle_key(app: &mut App<'_>, key: KeyEvent) {
 }
 
 pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: crossterm::event::MouseEvent) {
-    let Some(panel) = app.activity_panel.as_mut() else {
+    let Some(panel) = app.ui.activity_page.as_mut().map(|page| &mut page.panel) else {
         return;
     };
     let action = panel.handle_mouse(mouse);
@@ -235,8 +252,7 @@ fn handle_action(app: &mut App<'_>, action: ActivityAction) {
     match action {
         ActivityAction::None => {}
         ActivityAction::Close => {
-            app.activity_panel = None;
-            app.activity_view = None;
+            app.ui.activity_page = None;
         }
         ActivityAction::Refresh => refresh(app),
         ActivityAction::FocusSession(center) => {
@@ -244,19 +260,16 @@ fn handle_action(app: &mut App<'_>, action: ActivityAction) {
                 show_error(app, error);
                 return;
             }
-            app.activity_view = Some(ActivityView {
-                mode: ActivityMode::SessionGraph,
-                session_only: false,
-                center: center.clone(),
-                last_refresh: Instant::now(),
-                session_labels: BTreeMap::new(),
-                session_details: BTreeMap::new(),
-            });
-            app.activity_panel = Some(ActivityPanel::new(
-                "Session graph · re-centered (does not activate session)".into(),
+            app.ui.activity_page = Some(ActivityPage::new(
                 ActivityMode::SessionGraph,
-                center,
-                Vec::new(),
+                false,
+                center.clone(),
+                ActivityPanel::new(
+                    "Session graph · re-centered (does not activate session)".into(),
+                    ActivityMode::SessionGraph,
+                    center,
+                    Vec::new(),
+                ),
             ));
             refresh(app);
         }
@@ -274,7 +287,7 @@ fn handle_action(app: &mut App<'_>, action: ActivityAction) {
             });
             match result {
                 Ok(details) => {
-                    if let Some(panel) = app.activity_panel.as_mut() {
+                    if let Some(panel) = app.ui.activity_page.as_mut().map(|page| &mut page.panel) {
                         panel.show_rollback_confirmation(id, details);
                     }
                 }
@@ -286,9 +299,15 @@ fn handle_action(app: &mut App<'_>, action: ActivityAction) {
                 .and_then(|manager| manager.dream_rollback(&id));
             match result {
                 Ok(_) => {
-                    app.conversation_panel.add_info_string(format!(
-                        "Dream run {id} rolled back; source transcripts were not requeued."
-                    ));
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .add_info_string(format!(
+                            "Dream run {id} rolled back; source transcripts were not requeued."
+                        ));
+                    app.ui.conversation_panel.scroll_to_bottom();
                     refresh(app);
                 }
                 Err(error) => show_error(app, error),
@@ -298,8 +317,14 @@ fn handle_action(app: &mut App<'_>, action: ActivityAction) {
 }
 
 fn show_error(app: &mut App<'_>, error: String) {
-    app.conversation_panel.add_warning_string(error.clone());
-    if let Some(panel) = app.activity_panel.as_mut() {
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .add_warning_string(error.clone());
+    app.ui.conversation_panel.scroll_to_bottom();
+    if let Some(panel) = app.ui.activity_page.as_mut().map(|page| &mut page.panel) {
         panel.show_notice(error);
     }
 }

@@ -261,6 +261,103 @@ async fn http_client_echo_roundtrip() {
 }
 
 #[tokio::test]
+async fn runtime_reload_preserves_live_snapshot_and_rejects_stale_connections() {
+    use super::runtime::McpRuntime;
+    use std::sync::Arc;
+
+    // Abort listeners even on assertion failure; connection tasks belong to this
+    // test's Tokio runtime and terminate when it is dropped.
+    struct TestServers(Vec<tokio::task::JoinHandle<()>>);
+    impl Drop for TestServers {
+        fn drop(&mut self) {
+            for server in &self.0 {
+                server.abort();
+            }
+        }
+    }
+
+    async fn assert_echo(manager: &McpManager, server: &str, text: &str) {
+        let result = manager
+            .call_tool(
+                &format!("mcp__{server}__echo"),
+                serde_json::json!({"text": text}),
+            )
+            .await
+            .expect("snapshot must retain a working MCP connection");
+        assert!(matches!(
+            result.content.as_slice(),
+            [types::ToolContent::Text { text: actual }] if actual == &format!("echo: {text}")
+        ));
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (old_url, old_server) = spawn_mock_http_server().await;
+        let (new_url, new_server) = spawn_mock_http_server().await;
+        let _servers = TestServers(vec![old_server, new_server]);
+        let configuration = |name: &str, url| McpServerConfig {
+            name: name.to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some(url),
+        };
+        let old_configuration = [configuration("old", old_url)];
+        let new_configuration = [configuration("new", new_url)];
+        let mut runtime = McpRuntime::default();
+        let first_generation = runtime.begin_reload(&old_configuration);
+        let old_manager = McpManager::from_config(&old_configuration, ".").await;
+        assert_eq!(
+            runtime.finish_reload(first_generation, old_manager),
+            Some(Vec::new())
+        );
+        let old_snapshot = runtime.connections().unwrap().clone();
+        assert_echo(&old_snapshot, "old", "before reload").await;
+
+        // Model an overlapping reload whose completion arrives too late.
+        let stale_generation = runtime.begin_reload(&old_configuration);
+        assert!(runtime.connections().is_none());
+        assert_echo(&old_snapshot, "old", "during reload").await;
+        let stale_manager = McpManager::from_config(&old_configuration, ".").await;
+        assert!(stale_manager.startup_errors.is_empty());
+        assert_echo(&stale_manager, "old", "stale connection is live").await;
+
+        let new_generation = runtime.begin_reload(&new_configuration);
+        let new_manager = McpManager::from_config(&new_configuration, ".").await;
+        assert_eq!(
+            runtime.finish_reload(new_generation, new_manager),
+            Some(Vec::new())
+        );
+        let new_snapshot = runtime.connections().unwrap().clone();
+        assert!(!Arc::ptr_eq(&old_snapshot, &new_snapshot));
+        assert_echo(&new_snapshot, "new", "after reload").await;
+        assert_echo(&old_snapshot, "old", "after reload").await;
+        assert!(
+            new_snapshot
+                .call_tool("mcp__old__echo", serde_json::json!({}))
+                .await
+                .is_err(),
+            "new turns must not retain the removed server"
+        );
+
+        assert!(
+            runtime
+                .finish_reload(stale_generation, stale_manager)
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(runtime.connections().unwrap(), &new_snapshot));
+        assert_echo(
+            runtime.connections().unwrap(),
+            "new",
+            "after stale completion",
+        )
+        .await;
+        assert_echo(&old_snapshot, "old", "after stale completion").await;
+    })
+    .await
+    .expect("loopback MCP reload test timed out");
+}
+
+#[tokio::test]
 async fn mcp_read_only_hint_drives_provider_policy() {
     use crate::tools::provider::{McpToolProvider, ToolApproval, ToolProvider};
     use std::sync::Arc;

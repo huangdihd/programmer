@@ -21,7 +21,6 @@ use super::{command_handlers, diagnostics, session};
 use crate::cancel::OperationId;
 use crate::classifier::{PlanPhase, WorkMode};
 use crate::commands::Command;
-use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
 use crate::ui::event::{AppEvent, Event};
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
@@ -65,10 +64,10 @@ impl KeepRetryMode {
 
 /// Build an optional plan-mode system prompt snippet.
 fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
-    if app.work_mode != WorkMode::Plan {
+    if app.agent_loop.session.work_mode != WorkMode::Plan {
         return None;
     }
-    match app.plan_phase {
+    match app.agent_loop.plan_phase {
         PlanPhase::Planning => Some(PLAN_PLANNING_PROMPT),
         PlanPhase::Reviewing => None,
     }
@@ -80,35 +79,52 @@ fn plan_system_prompt(app: &App<'_>) -> Option<&'static str> {
 
 /// Collect input, push to history, and start a user request.
 pub(crate) async fn send_message(app: &mut App<'_>) {
-    let typed = app.input_panel.expanded_content();
+    if !app.require_running_session() {
+        return;
+    }
+    let typed = app.ui.input_panel.expanded_content();
     if typed.is_empty() {
         return;
     }
-    let draft = app.input_panel.draft_snapshot();
+    let draft = app.ui.input_panel.draft_snapshot();
     let history_text = typed.clone();
-    let pasted_images = app.input_panel.take_images();
+    let pasted_images = app.ui.input_panel.take_images();
     // History keeps the compact `@path` form; the model receives a path-only
     // reference for regular files or a stored image for image paths. The
     // conversation filters stored images out of API requests while vision is
     // off, without deleting them from session history.
-    app.input_panel.push_history(typed.clone());
-    app.input_panel.clear();
+    app.ui.input_panel.push_history(typed.clone());
+    app.ui.input_panel.clear();
 
     // Expand before deciding whether to start or queue the request. Queued
     // messages must retain the same path annotations and image attachments as
     // messages that start immediately.
-    let diagnostics = app.diagnostics_state.lock().unwrap().baseline.clone();
+    let diagnostics = app
+        .agent_loop
+        .session
+        .diagnostics_state
+        .lock()
+        .unwrap()
+        .baseline
+        .clone();
     let expanded = crate::commands::expand_references(&typed, diagnostics.as_deref()).await;
     for notice in expanded.notices {
-        app.conversation_panel.add_warning_string(notice);
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_warning_string(notice);
+        app.ui.conversation_panel.scroll_to_bottom();
     }
     let mut images = pasted_images;
     images.extend(expanded.images);
     let omitted = crate::commands::limit_image_attachments(&mut images);
     if omitted > 0 {
-        app.conversation_panel.add_warning_string(format!(
-            "omitted {omitted} image(s): attachment count or total size exceeds the per-message limit"
+        app.agent_loop.session.conversation.lock().unwrap().add_warning_string(format!(
+        "omitted {omitted} image(s): attachment count or total size exceeds the per-message limit"
         ));
+        app.ui.conversation_panel.scroll_to_bottom();
     }
     start_request_as_with_images(
         app,
@@ -144,45 +160,56 @@ async fn start_request_as_with_images(
         String,
     )>,
 ) {
+    if !app.require_running_session() {
+        return;
+    }
     // active_id is the lifecycle authority. UI phases are presentation state
     // and can briefly lag the runner; they must never decide whether two turns
     // are allowed to overlap.
-    if app.cancel.active_id.is_some() {
+    if app.agent_loop.cancel.active_id.is_some() {
         queue_pending_request(
-            &mut app.conversation_panel,
-            &mut app.pending_images,
-            text,
-            images,
+            &mut app.agent_loop.pending_request,
+            super::scheduling::UserRequest { text, images },
         );
         return;
     }
 
     // An explicit submission may retry a previously failed mandatory pass.
-    app.auto_compact.retry_blocked = false;
+    app.agent_loop.auto_compact.retry_blocked = false;
     if app.mandatory_compact_tokens().is_some_and(|limit| {
-        app.auto_compact
+        app.agent_loop
+            .auto_compact
             .last_input_tokens
             .is_some_and(|tokens| tokens >= limit)
     }) {
         queue_pending_request(
-            &mut app.conversation_panel,
-            &mut app.pending_images,
-            text,
-            images,
+            &mut app.agent_loop.pending_request,
+            super::scheduling::UserRequest { text, images },
         );
-        app.auto_compact.mandatory_waiting = true;
+        app.agent_loop.auto_compact.mandatory_waiting = true;
         // A new request may retry a failed prefix. Keep the background dedup
         // marker otherwise, so idle polling cannot spin on a provider failure.
-        if app.auto_compact.active_id.is_none() {
-            app.auto_compact.last_cutoff = None;
+        if app.agent_loop.auto_compact.active_id.is_none() {
+            app.agent_loop.auto_compact.last_cutoff = None;
         }
-        let input_tokens = app.auto_compact.last_input_tokens.unwrap_or_default();
+        let input_tokens = app
+            .agent_loop
+            .auto_compact
+            .last_input_tokens
+            .unwrap_or_default();
         if !maybe_start_auto_compact(app, input_tokens) {
-            app.auto_compact.mandatory_waiting = false;
-            app.auto_compact.retry_blocked = true;
-            app.conversation_panel.add_error_string(
-                "mandatory context compaction could not start; request remains queued".to_string(),
-            );
+            app.agent_loop.auto_compact.mandatory_waiting = false;
+            app.agent_loop.auto_compact.retry_blocked = true;
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(
+                    "mandatory context compaction could not start; request remains queued"
+                        .to_string(),
+                );
+            app.ui.conversation_panel.scroll_to_bottom();
         }
         return;
     }
@@ -256,59 +283,106 @@ fn format_agent_updates(agents: &[crate::agents::AgentSnapshot]) -> String {
 }
 
 pub(in crate::app) fn start_keep_retry(app: &mut App<'_>, mode: KeepRetryMode) {
+    if !app.require_running_session() {
+        return;
+    }
     use std::sync::atomic::Ordering;
 
-    if app.cancel.active_id.is_some() {
-        app.conversation_panel
+    if app.agent_loop.cancel.active_id.is_some() {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_warning_string("cannot retry while another request is active");
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     }
     if !app
-        .conversation_panel
-        .items_snapshot()
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .items
+        .clone()
         .iter()
         .any(|item| matches!(item, crate::response::message_item::MessageItem::Input(_)))
     {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_warning_string("nothing to retry yet — send a message first");
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     }
     let Some(mut runner) = app.build_runner() else {
-        app.conversation_panel
-            .add_error_string(format!("unknown provider/model: {}", app.current_model));
+        {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(format!(
+                    "unknown provider/model: {}",
+                    app.agent_loop.session.current_model
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
+        };
         return;
     };
     // `/keepretry` owns the retry loop so its selected delay is applied after
     // every failed model attempt rather than after the runner's normal batch.
     runner.stream_retry_limit = 0;
+    let runner = std::sync::Arc::new(runner);
+    app.agent_loop.runner = Some(runner.clone());
 
-    app.input_panel.clear_suggestion();
-    app.conversation_panel.reset_accumulated_usage();
-    app.conversation_panel.add_info_string(format!(
-        "Retrying the previous model request with {} until it succeeds. Press Esc to stop.",
-        mode.label()
+    app.ui.input_panel.clear_suggestion();
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .reset_accumulated_usage();
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .add_info_string(format!(
+            "Retrying the previous model request with {} until it succeeds. Press Esc to stop.",
+            mode.label()
+        ));
+    app.ui.conversation_panel.scroll_to_bottom();
+    let operation_id = app.agent_loop.cancel.begin(Some(
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .items
+            .len(),
     ));
-    let operation_id = app
-        .cancel
-        .begin(Some(app.conversation_panel.items_snapshot().len()));
 
     let surface = TuiSurface {
         tx: app.events.sender.clone(),
-        skill_prompt: app.skill_registry.catalog_prompt(),
+        skill_prompt: app.agent_loop.skill_registry.catalog_prompt(),
         plan_prompt: plan_system_prompt(app),
         approval_label: format!(
             "{} approved by {} mode",
-            app.work_mode.icon(),
-            app.work_mode.label()
+            app.agent_loop.session.work_mode.icon(),
+            app.agent_loop.session.work_mode.label()
         ),
         operation_id,
-        cancel: app.cancel.active.clone(),
+        cancel: app.agent_loop.cancel.active.clone(),
     };
-    let shared = app.conversation_panel.shared_conversation();
-    let cancel = app.cancel.active.clone();
-    let retrying = app.cancel.stream_retrying.clone();
+    let shared = app.agent_loop.session.conversation.clone();
+    let cancel = app.agent_loop.cancel.active.clone();
+    let retrying = app.agent_loop.cancel.stream_retrying.clone();
     let tx = app.events.sender.clone();
-    tokio::spawn(async move {
+    app.agent_loop.runner_handles.push(tokio::spawn(async move {
         let mut attempt = 1u32;
         let result = loop {
             match runner.run_turn(&shared, &cancel, &surface).await {
@@ -333,7 +407,7 @@ pub(in crate::app) fn start_keep_retry(app: &mut App<'_>, mode: KeepRetryMode) {
         };
         retrying.store(false, Ordering::Relaxed);
         let _ = tx.send(Event::App(AppEvent::TurnFinished(operation_id, result)));
-    });
+    }));
 }
 
 async fn start_ready_request(
@@ -344,54 +418,91 @@ async fn start_ready_request(
         String,
     )>,
 ) {
-    debug_assert!(app.cancel.active_id.is_none());
-    app.active_suggestion_operation_id = None;
-    if let Some(cancel) = app.input_suggestion_cancel.take() {
+    if !app.session_accepts_work() {
+        return;
+    }
+    debug_assert!(app.agent_loop.cancel.active_id.is_none());
+    app.ui.active_suggestion_operation_id = None;
+    if let Some(cancel) = app.ui.input_suggestion_cancel.take() {
         cancel.cancel();
     }
-    app.input_panel.clear_suggestion();
-    let conversation_cutoff = app.conversation_panel.items_snapshot().len();
-    let title_source = (app.session.title.is_empty() && !app.session.title_generation_started)
+    app.ui.input_panel.clear_suggestion();
+    let conversation_cutoff = app
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .items
+        .len();
+    let title_source = (app.agent_loop.session.title.is_empty()
+        && !app.agent_loop.session.title_generation_started)
         .then(|| inputs.first().map(|(text, _, _)| text.clone()))
         .flatten();
     let user_prompt = inputs
         .iter()
         .find(|(_, role, _)| matches!(role, InputRole::User))
         .map(|(text, _, _)| text.clone());
-    app.current_checkpoint_id = None;
-    if let (Some(prompt), Some(store)) = (user_prompt, app.checkpoint_store.as_ref()) {
-        let cutoff = app.conversation_panel.items_snapshot().len();
+    app.agent_loop.current_checkpoint_id = None;
+    if let (Some(prompt), Some(store)) = (
+        user_prompt,
+        app.agent_loop.session.checkpoint_store.as_ref(),
+    ) {
+        let cutoff = app
+            .agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .items
+            .len();
         match store
             .lock()
             .unwrap()
-            .begin(prompt, cutoff, app.todo_list.todos.clone())
+            .begin(prompt, cutoff, app.ui.todo_list.todos.clone())
         {
-            Ok(id) => app.current_checkpoint_id = Some(id),
-            Err(error) => app
-                .conversation_panel
-                .add_warning_string(format!("could not create rewind checkpoint: {error}")),
+            Ok(id) => app.agent_loop.current_checkpoint_id = Some(id),
+            Err(error) => {
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .add_warning_string(format!("could not create rewind checkpoint: {error}"));
+                app.ui.conversation_panel.scroll_to_bottom();
+            }
         }
     }
     for (text, role, images) in inputs {
         let content = ordered_message_content(text, images);
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_input_message(ApiMessageItem::Input(InputMessage {
                 content,
                 role,
                 status: Some(OutputStatus::Completed),
             }));
+        app.ui.conversation_panel.scroll_to_bottom();
     }
     if let Some(source) = title_source {
         maybe_start_session_title(app, source);
     }
-    app.conversation_panel.reset_accumulated_usage();
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .reset_accumulated_usage();
     diagnostics::maybe_seed_diagnostics_baseline(app);
     session::save_session(app);
     // Fresh turn: start from an un-cancelled root token so a prior turn's Esc
     // doesn't carry over to this one. Bump the operation id synchronously
     // before spawning so the UI can tag all turn events and filter stale ones.
-    let operation_id = app.cancel.begin(Some(conversation_cutoff));
-    app.cancel.active_user_request =
+    let operation_id = app.agent_loop.cancel.begin(Some(conversation_cutoff));
+    app.agent_loop.cancel.active_user_request =
         original_draft.map(|(draft, history_text)| super::ActiveUserRequest {
             draft,
             conversation_cutoff,
@@ -399,39 +510,55 @@ async fn start_ready_request(
         });
 
     let Some(runner) = app.build_runner() else {
-        app.cancel.clear();
-        app.conversation_panel
-            .add_error_string(format!("unknown provider/model: {}", app.current_model));
+        app.agent_loop.cancel.clear();
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_error_string(format!(
+                "unknown provider/model: {}",
+                app.agent_loop.session.current_model
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     };
-    if let Some(details) = app.input_panel.take_next_turn_compaction() {
-        app.conversation_panel.insert_info_string(
-            conversation_cutoff,
-            format!(
-                "Automatic context compaction — {details} summarized. The model turn below is \
-                 the first to use the compacted context; older history remains visible above."
-            ),
-        );
+    let runner = std::sync::Arc::new(runner);
+    app.agent_loop.runner = Some(runner.clone());
+    if let Some(details) = app.ui.input_panel.take_next_turn_compaction() {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .insert_info_string(
+                conversation_cutoff,
+                format!(
+                    "Automatic context compaction — {details} summarized. The model turn below is \
+             the first to use the compacted context; older history remains visible above."
+                ),
+            );
+        app.ui.conversation_panel.scroll_to_bottom();
     }
     let surface = TuiSurface {
         tx: app.events.sender.clone(),
-        skill_prompt: app.skill_registry.catalog_prompt(),
+        skill_prompt: app.agent_loop.skill_registry.catalog_prompt(),
         plan_prompt: plan_system_prompt(app),
         approval_label: format!(
             "{} approved by {} mode",
-            app.work_mode.icon(),
-            app.work_mode.label()
+            app.agent_loop.session.work_mode.icon(),
+            app.agent_loop.session.work_mode.label()
         ),
         operation_id,
-        cancel: app.cancel.active.clone(),
+        cancel: app.agent_loop.cancel.active.clone(),
     };
-    let shared = app.conversation_panel.shared_conversation();
-    let cancel = app.cancel.active.clone();
+    let shared = app.agent_loop.session.conversation.clone();
+    let cancel = app.agent_loop.cancel.active.clone();
     let tx = app.events.sender.clone();
-    tokio::spawn(async move {
+    app.agent_loop.runner_handles.push(tokio::spawn(async move {
         let result = runner.run_turn(&shared, &cancel, &surface).await;
         let _ = tx.send(Event::App(AppEvent::TurnFinished(operation_id, result)));
-    });
+    }));
 }
 
 fn format_task_updates(events: &[crate::tasks::TaskLifecycleEvent]) -> String {
@@ -514,23 +641,16 @@ fn tail_chars(text: &str, max_chars: usize) -> String {
 /// Multiple messages are deliberately coalesced with newlines because the UI
 /// exposes one pending-message slot.
 pub(super) fn queue_pending_request(
-    panel: &mut ConversationPanel,
-    pending_images: &mut Vec<InputImageContent>,
-    text: String,
-    mut images: Vec<InputImageContent>,
+    pending_request: &mut Option<super::scheduling::UserRequest>,
+    mut request: super::scheduling::UserRequest,
 ) {
-    let is_at_bottom = panel.is_at_bottom();
-    match panel.pending_message.as_mut() {
-        Some(pending) => {
-            pending.push('\n');
-            pending.push_str(&text);
-        }
-        None => panel.pending_message = Some(text),
-    }
-    pending_images.append(&mut images);
-    if is_at_bottom {
-        panel.scroll_to_bottom();
-    }
+    let Some(pending) = pending_request.as_mut() else {
+        *pending_request = Some(request);
+        return;
+    };
+    pending.text.push('\n');
+    pending.text.push_str(&request.text);
+    pending.images.append(&mut request.images);
 }
 
 fn ordered_message_content(text: String, images: Vec<InputImageContent>) -> Vec<InputContent> {
@@ -569,16 +689,19 @@ fn push_input_text(content: &mut Vec<InputContent>, text: &str) {
 /// The exit is watched from [`super::events`]'s tick: the panel closes, focus
 /// returns to the input, and the transcript goes to the agent for a response.
 pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
+    if !app.require_running_session() {
+        return;
+    }
     use crate::ui::components::terminal_panel::TerminalPane;
 
     let command = input.strip_prefix('!').unwrap_or(input).trim().to_string();
     if command.is_empty() {
-        app.input_panel.clear();
+        app.ui.input_panel.clear();
         return;
     }
-    app.input_panel.push_history(input.to_string());
-    app.input_panel.clear();
-    app.input_panel.completion = None;
+    app.ui.input_panel.push_history(input.to_string());
+    app.ui.input_panel.clear();
+    app.ui.input_panel.completion = None;
 
     // Spawn at the size the terminal panel will render at, so the first frame
     // doesn't have to resize the fresh PTY. A resize racing the child's
@@ -589,42 +712,67 @@ pub(crate) fn run_bang_command(app: &mut App<'_>, input: &str) {
         .map(|(w, h)| (h.saturating_sub(2).max(1), w.max(1)))
         .unwrap_or((24, 80));
     let security = app.security.snapshot();
-    match app
-        .tasks
-        .spawn_bang_secure(&command, None, Some(&command), rows, cols, &security)
-    {
+    match app.agent_loop.session.tasks.spawn_bang_secure(
+        &command,
+        None,
+        Some(&command),
+        rows,
+        cols,
+        &security,
+    ) {
         Ok(id) => {
             // The record in the conversation; the transcript follows when the
             // command exits and the agent picks it up.
-            app.conversation_panel.add_info_string(format!(
-                "🖥 !{command} — running in the interactive terminal; \
-                 the agent will respond when it exits"
-            ));
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_info_string(format!(
+                    "🖥 !{command} — running in the interactive terminal; \
+             the agent will respond when it exits"
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
             session::mark_dirty(app);
-            let mut pane = TerminalPane::new(app.tasks.clone(), id, command);
+            let mut pane = TerminalPane::new(app.agent_loop.session.tasks.clone(), id, command);
             // Grab input immediately — the user typed `!` to interact.
             pane.grabbed = true;
-            app.terminal_pane = Some(pane);
+            app.ui.terminal_pane = Some(pane);
         }
-        Err(e) => app.conversation_panel.add_error_string(e),
+        Err(e) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(e);
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
     }
 }
 
 fn maybe_start_session_title(app: &mut App<'_>, first_message: String) -> bool {
     use crate::ui::event::{AppEvent, Event};
 
-    app.session.title_generation_started = true;
+    app.agent_loop.session.title_generation_started = true;
     let target_model = app.effective_title_model();
     let Some((client, model_name)) = app.provider_manager.resolve(&target_model) else {
-        app.conversation_panel.add_warning_string(format!(
-            "session title generation skipped: unknown provider/model {target_model}"
-        ));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_warning_string(format!(
+                "session title generation skipped: unknown provider/model {target_model}"
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
         return false;
     };
     let client = client.clone();
-    app.session.title_generation_id = app.session.title_generation_id.wrapping_add(1);
-    let generation_id = app.session.title_generation_id;
-    let session_uuid = app.session.uuid.clone();
+    app.agent_loop.session.title_generation_id =
+        app.agent_loop.session.title_generation_id.wrapping_add(1);
+    let generation_id = app.agent_loop.session.title_generation_id;
+    let session_uuid = app.agent_loop.session.uuid.clone();
     let prompt = format!("{}{first_message}", crate::prompts::SESSION_TITLE_PROMPT);
     let request = async_openai::types::responses::CreateResponse {
         input: async_openai::types::responses::InputParam::Text(prompt),
@@ -633,45 +781,75 @@ fn maybe_start_session_title(app: &mut App<'_>, first_message: String) -> bool {
         ..Default::default()
     };
     let sender = app.events.sender.clone();
-    tokio::spawn(async move {
-        let result =
-            stream_compact_response(&client, request, crate::cancel::CancellationToken::new())
-                .await
-                .and_then(|response| normalize_session_title(&response.summary));
-        let _ = sender.send(Event::App(AppEvent::SessionTitleGenerated {
-            session_uuid,
-            generation_id,
-            result,
+    app.agent_loop
+        .background_handles
+        .push(tokio::spawn(async move {
+            let result =
+                stream_compact_response(&client, request, crate::cancel::CancellationToken::new())
+                    .await
+                    .and_then(|response| normalize_session_title(&response.summary));
+            let _ = sender.send(Event::App(AppEvent::SessionTitleGenerated {
+                session_uuid,
+                generation_id,
+                result,
+            }));
         }));
-    });
     true
 }
 
 pub(in crate::app) fn set_or_regenerate_session_title(app: &mut App<'_>, requested: &str) {
     if !requested.trim().is_empty() {
         let Ok(title) = normalize_session_title(requested) else {
-            app.conversation_panel
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
                 .add_warning_string("session title cannot be empty");
+            app.ui.conversation_panel.scroll_to_bottom();
             return;
         };
-        app.session.title_generation_id = app.session.title_generation_id.wrapping_add(1);
-        app.session.title_generation_started = true;
-        app.session.title = title.clone();
+        app.agent_loop.session.title_generation_id =
+            app.agent_loop.session.title_generation_id.wrapping_add(1);
+        app.agent_loop.session.title_generation_started = true;
+        app.agent_loop.session.title = title.clone();
         session::mark_dirty(app);
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_info_string(format!("Session title set to: {title}"));
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     }
 
-    let items = app.conversation_panel.items_snapshot();
+    let items = app
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .items
+        .clone();
     let Some(first_message) = super::helpers::first_user_text(&items) else {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_warning_string("cannot generate a title before the first user message");
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     };
     if maybe_start_session_title(app, first_message) {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_info_string("Regenerating session title…");
+        app.ui.conversation_panel.scroll_to_bottom();
     }
 }
 
@@ -693,27 +871,33 @@ fn normalize_session_title(response: &str) -> Result<String, String> {
 pub(super) fn maybe_start_input_suggestion(app: &mut App<'_>, operation_id: OperationId) {
     use async_openai::types::responses::{InputItem, InputParam, Item};
 
-    if !app.input_panel.get_content().is_empty() || app.cancel.active_id.is_some() {
+    if !app.session_accepts_work()
+        || !app.ui.input_panel.get_content().is_empty()
+        || app.agent_loop.cancel.active_id.is_some()
+    {
         return;
     }
     let target_model = app.effective_suggestion_model();
     let Some((client, model_name)) = app.provider_manager.resolve(&target_model) else {
         return;
     };
-    let mut input =
-        match app
-            .conversation_panel
-            .get_input_param(&target_model, None, None, None, false)
-        {
-            InputParam::Items(items) => items,
-            InputParam::Text(text) => vec![InputItem::from(Item::Message(ApiMessageItem::Input(
-                InputMessage {
-                    content: vec![InputContent::InputText(InputTextContent { text })],
-                    role: InputRole::User,
-                    status: Some(OutputStatus::Completed),
-                },
-            )))],
-        };
+    let mut input = match app
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .to_input_param_with_vision(&target_model, None, None, None, false)
+    {
+        InputParam::Items(items) => items,
+        InputParam::Text(text) => vec![InputItem::from(Item::Message(ApiMessageItem::Input(
+            InputMessage {
+                content: vec![InputContent::InputText(InputTextContent { text })],
+                role: InputRole::User,
+                status: Some(OutputStatus::Completed),
+            },
+        )))],
+    };
     input.push(InputItem::from(Item::Message(ApiMessageItem::Input(
         InputMessage {
             content: vec![InputContent::InputText(InputTextContent {
@@ -724,9 +908,9 @@ pub(super) fn maybe_start_input_suggestion(app: &mut App<'_>, operation_id: Oper
         },
     ))));
 
-    app.active_suggestion_operation_id = Some(operation_id);
+    app.ui.active_suggestion_operation_id = Some(operation_id);
     let cancel = crate::cancel::CancellationToken::new();
-    app.input_suggestion_cancel = Some(cancel.clone());
+    app.ui.input_suggestion_cancel = Some(cancel.clone());
     let request = async_openai::types::responses::CreateResponse {
         input: InputParam::Items(input),
         model: Some(model_name),
@@ -734,18 +918,20 @@ pub(super) fn maybe_start_input_suggestion(app: &mut App<'_>, operation_id: Oper
         ..Default::default()
     };
     let client = client.clone();
-    let session_uuid = app.session.uuid.clone();
+    let session_uuid = app.agent_loop.session.uuid.clone();
     let sender = app.events.sender.clone();
-    tokio::spawn(async move {
-        let result = stream_compact_response(&client, request, cancel)
-            .await
-            .and_then(|response| normalize_input_suggestion(&response.summary));
-        let _ = sender.send(Event::App(AppEvent::InputSuggestionGenerated {
-            session_uuid,
-            operation_id,
-            result,
+    app.agent_loop
+        .background_handles
+        .push(tokio::spawn(async move {
+            let result = stream_compact_response(&client, request, cancel)
+                .await
+                .and_then(|response| normalize_input_suggestion(&response.summary));
+            let _ = sender.send(Event::App(AppEvent::InputSuggestionGenerated {
+                session_uuid,
+                operation_id,
+                result,
+            }));
         }));
-    });
 }
 
 fn normalize_input_suggestion(response: &str) -> Result<String, String> {
@@ -885,69 +1071,108 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 }
 
 pub(crate) fn start_compact(app: &mut App<'_>) {
+    if !app.require_running_session() {
+        return;
+    }
     use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
     use crate::ui::event::Event;
 
-    if app.cancel.active_id.is_some() {
-        app.conversation_panel
+    if app.agent_loop.cancel.active_id.is_some() {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_warning_string("cannot compact while a turn is in flight");
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     }
     invalidate_auto_compaction(app);
-    let Some(cutoff) = app
-        .conversation_panel
-        .compaction_cutoff(app.effective_compact_keep_recent_turns())
-    else {
-        app.conversation_panel
+    let cutoff = app
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .compaction_cutoff(app.effective_compact_keep_recent_turns());
+    let Some(cutoff) = cutoff else {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_info_string("nothing old enough to compact yet".to_string());
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     };
     let target_model = app.effective_compact_model();
     let (client, model_name) = match app.provider_manager.resolve(&target_model) {
         Some((c, m)) => (c.clone(), m),
         None => {
-            app.conversation_panel
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
                 .add_error_string(format!("unknown provider/model: {target_model}"));
+            app.ui.conversation_panel.scroll_to_bottom();
             return;
         }
     };
-    app.conversation_panel
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
         .add_info_string(format!("compacting with {target_model}"));
+    app.ui.conversation_panel.scroll_to_bottom();
 
     // The full current context plus the summarization instruction. No tools:
     // the model must answer with the summary text, not act.
-    let input_items = compact_input_items(app.conversation_panel.input_param_for_prefix(
-        cutoff,
-        &target_model,
-        app.config.soul.as_deref(),
-        app.vision_enabled,
-    ));
+    let input_items = compact_input_items(
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .input_param_for_prefix(
+                cutoff,
+                &target_model,
+                app.config.soul.as_deref(),
+                app.agent_loop.session.vision_enabled,
+            ),
+    );
 
-    app.conversation_panel.phase = ActivePhase::Compacting;
-    let operation_id = app.cancel.begin(None);
-    let cancel_token = app.cancel.active.child();
-    let thinking_level = app.thinking_level;
+    app.agent_loop.phase = ActivePhase::Compacting;
+    let operation_id = app.agent_loop.cancel.begin(None);
+    let cancel_token = app.agent_loop.cancel.active.child();
+    let thinking_level = app.agent_loop.session.thinking_level;
     let sender = app.events.sender.clone();
-    tokio::spawn(async move {
-        let request = build_compact_request(input_items, model_name, thinking_level);
-        let result = stream_compact_response(&client, request, cancel_token.clone()).await;
-        // Always send CompactFinished — even when cancelled — so
-        // handle_compact_finished can clear active_id and reset the phase.
-        let _ = sender.send(Event::App(crate::ui::event::AppEvent::CompactFinished(
-            operation_id,
-            cutoff,
-            result,
-            cancel_token,
-        )));
-    });
+    app.agent_loop
+        .background_handles
+        .push(tokio::spawn(async move {
+            let request = build_compact_request(input_items, model_name, thinking_level);
+            let result = stream_compact_response(&client, request, cancel_token.clone()).await;
+            // Always send CompactFinished — even when cancelled — so
+            // handle_compact_finished can clear active_id and reset the phase.
+            let _ = sender.send(Event::App(crate::ui::event::AppEvent::CompactFinished(
+                operation_id,
+                cutoff,
+                result,
+                cancel_token,
+            )));
+        }));
 }
 
 /// Observe a provider-reported input-token count and, when the session's
 /// threshold is crossed, snapshot a complete historical prefix for seamless
 /// background compaction. The foreground turn and input remain interactive.
 pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> bool {
-    app.auto_compact.last_input_tokens = Some(input_tokens);
-    let threshold = if app.auto_compact.mandatory_waiting {
+    if !app.session_accepts_work() {
+        return false;
+    }
+    app.agent_loop.auto_compact.last_input_tokens = Some(input_tokens);
+    let threshold = if app.agent_loop.auto_compact.mandatory_waiting {
         app.mandatory_compact_tokens()
     } else {
         app.effective_auto_compact_tokens()
@@ -955,13 +1180,19 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> 
     let Some(threshold) = threshold else {
         return false;
     };
-    if !app.auto_compact.mandatory_waiting
+    if !app.agent_loop.auto_compact.mandatory_waiting
         && app.config.auto_compact_cooldown_turns > 0
         && app
+            .agent_loop
             .auto_compact
             .last_completed_item_count
             .is_some_and(|start| {
-                app.conversation_panel.user_turns_after(start)
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .user_turns_after(start)
                     <= app.config.auto_compact_cooldown_turns
             })
     {
@@ -970,23 +1201,35 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> 
     if input_tokens < threshold {
         return false;
     }
-    if app.auto_compact.active_id.is_some() {
+    if app.agent_loop.auto_compact.active_id.is_some() {
         return true;
     }
-    let snapshot = app.conversation_panel.items_snapshot();
+    let snapshot = app
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .items
+        .clone();
     let stable_end = app
+        .agent_loop
         .cancel
         .turn_conversation_cutoff
         .unwrap_or(snapshot.len())
         .min(snapshot.len());
     let cutoff = app
-        .conversation_panel
+        .agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
         .compaction_cutoff_before(app.effective_compact_keep_recent_turns(), stable_end)
         .or_else(|| {
             // A mandatory retry may need to summarize the summary installed by
             // the previous attempt. Appending another boundary at the stable
             // edge replaces that summary without touching the in-flight turn.
-            (app.auto_compact.mandatory_waiting
+            (app.agent_loop.auto_compact.mandatory_waiting
                 && snapshot[..stable_end].iter().any(|item| {
                     matches!(
                         item,
@@ -998,73 +1241,93 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> 
     let Some(cutoff) = cutoff else {
         return false;
     };
-    if app.auto_compact.last_cutoff == Some(cutoff) {
+    if app.agent_loop.auto_compact.last_cutoff == Some(cutoff) {
         return false;
     }
     let target_model = app.effective_compact_model();
     let Some((client, model_name)) = app.provider_manager.resolve(&target_model) else {
-        app.conversation_panel.add_warning_string(format!(
-            "automatic context compaction skipped: unknown provider/model {target_model}"
-        ));
-        app.auto_compact.last_cutoff = Some(cutoff);
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_warning_string(format!(
+                "automatic context compaction skipped: unknown provider/model {target_model}"
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
+        app.agent_loop.auto_compact.last_cutoff = Some(cutoff);
         return false;
     };
     let client = client.clone();
-    let input_items = compact_input_items(app.conversation_panel.input_param_for_prefix(
-        cutoff,
-        &target_model,
-        app.config.soul.as_deref(),
-        app.vision_enabled,
-    ));
-    app.auto_compact.next_id = app.auto_compact.next_id.wrapping_add(1);
-    let job_id = app.auto_compact.next_id;
-    let history_epoch = app.auto_compact.history_epoch;
-    app.auto_compact.active_id = Some(job_id);
-    app.auto_compact.last_cutoff = Some(cutoff);
-    let thinking_level = app.thinking_level;
+    let input_items = compact_input_items(
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .input_param_for_prefix(
+                cutoff,
+                &target_model,
+                app.config.soul.as_deref(),
+                app.agent_loop.session.vision_enabled,
+            ),
+    );
+    app.agent_loop.auto_compact.next_id = app.agent_loop.auto_compact.next_id.wrapping_add(1);
+    let job_id = app.agent_loop.auto_compact.next_id;
+    let history_epoch = app.agent_loop.auto_compact.history_epoch;
+    app.agent_loop.auto_compact.active_id = Some(job_id);
+    app.agent_loop.auto_compact.last_cutoff = Some(cutoff);
+    let thinking_level = app.agent_loop.session.thinking_level;
     let sender = app.events.sender.clone();
-    tokio::spawn(async move {
-        let request = build_compact_request(input_items, model_name, thinking_level);
-        // Keep the same job active during recovery: queued input must not be
-        // left idle between a transient provider failure and its retry.
-        let result = stream_compact_response(
-            &client,
-            request.clone(),
-            crate::cancel::CancellationToken::new(),
-        )
-        .await;
-        let result = match result {
-            Ok(result) => Ok(result),
-            Err(_) => {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                stream_compact_response(&client, request, crate::cancel::CancellationToken::new())
+    app.agent_loop
+        .background_handles
+        .push(tokio::spawn(async move {
+            let request = build_compact_request(input_items, model_name, thinking_level);
+            // Keep the same job active during recovery: queued input must not be
+            // left idle between a transient provider failure and its retry.
+            let result = stream_compact_response(
+                &client,
+                request.clone(),
+                crate::cancel::CancellationToken::new(),
+            )
+            .await;
+            let result = match result {
+                Ok(result) => Ok(result),
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    stream_compact_response(
+                        &client,
+                        request,
+                        crate::cancel::CancellationToken::new(),
+                    )
                     .await
-            }
-        };
-        let _ = sender.send(Event::App(AppEvent::AutoCompactFinished {
-            job_id,
-            history_epoch,
-            cutoff,
-            result,
+                }
+            };
+            let _ = sender.send(Event::App(AppEvent::AutoCompactFinished {
+                job_id,
+                history_epoch,
+                cutoff,
+                result,
+            }));
         }));
-    });
     true
 }
 
 pub(crate) fn invalidate_auto_compaction(app: &mut App<'_>) {
-    app.auto_compact.history_epoch = app.auto_compact.history_epoch.wrapping_add(1);
-    app.auto_compact.active_id = None;
-    app.auto_compact.last_cutoff = None;
-    app.auto_compact.last_completed_item_count = None;
-    app.auto_compact.mandatory_waiting = false;
-    app.auto_compact.retry_blocked = false;
-    if app.auto_compact.mandatory_resume.is_some() {
-        app.cancel.active.cancel();
+    app.agent_loop.auto_compact.history_epoch =
+        app.agent_loop.auto_compact.history_epoch.wrapping_add(1);
+    app.agent_loop.auto_compact.active_id = None;
+    app.agent_loop.auto_compact.last_cutoff = None;
+    app.agent_loop.auto_compact.last_completed_item_count = None;
+    app.agent_loop.auto_compact.mandatory_waiting = false;
+    app.agent_loop.auto_compact.retry_blocked = false;
+    if app.agent_loop.auto_compact.mandatory_resume.is_some() {
+        app.agent_loop.cancel.active.cancel();
     }
-    if let Some(resume) = app.auto_compact.mandatory_resume.take() {
+    if let Some(resume) = app.agent_loop.auto_compact.mandatory_resume.take() {
         let _ = resume.send(());
     }
-    app.input_panel.clear_next_turn_compaction();
+    app.ui.input_panel.clear_next_turn_compaction();
 }
 
 /// Open the full-screen task panel. Interactive tasks can grab input; pipe
@@ -1075,18 +1338,25 @@ pub(super) fn open_terminal(app: &mut App<'_>, arg: &str) {
     // Accept an id as the first token (completion may append the task name).
     let first = arg.split_whitespace().next().unwrap_or("");
     if first.eq_ignore_ascii_case("clear") {
-        let cleared = app.tasks.clear_finished();
-        if let Some(sidebar) = app.sidebar.as_mut() {
-            sidebar.retain_existing_tasks(&app.tasks);
+        let cleared = app.agent_loop.session.tasks.clear_finished();
+        if let Some(sidebar) = app.ui.sidebar.as_mut() {
+            sidebar.retain_existing_tasks(&app.agent_loop.session.tasks);
         }
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_info_string(format!("Cleared {cleared} finished task(s)."));
+        app.ui.conversation_panel.scroll_to_bottom();
         session::mark_dirty(app);
         return;
     }
     let id = if first.is_empty() {
         // Auto-select the sole running task.
         let running: Vec<u64> = app
+            .agent_loop
+            .session
             .tasks
             .snapshot_all()
             .iter()
@@ -1096,13 +1366,23 @@ pub(super) fn open_terminal(app: &mut App<'_>, arg: &str) {
         match running.as_slice() {
             [only] => *only,
             [] => {
-                app.conversation_panel
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
                     .add_warning_string("no running task — create one with the task tool");
+                app.ui.conversation_panel.scroll_to_bottom();
                 return;
             }
             _ => {
-                app.conversation_panel
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
                     .add_warning_string("multiple running tasks — specify one with /terminal <id>");
+                app.ui.conversation_panel.scroll_to_bottom();
                 return;
             }
         }
@@ -1110,19 +1390,33 @@ pub(super) fn open_terminal(app: &mut App<'_>, arg: &str) {
         match first.parse::<u64>() {
             Ok(id) => id,
             Err(_) => {
-                app.conversation_panel
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
                     .add_warning_string(format!("/terminal: '{first}' is not a task id"));
+                app.ui.conversation_panel.scroll_to_bottom();
                 return;
             }
         }
     };
 
-    let Some(snapshot) = app.tasks.snapshot(id) else {
-        app.conversation_panel
+    let Some(snapshot) = app.agent_loop.session.tasks.snapshot(id) else {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_warning_string(format!("task {id} was not found"));
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     };
-    app.terminal_pane = Some(TerminalPane::new(app.tasks.clone(), id, snapshot.name));
+    app.ui.terminal_pane = Some(TerminalPane::new(
+        app.agent_loop.session.tasks.clone(),
+        id,
+        snapshot.name,
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,7 +1424,7 @@ pub(super) fn open_terminal(app: &mut App<'_>, arg: &str) {
 // ---------------------------------------------------------------------------
 
 async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::CommandOutcome {
-    app.input_panel.clear();
+    app.ui.input_panel.clear();
     let mut parts = argument.trim().splitn(4, char::is_whitespace);
     let action = parts
         .next()
@@ -1142,8 +1436,13 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
         // The worker reads this on its next wake, so turning memory off also
         // stops background consolidation rather than only recall.
         app.refresh_dream_runtime();
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_info_string(format!("Persistent memory {} for this run.", action));
+        app.ui.conversation_panel.scroll_to_bottom();
         return command_handlers::CommandOutcome::handled(false);
     }
 
@@ -1176,9 +1475,10 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
             "id": parts.next(),
         }),
         _ => {
-            app.conversation_panel.add_warning_string(
-                "usage: /memory [list [global|project] | recall <query> | remember <global|project> <kind> <content> | update <id> <content> | forget <id> | dream [status|preview|apply|history] [global|project] | on | off]",
+            app.agent_loop.session.conversation.lock().unwrap().add_warning_string(
+            "usage: /memory [list [global|project] | recall <query> | remember <global|project> <kind> <content> | update <id> <content> | forget <id> | dream [status|preview|apply|history] [global|project] | on | off]",
             );
+            app.ui.conversation_panel.scroll_to_bottom();
             return command_handlers::CommandOutcome::handled(false);
         }
     };
@@ -1188,12 +1488,14 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
     // which provider/model does memory work.
     let memory_model = is_recall.then(|| app.effective_memory_model()).flatten();
     if is_recall {
-        app.conversation_panel.phase =
+        app.agent_loop.phase =
             crate::ui::components::conversation_panel::conversation_panel::ActivePhase::Associating;
     }
     let excluded = app
-        .conversation_panel
-        .shared_conversation()
+        .agent_loop
+        .session
+        .conversation
+        .clone()
         .lock()
         .unwrap()
         .context_memory_ids();
@@ -1204,12 +1506,28 @@ async fn memory_command(app: &mut App<'_>, argument: &str) -> command_handlers::
     )
     .await;
     if is_recall {
-        app.conversation_panel.phase =
+        app.agent_loop.phase =
             crate::ui::components::conversation_panel::conversation_panel::ActivePhase::None;
     }
     match result {
-        Ok(output) => app.conversation_panel.add_info_string(output),
-        Err(error) => app.conversation_panel.add_warning_string(error),
+        Ok(output) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_info_string(output);
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
+        Err(error) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_warning_string(error);
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
     }
     command_handlers::CommandOutcome::handled(false)
 }
@@ -1231,28 +1549,46 @@ async fn dream_command(
     if mode == "recover" {
         let confirmed = parts.next() == Some("confirm") && parts.next().is_none();
         if !confirmed {
-            app.conversation_panel.add_warning_string(
-                "Recovery completes the recorded target of an interrupted Dream apply/rollback, including any remaining writes. It does NOT undo it. Run `/memory dream recover confirm` in the originating workspace to proceed.",
+            app.agent_loop.session.conversation.lock().unwrap().add_warning_string(
+            "Recovery completes the recorded target of an interrupted Dream apply/rollback, including any remaining writes. It does NOT undo it. Run `/memory dream recover confirm` in the originating workspace to proceed.",
             );
+            app.ui.conversation_panel.scroll_to_bottom();
             return command_handlers::CommandOutcome::handled(false);
         }
         match crate::memory::MemoryManager::for_current_dir()
             .and_then(|manager| manager.dream_recover())
         {
-            Ok(()) => app
-                .conversation_panel
-                .add_info_string("Dream transaction recovered."),
-            Err(error) => app
-                .conversation_panel
-                .add_warning_string(format!("Dream recovery failed: {error}")),
+            Ok(()) => {
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .add_info_string("Dream transaction recovered.");
+                app.ui.conversation_panel.scroll_to_bottom();
+            }
+            Err(error) => {
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .add_warning_string(format!("Dream recovery failed: {error}"));
+                app.ui.conversation_panel.scroll_to_bottom();
+            }
         }
         return command_handlers::CommandOutcome::handled(false);
     }
     if mode == "history" {
         let filter = parts.next();
         if !matches!(filter, None | Some("session")) || parts.next().is_some() {
-            app.conversation_panel
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
                 .add_warning_string("usage: /memory dream history [session]");
+            app.ui.conversation_panel.scroll_to_bottom();
             return command_handlers::CommandOutcome::handled(false);
         }
         super::activity::open_dream(app, filter.is_some());
@@ -1262,16 +1598,27 @@ async fn dream_command(
         Some("global") => Some(crate::memory::MemoryScope::Global),
         Some("project") => Some(crate::memory::MemoryScope::Project),
         Some(other) => {
-            app.conversation_panel.add_warning_string(format!(
-                "unknown Dream scope '{other}' — use global or project"
-            ));
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_warning_string(format!(
+                    "unknown Dream scope '{other}' — use global or project"
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
             return command_handlers::CommandOutcome::handled(false);
         }
         None => None,
     };
     let Ok(manager) = crate::memory::MemoryManager::for_current_dir() else {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_warning_string("error: memory store is unavailable");
+        app.ui.conversation_panel.scroll_to_bottom();
         return command_handlers::CommandOutcome::handled(false);
     };
 
@@ -1285,15 +1632,26 @@ async fn dream_command(
             line
         }),
         "preview" => {
-            if app.cancel.active_id.is_some() {
-                app.conversation_panel.add_warning_string(
-                    "cannot preview Dream while another operation is in flight",
-                );
+            if app.agent_loop.cancel.active_id.is_some() {
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .add_warning_string(
+                        "cannot preview Dream while another operation is in flight",
+                    );
+                app.ui.conversation_panel.scroll_to_bottom();
                 return command_handlers::CommandOutcome::handled(false);
             }
             let Some(model) = app.effective_memory_model() else {
-                app.conversation_panel
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
                     .add_warning_string("error: Dream preview requires a configured memory model");
+                app.ui.conversation_panel.scroll_to_bottom();
                 return command_handlers::CommandOutcome::handled(false);
             };
             let model = dream::DreamModel {
@@ -1310,19 +1668,39 @@ async fn dream_command(
         }
         "apply" => dream::apply_saved_preview(&manager, scope).map(dream_report_line),
         other => {
-            app.conversation_panel.add_warning_string(format!(
-                "usage: /memory dream [status|preview|apply|history] [global|project] \
-                 — '{other}' is not a Dream mode"
-            ));
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_warning_string(format!(
+                    "usage: /memory dream [status|preview|apply|history] [global|project] \
+             — '{other}' is not a Dream mode"
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
             return command_handlers::CommandOutcome::handled(false);
         }
     };
 
     match result {
-        Ok(line) => app.conversation_panel.add_info_string(line),
-        Err(error) => app
-            .conversation_panel
-            .add_warning_string(format!("error: {error}")),
+        Ok(line) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_info_string(line);
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
+        Err(error) => {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_warning_string(format!("error: {error}"));
+            app.ui.conversation_panel.scroll_to_bottom();
+        }
     }
     command_handlers::CommandOutcome::handled(false)
 }
@@ -1334,26 +1712,41 @@ where
     F: FnOnce(crate::cancel::CancellationToken) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
 {
-    if app.cancel.active_id.is_some() {
-        app.conversation_panel
-            .add_warning_string("cannot preview Dream while another operation is in flight");
+    if !app.require_running_session() {
         return;
     }
-    let operation_id = app.cancel.begin(None);
-    let cancellation = app.cancel.active.child();
-    app.cancel.activity = Some("Dream preview".into());
-    app.conversation_panel.phase =
+    if app.agent_loop.cancel.active_id.is_some() {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_warning_string("cannot preview Dream while another operation is in flight");
+        app.ui.conversation_panel.scroll_to_bottom();
+        return;
+    }
+    let operation_id = app.agent_loop.cancel.begin(None);
+    let cancellation = app.agent_loop.cancel.active.child();
+    app.agent_loop.cancel.activity = Some("Dream preview".into());
+    app.agent_loop.phase =
         crate::ui::components::conversation_panel::conversation_panel::ActivePhase::Associating;
-    app.conversation_panel
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
         .add_info_string("Generating Dream preview · Esc cancels; memories will not be applied.");
+    app.ui.conversation_panel.scroll_to_bottom();
     let sender = app.events.sender.clone();
-    tokio::spawn(async move {
-        let result = preview(cancellation).await;
-        let _ = sender.send(Event::App(AppEvent::DreamPreviewFinished(
-            operation_id,
-            result,
-        )));
-    });
+    app.agent_loop
+        .background_handles
+        .push(tokio::spawn(async move {
+            let result = preview(cancellation).await;
+            let _ = sender.send(Event::App(AppEvent::DreamPreviewFinished(
+                operation_id,
+                result,
+            )));
+        }));
 }
 
 fn dream_report_line(report: crate::memory::dream::DreamReport) -> String {
@@ -1366,13 +1759,16 @@ fn dream_report_line(report: crate::memory::dream::DreamReport) -> String {
 /// Parse and execute a slash command. If the command is unknown, fall back
 /// to sending it to the AI model.
 pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
-    app.input_panel.completion = None;
+    app.ui.input_panel.completion = None;
     let Some(command) = Command::parse(input) else {
         // Unknown slash-command; send it to the AI as a normal message.
         app.events.send(AppEvent::Start);
         return;
     };
 
+    if !matches!(command, Command::New | Command::Quit) && !app.require_running_session() {
+        return;
+    }
     let outcome = match command {
         command @ (Command::Quit
         | Command::Clear
@@ -1383,7 +1779,7 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         | Command::Rewind
         | Command::Todo
         | Command::Terminal(_)
-        | Command::Help) => command_handlers::session::execute(app, command),
+        | Command::Help) => command_handlers::session::execute(app, command).await,
         command @ (Command::Model(_)
         | Command::Vision(_)
         | Command::Select(_)
@@ -1407,19 +1803,22 @@ pub(crate) async fn execute_command(app: &mut App<'_>, input: &str) {
         session::save_session(app);
     }
     if outcome.record_history {
-        app.input_panel.push_history(input.to_string());
+        app.ui.input_panel.push_history(input.to_string());
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
-        ConversationPanel, build_compact_request, execute_command, format_agent_updates,
+        KeepRetryMode, build_compact_request, execute_command, format_agent_updates,
         format_task_updates, normalize_input_suggestion, normalize_session_title,
-        ordered_message_content, queue_pending_request,
+        ordered_message_content, queue_pending_request, send_message, start_keep_retry,
+        start_request_as, start_runtime_update_request,
     };
     use crate::cancel::OperationId;
+    use crate::ui::event::{AppEvent, Event};
     use async_openai::types::responses::{ImageDetail, InputContent, InputImageContent};
+    use async_openai::types::responses::{InputMessage, InputRole, MessageItem as ApiMessageItem};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::{collections::BTreeSet, time::Duration};
@@ -1438,23 +1837,432 @@ mod tests {
         Quit,
     }
 
-    async fn command_test_app() -> crate::app::App<'static> {
+    pub(crate) async fn command_test_app() -> crate::app::App<'static> {
         let mut config = crate::config::programmer_config::ProgrammerConfig::default();
         config.providers.clear();
-        crate::app::App::new(
+        let mut app = crate::app::App::new(
             config,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            crate::tasks::TaskManager::default(),
-            "test-session".to_string(),
+            crate::app::session::SessionSeed::Fresh {
+                uuid: uuid::Uuid::new_v4().to_string(),
+            },
             None,
             Vec::new(),
             false,
             "test-project".to_string(),
         )
+        .await;
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(".programmer")
+            .join(format!(
+                "command-checkpoints-{}",
+                app.agent_loop.session.uuid
+            ));
+        app.agent_loop.session.checkpoint_store = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::checkpoint::CheckpointStore::for_test(root),
+        )));
+        app
+    }
+
+    #[tokio::test]
+    async fn clear_closes_background_work_before_resetting_domain_state() {
+        let mut app = command_test_app().await;
+        let tasks = app.agent_loop.session.tasks.clone();
+        let conversation = app.agent_loop.session.conversation.clone();
+        let todos = app.agent_loop.session.todo_store.clone();
+        let generation = app.task_event_generation;
+        let task = tasks.spawn("sleep 30", None, None).unwrap();
+        execute_command(&mut app, "/clear").await;
+        assert_ne!(
+            tasks.snapshot(task).unwrap().status,
+            crate::tasks::TaskStatus::Running
+        );
+        assert!(tasks.spawn("true", None, None).is_err());
+        assert!(app.session_accepts_work());
+        assert!(app.agent_loop.session.tasks.snapshot_all().is_empty());
+        let task = app
+            .agent_loop
+            .session
+            .tasks
+            .spawn("true", None, None)
+            .unwrap();
+        assert!(app.ui.conversation_panel.tasks.snapshot(task).is_some());
+        assert!(app.task_event_generation > generation);
+        assert!(!std::sync::Arc::ptr_eq(
+            &conversation,
+            &app.agent_loop.session.conversation
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &todos,
+            &app.agent_loop.session.todo_store
+        ));
+        app.close_session().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_session_joins_its_event_forwarder() {
+        let mut app = command_test_app().await;
+        let forwarders: Vec<_> = app
+            .agent_loop
+            .background_handles
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        assert!(!forwarders.is_empty());
+        // Keep the manager alive: dropping App is not enough to close its sink.
+        let tasks = app.agent_loop.session.tasks.clone();
+        app.close_session().await.unwrap();
+        assert!(forwarders.iter().all(tokio::task::AbortHandle::is_finished));
+        assert!(app.agent_loop.background_handles.is_empty());
+        assert!(tasks.spawn("true", None, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn new_session_barrier_joins_runner_and_replaces_closed_tasks() {
+        let mut app = command_test_app().await;
+        let old_uuid = app.agent_loop.session.uuid.clone();
+        let old_tasks = app.agent_loop.session.tasks.clone();
+        let task = old_tasks.spawn("sleep 30", None, None).unwrap();
+        let operation = app.agent_loop.cancel.begin(None);
+        let cancel = app.agent_loop.cancel.active.clone();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        app.agent_loop.runner_handles.push(tokio::spawn(async move {
+            cancel.wait_or(std::future::pending::<()>()).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            finished.send(()).unwrap();
+        }));
+        execute_command(&mut app, "/new").await;
+        completion.await.unwrap();
+        assert!(!app.agent_loop.cancel.is_current(operation));
+        assert_ne!(app.agent_loop.session.uuid, old_uuid);
+        assert!(app.agent_loop.runner_handles.is_empty());
+        assert_ne!(
+            old_tasks.snapshot(task).unwrap().status,
+            crate::tasks::TaskStatus::Running
+        );
+        assert!(old_tasks.spawn("true", None, None).is_err());
+        assert!(app.agent_loop.session.tasks.snapshot_all().is_empty());
+        let task = app
+            .agent_loop
+            .session
+            .tasks
+            .spawn("true", None, None)
+            .unwrap();
+        assert!(app.ui.conversation_panel.tasks.snapshot(task).is_some());
+        app.agent_loop
+            .session
+            .tasks
+            .spawn("true", None, None)
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Event::App(AppEvent::TaskStateChanged(event)) =
+                    app.events.next().await.unwrap()
+                    && event.generation == app.task_event_generation
+                {
+                    break;
+                }
+            }
+        })
         .await
+        .unwrap();
+        app.close_session().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_session_persists_terminal_task_state_in_old_session() {
+        let mut app = command_test_app().await;
+        let directory =
+            std::env::temp_dir().join(format!("programmer-close-session-{}", uuid::Uuid::new_v4()));
+        app.agent_loop.session.mgr =
+            Some(crate::session::SessionManager::for_test(directory.clone()));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_input_message(ApiMessageItem::Input(InputMessage {
+                content: vec![InputContent::InputText("keep task history".into())],
+                role: InputRole::User,
+                status: None,
+            }));
+        app.ui.conversation_panel.scroll_to_bottom();
+        let uuid = app.agent_loop.session.uuid.clone();
+        app.agent_loop
+            .session
+            .tasks
+            .spawn("sleep 30", None, None)
+            .unwrap();
+        execute_command(&mut app, "/new").await;
+        assert_ne!(app.agent_loop.session.uuid, uuid);
+        let old = app
+            .agent_loop
+            .session
+            .mgr
+            .as_ref()
+            .unwrap()
+            .load(&uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.tasks.len(), 1);
+        assert_ne!(old.tasks[0].status, "running");
+        assert!(!app.agent_loop.session.did_save);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_session_runner_join_failure_is_reported_without_replacing_session() {
+        let mut app = command_test_app().await;
+        let uuid = app.agent_loop.session.uuid.clone();
+        app.agent_loop
+            .runner_handles
+            .push(tokio::spawn(async { panic!("runner failed") }));
+        execute_command(&mut app, "/new").await;
+        assert_eq!(app.agent_loop.session.uuid, uuid);
+        assert!(!app.session_accepts_work());
+        assert!(
+            app.ui
+                .conversation_panel
+                .items_snapshot()
+                .iter()
+                .any(|item| matches!(item, crate::response::message_item::MessageItem::Error(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_save_failure_keeps_old_session_without_success_message() {
+        let mut app = command_test_app().await;
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_input_message(ApiMessageItem::Input(InputMessage {
+                content: vec![InputContent::InputText("keep me".into())],
+                role: InputRole::User,
+                status: None,
+            }));
+        app.ui.conversation_panel.scroll_to_bottom();
+        let uuid = app.agent_loop.session.uuid.clone();
+        execute_command(&mut app, "/new").await;
+        assert_eq!(app.agent_loop.session.uuid, uuid);
+        assert!(!app.session_accepts_work());
+        let items = app.ui.conversation_panel.items_snapshot();
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, crate::response::message_item::MessageItem::Error(_)))
+        );
+        assert!(
+            !items.iter().any(|item| matches!(
+                item,
+                crate::response::message_item::MessageItem::Info(message)
+                    if message.contains("Started a new session.")
+            )),
+            "a failed save must not announce a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_session_close_keeps_admission_sealed_and_runner_for_retry() {
+        let mut app = command_test_app().await;
+        let uuid = app.agent_loop.session.uuid.clone();
+        let tasks = app.agent_loop.session.tasks.clone();
+        let operation = app.agent_loop.cancel.begin(None);
+        let (release, completion) = tokio::sync::oneshot::channel::<()>();
+        let runner = tokio::spawn(async move {
+            completion.await.unwrap();
+        });
+        let runner_id = runner.id();
+        app.agent_loop.runner_handles.push(runner);
+
+        // Bound the test's wait, not the production timeout: dropping this
+        // close future must leave ownership intact for a subsequent retry.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), app.close_session())
+                .await
+                .is_err()
+        );
+        assert!(!app.session_accepts_work());
+        assert!(!app.require_running_session());
+        assert!(tasks.spawn("true", None, None).is_err());
+        assert_eq!(app.agent_loop.session.uuid, uuid);
+        assert_eq!(app.agent_loop.runner_handles.len(), 1);
+        assert_eq!(app.agent_loop.runner_handles[0].id(), runner_id);
+        assert!(!app.agent_loop.runner_handles[0].is_finished());
+        assert_eq!(app.agent_loop.cancel.active_id, Some(operation));
+
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), app.close_session())
+            .await
+            .expect("released runner should not block the close retry")
+            .unwrap();
+        assert!(app.agent_loop.runner_handles.is_empty());
+        assert_eq!(app.agent_loop.cancel.active_id, None);
+        assert_eq!(app.agent_loop.session.uuid, uuid);
+        assert!(!app.session_accepts_work());
+        assert!(tasks.spawn("true", None, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn timed_out_session_close_keeps_runner_owned_until_retry() {
+        let mut app = command_test_app().await;
+        let uuid = app.agent_loop.session.uuid.clone();
+        let tasks = app.agent_loop.session.tasks.clone();
+        let operation = app.agent_loop.cancel.begin(None);
+        let (release, completion) = tokio::sync::oneshot::channel::<()>();
+        let runner = tokio::spawn(async move {
+            completion.await.unwrap();
+        });
+        let runner_id = runner.id();
+        app.agent_loop.runner_handles.push(runner);
+
+        // Exercise the production ten-second deadline, not cancellation of the
+        // close future by a shorter test timeout.
+        let started = std::time::Instant::now();
+        let error = app.close_session().await.unwrap_err();
+        assert_eq!(error, "runner shutdown timed out; session was not replaced");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(10));
+        assert!(!app.session_accepts_work());
+        assert!(tasks.spawn("true", None, None).is_err());
+        assert_eq!(app.agent_loop.session.uuid, uuid);
+        assert_eq!(app.agent_loop.runner_handles.len(), 1);
+        assert_eq!(app.agent_loop.runner_handles[0].id(), runner_id);
+        assert!(!app.agent_loop.runner_handles[0].is_finished());
+        assert_eq!(app.agent_loop.cancel.active_id, Some(operation));
+
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), app.close_session())
+            .await
+            .expect("released runner should not block the close retry")
+            .unwrap();
+        assert!(app.agent_loop.runner_handles.is_empty());
+        assert_eq!(app.agent_loop.cancel.active_id, None);
+        assert_eq!(app.agent_loop.session.uuid, uuid);
+        assert!(!app.session_accepts_work());
+        assert!(tasks.spawn("true", None, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn stopping_session_rejects_all_startup_paths_and_can_retry_new() {
+        let mut app = command_test_app().await;
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_input_message(ApiMessageItem::Input(InputMessage {
+                content: vec![InputContent::InputText("preserve source".into())],
+                role: InputRole::User,
+                status: None,
+            }));
+        app.ui.conversation_panel.scroll_to_bottom();
+        let source = app.agent_loop.session.conversation.clone();
+        let todos = app.agent_loop.session.todo_store.clone();
+        let operation = app.agent_loop.cancel.begin(None);
+        app.agent_loop.pending_request = Some(super::super::scheduling::UserRequest {
+            text: "must not run".into(),
+            images: Vec::new(),
+        });
+        execute_command(&mut app, "/new").await;
+        assert!(!app.session_accepts_work()); // no persistence manager: save failed
+        let next_id = app.agent_loop.cancel.next_id;
+        app.ui.input_panel.set_content("draft stays here");
+        send_message(&mut app).await;
+        assert_eq!(app.ui.input_panel.get_content(), "draft stays here");
+        start_request_as(&mut app, "user".into(), InputRole::User).await;
+        start_runtime_update_request(
+            &mut app,
+            Vec::new(),
+            Vec::new(),
+            Some(super::super::scheduling::UserRequest {
+                text: "notification".into(),
+                images: Vec::new(),
+            }),
+        )
+        .await;
+        start_keep_retry(&mut app, KeepRetryMode::Exponential);
+        for event in [
+            AppEvent::StartInit("init".into()),
+            AppEvent::TurnFinished(operation, Err(crate::runner::RunnerError::Cancelled)),
+        ] {
+            crate::app::events::handle_event(&mut app, Event::App(event))
+                .await
+                .unwrap();
+        }
+        crate::app::peers::sync_session(&mut app).await;
+        assert!(!crate::app::peers::poll(&mut app, true).await);
+        assert_eq!(app.agent_loop.cancel.next_id, next_id);
+        assert!(app.agent_loop.cancel.active_id.is_none());
+        assert_eq!(
+            app.agent_loop.pending_request.as_ref().unwrap().text,
+            "must not run"
+        );
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join(".programmer")
+            .join(format!("barrier-test-{}", uuid::Uuid::new_v4()));
+        app.agent_loop.session.mgr = Some(crate::session::SessionManager::for_test(directory));
+        execute_command(&mut app, "/new").await;
+        assert!(app.session_accepts_work());
+        assert!(!Arc::ptr_eq(&source, &app.agent_loop.session.conversation));
+        assert!(!Arc::ptr_eq(&todos, &app.agent_loop.session.todo_store));
+        assert!(
+            source
+                .lock()
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| matches!(item, crate::response::message_item::MessageItem::Input(_)))
+        );
+        app.close_session().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_during_active_turn_preserves_history_and_operation() {
+        let mut app = command_test_app().await;
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_input_message(ApiMessageItem::Input(InputMessage {
+                content: vec![InputContent::InputText("keep active history".into())],
+                role: InputRole::User,
+                status: None,
+            }));
+        app.ui.conversation_panel.scroll_to_bottom();
+        let before = app.ui.conversation_panel.items_snapshot().len();
+        let operation = app.agent_loop.cancel.begin(None);
+        execute_command(&mut app, "/clear").await;
+        assert_eq!(app.agent_loop.cancel.active_id, Some(operation));
+        let items = app.ui.conversation_panel.items_snapshot();
+        assert_eq!(items.len(), before + 1);
+        assert!(format!("{:?}", items.last()).contains("Cannot clear while a turn is in flight"));
+        assert!(app.session_accepts_work());
+        app.close_session().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quit_defers_saving_until_barrier_and_escape_keeps_task_admission_open() {
+        let mut app = command_test_app().await;
+        app.agent_loop.cancel.begin(None);
+        crate::app::events::handle_event(&mut app, Event::App(AppEvent::Cancel))
+            .await
+            .unwrap();
+        let tasks = app.agent_loop.session.tasks.clone();
+        tasks.spawn("sleep 30", None, None).unwrap();
+        app.quit();
+        assert!(!app.running);
+        assert!(!app.agent_loop.session.did_save);
+        app.close_session().await.unwrap();
+        assert!(
+            tasks
+                .snapshot_all()
+                .iter()
+                .all(|task| task.status != crate::tasks::TaskStatus::Running)
+        );
+        assert!(tasks.spawn("true", None, None).is_err());
     }
 
     #[tokio::test]
@@ -1473,22 +2281,22 @@ mod tests {
             },
         );
         app.provider_manager = crate::providers::ProviderManager::from_config(&app.config);
-        app.current_model = "test/old".into();
+        app.agent_loop.session.current_model = "test/old".into();
         let runner = app.build_runner().expect("snapshot");
-        app.cancel.active_id = Some(OperationId(42));
-        let cancel = app.cancel.active.clone();
+        app.agent_loop.cancel.active_id = Some(OperationId(42));
+        let cancel = app.agent_loop.cancel.active.clone();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let mut panel = QuestionPanel::delegation("source", "task", true, AnswerTx(tx));
         panel.set_delegation_models(
-            &app.current_model,
+            &app.agent_loop.session.current_model,
             vec![crate::commands::CompletionCandidate {
                 value: "test/new".into(),
                 label: "test/new".into(),
             }],
         );
-        app.question_panel = Some(panel);
+        app.ui.question_panel = Some(panel);
         let (_consent_tx, consent_rx) = tokio::sync::oneshot::channel();
-        app.peers.consent = Some((
+        app.agent_loop.peer_consent = Some((
             crate::peers::PeerEnvelope::new(
                 uuid::Uuid::new_v4().to_string(),
                 uuid::Uuid::new_v4().to_string(),
@@ -1500,7 +2308,7 @@ mod tests {
             consent_rx,
         ));
         // Model selection is routed before tool review and must not answer consent.
-        let before = app.conversation_panel.items_snapshot().len();
+        let before = app.ui.conversation_panel.items_snapshot().len();
         for code in [KeyCode::Char('m'), KeyCode::Down, KeyCode::Enter] {
             crate::app::events::handle_key_events(
                 &mut app,
@@ -1509,14 +2317,14 @@ mod tests {
             .await
             .unwrap();
         }
-        assert_eq!(app.current_model, "test/new");
-        assert!(app.session.dirty);
-        assert_eq!(app.conversation_panel.items_snapshot().len(), before);
+        assert_eq!(app.agent_loop.session.current_model, "test/new");
+        assert!(app.agent_loop.session.dirty);
+        assert_eq!(app.ui.conversation_panel.items_snapshot().len(), before);
         assert!(rx.try_recv().is_err());
         assert_eq!(runner.model_str, "test/old");
         assert_eq!(runner.model_name, "old");
         assert_eq!(app.build_runner().unwrap().model_str, "test/new");
-        assert_eq!(app.cancel.active_id, Some(OperationId(42)));
+        assert_eq!(app.agent_loop.cancel.active_id, Some(OperationId(42)));
         assert!(!cancel.is_cancelled());
         // Peer consent owns Escape even while a turn is active.
         for code in [KeyCode::Char('m'), KeyCode::Esc] {
@@ -1527,8 +2335,8 @@ mod tests {
             .await
             .unwrap();
         }
-        assert!(app.question_panel.is_some());
-        assert_eq!(app.cancel.active_id, Some(OperationId(42)));
+        assert!(app.ui.question_panel.is_some());
+        assert_eq!(app.agent_loop.cancel.active_id, Some(OperationId(42)));
         assert!(!cancel.is_cancelled());
         crate::app::events::handle_key_events(
             &mut app,
@@ -1537,7 +2345,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rx.await.unwrap(), "No");
-        assert_eq!(app.current_model, "test/new");
+        assert_eq!(app.agent_loop.session.current_model, "test/new");
     }
 
     #[tokio::test]
@@ -1626,29 +2434,29 @@ mod tests {
 
         for (name, input, expected) in cases {
             let mut app = command_test_app().await;
-            let before = app.conversation_panel.items_snapshot().len();
+            let before = app.ui.conversation_panel.items_snapshot().len();
             execute_command(&mut app, input).await;
 
             match expected {
                 ExpectedCommandEffect::AppendedMessage => assert!(
-                    app.conversation_panel.items_snapshot().len() > before,
+                    app.ui.conversation_panel.items_snapshot().len() > before,
                     "/{name} produced no visible message"
                 ),
                 ExpectedCommandEffect::ResetWithInfo => assert!(matches!(
-                    app.conversation_panel.items_snapshot().last(),
+                    app.ui.conversation_panel.items_snapshot().last(),
                     Some(crate::response::message_item::MessageItem::Info(_))
                 )),
                 ExpectedCommandEffect::ClearedConversation => {
-                    assert!(app.conversation_panel.items_snapshot().is_empty())
+                    assert!(app.ui.conversation_panel.items_snapshot().is_empty())
                 }
-                ExpectedCommandEffect::ProviderPanel => assert!(app.provider_panel.is_some()),
-                ExpectedCommandEffect::SkillsPanel => assert!(app.skills_panel.is_some()),
-                ExpectedCommandEffect::McpPanel => assert!(app.mcp_panel.is_some()),
+                ExpectedCommandEffect::ProviderPanel => assert!(app.ui.provider_panel.is_some()),
+                ExpectedCommandEffect::SkillsPanel => assert!(app.ui.skills_panel.is_some()),
+                ExpectedCommandEffect::McpPanel => assert!(app.ui.mcp_panel.is_some()),
                 ExpectedCommandEffect::DiagnosticsPanel => {
-                    assert!(app.diagnostics_panel.is_some())
+                    assert!(app.ui.diagnostics_panel.is_some())
                 }
-                ExpectedCommandEffect::SecurityPanel => assert!(app.security_panel.is_some()),
-                ExpectedCommandEffect::TodoPanel => assert!(app.todo_panel.is_some()),
+                ExpectedCommandEffect::SecurityPanel => assert!(app.ui.security_panel.is_some()),
+                ExpectedCommandEffect::TodoPanel => assert!(app.ui.todo_panel.is_some()),
                 ExpectedCommandEffect::Quit => assert!(!app.running),
             }
         }
@@ -1680,9 +2488,9 @@ mod tests {
 
         execute_command(&mut app, "/title  Fix queued editing  ").await;
 
-        assert_eq!(app.session.title, "Fix queued editing");
-        assert!(app.session.title_generation_started);
-        assert_eq!(app.session.title_generation_id, 1);
+        assert_eq!(app.agent_loop.session.title, "Fix queued editing");
+        assert!(app.agent_loop.session.title_generation_started);
+        assert_eq!(app.agent_loop.session.title_generation_id, 1);
     }
 
     #[test]
@@ -1723,20 +2531,21 @@ mod tests {
     #[tokio::test]
     async fn queued_file_reference_uses_the_real_expansion_path() {
         let expanded = crate::commands::expand_references("inspect @Cargo.toml", None).await;
-        let mut panel = ConversationPanel::new();
-        let mut pending_images = Vec::new();
+        let mut pending_request = None;
 
         queue_pending_request(
-            &mut panel,
-            &mut pending_images,
-            expanded.text,
-            expanded.images,
+            &mut pending_request,
+            super::super::scheduling::UserRequest {
+                text: expanded.text,
+                images: expanded.images,
+            },
         );
 
-        let pending = panel.pending_message.as_deref().expect("queued text");
+        let request = pending_request.expect("queued request");
+        let pending = &request.text;
         assert!(pending.contains("inspect @Cargo.toml"));
         assert!(pending.contains("Referenced local file path (content not included): Cargo.toml"));
-        assert!(pending_images.is_empty());
+        assert!(request.images.is_empty());
     }
 
     #[test]
@@ -1746,24 +2555,26 @@ mod tests {
             file_id: None,
             image_url: Some("data:image/png;base64,AAAA".to_string()),
         };
-        let mut panel = ConversationPanel::new();
-        let mut pending_images = Vec::new();
+        let mut pending_request = None;
 
         queue_pending_request(
-            &mut panel,
-            &mut pending_images,
-            "first".to_string(),
-            vec![image()],
+            &mut pending_request,
+            super::super::scheduling::UserRequest {
+                text: "first".to_string(),
+                images: vec![image()],
+            },
         );
         queue_pending_request(
-            &mut panel,
-            &mut pending_images,
-            "second".to_string(),
-            vec![image()],
+            &mut pending_request,
+            super::super::scheduling::UserRequest {
+                text: "second".to_string(),
+                images: vec![image()],
+            },
         );
 
-        assert_eq!(panel.pending_message.as_deref(), Some("first\nsecond"));
-        assert_eq!(pending_images.len(), 2);
+        let request = pending_request.expect("coalesced request");
+        assert_eq!(request.text, "first\nsecond");
+        assert_eq!(request.images, vec![image(), image()]);
     }
 
     #[test]

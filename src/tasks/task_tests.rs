@@ -588,3 +588,174 @@ async fn completion_waiters_observe_drained_output_and_late_waits_return() {
     assert_eq!(late.status, TaskStatus::Completed);
     assert!(manager.wait_until_finished(id + 1).await.is_err());
 }
+
+#[tokio::test]
+async fn shutdown_is_repeatable_and_closes_admission_across_clones() {
+    let manager = TaskManager::default();
+    let clone = manager.clone();
+    manager.spawn(stdin_reader_cmd(), None, None).unwrap();
+    manager.shutdown(Duration::from_secs(5)).await.unwrap();
+    clone.shutdown(Duration::ZERO).await.unwrap();
+    assert!(clone.spawn(echo_cmd(), None, None).is_err());
+    assert!(clone.spawn_command(echo_cmd(), None, None).is_err());
+    assert!(
+        clone
+            .spawn_interactive(echo_cmd(), None, None, 24, 80)
+            .is_err()
+    );
+    assert!(manager.state.lifecycle.lock().unwrap().workers.is_empty());
+    let fresh = TaskManager::default();
+    fresh.spawn(echo_cmd(), None, None).unwrap();
+    fresh.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_joins_workers_even_after_kill_all_clears_registry() {
+    let manager = TaskManager::default();
+    manager.spawn(stdin_reader_cmd(), None, None).unwrap();
+    manager.kill_all();
+    assert!(manager.state.registry.lock().unwrap().is_empty());
+    // kill_all remains reusable, unlike shutdown.
+    manager.spawn(stdin_reader_cmd(), None, None).unwrap();
+    manager.shutdown(Duration::from_secs(5)).await.unwrap();
+    assert!(manager.state.lifecycle.lock().unwrap().workers.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_racing_spawn_does_not_lose_admitted_workers() {
+    let manager = TaskManager::default();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let spawning = {
+        let manager = manager.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait();
+            for _ in 0..32 {
+                if manager.spawn(stdin_reader_cmd(), None, None).is_err() {
+                    break;
+                }
+            }
+        })
+    };
+    barrier.wait();
+    let clone = manager.clone();
+    let (first, second) = tokio::join!(
+        manager.shutdown(Duration::from_secs(5)),
+        clone.shutdown(Duration::from_secs(5))
+    );
+    first.unwrap();
+    second.unwrap();
+    spawning.await.unwrap();
+    assert!(manager.state.lifecycle.lock().unwrap().workers.is_empty());
+    assert!(
+        manager
+            .state
+            .registry
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.status != TaskStatus::Running)
+    );
+}
+
+#[tokio::test]
+async fn shutdown_timeout_retains_worker_for_retry_and_reports_panics() {
+    let manager = TaskManager::default();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        wait.await.unwrap();
+        Ok(())
+    });
+    manager
+        .state
+        .lifecycle
+        .lock()
+        .unwrap()
+        .workers
+        .push(TaskWorker::Async(worker));
+    assert!(
+        manager
+            .shutdown(Duration::ZERO)
+            .await
+            .unwrap_err()
+            .contains("timed out")
+    );
+    assert_eq!(manager.state.lifecycle.lock().unwrap().workers.len(), 1);
+    release.send(()).unwrap();
+    manager.shutdown(Duration::from_secs(5)).await.unwrap();
+
+    let manager = TaskManager::default();
+    let worker = tokio::spawn(async {
+        panic!("injected worker failure");
+    });
+    manager
+        .state
+        .lifecycle
+        .lock()
+        .unwrap()
+        .workers
+        .push(TaskWorker::Async(worker));
+    assert!(
+        manager
+            .shutdown(Duration::from_secs(5))
+            .await
+            .unwrap_err()
+            .contains("worker failed")
+    );
+    assert!(manager.shutdown(Duration::ZERO).await.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_kills_descendants_while_pipe_waiter_is_draining() {
+    let manager = TaskManager::default();
+    let id = manager
+        .spawn("sleep 30 & echo shell-exited", None, None)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    manager.shutdown(Duration::from_secs(5)).await.unwrap();
+    let snapshot = manager.wait_until_finished(id).await.unwrap();
+    assert!(snapshot.output.contains("shell-exited"));
+    assert_eq!(snapshot.status, TaskStatus::Killed);
+}
+
+#[tokio::test]
+async fn shutdown_joins_pty_waiter_and_reader() {
+    let manager = TaskManager::default();
+    let id = manager
+        .spawn_interactive(stdin_reader_cmd(), None, None, 24, 80)
+        .unwrap();
+    manager.shutdown(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        manager.wait_until_finished(id).await.unwrap().status,
+        TaskStatus::Killed
+    );
+    assert!(manager.state.lifecycle.lock().unwrap().workers.is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_shutdown_keeps_thread_ownership_until_retry() {
+    let manager = TaskManager::default();
+    let (release, wait) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        wait.recv().unwrap();
+        Ok(())
+    });
+    manager
+        .state
+        .lifecycle
+        .lock()
+        .unwrap()
+        .workers
+        .push(TaskWorker::Thread(worker));
+    let shutdown = tokio::time::timeout(
+        Duration::from_millis(20),
+        manager.shutdown(Duration::from_secs(30)),
+    )
+    .await;
+    assert!(shutdown.is_err());
+    assert!(manager.spawn(echo_cmd(), None, None).is_err());
+    assert_eq!(manager.state.lifecycle.lock().unwrap().workers.len(), 1);
+    release.send(()).unwrap();
+    manager.shutdown(Duration::from_secs(5)).await.unwrap();
+}

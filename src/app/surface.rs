@@ -47,6 +47,10 @@ impl AgentSurface for TuiSurface {
         let app_ev = match ev {
             RunnerEvent::StreamChunk(b) => AppEvent::ChunkReceived(self.operation_id, Box::new(*b)),
             RunnerEvent::ResponseCommitted => AppEvent::ResponseCommitted(self.operation_id),
+            RunnerEvent::ResponseAborted {
+                start,
+                retained_indices,
+            } => AppEvent::ResponseAborted(self.operation_id, start, retained_indices),
             RunnerEvent::Activity(description) => {
                 AppEvent::RunnerActivity(self.operation_id, description.to_string())
             }
@@ -97,7 +101,18 @@ impl AgentSurface for TuiSurface {
         match self.cancel.wait_or(reply_rx).await {
             Some(Ok(decision)) => decision,
             _ => ReviewDecision::Deny {
-                output: crate::runner::classify::classifier_denied_output(call, "cancelled"),
+                output: crate::tools::ToolOutput {
+                    param: async_openai::types::responses::FunctionCallOutputItemParam {
+                        call_id: call.call_id.clone(),
+                        output: async_openai::types::responses::FunctionCallOutput::Text(
+                            "error: tool approval cancelled; tool was not executed".into(),
+                        ),
+                        id: None,
+                        status: None,
+                    },
+                    failed: true,
+                    approval_label: Some("Approval cancelled; tool was not executed".into()),
+                },
             },
         }
     }
@@ -169,6 +184,45 @@ mod tests {
         answer_tx.send("Yes".to_string());
         assert_eq!(question.await.unwrap(), "Yes");
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_approval_is_not_attributed_to_the_classifier() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let surface = TuiSurface {
+            tx: sender,
+            skill_prompt: None,
+            plan_prompt: None,
+            approval_label: "test".into(),
+            operation_id: OperationId(42),
+            cancel: cancel.clone(),
+        };
+        let call: FunctionToolCall = serde_json::from_value(serde_json::json!({
+            "type": "function_call", "id": "call", "call_id": "approval-test",
+            "name": "command", "arguments": "{}"
+        }))
+        .unwrap();
+        let review = surface.review(&call, "Manual approval", (1, 1));
+        tokio::pin!(review);
+        assert!(futures::poll!(&mut review).is_pending());
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(event, Event::App(AppEvent::ReviewRequest { .. })));
+        cancel.cancel();
+        let ReviewDecision::Deny { output } = review.await else {
+            panic!("cancelled review must deny execution");
+        };
+        assert!(output.failed);
+        assert_eq!(output.param.call_id, "approval-test");
+        let label = output.approval_label.unwrap();
+        assert!(label.contains("cancelled"));
+        assert!(!label.contains("classifier"));
+        let async_openai::types::responses::FunctionCallOutput::Text(text) = output.param.output
+        else {
+            panic!("expected cancellation text");
+        };
+        assert!(text.contains("not executed"));
+        assert!(!text.contains("classifier"));
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::providers::ProviderManager;
 use crate::response::message_item::MessageItem;
-use crate::session::{Session, SessionLockError, SessionManager};
+use crate::session::{SessionLockError, SessionManager, SessionSnapshot};
 use crate::tools::provider::{ToolApproval, ToolCtx, ToolProvider};
 use store::{Store, validate_uuid};
 
@@ -347,7 +347,7 @@ fn lock_error(error: SessionLockError) -> String {
 fn prepare_delegation_session(
     manager: &SessionManager,
     workspace: &str,
-) -> Result<Session, String> {
+) -> Result<SessionSnapshot, String> {
     let workspace = Path::new(workspace)
         .canonicalize()
         .map_err(|e| format!("Invalid workspace: {e}"))?;

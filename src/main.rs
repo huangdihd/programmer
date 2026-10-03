@@ -32,6 +32,7 @@ mod config;
 mod consts;
 mod conversation;
 mod diagnostics;
+mod execution;
 mod headless;
 mod mcp;
 mod memory;
@@ -72,118 +73,82 @@ async fn build_mcp_classifier() -> Option<(
 
 /// Resolved session data ready for the application.
 struct SessionBootstrap {
-    tasks: tasks::TaskManager,
-    uuid: String,
-    items: Vec<crate::response::message_item::MessageItem>,
-    history: Vec<String>,
-    todos: Vec<crate::todos::Todo>,
-    agents: Vec<crate::agents::PersistedAgent>,
+    seed: app::session::SessionSeed,
     mgr: Option<SessionManager>,
     messages: Vec<String>,
     _lock: Option<crate::session::SessionLock>,
 }
 
 fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
-    let tasks = tasks::TaskManager::default();
     let session_mgr = SessionManager::new();
     let mut startup_messages: Vec<String> = Vec::new();
 
-    let (mut session_uuid, mut saved_items, mut saved_history, mut saved_todos, mut saved_agents) =
-        match (resume, &session_mgr) {
-            (Some(Some(uuid)), Some(mgr)) => match mgr.load(&uuid) {
-                Ok(Some(session)) => {
-                    let history = session.history.clone();
-                    let todos = session.todos.clone();
-                    let agents = session.agents.clone();
-                    tasks.restore(&session.tasks);
-                    let items = SessionManager::into_items(session);
-                    (uuid, items, history, todos, agents)
-                }
-                Err(error) => {
-                    eprintln!(
-                        "Cannot resume session {uuid}: {error}. Original file was not changed."
-                    );
-                    return None;
-                }
-                Ok(None) => {
-                    startup_messages
-                        .push(format!("Session {uuid} not found, creating a new session."));
-                    let session = mgr.create();
-                    (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                }
-            },
-            (Some(None), Some(mgr)) => match mgr.list_all() {
-                Ok(sessions) => {
-                    let was_empty = sessions.is_empty();
-                    match session::pick_session(&sessions, mgr) {
-                        Some(uuid) => match mgr.load(&uuid) {
-                            Ok(Some(session)) => {
-                                let history = session.history.clone();
-                                let todos = session.todos.clone();
-                                let agents = session.agents.clone();
-                                tasks.restore(&session.tasks);
-                                let items = SessionManager::into_items(session);
-                                (uuid, items, history, todos, agents)
-                            }
-                            Err(error) => {
-                                eprintln!(
-                                    "Cannot resume session {uuid}: {error}. Original file was not changed."
-                                );
-                                return None;
-                            }
-                            Ok(None) => {
-                                startup_messages.push(format!(
-                                    "Session {uuid} not found on disk, starting a new session."
-                                ));
-                                let session = mgr.create();
-                                (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                            }
-                        },
-                        None => {
-                            if was_empty {
-                                startup_messages.push(
-                                    "No existing sessions found, creating a new one.".to_string(),
-                                );
-                            }
-                            let session = mgr.create();
-                            (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    let mut session_uuid = match (resume, &session_mgr) {
+        (Some(Some(uuid)), Some(mgr)) => match mgr.load(&uuid) {
+            Ok(Some(_)) => uuid,
+            Err(error) => {
+                eprintln!("Cannot resume session {uuid}: {error}. Original file was not changed.");
+                return None;
+            }
+            Ok(None) => {
+                startup_messages.push(format!("Session {uuid} not found, creating a new session."));
+                let session = mgr.create();
+                session.uuid
+            }
+        },
+        (Some(None), Some(mgr)) => match mgr.list_all() {
+            Ok(sessions) => {
+                let was_empty = sessions.is_empty();
+                match session::pick_session(&sessions, mgr) {
+                    Some(uuid) => match mgr.load(&uuid) {
+                        Ok(Some(_)) => uuid,
+                        Err(error) => {
+                            eprintln!(
+                                "Cannot resume session {uuid}: {error}. Original file was not changed."
+                            );
+                            return None;
                         }
-                    }
-                }
-                Err(e) => {
-                    startup_messages.push(format!(
-                        "Failed to list sessions: {e}, creating new session."
-                    ));
-                    if let Some(mgr) = session_mgr.as_ref() {
+                        Ok(None) => {
+                            startup_messages.push(format!(
+                                "Session {uuid} not found on disk, starting a new session."
+                            ));
+                            let session = mgr.create();
+                            session.uuid
+                        }
+                    },
+                    None => {
+                        if was_empty {
+                            startup_messages.push(
+                                "No existing sessions found, creating a new one.".to_string(),
+                            );
+                        }
                         let session = mgr.create();
-                        (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                    } else {
-                        (
-                            String::new(),
-                            Vec::new(),
-                            Vec::new(),
-                            Vec::new(),
-                            Vec::new(),
-                        )
+                        session.uuid
                     }
-                }
-            },
-            _ => {
-                if let Some(mgr) = &session_mgr {
-                    let session = mgr.create();
-                    (session.uuid, Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                } else {
-                    startup_messages.push("Session persistence unavailable.".to_string());
-                    (
-                        String::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
                 }
             }
-        };
+            Err(e) => {
+                startup_messages.push(format!(
+                    "Failed to list sessions: {e}, creating new session."
+                ));
+                if let Some(mgr) = session_mgr.as_ref() {
+                    let session = mgr.create();
+                    session.uuid
+                } else {
+                    String::new()
+                }
+            }
+        },
+        _ => {
+            if let Some(mgr) = &session_mgr {
+                let session = mgr.create();
+                session.uuid
+            } else {
+                startup_messages.push("Session persistence unavailable.".to_string());
+                String::new()
+            }
+        }
+    };
 
     let session_lock = if let Some(mgr) = &session_mgr {
         match mgr.try_lock(&session_uuid) {
@@ -233,36 +198,20 @@ fn resolve_session(resume: Option<Option<String>>) -> Option<SessionBootstrap> {
 
     // An offline peer inquiry may have saved an exchange between the picker
     // read and lock acquisition. Restore the authoritative locked snapshot.
-    let locked_snapshot = if session_lock.is_some() {
-        match session_mgr
-            .as_ref()
-            .map(|manager| manager.load(&session_uuid))
-            .transpose()
-        {
-            Ok(saved) => saved.flatten(),
+    let seed = if let Some(manager) = session_mgr.as_ref().filter(|_| session_lock.is_some()) {
+        match app::session::SessionSeed::load(manager, session_uuid) {
+            Ok(seed) => seed,
             Err(error) => {
                 eprintln!("Cannot restore locked session: {error}. Original file was not changed.");
                 return None;
             }
         }
     } else {
-        None
+        app::session::SessionSeed::Fresh { uuid: session_uuid }
     };
-    if let Some(saved) = locked_snapshot {
-        saved_history = saved.history.clone();
-        saved_todos = saved.todos.clone();
-        saved_agents = saved.agents.clone();
-        tasks.restore(&saved.tasks);
-        saved_items = SessionManager::into_items(saved);
-    }
 
     Some(SessionBootstrap {
-        tasks,
-        uuid: session_uuid,
-        items: saved_items,
-        history: saved_history,
-        todos: saved_todos,
-        agents: saved_agents,
+        seed,
         mgr: session_mgr,
         messages: startup_messages,
         _lock: session_lock,
@@ -373,12 +322,7 @@ async fn async_main(mut args: cli::Args) -> color_eyre::Result<()> {
         let (_guard, terminal) = terminal::TerminalGuard::enter(&project_name)?;
         (result, final_uuid) = App::new(
             programmer_config,
-            bootstrap.items,
-            bootstrap.history,
-            bootstrap.todos,
-            bootstrap.agents,
-            bootstrap.tasks,
-            bootstrap.uuid,
+            bootstrap.seed,
             bootstrap.mgr,
             bootstrap.messages,
             args.providers,

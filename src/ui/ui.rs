@@ -52,29 +52,31 @@ impl App<'_> {
     /// The single status the footer shows, by precedence: user-input waits
     /// first, then the current busy phase, then idle.
     pub(crate) fn resolve_status(&self) -> StatusState {
-        if self.conversation_panel.phase == ActivePhase::Cancelling {
+        if self.agent_loop.phase == ActivePhase::Cancelling {
             return StatusState::Cancelling;
         }
-        if self.question_panel.is_some() {
+        if self.ui.question_panel.is_some() {
             return StatusState::WaitingAnswer;
         }
-        if self.pending_review.is_some() {
+        if self.agent_loop.pending_review.is_some() {
             return StatusState::WaitingApproval;
         }
         // This is set only while the main runner is executing an `agent wait`
         // tool call. Merely having running children does not mean the parent is
         // waiting for them.
-        if let Some(status) = status_for_waiting_subagents(self.waiting_for_subagents) {
+        if let Some(status) = status_for_waiting_subagents(self.agent_loop.waiting_for_subagents) {
             return status;
         }
         // At a mandatory safe point the runner has finished its tools and is
         // waiting for compaction; its last phase is no longer current work.
         // A concurrent background pass must not mask foreground activity.
-        if self.auto_compact.mandatory_waiting && self.auto_compact.active_id.is_some() {
+        if self.agent_loop.auto_compact.mandatory_waiting
+            && self.agent_loop.auto_compact.active_id.is_some()
+        {
             return StatusState::Compacting;
         }
-        let cp = &self.conversation_panel;
-        match cp.phase {
+        let cp = &self.ui.conversation_panel;
+        match self.agent_loop.phase {
             ActivePhase::Classifying => StatusState::Classifying,
             ActivePhase::Associating => StatusState::Associating,
             ActivePhase::Checking => StatusState::Checking,
@@ -83,13 +85,16 @@ impl App<'_> {
             ActivePhase::ToolRunning => StatusState::ToolRunning,
             ActivePhase::CreatingToolCall => StatusState::CreatingToolCall,
             ActivePhase::Outputting => StatusState::Outputting,
-            ActivePhase::None if self.auto_compact.active_id.is_some() => StatusState::Compacting,
+            ActivePhase::None if self.agent_loop.auto_compact.active_id.is_some() => {
+                StatusState::Compacting
+            }
             ActivePhase::None => match &cp.receiving_response {
                 // Request in flight but nothing has streamed back yet: either
                 // still connecting, or backing off between retries.
                 Some(partial) if !partial.started() => status_for_pending_turn(
                     true,
-                    self.cancel
+                    self.agent_loop
+                        .cancel
                         .stream_retrying
                         .load(std::sync::atomic::Ordering::Relaxed),
                 ),
@@ -105,8 +110,9 @@ impl App<'_> {
                     _ => StatusState::Thinking,
                 },
                 None => status_for_pending_turn(
-                    self.cancel.active_id.is_some(),
-                    self.cancel
+                    self.agent_loop.cancel.active_id.is_some(),
+                    self.agent_loop
+                        .cancel
                         .stream_retrying
                         .load(std::sync::atomic::Ordering::Relaxed),
                 ),
@@ -133,11 +139,11 @@ impl App<'_> {
                 Constraint::Length(1),             // POS_FOOTER
             ])
             .split(area);
-        self.conversation_panel.render(chunks[POS_CONV], buf);
+        self.ui.conversation_panel.render(chunks[POS_CONV], buf);
 
-        if let Some(panel) = &self.question_panel {
+        if let Some(panel) = &self.ui.question_panel {
             panel.render(chunks[POS_BOTTOM], buf);
-        } else if let Some(ref review) = self.pending_review {
+        } else if let Some(ref review) = self.agent_loop.pending_review {
             let (current, total) = review.position;
             let detail_lines = crate::ui::tool_details::format_tool_details(
                 &review.call.name,
@@ -195,8 +201,8 @@ impl App<'_> {
                         .border_style(Style::default().fg(Color::Yellow)),
                 )
                 .render(chunks[POS_BOTTOM], buf);
-        } else if self.work_mode == crate::classifier::WorkMode::Plan
-            && self.plan_phase == crate::classifier::PlanPhase::Reviewing
+        } else if self.agent_loop.session.work_mode == crate::classifier::WorkMode::Plan
+            && self.agent_loop.plan_phase == crate::classifier::PlanPhase::Reviewing
         {
             let yolo_on = self.config.allow_yolo;
             let options: &[&str] = if yolo_on {
@@ -213,7 +219,7 @@ impl App<'_> {
                     "Propose changes\u{2026}     (give feedback first)",
                 ]
             };
-            let sel = self.plan_review_selected;
+            let sel = self.ui.plan_review_selected;
             let option_lines: Vec<Line> = options
                 .iter()
                 .enumerate()
@@ -265,14 +271,14 @@ impl App<'_> {
                 )
                 .render(chunks[POS_BOTTOM], buf);
         } else {
-            self.input_panel.render(chunks[POS_BOTTOM], buf);
+            self.ui.input_panel.render(chunks[POS_BOTTOM], buf);
         }
-        (&self.footer).render(chunks[POS_FOOTER], buf);
+        (&self.ui.footer).render(chunks[POS_FOOTER], buf);
 
         // ---- completion popup (floats above the input panel) ----
-        if let Some(ref completion) = self.input_panel.completion
+        if let Some(ref completion) = self.ui.input_panel.completion
             && completion.visible
-            && self.question_panel.is_none()
+            && self.ui.question_panel.is_none()
         {
             let max_visible = 10u16;
             let count = (completion.candidates.len() as u16).min(max_visible);
@@ -304,7 +310,7 @@ impl App<'_> {
         }
 
         // ---- todo panel (floating overlay, centered) ----
-        if let Some(panel) = &self.todo_panel {
+        if let Some(panel) = &self.ui.todo_panel {
             let panel_height = panel.needed_height().min(area.height.saturating_sub(4));
             let panel_width = (area.width / 2 + 20).min(area.width.saturating_sub(4));
             let x = area.x + (area.width.saturating_sub(panel_width)) / 2;
@@ -339,8 +345,14 @@ impl App<'_> {
 
 impl Widget for &mut App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        self.ui.conversation_panel.phase = self.agent_loop.phase;
+        self.ui.conversation_panel.pending_message = self
+            .agent_loop
+            .pending_request
+            .as_ref()
+            .map(|request| request.text.clone());
         let theme = self.config.theme;
-        let terminal_pane = self.terminal_pane.is_some();
+        let terminal_pane = self.ui.terminal_pane.is_some();
         self.render_content(area, buf);
         // A child terminal owns its ANSI colors, not the application's theme.
         if !terminal_pane {
@@ -351,37 +363,45 @@ impl Widget for &mut App<'_> {
 
 impl App<'_> {
     fn render_content(&mut self, area: Rect, buf: &mut Buffer) {
-        if let Some(panel) = &self.provider_panel {
+        if let Some(sidebar) = &mut self.ui.sidebar {
+            sidebar.hide();
+        }
+        if let Some(panel) = &self.ui.provider_panel {
             panel.render(&self.config, &self.provider_manager, area, buf);
             return;
         }
-        if let Some(panel) = &self.rewind_panel {
+        if let Some(panel) = &self.ui.rewind_panel {
             panel.render(area, buf);
             return;
         }
         // The skills management panel is modal and replaces the whole UI.
-        if let Some(panel) = &self.skills_panel {
-            panel.render(&self.skill_registry, area, buf);
+        if let Some(panel) = &self.ui.skills_panel {
+            panel.render(&self.agent_loop.skill_registry, area, buf);
             return;
         }
         // The MCP management panel is modal and replaces the whole UI.
-        if let Some(panel) = &self.mcp_panel {
-            panel.render(&self.config, self.mcp_manager.as_deref(), area, buf);
+        if let Some(panel) = &self.ui.mcp_panel {
+            panel.render(
+                &self.config,
+                self.mcp_runtime.connections().map(AsRef::as_ref),
+                area,
+                buf,
+            );
             return;
         }
         // The diagnostics management panel is modal and replaces the whole UI.
-        if let Some(panel) = &self.diagnostics_panel {
+        if let Some(panel) = &self.ui.diagnostics_panel {
             panel.render(area, buf);
             return;
         }
         // The security profile panel is modal and replaces the whole UI.
-        if let Some(panel) = &self.security_panel {
+        if let Some(panel) = &self.ui.security_panel {
             panel.render(&self.config, area, buf);
             return;
         }
         // The task panel is modal and replaces the whole UI. Interactive tasks
         // receive the visible grid size; pipe tasks render captured output.
-        if let Some(pane) = &mut self.terminal_pane {
+        if let Some(pane) = &mut self.ui.terminal_pane {
             use crate::ui::components::terminal_panel;
             let grid = terminal_panel::grid_area(area);
             pane.grid = Some(grid);
@@ -389,48 +409,60 @@ impl App<'_> {
             terminal_panel::render(pane, area, buf);
             return;
         }
-        if let Some(panel) = &mut self.activity_panel {
-            panel.render(area, buf);
+        if let Some(page) = &mut self.ui.activity_page {
+            page.panel.render(area, buf);
             return;
         }
-        if let Some(panel) = &mut self.agent_panel {
+        if let Some(panel) = &mut self.ui.agent_panel {
             panel.render(area, buf);
             return;
         }
 
         // Resolve the single status the footer should show, then let the
         // status bar track its own busy timer.
-        self.footer.status.set(self.resolve_status());
+        self.ui.footer.status.set(self.resolve_status());
         // Keep the terminal title in sync with the current status. Once the
         // session has a generated title, use it in place of the project
         // directory so several Programmer windows remain distinguishable.
-        let title_subject = terminal_title_subject(&self.session.title, &self.project_name);
+        let title_subject =
+            terminal_title_subject(&self.agent_loop.session.title, &self.project_name);
         crate::terminal::set_terminal_title(&format!(
             "{} {} \u{b7} programmer",
-            self.footer.status.status.emoji_label(),
+            self.ui.footer.status.status.emoji_label(),
             title_subject,
         ));
-        self.footer.status.detail =
-            (self.footer.status.status == StatusState::Cancelling).then(|| {
+        self.ui.footer.status.detail = (self.ui.footer.status.status == StatusState::Cancelling)
+            .then(|| {
                 format!(
                     "waiting for {} to return (last observed)",
-                    self.cancel.activity.as_deref().unwrap_or("runner")
+                    self.agent_loop
+                        .cancel
+                        .activity
+                        .as_deref()
+                        .unwrap_or("runner")
                 )
             });
-        self.footer.work_mode = self.work_mode;
-        self.footer.sandbox_mode = self.security.sandbox_mode();
-        self.footer.sandbox_profile = self.config.active_security_profile.clone();
-        self.footer.current_model = self.current_model.clone();
-        self.footer.thinking_level = self.thinking_level;
-        self.footer.lsp_configured = self.diag.lsp_configured;
+        self.ui.footer.work_mode = self.agent_loop.session.work_mode;
+        self.ui.footer.sandbox_mode = self.security.sandbox_mode();
+        self.ui.footer.sandbox_profile = self.config.active_security_profile.clone();
+        self.ui.footer.current_model = self.agent_loop.session.current_model.clone();
+        self.ui.footer.thinking_level = self.agent_loop.session.thinking_level;
+        self.ui.footer.lsp_configured = self
+            .agent_loop
+            .session
+            .diagnostics_state
+            .lock()
+            .unwrap()
+            .lsp_configured;
 
         // When the model is asking a question or waiting for approval,
         // the bottom area grows; the conversation panel shrinks.
         let question_height: u16 = self
+            .ui
             .question_panel
             .as_ref()
             .map(|q| {
-                let sidebar_width = if self.sidebar.is_some() {
+                let sidebar_width = if self.ui.sidebar.is_some() {
                     Sidebar::needed_width().min(area.width / 3)
                 } else {
                     0
@@ -438,7 +470,7 @@ impl App<'_> {
                 q.needed_height_for_width(area.width.saturating_sub(sidebar_width))
             })
             .unwrap_or(3);
-        let approval_height: u16 = if let Some(ref review) = self.pending_review {
+        let approval_height: u16 = if let Some(ref review) = self.agent_loop.pending_review {
             let detail_count = crate::ui::tool_details::format_tool_details(
                 &review.call.name,
                 &review.call.arguments,
@@ -450,22 +482,23 @@ impl App<'_> {
         };
         // The bottom row is either a modal (question / approval / plan review) or the input.
         // When it's the input, let it grow with multi-line content.
-        let plan_review_height: u16 = if self.work_mode == crate::classifier::WorkMode::Plan
-            && self.plan_phase == crate::classifier::PlanPhase::Reviewing
+        let plan_review_height: u16 = if self.agent_loop.session.work_mode
+            == crate::classifier::WorkMode::Plan
+            && self.agent_loop.plan_phase == crate::classifier::PlanPhase::Reviewing
         {
             let option_count: u16 = if self.config.allow_yolo { 4 } else { 3 };
             5 + option_count // header + separator + options
         } else {
             0
         };
-        let bottom_height = if self.question_panel.is_some() {
+        let bottom_height = if self.ui.question_panel.is_some() {
             question_height
-        } else if self.pending_review.is_some() {
+        } else if self.agent_loop.pending_review.is_some() {
             approval_height
         } else if plan_review_height > 0 {
             plan_review_height
         } else {
-            self.input_panel.needed_height()
+            self.ui.input_panel.needed_height()
         };
 
         // ---- logo at top (full width, even with sidebar open) ----
@@ -476,10 +509,10 @@ impl App<'_> {
                 Constraint::Min(1),    // content area
             ])
             .split(area);
-        let title = if self.session.title.is_empty() {
+        let title = if self.agent_loop.session.title.is_empty() {
             "Programmer"
         } else {
-            &self.session.title
+            &self.agent_loop.session.title
         };
         Logo::new(title)
             .with_dream(self.dream_active.load(std::sync::atomic::Ordering::Relaxed))
@@ -487,7 +520,7 @@ impl App<'_> {
         let content_area = vert[1];
 
         // ---- sidebar: conditionally split the content area horizontally ----
-        if self.sidebar.is_some() {
+        if self.ui.sidebar.is_some() {
             let sidebar_width = Sidebar::needed_width().min(content_area.width / 3);
             let horiz = Layout::default()
                 .direction(Direction::Horizontal)
@@ -496,43 +529,44 @@ impl App<'_> {
                     Constraint::Length(sidebar_width), // sidebar
                 ])
                 .split(content_area);
-            self.sidebar_area = Some(horiz[1]);
 
             self.render_main(horiz[0], buf, bottom_height);
 
             let expanded_task_ids = self
+                .ui
                 .sidebar
                 .as_ref()
                 .map(|sidebar| sidebar.expanded_task_ids().clone())
                 .unwrap_or_default();
-            let sidebar_tasks = self.tasks.snapshot_for_sidebar(&expanded_task_ids);
-            let sidebar_agents = self.agents.snapshot_all();
+            let sidebar_tasks = self
+                .agent_loop
+                .session
+                .tasks
+                .snapshot_for_sidebar(&expanded_task_ids);
+            let sidebar_agents = self.agent_loop.session.agents.snapshot_all();
             let active_provider = self
+                .agent_loop
+                .session
                 .current_model
                 .split_once('/')
                 .map_or(self.config.default_provider.as_str(), |(provider, _)| {
                     provider
                 });
-            self.sidebar.as_mut().unwrap().render(
+            let diagnostics_state = self.agent_loop.session.diagnostics_state.lock().unwrap();
+            self.ui.sidebar.as_mut().unwrap().render(
                 horiz[1],
                 buf,
-                self.diagnostics_state
-                    .lock()
-                    .unwrap()
-                    .baseline
-                    .as_deref()
-                    .unwrap_or(&[]),
-                self.diag.lsp_configured,
-                &self.mcp_server_statuses,
-                &self.provider_model_statuses,
+                diagnostics_state.baseline.as_deref().unwrap_or(&[]),
+                diagnostics_state.lsp_configured,
+                self.mcp_runtime.statuses(),
+                self.provider_manager.model_statuses(),
                 active_provider,
-                self.skill_registry.activated_names(),
-                &self.todo_list,
+                self.agent_loop.skill_registry.activated_names(),
+                &self.ui.todo_list,
                 &sidebar_tasks,
                 &sidebar_agents,
             );
         } else {
-            self.sidebar_area = None;
             self.render_main(content_area, buf, bottom_height);
         }
     }

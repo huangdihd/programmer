@@ -33,8 +33,8 @@ pub(crate) async fn handle_key_events(
     // owns the key. Approval/question prompts belong to the active turn and
     // intentionally are not listed here, so Esc still cancels that turn.
     if key_event.code == KeyCode::Esc
-        && app.cancel.active_id.is_some()
-        && app.peers.consent.is_none()
+        && app.agent_loop.cancel.active_id.is_some()
+        && app.agent_loop.peer_consent.is_none()
         && !independent_overlay_owns_escape(app)
     {
         app.events.send(AppEvent::Cancel);
@@ -44,42 +44,49 @@ pub(crate) async fn handle_key_events(
     // ---- Ctrl+Z while a command tool is running: keep its process alive as
     // a background task. Do this before modal routing so the foreground turn
     // can finish and the promoted task can appear in the sidebar immediately.
-    if is_promote_shortcut(key_event) && app.tasks.promote_running_command().is_some() {
+    if is_promote_shortcut(key_event)
+        && app
+            .agent_loop
+            .session
+            .tasks
+            .promote_running_command()
+            .is_some()
+    {
         return Ok(());
     }
 
     // ---- interactive terminal panel (fully modal; grabs input) ----
-    if app.terminal_pane.is_some() {
+    if app.ui.terminal_pane.is_some() {
         handle_terminal_key(app, key_event);
         return Ok(());
     }
 
-    if app.activity_panel.is_some() {
+    if app.ui.activity_page.is_some() {
         super::super::activity::handle_key(app, key_event);
         return Ok(());
     }
 
-    if let Some(panel) = app.agent_panel.as_mut() {
+    if let Some(panel) = app.ui.agent_panel.as_mut() {
         if panel.handle_key(key_event) {
-            app.agent_panel = None;
+            app.ui.agent_panel = None;
         }
         return Ok(());
     }
 
-    if let Some(panel) = app.rewind_panel.as_mut() {
+    if let Some(panel) = app.ui.rewind_panel.as_mut() {
         use crate::ui::components::rewind_panel::PanelAction as RewindAction;
         let action = panel.handle_key(key_event);
         match action {
-            RewindAction::Close => app.rewind_panel = None,
+            RewindAction::Close => app.ui.rewind_panel = None,
             RewindAction::Fork { checkpoint_id } => {
-                app.rewind_panel = None;
-                apply_rewind_fork(app, checkpoint_id);
+                app.ui.rewind_panel = None;
+                apply_rewind_fork(app, checkpoint_id).await;
             }
             RewindAction::Restore {
                 checkpoint_id,
                 mode,
             } => {
-                app.rewind_panel = None;
+                app.ui.rewind_panel = None;
                 apply_rewind(app, checkpoint_id, mode);
             }
             RewindAction::None => {}
@@ -91,17 +98,23 @@ pub(crate) async fn handle_key_events(
     // must not consume Enter while the user sees peer consent instead.
     // ---- question panel ----
     super::super::peers::refresh_consent_models(app);
-    if let Some(panel) = app.question_panel.as_mut() {
+    if let Some(panel) = app.ui.question_panel.as_mut() {
         match panel.handle_key(key_event) {
             crate::ui::components::question_panel::AnswerAction::Answer(text) => {
                 panel.answer(text);
-                app.question_panel = None;
+                app.ui.question_panel = None;
             }
             crate::ui::components::question_panel::AnswerAction::SelectModel(model) => {
                 if let Err(error) =
                     super::super::command_handlers::settings::switch_model(app, &model)
                 {
-                    app.conversation_panel.add_error_string(error);
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .add_error_string(error);
+                    app.ui.conversation_panel.scroll_to_bottom();
                 }
                 super::super::peers::refresh_consent_models(app);
             }
@@ -111,42 +124,64 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- tool-call approval (Manual mode) ----
-    if app.pending_review.is_some() {
+    if app.agent_loop.pending_review.is_some() {
         return handle_approval_key(app, key_event);
     }
 
     // ---- plan review (Plan mode) ----
-    if app.work_mode == WorkMode::Plan && app.plan_phase == crate::classifier::PlanPhase::Reviewing
+    if app.agent_loop.session.work_mode == WorkMode::Plan
+        && app.agent_loop.plan_phase == crate::classifier::PlanPhase::Reviewing
     {
         return handle_plan_review_key(app, key_event).await;
     }
 
     // ---- todo panel ----
-    if let Some(panel) = app.todo_panel.as_mut() {
+    if let Some(panel) = app.ui.todo_panel.as_mut() {
+        use crate::ui::components::todo_panel::PanelAction;
         let action = panel.handle_key(key_event);
-        app.todo_list = panel.list.clone();
-        app.sync_todos_to_store();
-        session::mark_dirty(app);
         match action {
-            crate::ui::components::todo_panel::PanelAction::Close => {
-                app.todo_panel = None;
+            PanelAction::Close => app.ui.todo_panel = None,
+            PanelAction::None => return Ok(()),
+            action => {
+                let result = {
+                    let mut list = app.agent_loop.session.todo_store.lock().unwrap();
+                    match action {
+                        PanelAction::Add { title, description } => {
+                            list.add(title, description);
+                            Ok(())
+                        }
+                        PanelAction::Toggle { id } => list.toggle_status(&id).map(|_| ()),
+                        PanelAction::Delete { id } => list.delete(&id).map(|_| ()),
+                        PanelAction::None | PanelAction::Close => unreachable!(),
+                    }
+                };
+                if let Err(error) = result {
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .add_error_string(error);
+                    app.ui.conversation_panel.scroll_to_bottom();
+                }
+                app.sync_todos_from_store();
+                session::mark_dirty(app);
             }
-            crate::ui::components::todo_panel::PanelAction::None => {}
         }
         return Ok(());
     }
 
     // ---- sidebar keyboard (when focused) ----
-    if app.sidebar.as_ref().is_some_and(|s| s.has_focus) {
+    if app.ui.sidebar.as_ref().is_some_and(|s| s.has_focus) {
         if key_event.code == KeyCode::Esc {
-            if let Some(ref mut s) = app.sidebar {
+            if let Some(ref mut s) = app.ui.sidebar {
                 s.has_focus = false;
             }
             return Ok(());
         }
-        if let Some(ref mut s) = app.sidebar {
-            let visible_lines = app
-                .sidebar_area
+        if let Some(ref mut s) = app.ui.sidebar {
+            let visible_lines = s
+                .area()
                 .map_or(1, |area| area.height.saturating_sub(1).max(1));
             s.handle_key(key_event, visible_lines);
         }
@@ -155,23 +190,24 @@ pub(crate) async fn handle_key_events(
 
     // ---- Ctrl+B: toggle sidebar ----
     if key_event.code == KeyCode::Char('b') && key_event.modifiers == KeyModifiers::CONTROL {
-        if app.sidebar.is_some() {
-            app.sidebar = None;
+        if app.ui.sidebar.is_some() {
+            app.ui.sidebar = None;
         } else {
-            app.sidebar = Some(crate::ui::components::sidebar::Sidebar::new());
+            app.ui.sidebar = Some(crate::ui::components::sidebar::Sidebar::new());
         }
         return Ok(());
     }
 
     // ---- Ctrl+T: cycle work mode ----
     if key_event.code == KeyCode::Char('t') && key_event.modifiers == KeyModifiers::CONTROL {
-        app.work_mode = app.work_mode.next(app.config.allow_yolo);
+        app.agent_loop.session.work_mode =
+            app.agent_loop.session.work_mode.next(app.config.allow_yolo);
         session::persist_config(app);
         return Ok(());
     }
 
     // ---- provider management panel (modal) ----
-    if let Some(panel) = app.provider_panel.as_mut() {
+    if let Some(panel) = app.ui.provider_panel.as_mut() {
         if matches!(key_event.code, KeyCode::Char('q' | 'Q' | 'c' | 'C'))
             && key_event.modifiers == KeyModifiers::CONTROL
         {
@@ -179,7 +215,7 @@ pub(crate) async fn handle_key_events(
             return Ok(());
         }
         match panel.handle_key(key_event, &mut app.config, &app.provider_manager) {
-            PanelAction::Close => app.provider_panel = None,
+            PanelAction::Close => app.ui.provider_panel = None,
             PanelAction::Saved => {
                 session::persist_config(app);
                 app.events.send(AppEvent::ProvidersChanged);
@@ -196,10 +232,10 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- skills management panel (modal) ----
-    if let Some(panel) = app.skills_panel.as_mut() {
+    if let Some(panel) = app.ui.skills_panel.as_mut() {
         use crate::ui::components::skills_panel::PanelAction as SkillsAction;
-        match panel.handle_key(key_event, &mut app.skill_registry) {
-            SkillsAction::Close => app.skills_panel = None,
+        match panel.handle_key(key_event, &mut app.agent_loop.skill_registry) {
+            SkillsAction::Close => app.ui.skills_panel = None,
             SkillsAction::Saved => session::save_session(app),
             SkillsAction::None => {}
         }
@@ -207,7 +243,7 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- MCP management panel (modal) ----
-    if let Some(panel) = app.mcp_panel.as_mut() {
+    if let Some(panel) = app.ui.mcp_panel.as_mut() {
         use crate::ui::components::mcp_panel::PanelAction as McpAction;
         if matches!(key_event.code, KeyCode::Char('q' | 'Q' | 'c' | 'C'))
             && key_event.modifiers == KeyModifiers::CONTROL
@@ -216,7 +252,7 @@ pub(crate) async fn handle_key_events(
             return Ok(());
         }
         match panel.handle_key(key_event, &mut app.config) {
-            McpAction::Close => app.mcp_panel = None,
+            McpAction::Close => app.ui.mcp_panel = None,
             McpAction::Saved => {
                 session::persist_config(app);
                 app.events.send(AppEvent::McpChanged);
@@ -227,20 +263,33 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- diagnostics management panel (modal) ----
-    if let Some(panel) = app.diagnostics_panel.as_mut() {
+    if let Some(panel) = app.ui.diagnostics_panel.as_mut() {
         use crate::ui::components::diagnostics_panel::PanelAction as DiagnosticsAction;
         match panel.handle_key(key_event) {
-            DiagnosticsAction::Close => app.diagnostics_panel = None,
+            DiagnosticsAction::Close => app.ui.diagnostics_panel = None,
             DiagnosticsAction::Saved(profile) => {
                 match crate::app::diagnostics::save_profile(&profile) {
                     Ok(()) => {
                         crate::app::diagnostics::reset_diagnostics_state(app);
-                        app.diag.lsp_configured = crate::app::helpers::lsp_checker_configured();
+                        app.agent_loop
+                            .session
+                            .diagnostics_state
+                            .lock()
+                            .unwrap()
+                            .lsp_configured = crate::app::helpers::lsp_checker_configured();
                         crate::app::diagnostics::start_update(app, false);
                     }
-                    Err(error) => app
-                        .conversation_panel
-                        .add_error_string(format!("could not save diagnostics profile: {error}")),
+                    Err(error) => {
+                        app.agent_loop
+                            .session
+                            .conversation
+                            .lock()
+                            .unwrap()
+                            .add_error_string(format!(
+                                "could not save diagnostics profile: {error}"
+                            ));
+                        app.ui.conversation_panel.scroll_to_bottom();
+                    }
                 }
             }
             DiagnosticsAction::None => {}
@@ -249,17 +298,18 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- security profile management panel (modal) ----
-    if app.security_panel.is_some() {
+    if app.ui.security_panel.is_some() {
         use crate::ui::components::security_panel::PanelAction as SecurityAction;
         let previous_profile = app.config.active_security_profile.clone();
         let previous_security = app.config.security.clone();
         let action = app
+            .ui
             .security_panel
             .as_mut()
             .expect("checked above")
             .handle_key(key_event, &mut app.config);
         match action {
-            SecurityAction::Close => app.security_panel = None,
+            SecurityAction::Close => app.ui.security_panel = None,
             SecurityAction::Saved => session::persist_config(app),
             SecurityAction::Apply => match app.install_active_security() {
                 Ok(()) => session::persist_config(app),
@@ -269,8 +319,13 @@ pub(crate) async fn handle_key_events(
                         .security_profiles
                         .insert(previous_profile, previous_security.clone());
                     app.config.security = previous_security;
-                    app.conversation_panel
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
                         .add_error_string(format!("invalid security configuration: {error}"));
+                    app.ui.conversation_panel.scroll_to_bottom();
                 }
             },
             SecurityAction::None => {}
@@ -286,6 +341,7 @@ pub(crate) async fn handle_key_events(
 
     // ---- completion-popup navigation ----
     if app
+        .ui
         .input_panel
         .completion
         .as_ref()
@@ -293,11 +349,11 @@ pub(crate) async fn handle_key_events(
     {
         match key_event.code {
             KeyCode::Tab => {
-                let content = app.input_panel.get_content();
-                if let Some(c) = app.input_panel.completion.as_mut() {
+                let content = app.ui.input_panel.get_content();
+                if let Some(c) = app.ui.input_panel.completion.as_mut() {
                     if content == c.line(c.selected) {
                         if c.candidates.len() == 1 {
-                            app.input_panel.completion = None;
+                            app.ui.input_panel.completion = None;
                             return Ok(());
                         }
                         c.selected = (c.selected + 1) % c.candidates.len();
@@ -309,12 +365,12 @@ pub(crate) async fn handle_key_events(
                         c.scroll_offset = c.selected - visible + 1;
                     }
                     let text = c.line(c.selected);
-                    app.input_panel.set_content(&text);
+                    app.ui.input_panel.set_content(&text);
                 }
                 return Ok(());
             }
             KeyCode::Up => {
-                if let Some(ref mut c) = app.input_panel.completion {
+                if let Some(ref mut c) = app.ui.input_panel.completion {
                     let visible = 10usize;
                     if c.selected > 0 {
                         c.selected -= 1;
@@ -327,12 +383,12 @@ pub(crate) async fn handle_key_events(
                         c.scroll_offset = c.selected - visible + 1;
                     }
                     let text = c.line(c.selected);
-                    app.input_panel.set_content(&text);
+                    app.ui.input_panel.set_content(&text);
                 }
                 return Ok(());
             }
             KeyCode::Down => {
-                if let Some(ref mut c) = app.input_panel.completion {
+                if let Some(ref mut c) = app.ui.input_panel.completion {
                     c.selected = (c.selected + 1) % c.candidates.len();
                     let visible = 10usize;
                     if c.selected < c.scroll_offset {
@@ -341,12 +397,12 @@ pub(crate) async fn handle_key_events(
                         c.scroll_offset = c.selected - visible + 1;
                     }
                     let text = c.line(c.selected);
-                    app.input_panel.set_content(&text);
+                    app.ui.input_panel.set_content(&text);
                 }
                 return Ok(());
             }
             KeyCode::Esc | KeyCode::Char('q') if key_event.modifiers == KeyModifiers::CONTROL => {
-                app.input_panel.completion = None;
+                app.ui.input_panel.completion = None;
                 return Ok(());
             }
             _ => {}
@@ -354,7 +410,10 @@ pub(crate) async fn handle_key_events(
     }
 
     // ---- Esc: cancel current stream ----
-    if key_event.code == KeyCode::Esc && app.conversation_panel.is_busy() {
+    if key_event.code == KeyCode::Esc
+        && (app.agent_loop.cancel.active_id.is_some()
+            || app.agent_loop.auto_compact.active_id.is_some())
+    {
         app.events.send(AppEvent::Cancel);
         return Ok(());
     }
@@ -373,52 +432,54 @@ pub(crate) async fn handle_key_events(
     // ---- text input ----
     match key_event.code {
         KeyCode::Char(_c) => {
-            app.input_panel.input(key_event);
+            app.ui.input_panel.input(key_event);
             update_completions(app);
         }
         KeyCode::Backspace => {
-            if !app.input_panel.delete_placeholder_backward() {
-                app.input_panel.input(key_event);
+            if !app.ui.input_panel.delete_placeholder_backward() {
+                app.ui.input_panel.input(key_event);
             }
             update_completions(app);
         }
         KeyCode::Delete => {
-            if !app.input_panel.delete_placeholder_forward() {
-                app.input_panel.input(key_event);
+            if !app.ui.input_panel.delete_placeholder_forward() {
+                app.ui.input_panel.input(key_event);
             }
             update_completions(app);
         }
         KeyCode::Right
-            if key_event.modifiers == KeyModifiers::NONE && app.input_panel.accept_suggestion() =>
+            if key_event.modifiers == KeyModifiers::NONE
+                && app.ui.input_panel.accept_suggestion() =>
         {
             update_completions(app);
         }
         KeyCode::PageUp => {
-            app.conversation_panel.scroll_page_up();
+            app.ui.conversation_panel.scroll_page_up();
         }
         KeyCode::PageDown => {
-            app.conversation_panel.scroll_page_down();
+            app.ui.conversation_panel.scroll_page_down();
         }
         KeyCode::Up => {
-            if app.input_panel.get_content().is_empty() {
-                if let Some(pending) = app.conversation_panel.pending_message.take() {
-                    app.pending_images.clear();
-                    app.input_panel.set_content(&pending);
+            if app.ui.input_panel.get_content().is_empty() {
+                if let Some(pending) = app.agent_loop.pending_request.take() {
+                    // Draft recall remains text-only; consume the entire request
+                    // so expanded images cannot leak into the next submission.
+                    app.ui.input_panel.set_content(&pending.text);
                 } else {
-                    app.input_panel.history_up();
+                    app.ui.input_panel.history_up();
                 }
-            } else if app.input_panel.is_navigating_history() {
-                app.input_panel.history_up();
+            } else if app.ui.input_panel.is_navigating_history() {
+                app.ui.input_panel.history_up();
             } else {
-                app.input_panel.input(key_event);
+                app.ui.input_panel.input(key_event);
             }
         }
         KeyCode::Enter if is_newline_modifier(key_event.modifiers) => {
-            app.input_panel.insert_newline();
+            app.ui.input_panel.insert_newline();
             update_completions(app);
         }
         KeyCode::Enter => {
-            let text = app.input_panel.get_content();
+            let text = app.ui.input_panel.get_content();
             if text.starts_with('/') {
                 commands::execute_command(app, &text).await;
             } else if text.starts_with('!') {
@@ -428,7 +489,7 @@ pub(crate) async fn handle_key_events(
             }
         }
         _ => {
-            app.input_panel.input(key_event);
+            app.ui.input_panel.input(key_event);
             update_completions(app);
         }
     }
@@ -438,21 +499,23 @@ pub(crate) async fn handle_key_events(
 /// Independent UI surfaces must get the first chance to close or leave their
 /// local mode before Esc is interpreted as cancelling the active model turn.
 fn independent_overlay_owns_escape(app: &App<'_>) -> bool {
-    app.terminal_pane.is_some()
-        || app.agent_panel.is_some()
-        || app.activity_panel.is_some()
-        || app.rewind_panel.is_some()
-        || app.todo_panel.is_some()
-        || app.provider_panel.is_some()
-        || app.skills_panel.is_some()
-        || app.mcp_panel.is_some()
-        || app.diagnostics_panel.is_some()
-        || app.security_panel.is_some()
+    app.ui.terminal_pane.is_some()
+        || app.ui.agent_panel.is_some()
+        || app.ui.activity_page.is_some()
+        || app.ui.rewind_panel.is_some()
+        || app.ui.todo_panel.is_some()
+        || app.ui.provider_panel.is_some()
+        || app.ui.skills_panel.is_some()
+        || app.ui.mcp_panel.is_some()
+        || app.ui.diagnostics_panel.is_some()
+        || app.ui.security_panel.is_some()
         || app
+            .ui
             .sidebar
             .as_ref()
             .is_some_and(|sidebar| sidebar.has_focus)
         || app
+            .ui
             .input_panel
             .completion
             .as_ref()
@@ -466,6 +529,9 @@ fn apply_rewind(
 ) {
     use crate::ui::components::rewind_panel::RestoreMode;
 
+    if !app.require_running_session() {
+        return;
+    }
     let restore_code = matches!(
         mode,
         RestoreMode::CodeAndConversation | RestoreMode::CodeOnly
@@ -476,25 +542,42 @@ fn apply_rewind(
     );
     if restore_code
         && (app
+            .agent_loop
+            .session
             .tasks
             .snapshot_all()
             .iter()
             .any(|task| task.status == crate::tasks::TaskStatus::Running)
             || app
+                .agent_loop
+                .session
                 .agents
                 .snapshot_all()
                 .iter()
                 .any(|agent| !agent.status.is_terminal()))
     {
-        app.conversation_panel.add_warning_string(
-            "cannot restore files while a background task or sub-agent is running",
-        );
+        {
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_warning_string(
+                    "cannot restore files while a background task or sub-agent is running",
+                );
+            app.ui.conversation_panel.scroll_to_bottom();
+        };
         return;
     }
 
-    let Some(store) = app.checkpoint_store.as_ref().cloned() else {
-        app.conversation_panel
+    let Some(store) = app.agent_loop.session.checkpoint_store.as_ref().cloned() else {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_error_string("rewind checkpoints are unavailable");
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     };
     let checkpoint = {
@@ -502,8 +585,13 @@ fn apply_rewind(
         store.checkpoint(checkpoint_id).cloned()
     };
     let Some(checkpoint) = checkpoint else {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_error_string("the selected rewind checkpoint no longer exists");
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     };
 
@@ -515,18 +603,33 @@ fn apply_rewind(
             .unwrap()
             .has_file_changes_for_restore(checkpoint_id);
         if has_file_changes {
-            let conversation_cutoff = app.conversation_panel.items_snapshot().len();
+            let conversation_cutoff = app
+                .agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .items
+                .len();
             let begin_recovery = store.lock().unwrap().begin_recovery(
                 checkpoint_id,
                 conversation_cutoff,
-                app.todo_list.todos.clone(),
+                app.ui.todo_list.todos.clone(),
             );
             match begin_recovery {
                 Ok(id) => recovery_id = Some(id),
                 Err(error) => {
-                    app.conversation_panel.add_error_string(format!(
-                        "could not create rewind recovery point: {error}"
-                    ));
+                    {
+                        app.agent_loop
+                            .session
+                            .conversation
+                            .lock()
+                            .unwrap()
+                            .add_error_string(format!(
+                                "could not create rewind recovery point: {error}"
+                            ));
+                        app.ui.conversation_panel.scroll_to_bottom();
+                    };
                     return;
                 }
             }
@@ -544,65 +647,106 @@ fn apply_rewind(
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                app.conversation_panel.add_warning_string(format!(
-                    "rewind stopped: files changed outside Programmer: {paths}"
-                ));
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .add_warning_string(format!(
+                        "rewind stopped: files changed outside Programmer: {paths}"
+                    ));
+                app.ui.conversation_panel.scroll_to_bottom();
                 return;
             }
             Err(error) => {
                 if let Some(recovery_id) = recovery_id {
                     let _ = store.lock().unwrap().discard_checkpoint(recovery_id);
                 }
-                app.conversation_panel
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
                     .add_error_string(format!("rewind failed: {error}"));
+                app.ui.conversation_panel.scroll_to_bottom();
                 return;
             }
         }
         if let Some(recovery_id) = recovery_id
             && let Err(error) = store.lock().unwrap().finalize_recovery(recovery_id)
         {
-            app.conversation_panel.add_warning_string(format!(
-                "files were restored, but the recovery point could not be finalized: {error}"
-            ));
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_warning_string(format!(
+                    "files were restored, but the recovery point could not be finalized: {error}"
+                ));
+            app.ui.conversation_panel.scroll_to_bottom();
         }
     }
 
     if restore_conversation {
         commands::invalidate_auto_compaction(app);
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .truncate(checkpoint.conversation_cutoff);
-        app.input_panel.set_content(&checkpoint.prompt);
-        app.todo_list = crate::todos::TodoList {
+        app.ui.conversation_panel.history_truncated();
+        app.ui.input_panel.set_content(&checkpoint.prompt);
+        *app.agent_loop.session.todo_store.lock().unwrap() = crate::todos::TodoList {
             todos: checkpoint.todos,
         };
-        app.sync_todos_to_store();
-        app.pending_images.clear();
+        app.sync_todos_from_store();
+        app.agent_loop.pending_request = None;
     }
     if let Err(error) = store
         .lock()
         .unwrap()
         .truncate_after(checkpoint_id, recovery_id)
     {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_warning_string(format!("could not prune rewind history: {error}"));
+        app.ui.conversation_panel.scroll_to_bottom();
     }
-    app.current_checkpoint_id = None;
+    app.agent_loop.current_checkpoint_id = None;
     session::mark_dirty(app);
-    app.conversation_panel.add_info_string(format!(
-        "Rewound to prompt #{checkpoint_id}: {} file(s) restored{}",
-        restored_files,
-        if restore_conversation {
-            "; prompt returned to the input"
-        } else {
-            ""
-        }
-    ));
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .add_info_string(format!(
+            "Rewound to prompt #{checkpoint_id}: {} file(s) restored{}",
+            restored_files,
+            if restore_conversation {
+                "; prompt returned to the input"
+            } else {
+                ""
+            }
+        ));
+    app.ui.conversation_panel.scroll_to_bottom();
 }
 
-fn apply_rewind_fork(app: &mut App<'_>, checkpoint_id: u64) {
-    let Some(source_store) = app.checkpoint_store.as_ref().cloned() else {
-        app.conversation_panel
+async fn apply_rewind_fork(app: &mut App<'_>, checkpoint_id: u64) {
+    if !app.require_running_session() {
+        return;
+    }
+    let Some(source_store) = app.agent_loop.session.checkpoint_store.as_ref().cloned() else {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_error_string("rewind checkpoints are unavailable");
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     };
     let checkpoint = {
@@ -610,60 +754,136 @@ fn apply_rewind_fork(app: &mut App<'_>, checkpoint_id: u64) {
         store.checkpoint(checkpoint_id).cloned()
     };
     let Some(checkpoint) = checkpoint.filter(|checkpoint| !checkpoint.recovery) else {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_error_string("the selected rewind checkpoint cannot be forked");
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     };
-    if app.session.mgr.is_none() {
-        app.conversation_panel
+    if app.agent_loop.session.mgr.is_none() {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_error_string("cannot fork without session persistence");
+        app.ui.conversation_panel.scroll_to_bottom();
+        return;
+    }
+    if let Err(error) = app.close_session().await {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_error_string(format!(
+                "could not close the source session before forking: {error}"
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     }
     if let Err(error) = session::save_session_checked(app) {
-        app.conversation_panel.add_error_string(format!(
-            "could not save the source session before forking: {error}"
-        ));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_error_string(format!(
+                "could not save the source session before forking: {error}"
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     }
     let manager = app
+        .agent_loop
         .session
         .mgr
         .as_ref()
         .expect("session manager checked above");
-    let source_uuid = app.session.uuid.clone();
+    let source_uuid = app.agent_loop.session.uuid.clone();
     let fork_uuid = manager.create().uuid;
     let Some(mut fork_store) = crate::checkpoint::CheckpointStore::for_session(&fork_uuid) else {
-        app.conversation_panel
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
             .add_error_string("could not create rewind history for the fork");
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     };
     if let Err(error) =
         fork_store.copy_conversation_history_before(&source_store.lock().unwrap(), checkpoint_id)
     {
-        app.conversation_panel.add_error_string(format!(
-            "could not create rewind history for the fork: {error}"
-        ));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_error_string(format!(
+                "could not create rewind history for the fork: {error}"
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
         return;
     }
 
     commands::invalidate_auto_compaction(app);
-    app.session.uuid = fork_uuid.clone();
-    app.session.did_save = false;
-    app.conversation_panel
+    // Detach all mutable resources: retained source handles must never write into the fork.
+    let conversation = std::sync::Arc::new(std::sync::Mutex::new(
+        app.agent_loop.session.conversation.lock().unwrap().clone(),
+    ));
+    app.agent_loop.session.conversation = conversation.clone();
+    app.ui.conversation_panel.conversation = conversation;
+    app.agent_loop.session.todo_store = Default::default();
+    app.agent_loop.session.tasks = crate::tasks::TaskManager::default();
+    app.connect_task_events();
+    app.agent_loop.task_notifications.clear();
+    app.agent_loop.session.agents = crate::agents::AgentManager::default();
+    app.agent_loop.agent_notifications = crate::app::AgentNotificationState::new();
+    app.agent_loop.session.persistence = session::PersistenceState::default();
+    app.agent_loop.session.title_generation_id =
+        app.agent_loop.session.title_generation_id.wrapping_add(1);
+    app.agent_loop.session.title_generation_started = !app.agent_loop.session.title.is_empty();
+    crate::app::diagnostics::reset_diagnostics_state(app);
+    app.agent_loop.session.uuid = fork_uuid.clone();
+    app.agent_loop.session.did_save = false;
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
         .truncate(checkpoint.conversation_cutoff);
-    app.input_panel.set_content(&checkpoint.prompt);
-    app.todo_list = crate::todos::TodoList {
+    app.ui.conversation_panel.history_truncated();
+    app.ui.input_panel.set_content(&checkpoint.prompt);
+    *app.agent_loop.session.todo_store.lock().unwrap() = crate::todos::TodoList {
         todos: checkpoint.todos,
     };
-    app.sync_todos_to_store();
-    app.pending_images.clear();
-    app.checkpoint_store = Some(std::sync::Arc::new(std::sync::Mutex::new(fork_store)));
-    app.current_checkpoint_id = None;
+    app.sync_todos_from_store();
+    app.agent_loop.pending_request = None;
+    app.agent_loop.session.checkpoint_store =
+        Some(std::sync::Arc::new(std::sync::Mutex::new(fork_store)));
+    app.agent_loop.current_checkpoint_id = None;
     session::mark_dirty(app);
-    app.conversation_panel.add_info_string(format!(
-        "Forked prompt #{checkpoint_id} into session {fork_uuid}. Source session {source_uuid} was preserved; prompt returned to the input."
+    app.agent_loop.session.conversation.lock().unwrap().add_info_string(format!(
+    "Forked prompt #{checkpoint_id} into session {fork_uuid}. Source session {source_uuid} was preserved; prompt returned to the input."
     ));
-    session::save_session(app);
+    app.ui.conversation_panel.scroll_to_bottom();
+    if let Err(error) = session::persist_session(app) {
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_error_string(format!(
+                "could not save the fork; session remains stopped: {error}"
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
+        return;
+    }
+    app.agent_loop.session.lifecycle = crate::app::SessionLifecycle::Running;
 }
 
 fn is_promote_shortcut(key: KeyEvent) -> bool {
@@ -678,30 +898,54 @@ fn paste_clipboard_image(app: &mut App<'_>) {
     let image = match crate::clipboard::read_image() {
         Ok(Some(image)) => image,
         Ok(None) => {
-            app.conversation_panel
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
                 .add_warning_string("clipboard does not contain an image");
+            app.ui.conversation_panel.scroll_to_bottom();
             return;
         }
         Err(error) => {
-            app.conversation_panel.add_error_string(error);
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_error_string(error);
+            app.ui.conversation_panel.scroll_to_bottom();
             return;
         }
     };
     let attachment = match crate::commands::image_content_from_bytes(&image.png) {
         Ok(attachment) => attachment,
         Err(error) => {
-            app.conversation_panel.add_warning_string(error);
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .add_warning_string(error);
+            app.ui.conversation_panel.scroll_to_bottom();
             return;
         }
     };
     if !app
+        .ui
         .input_panel
         .add_image(attachment, image.width, image.height)
     {
-        app.conversation_panel.add_warning_string(format!(
-            "cannot paste more than {} images into one message",
-            crate::commands::MAX_IMAGES_PER_MESSAGE
-        ));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_warning_string(format!(
+                "cannot paste more than {} images into one message",
+                crate::commands::MAX_IMAGES_PER_MESSAGE
+            ));
+        app.ui.conversation_panel.scroll_to_bottom();
     }
     update_completions(app);
 }
@@ -712,7 +956,7 @@ fn paste_clipboard_image(app: &mut App<'_>) {
 fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
     use crate::ui::components::terminal_panel::key_event_to_bytes;
 
-    let Some(pane) = app.terminal_pane.as_mut() else {
+    let Some(pane) = app.ui.terminal_pane.as_mut() else {
         return;
     };
 
@@ -722,7 +966,7 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
             .map(|grid| grid.height.max(1) as i32)
             .unwrap_or(10);
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => app.terminal_pane = None,
+            KeyCode::Esc | KeyCode::Char('q') => app.ui.terminal_pane = None,
             KeyCode::Up | KeyCode::Char('k') => pane.scroll_read_only(1),
             KeyCode::Down | KeyCode::Char('j') => pane.scroll_read_only(-1),
             KeyCode::PageUp => pane.scroll_read_only(page),
@@ -743,20 +987,29 @@ fn handle_terminal_key(app: &mut App<'_>, key_event: KeyEvent) {
     if pane.grabbed {
         // Cursor keys need the child's DECCKM mode to pick CSI vs SS3.
         let app_cursor = app
+            .agent_loop
+            .session
             .tasks
             .with_screen(pane.task_id, |s| s.application_cursor())
             .unwrap_or(false);
         if let Some(bytes) = key_event_to_bytes(key_event, app_cursor) {
-            let _ = app.tasks.write_bytes(pane.task_id, &bytes);
+            let _ = app
+                .agent_loop
+                .session
+                .tasks
+                .write_bytes(pane.task_id, &bytes);
             // Typing snaps the view back to live output.
-            app.tasks.scroll_screen(pane.task_id, i32::MIN);
+            app.agent_loop
+                .session
+                .tasks
+                .scroll_screen(pane.task_id, i32::MIN);
         }
         return;
     }
 
     // Released: the panel owns Esc/q and uses them to close.
     if matches!(key_event.code, KeyCode::Esc | KeyCode::Char('q')) {
-        app.terminal_pane = None;
+        app.ui.terminal_pane = None;
     }
 }
 
@@ -766,7 +1019,7 @@ pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::
     use crate::ui::components::terminal_panel::mouse_event_to_bytes;
     use crossterm::event::MouseEventKind;
 
-    let Some(pane) = app.terminal_pane.as_mut() else {
+    let Some(pane) = app.ui.terminal_pane.as_mut() else {
         return;
     };
 
@@ -780,6 +1033,8 @@ pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::
     }
 
     let mode = app
+        .agent_loop
+        .session
         .tasks
         .with_screen(pane.task_id, |s| s.mouse_protocol_mode())
         .unwrap_or(vt100::MouseProtocolMode::None);
@@ -789,11 +1044,11 @@ pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::
     let program_wants_mouse = pane.grabbed && mode != vt100::MouseProtocolMode::None;
     match mouse.kind {
         MouseEventKind::ScrollUp if !program_wants_mouse => {
-            app.tasks.scroll_screen(pane.task_id, 3);
+            app.agent_loop.session.tasks.scroll_screen(pane.task_id, 3);
             return;
         }
         MouseEventKind::ScrollDown if !program_wants_mouse => {
-            app.tasks.scroll_screen(pane.task_id, -3);
+            app.agent_loop.session.tasks.scroll_screen(pane.task_id, -3);
             return;
         }
         _ => {}
@@ -807,7 +1062,11 @@ pub(crate) fn handle_terminal_mouse(app: &mut App<'_>, mouse: crossterm::event::
         return;
     };
     if let Some(bytes) = mouse_event_to_bytes(mouse, grid, mode) {
-        let _ = app.tasks.write_bytes(pane.task_id, &bytes);
+        let _ = app
+            .agent_loop
+            .session
+            .tasks
+            .write_bytes(pane.task_id, &bytes);
     }
 }
 
@@ -819,40 +1078,44 @@ pub(crate) fn is_newline_modifier(modifiers: KeyModifiers) -> bool {
 /// Handles text pasted into the terminal (bracketed paste).
 pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
     // While the terminal panel has input grabbed, a paste goes to the PTY.
-    if let Some(pane) = app.terminal_pane.as_ref() {
+    if let Some(pane) = app.ui.terminal_pane.as_ref() {
         if pane.grabbed {
-            let _ = app.tasks.write_bytes(pane.task_id, data.as_bytes());
+            let _ = app
+                .agent_loop
+                .session
+                .tasks
+                .write_bytes(pane.task_id, data.as_bytes());
         }
         return;
     }
     let data = data.replace("\r\n", "\n").replace('\r', "\n");
-    if app.rewind_panel.is_some() || app.activity_panel.is_some() {
+    if app.ui.rewind_panel.is_some() || app.ui.activity_page.is_some() {
         return;
     }
-    if let Some(panel) = app.question_panel.as_mut() {
+    if let Some(panel) = app.ui.question_panel.as_mut() {
         panel.handle_paste(&data);
         return;
     }
-    if let Some(panel) = app.provider_panel.as_mut() {
+    if let Some(panel) = app.ui.provider_panel.as_mut() {
         panel.handle_paste(&data);
         return;
     }
-    if let Some(panel) = app.mcp_panel.as_mut() {
+    if let Some(panel) = app.ui.mcp_panel.as_mut() {
         panel.handle_paste(&data);
         return;
     }
-    if let Some(panel) = app.diagnostics_panel.as_mut() {
+    if let Some(panel) = app.ui.diagnostics_panel.as_mut() {
         panel.handle_paste(&data);
         return;
     }
-    if let Some(panel) = app.security_panel.as_mut() {
+    if let Some(panel) = app.ui.security_panel.as_mut() {
         panel.handle_paste(&data);
         return;
     }
     if !data.contains('\n') && data.chars().count() <= 200 {
-        app.input_panel.insert_str(&data);
+        app.ui.input_panel.insert_str(&data);
     } else {
-        app.input_panel.add_paste(data);
+        app.ui.input_panel.add_paste(data);
     }
     update_completions(app);
 }
@@ -865,19 +1128,19 @@ pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
 fn handle_approval_key(app: &mut App<'_>, key_event: KeyEvent) -> color_eyre::Result<()> {
     match key_event.code {
         KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(ref mut review) = app.pending_review {
+            if let Some(ref mut review) = app.agent_loop.pending_review {
                 review.selected = review.selected.saturating_sub(1);
             }
         }
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-            if let Some(ref mut review) = app.pending_review
+            if let Some(ref mut review) = app.agent_loop.pending_review
                 && review.selected + 1 < 2
             {
                 review.selected += 1;
             }
         }
         KeyCode::Enter => {
-            if let Some(review) = app.pending_review.take() {
+            if let Some(review) = app.agent_loop.pending_review.take() {
                 use crate::runner::ReviewDecision;
                 use async_openai::types::responses::{
                     FunctionCallOutput, FunctionCallOutputItemParam,
@@ -912,7 +1175,7 @@ fn handle_approval_key(app: &mut App<'_>, key_event: KeyEvent) -> color_eyre::Re
                     },
                 };
                 let _ = review.reply.0.send(decision);
-                app.pending_review = app.review_queue.pop_front();
+                app.agent_loop.pending_review = app.agent_loop.review_queue.pop_front();
             }
         }
         _ => {}
@@ -929,22 +1192,27 @@ async fn handle_plan_review_key(app: &mut App<'_>, key_event: KeyEvent) -> color
     let option_count = if app.config.allow_yolo { 4 } else { 3 };
     match key_event.code {
         KeyCode::Up | KeyCode::Char('k') => {
-            app.plan_review_selected = app.plan_review_selected.saturating_sub(1);
+            app.ui.plan_review_selected = app.ui.plan_review_selected.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-            if app.plan_review_selected + 1 < option_count {
-                app.plan_review_selected += 1;
+            if app.ui.plan_review_selected + 1 < option_count {
+                app.ui.plan_review_selected += 1;
             }
         }
         KeyCode::Esc => {
             // Cancel review — go back to Planning for revision.
-            app.plan_phase = crate::classifier::PlanPhase::Planning;
-            app.plan_review_selected = 0;
-            app.conversation_panel
+            app.agent_loop.plan_phase = crate::classifier::PlanPhase::Planning;
+            app.ui.plan_review_selected = 0;
+            app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
                 .add_info_string("Plan review cancelled — you can revise the plan.");
+            app.ui.conversation_panel.scroll_to_bottom();
             session::save_session(app);
         }
-        KeyCode::Enter => match app.plan_review_selected {
+        KeyCode::Enter => match app.ui.plan_review_selected {
             0 => {
                 approve_plan(
                         app,
@@ -983,7 +1251,7 @@ async fn handle_plan_review_key(app: &mut App<'_>, key_event: KeyEvent) -> color
         },
         _ => {
             // Any other key: pass through to input panel for feedback text
-            app.input_panel.input(key_event);
+            app.ui.input_panel.input(key_event);
         }
     }
     Ok(())
@@ -992,10 +1260,16 @@ async fn handle_plan_review_key(app: &mut App<'_>, key_event: KeyEvent) -> color
 /// Exit Plan mode into `mode` and kick off execution with a hidden
 /// developer-role instruction.
 async fn approve_plan(app: &mut App<'_>, mode: WorkMode, info: &str, hidden: &str) {
-    app.work_mode = mode;
-    app.plan_phase = crate::classifier::PlanPhase::default();
-    app.plan_review_selected = 0;
-    app.conversation_panel.add_info_string(info);
+    app.agent_loop.session.work_mode = mode;
+    app.agent_loop.plan_phase = crate::classifier::PlanPhase::default();
+    app.ui.plan_review_selected = 0;
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
+        .add_info_string(info);
+    app.ui.conversation_panel.scroll_to_bottom();
     session::save_session(app);
     commands::start_request_as(
         app,
@@ -1007,16 +1281,99 @@ async fn approve_plan(app: &mut App<'_>, mode: WorkMode, info: &str, hidden: &st
 
 /// Return to Planning phase so the user can type feedback on the plan.
 fn propose_plan_changes(app: &mut App<'_>) {
-    app.plan_phase = crate::classifier::PlanPhase::Planning;
-    app.plan_review_selected = 0;
-    app.conversation_panel
+    app.agent_loop.plan_phase = crate::classifier::PlanPhase::Planning;
+    app.ui.plan_review_selected = 0;
+    app.agent_loop
+        .session
+        .conversation
+        .lock()
+        .unwrap()
         .add_info_string("Enter your feedback in the input panel.");
+    app.ui.conversation_panel.scroll_to_bottom();
     session::save_session(app);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rewind_fork_closes_source_and_isolates_runtime_resources() {
+        use async_openai::types::responses::{InputContent, InputMessage, InputRole, MessageItem};
+        let mut app = crate::app::commands::tests::command_test_app().await;
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join(".programmer")
+            .join(format!("fork-test-{}", uuid::Uuid::new_v4()));
+        app.agent_loop.session.mgr = Some(crate::session::SessionManager::for_test(directory));
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_input_message(MessageItem::Input(InputMessage {
+                content: vec![InputContent::InputText("source prompt".into())],
+                role: InputRole::User,
+                status: None,
+            }));
+        app.ui.conversation_panel.scroll_to_bottom();
+        let source_uuid = app.agent_loop.session.uuid.clone();
+        let source = app.agent_loop.session.conversation.clone();
+        let todos = app.agent_loop.session.todo_store.clone();
+        let tasks = app.agent_loop.session.tasks.clone();
+        let generation = app.task_event_generation;
+        let checkpoint = app
+            .agent_loop
+            .session
+            .checkpoint_store
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .begin("fork prompt".into(), 0, Vec::new())
+            .unwrap();
+        tasks.spawn("sleep 30", None, None).unwrap();
+        apply_rewind_fork(&mut app, checkpoint).await;
+        assert!(app.session_accepts_work());
+        assert_ne!(app.agent_loop.session.uuid, source_uuid);
+        assert!(tasks.spawn("true", None, None).is_err());
+        assert!(
+            tasks
+                .snapshot_all()
+                .iter()
+                .all(|task| task.status != crate::tasks::TaskStatus::Running)
+        );
+        assert!(app.agent_loop.session.tasks.snapshot_all().is_empty());
+        assert!(app.task_event_generation > generation);
+        assert!(!std::sync::Arc::ptr_eq(
+            &source,
+            &app.agent_loop.session.conversation
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &todos,
+            &app.agent_loop.session.todo_store
+        ));
+        assert!(
+            source
+                .lock()
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| matches!(item, crate::response::message_item::MessageItem::Input(_)))
+        );
+        assert_eq!(app.ui.input_panel.get_content(), "fork prompt");
+        let saved = app
+            .agent_loop
+            .session
+            .mgr
+            .as_ref()
+            .unwrap()
+            .load(&source_uuid)
+            .unwrap()
+            .unwrap();
+        assert!(saved.tasks.iter().all(|task| task.status != "running"));
+        app.close_session().await.unwrap();
+    }
 
     #[test]
     fn ctrl_z_is_the_command_promotion_shortcut() {
@@ -1048,64 +1405,69 @@ mod tests {
         config.providers.clear();
         let mut app = crate::app::App::new(
             config,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            crate::tasks::TaskManager::default(),
-            "mcp-escape-routing-test".to_string(),
+            crate::app::session::SessionSeed::Fresh {
+                uuid: "mcp-escape-routing-test".to_string(),
+            },
             None,
             Vec::new(),
             false,
             "test".to_string(),
         )
         .await;
-        app.cancel.active_id = Some(crate::cancel::OperationId(42));
-        app.mcp_panel = Some(crate::ui::components::mcp_panel::McpPanel::new());
+        app.agent_loop.cancel.active_id = Some(crate::cancel::OperationId(42));
+        app.ui.mcp_panel = Some(crate::ui::components::mcp_panel::McpPanel::new());
 
         handle_key_events(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await
             .unwrap();
 
-        assert!(app.mcp_panel.is_none());
-        assert_eq!(app.cancel.active_id, Some(crate::cancel::OperationId(42)));
-        assert!(!app.cancel.active.is_cancelled());
+        assert!(app.ui.mcp_panel.is_none());
+        assert_eq!(
+            app.agent_loop.cancel.active_id,
+            Some(crate::cancel::OperationId(42))
+        );
+        assert!(!app.agent_loop.cancel.active.is_cancelled());
     }
     #[tokio::test]
-    async fn activity_view_owns_escape_and_paste_without_cancelling_active_turn() {
+    async fn activity_page_owns_escape_and_paste_without_cancelling_active_turn() {
         let mut config = crate::config::programmer_config::ProgrammerConfig::default();
         config.providers.clear();
         config.memory.dream_enabled = false;
         let mut app = crate::app::App::new(
             config,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            crate::tasks::TaskManager::default(),
-            "activity-routing-test".into(),
+            crate::app::session::SessionSeed::Fresh {
+                uuid: "activity-routing-test".into(),
+            },
             None,
             Vec::new(),
             false,
             "test".into(),
         )
         .await;
-        app.cancel.active_id = Some(crate::cancel::OperationId(42));
-        app.activity_panel = Some(crate::ui::components::activity_panel::ActivityPanel::new(
-            "History".into(),
+        app.agent_loop.cancel.active_id = Some(crate::cancel::OperationId(42));
+        app.ui.activity_page = Some(crate::app::activity::ActivityPage::new(
             crate::ui::components::activity_panel::ActivityMode::Dream,
-            app.session.uuid.clone(),
-            Vec::new(),
+            false,
+            app.agent_loop.session.uuid.clone(),
+            crate::ui::components::activity_panel::ActivityPanel::new(
+                "History".into(),
+                crate::ui::components::activity_panel::ActivityMode::Dream,
+                app.agent_loop.session.uuid.clone(),
+                Vec::new(),
+            ),
         ));
         assert!(super::super::has_blocking_surface(&app));
-        let original = app.input_panel.get_content();
+        let original = app.ui.input_panel.get_content();
         super::handle_paste(&mut app, "must not reach input".into());
-        assert_eq!(app.input_panel.get_content(), original);
+        assert_eq!(app.ui.input_panel.get_content(), original);
         handle_key_events(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await
             .unwrap();
-        assert!(app.activity_panel.is_none());
-        assert_eq!(app.cancel.active_id, Some(crate::cancel::OperationId(42)));
-        assert!(!app.cancel.active.is_cancelled());
+        assert!(app.ui.activity_page.is_none());
+        assert_eq!(
+            app.agent_loop.cancel.active_id,
+            Some(crate::cancel::OperationId(42))
+        );
+        assert!(!app.agent_loop.cancel.active.is_cancelled());
     }
 }

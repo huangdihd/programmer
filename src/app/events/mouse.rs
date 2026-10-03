@@ -25,59 +25,80 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollDown => {
-            if app.sidebar_area.is_some_and(|a| mouse.column >= a.x) {
-                if let Some(ref mut s) = app.sidebar {
+            if app
+                .ui
+                .sidebar
+                .as_ref()
+                .and_then(|sidebar| sidebar.area())
+                .is_some_and(|a| mouse.column >= a.x)
+            {
+                if let Some(ref mut s) = app.ui.sidebar {
                     s.scroll_by(3);
                 }
             } else {
-                app.conversation_panel.scroll_down();
+                app.ui.conversation_panel.scroll_down();
             }
         }
         MouseEventKind::ScrollUp => {
-            if app.sidebar_area.is_some_and(|a| mouse.column >= a.x) {
-                if let Some(ref mut s) = app.sidebar {
+            if app
+                .ui
+                .sidebar
+                .as_ref()
+                .and_then(|sidebar| sidebar.area())
+                .is_some_and(|a| mouse.column >= a.x)
+            {
+                if let Some(ref mut s) = app.ui.sidebar {
                     s.scroll_up_by(3);
                 }
             } else {
-                app.conversation_panel.scroll_up();
+                app.ui.conversation_panel.scroll_up();
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
             // If click is in the sidebar, track it and don't start selection.
-            app.sidebar_click_active = app.sidebar.is_some()
-                && app.sidebar_area.as_ref().is_some_and(|area| {
-                    mouse.column >= area.x
-                        && mouse.column < area.x + area.width
-                        && mouse.row >= area.y
-                        && mouse.row < area.y + area.height
-                });
-            if app.sidebar_click_active {
+            app.ui.sidebar_click_active = app.ui.sidebar.is_some()
+                && app
+                    .ui
+                    .sidebar
+                    .as_ref()
+                    .and_then(|sidebar| sidebar.area())
+                    .as_ref()
+                    .is_some_and(|area| {
+                        mouse.column >= area.x
+                            && mouse.column < area.x + area.width
+                            && mouse.row >= area.y
+                            && mouse.row < area.y + area.height
+                    });
+            if app.ui.sidebar_click_active {
                 return;
             }
             // Clicking the "jump to bottom" indicator snaps to the latest.
             if app
+                .ui
                 .conversation_panel
                 .jump_button_hit(mouse.column, mouse.row)
             {
-                app.conversation_panel.scroll_to_bottom();
+                app.ui.conversation_panel.scroll_to_bottom();
                 return;
             }
-            app.conversation_panel
+            app.ui
+                .conversation_panel
                 .selection_begin(mouse.column, mouse.row)
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if app.sidebar_click_active {
+            if app.ui.sidebar_click_active {
                 return;
             }
-            app.conversation_panel
+            app.ui
+                .conversation_panel
                 .selection_drag(mouse.column, mouse.row)
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            if app.sidebar_click_active {
-                app.sidebar_click_active = false;
+            if app.ui.sidebar_click_active {
+                app.ui.sidebar_click_active = false;
                 // Only act if the release is still in the sidebar.
-                if let Some(ref sidebar) = app.sidebar
-                    && let Some(ref area) = app.sidebar_area
+                if let Some(ref sidebar) = app.ui.sidebar
+                    && let Some(area) = sidebar.area()
                     && mouse.column > area.x
                     && mouse.column < area.x + area.width
                     && mouse.row >= area.y
@@ -92,23 +113,42 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
                 return;
             }
             match app
+                .ui
                 .conversation_panel
                 .selection_end(mouse.column, mouse.row)
             {
                 SelectionEnd::Click { column, row } => {
-                    app.conversation_panel.handle_buffer_click(column, row)
+                    if let Err(error) = app.ui.conversation_panel.handle_buffer_click(column, row) {
+                        app.agent_loop
+                            .session
+                            .conversation
+                            .lock()
+                            .unwrap()
+                            .add_error_string(error);
+                        app.ui.conversation_panel.scroll_to_bottom();
+                    }
                 }
                 SelectionEnd::Link(url) => {
                     if let Err(error) = crate::ui::components::conversation_panel::links::open(&url)
                     {
-                        app.conversation_panel
+                        app.agent_loop
+                            .session
+                            .conversation
+                            .lock()
+                            .unwrap()
                             .add_error_string(format!("failed to open link: {error}"));
+                        app.ui.conversation_panel.scroll_to_bottom();
                     }
                 }
                 SelectionEnd::Copied(text) => {
                     if !crate::clipboard::copy(&text) {
-                        app.conversation_panel
+                        app.agent_loop
+                            .session
+                            .conversation
+                            .lock()
+                            .unwrap()
                             .add_error_string("failed to copy selection to clipboard");
+                        app.ui.conversation_panel.scroll_to_bottom();
                         session::save_session(app);
                     }
                 }
@@ -122,32 +162,49 @@ pub(crate) fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
 fn handle_sidebar_click(app: &mut App<'_>, target: &ClickTarget) {
     match target {
         ClickTarget::Section(key) => {
-            if let Some(ref mut s) = app.sidebar {
+            if let Some(ref mut s) = app.ui.sidebar {
                 s.toggle_section(*key);
             }
         }
         ClickTarget::TodoItem(idx) => {
-            let mut sorted: Vec<&crate::todos::Todo> = app.todo_list.todos.iter().collect();
+            let mut sorted: Vec<&crate::todos::Todo> = app.ui.todo_list.todos.iter().collect();
             sorted
                 .sort_by_key(|t| crate::ui::components::sidebar::ui::todo_status_order(&t.status));
             if let Some(todo) = sorted.get(*idx) {
                 let id = todo.id.clone();
-                let _ = app.todo_list.toggle_status(&id);
-                app.sync_todos_to_store();
+                let result = app
+                    .agent_loop
+                    .session
+                    .todo_store
+                    .lock()
+                    .unwrap()
+                    .toggle_status(&id)
+                    .map(|_| ());
+                if let Err(error) = result {
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .add_error_string(error);
+                    app.ui.conversation_panel.scroll_to_bottom();
+                }
+                app.sync_todos_from_store();
                 session::mark_dirty(app);
             }
         }
         ClickTarget::Task(id) => {
-            if let Some(ref mut s) = app.sidebar {
+            if let Some(ref mut s) = app.ui.sidebar {
                 s.toggle_task(*id);
             }
         }
         ClickTarget::Agent(id) => {
-            if let (Some(snapshot), Some(conversation)) =
-                (app.agents.snapshot(*id), app.agents.conversation(*id))
-            {
-                app.agent_panel = Some(crate::ui::components::agent_panel::AgentPanel::new(
-                    app.tasks.clone(),
+            if let (Some(snapshot), Some(conversation)) = (
+                app.agent_loop.session.agents.snapshot(*id),
+                app.agent_loop.session.agents.conversation(*id),
+            ) {
+                app.ui.agent_panel = Some(crate::ui::components::agent_panel::AgentPanel::new(
+                    app.agent_loop.session.tasks.clone(),
                     *id,
                     snapshot.name,
                     conversation,

@@ -57,6 +57,14 @@ impl ProviderModelStatus {
     }
 }
 
+/// Counts only results owned by the refresh that was actually applied.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ModelRefreshSummary {
+    pub model_count: usize,
+    pub provider_count: usize,
+    pub error_count: usize,
+}
+
 /// Manages multiple OpenAI-compatible providers, each with its own API key,
 /// base URL, and model list (auto-discovered or manually configured).
 #[derive(Clone)]
@@ -65,6 +73,9 @@ pub struct ProviderManager {
     /// Resolved models per provider.
     models: HashMap<String, Vec<String>>,
     configs: HashMap<String, ProviderConfig>,
+    model_statuses: Vec<ProviderModelStatus>,
+    next_refresh_generation: u64,
+    refresh_owners: HashMap<String, u64>,
     default_provider: String,
     /// Errors from startup model discovery, surfaced in the UI after launch.
     pub startup_errors: Vec<String>,
@@ -100,6 +111,9 @@ impl ProviderManager {
             clients,
             models,
             configs: config.providers.clone(),
+            model_statuses: ProviderModelStatus::from_config(config),
+            next_refresh_generation: 0,
+            refresh_owners: HashMap::new(),
             default_provider: config.default_provider.clone(),
             startup_errors: Vec::new(),
         }
@@ -114,13 +128,20 @@ impl ProviderManager {
         let mut manager = Self::from_config(config);
         let (models, startup_errors) =
             Self::discover_models(&config.providers, &manager.clients).await;
-        manager.apply_model_refresh(models, startup_errors);
+        let requested_providers = config
+            .providers
+            .iter()
+            .filter(|(_, provider)| provider.models.is_none())
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let generation = manager.begin_model_refresh(&requested_providers);
+        manager.finish_model_refresh(&requested_providers, generation, models, startup_errors);
         manager
     }
 
     /// Fetch auto-discovered model lists for every provider without a manual
-    /// `models` list. Returns the discovered models plus any per-provider or
-    /// global timeout errors.
+    /// `models` list. Both models and errors are keyed by provider, including
+    /// global timeout errors, so stale refresh results can be discarded together.
     ///
     /// This runs the same network fetches as [`Self::new`] but without
     /// rebuilding clients, so it can be executed in a background task and the
@@ -128,45 +149,46 @@ impl ProviderManager {
     pub async fn discover_models(
         providers: &HashMap<String, ProviderConfig>,
         clients: &HashMap<String, Client<OpenAIConfig>>,
-    ) -> (HashMap<String, Vec<String>>, Vec<String>) {
+    ) -> (HashMap<String, Vec<String>>, HashMap<String, String>) {
         let mut models: HashMap<String, Vec<String>> = HashMap::new();
-        let mut startup_errors = Vec::new();
+        let mut startup_errors = HashMap::new();
 
         // Fetch models concurrently, but with a hard cap so startup is
         // never blocked indefinitely (some DNS / TCP stacks on Windows
         // can bypass tokio::time::timeout).
         const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-        let fetches = providers.iter().filter_map(|(name, pc)| {
-            if pc.models.is_some() {
-                return None; // manual list already present
-            }
-            let Some(client) = clients.get(name).cloned() else {
-                startup_errors.push(format!(
+        let fetches =
+            providers.iter().filter_map(|(name, pc)| {
+                if pc.models.is_some() {
+                    return None; // manual list already present
+                }
+                let Some(client) = clients.get(name).cloned() else {
+                    startup_errors.insert(name.clone(), format!(
                     "cannot fetch models for provider '{name}': provider client is unavailable"
                 ));
-                return None;
-            };
-            let name = name.clone();
-            Some(tokio::spawn(async move {
-                match tokio::time::timeout(MODEL_FETCH_TIMEOUT, client.models().list()).await {
-                    Ok(Ok(resp)) => {
-                        let list = resp.data.into_iter().map(|m| m.id).collect();
-                        (name, Ok(list))
-                    }
-                    Ok(Err(e)) => {
-                        let msg = format!(
-                            "failed to fetch models for provider '{name}': {e} \
+                    return None;
+                };
+                let name = name.clone();
+                Some(tokio::spawn(async move {
+                    match tokio::time::timeout(MODEL_FETCH_TIMEOUT, client.models().list()).await {
+                        Ok(Ok(resp)) => {
+                            let list = resp.data.into_iter().map(|m| m.id).collect();
+                            (name, Ok(list))
+                        }
+                        Ok(Err(e)) => {
+                            let msg = format!(
+                                "failed to fetch models for provider '{name}': {e} \
                              (provider still works, but /model completion won't list its models)"
-                        );
-                        (name, Err(msg))
+                            );
+                            (name, Err(msg))
+                        }
+                        Err(_) => {
+                            let msg = model_fetch_timeout_message(&name);
+                            (name, Err(msg))
+                        }
                     }
-                    Err(_) => {
-                        let msg = model_fetch_timeout_message(&name);
-                        (name, Err(msg))
-                    }
-                }
-            }))
-        });
+                }))
+            });
 
         match tokio::time::timeout(STARTUP_TIMEOUT, futures::future::join_all(fetches)).await {
             Ok(results) => {
@@ -175,39 +197,93 @@ impl ProviderManager {
                         Ok((name, Ok(list))) => {
                             models.insert(name, list);
                         }
-                        Ok((_, Err(msg))) => startup_errors.push(msg),
+                        Ok((name, Err(message))) => {
+                            startup_errors.insert(name, message);
+                        }
                         Err(_) => {} // task panicked; nothing to report
                     }
                 }
             }
             Err(_) => {
-                startup_errors.push(
-                    "model discovery timed out — providers work, \
-                     but /model completion may be incomplete; \
-                     use /providers refresh to retry"
-                        .to_string(),
-                );
+                for (name, provider) in providers {
+                    if provider.models.is_none() {
+                        startup_errors.entry(name.clone()).or_insert_with(|| {
+                            "model discovery timed out — providers work, \
+                             but /model completion may be incomplete; \
+                             use /providers refresh to retry"
+                                .to_string()
+                        });
+                    }
+                }
             }
         }
 
         (models, startup_errors)
     }
 
-    /// Apply a background model-discovery result to this manager.
-    ///
-    /// Replaces the auto-discovered model lists and startup errors, leaving
-    /// manually configured models and provider clients untouched.
-    pub fn apply_model_refresh(
-        &mut self,
-        models: HashMap<String, Vec<String>>,
-        startup_errors: Vec<String>,
-    ) {
-        // Only overwrite entries for providers that were auto-discovered
-        // (manual configs are not present in `models`).
-        for (name, list) in models {
-            self.models.insert(name, list);
+    pub(crate) fn model_statuses(&self) -> &[ProviderModelStatus] {
+        &self.model_statuses
+    }
+
+    pub(crate) fn begin_model_refresh(&mut self, requested_providers: &[String]) -> u64 {
+        self.next_refresh_generation = self
+            .next_refresh_generation
+            .checked_add(1)
+            .expect("provider refresh generation exhausted");
+        let generation = self.next_refresh_generation;
+        for status in &mut self.model_statuses {
+            if requested_providers.contains(&status.name) {
+                self.refresh_owners.insert(status.name.clone(), generation);
+                status.state = ProviderModelState::Refreshing;
+            }
         }
-        self.startup_errors = startup_errors;
+        generation
+    }
+
+    /// Only the latest request for each provider may replace its catalog or state.
+    /// Failed refreshes preserve the last successfully discovered catalog.
+    /// Errors and notification counts include only accepted providers; an entirely
+    /// stale completion leaves existing errors untouched and returns `None`.
+    pub(crate) fn finish_model_refresh(
+        &mut self,
+        requested_providers: &[String],
+        generation: u64,
+        mut models: HashMap<String, Vec<String>>,
+        mut startup_errors: HashMap<String, String>,
+    ) -> Option<ModelRefreshSummary> {
+        let mut summary = ModelRefreshSummary::default();
+        let mut accepted = false;
+        let mut accepted_errors = Vec::new();
+        for status in &mut self.model_statuses {
+            if !requested_providers.contains(&status.name)
+                || self.refresh_owners.get(&status.name) != Some(&generation)
+            {
+                continue;
+            }
+            self.refresh_owners.remove(&status.name);
+            accepted = true;
+            if let Some(error) = startup_errors.remove(&status.name) {
+                summary.error_count += 1;
+                accepted_errors.push(error);
+            }
+            let Some(models) = models.remove(&status.name) else {
+                status.state = ProviderModelState::Failed;
+                continue;
+            };
+            summary.model_count += models.len();
+            summary.provider_count += 1;
+            status.state = ProviderModelState::Ready {
+                model_count: models.len(),
+            };
+            self.models.insert(status.name.clone(), models);
+        }
+        if accepted {
+            // A global timeout retains the startup UI's single-message output.
+            accepted_errors.sort();
+            accepted_errors.dedup();
+            self.startup_errors = accepted_errors;
+        }
+        accepted.then_some(summary)
     }
 
     /// Resolve a `provider/model` string into a client reference and the bare
@@ -268,6 +344,9 @@ impl ProviderManager {
             clients: HashMap::new(),
             models,
             configs: HashMap::new(),
+            model_statuses: Vec::new(),
+            next_refresh_generation: 0,
+            refresh_owners: HashMap::new(),
             default_provider: String::new(),
             startup_errors: Vec::new(),
         }
@@ -314,7 +393,7 @@ mod tests {
         assert!(models.is_empty());
         assert!(
             errors
-                .iter()
+                .values()
                 .any(|error| error.contains("client is unavailable"))
         );
     }
@@ -333,6 +412,243 @@ mod tests {
         assert!(manager.models_for("openai").is_empty());
         assert_eq!(manager.default_model(), "openai/configured-model");
         assert!(manager.resolve("openai/any-model").is_some());
+    }
+
+    #[test]
+    fn model_refresh_status_and_catalog_share_one_owner() {
+        let mut configuration = ProgrammerConfig::default();
+        configuration.providers.clear();
+        for (name, models) in [("automatic", None), ("manual", Some(vec!["fixed".into()]))] {
+            configuration.providers.insert(
+                name.into(),
+                ProviderConfig {
+                    base_url: "https://example.invalid".into(),
+                    api_key: String::new(),
+                    models,
+                    default_model: None,
+                },
+            );
+        }
+        let mut manager = ProviderManager::from_config(&configuration);
+        let requested = vec!["automatic".into()];
+        assert_eq!(
+            manager.model_statuses()[0].state,
+            ProviderModelState::Refreshing
+        );
+        let generation = manager.begin_model_refresh(&requested);
+        manager.finish_model_refresh(
+            &requested,
+            generation,
+            HashMap::from([("automatic".into(), vec!["discovered".into()])]),
+            HashMap::new(),
+        );
+        assert_eq!(manager.models_for("automatic"), vec!["discovered"]);
+        assert_eq!(
+            manager.model_statuses()[0].state,
+            ProviderModelState::Ready { model_count: 1 }
+        );
+        let generation = manager.begin_model_refresh(&requested);
+        assert_eq!(
+            manager.model_statuses()[0].state,
+            ProviderModelState::Refreshing
+        );
+        manager.finish_model_refresh(
+            &requested,
+            generation,
+            HashMap::new(),
+            HashMap::from([("automatic".into(), "unavailable".into())]),
+        );
+        assert_eq!(
+            manager.model_statuses()[0].state,
+            ProviderModelState::Failed
+        );
+        assert_eq!(manager.models_for("automatic"), vec!["discovered"]);
+        assert_eq!(
+            manager.model_statuses()[1].state,
+            ProviderModelState::Ready { model_count: 1 }
+        );
+        assert_eq!(manager.models_for("manual"), vec!["fixed"]);
+    }
+
+    #[test]
+    fn overlapping_refresh_older_success_cannot_overwrite_newer_catalog_or_state() {
+        assert_overlapping_refresh_completion(false);
+    }
+
+    #[test]
+    fn overlapping_refresh_older_failure_cannot_overwrite_newer_state_or_catalog() {
+        assert_overlapping_refresh_completion(true);
+    }
+
+    fn assert_overlapping_refresh_completion(older_failed: bool) {
+        let mut configuration = ProgrammerConfig::default();
+        configuration.providers.retain(|name, _| name == "openai");
+        configuration.providers.get_mut("openai").unwrap().models = None;
+        let mut manager = ProviderManager::from_config(&configuration);
+        let requested = vec!["openai".to_string()];
+
+        // Begin A, then B; deliver B before A without network timing dependencies.
+        let older_generation = manager.begin_model_refresh(&requested);
+        let newer_generation = manager.begin_model_refresh(&requested);
+        manager.finish_model_refresh(
+            &requested,
+            newer_generation,
+            HashMap::from([("openai".into(), vec!["new-one".into(), "new-two".into()])]),
+            HashMap::new(),
+        );
+        assert_eq!(manager.models_for("openai"), vec!["new-one", "new-two"]);
+        assert_eq!(
+            manager.model_statuses()[0].state,
+            ProviderModelState::Ready { model_count: 2 }
+        );
+        assert!(manager.startup_errors.is_empty());
+
+        let (older_models, older_errors) = if older_failed {
+            (
+                HashMap::new(),
+                HashMap::from([("openai".into(), "older refresh failed".into())]),
+            )
+        } else {
+            (
+                HashMap::from([("openai".into(), vec!["old".into()])]),
+                HashMap::new(),
+            )
+        };
+        assert!(
+            manager
+                .finish_model_refresh(&requested, older_generation, older_models, older_errors,)
+                .is_none()
+        );
+        assert_eq!(manager.models_for("openai"), vec!["new-one", "new-two"]);
+        assert_eq!(
+            manager.model_statuses()[0].state,
+            ProviderModelState::Ready { model_count: 2 }
+        );
+        assert!(manager.startup_errors.is_empty());
+    }
+
+    #[test]
+    fn overlapping_refreshes_keep_different_provider_owners_independent() {
+        let mut configuration = ProgrammerConfig::default();
+        let mut provider = configuration.providers["openai"].clone();
+        provider.models = None;
+        configuration.providers = HashMap::from([
+            ("first".into(), provider.clone()),
+            ("second".into(), provider),
+        ]);
+        let mut manager = ProviderManager::from_config(&configuration);
+        let both = vec!["first".into(), "second".into()];
+        let first = vec!["first".into()];
+        let older_generation = manager.begin_model_refresh(&both);
+        let newer_generation = manager.begin_model_refresh(&first);
+
+        // The older batch can finish second, but must not finish first's new owner.
+        assert!(
+            manager
+                .finish_model_refresh(
+                    &both,
+                    older_generation,
+                    HashMap::from([
+                        ("first".into(), vec!["stale".into()]),
+                        ("second".into(), vec!["independent".into()]),
+                    ]),
+                    HashMap::new(),
+                )
+                .is_some()
+        );
+        assert!(manager.models_for("first").is_empty());
+        assert_eq!(
+            manager.model_statuses()[0].state,
+            ProviderModelState::Refreshing
+        );
+        assert_eq!(manager.models_for("second"), vec!["independent"]);
+        assert_eq!(
+            manager.model_statuses()[1].state,
+            ProviderModelState::Ready { model_count: 1 }
+        );
+        assert!(
+            manager
+                .finish_model_refresh(
+                    &first,
+                    newer_generation,
+                    HashMap::from([("first".into(), vec!["current".into()])]),
+                    HashMap::new(),
+                )
+                .is_some()
+        );
+        assert_eq!(manager.models_for("first"), vec!["current"]);
+        assert_eq!(
+            manager.model_statuses()[0].state,
+            ProviderModelState::Ready { model_count: 1 }
+        );
+        assert_eq!(manager.models_for("second"), vec!["independent"]);
+        assert!(
+            manager
+                .finish_model_refresh(&first, newer_generation, HashMap::new(), HashMap::new())
+                .is_none()
+        );
+        assert_eq!(
+            manager.model_statuses()[0].state,
+            ProviderModelState::Ready { model_count: 1 }
+        );
+    }
+
+    #[test]
+    fn partially_stale_refresh_counts_and_errors_include_only_accepted_providers() {
+        for stale_failed in [false, true] {
+            let mut configuration = ProgrammerConfig::default();
+            let mut provider = configuration.providers["openai"].clone();
+            provider.models = None;
+            configuration.providers = HashMap::from([
+                ("first".into(), provider.clone()),
+                ("second".into(), provider),
+            ]);
+            let mut manager = ProviderManager::from_config(&configuration);
+            let both = vec!["first".into(), "second".into()];
+            let first = vec!["first".into()];
+            let older_generation = manager.begin_model_refresh(&both);
+            let newer_generation = manager.begin_model_refresh(&first);
+            manager.finish_model_refresh(
+                &first,
+                newer_generation,
+                HashMap::from([("first".into(), vec!["current".into()])]),
+                HashMap::new(),
+            );
+            let (models, errors, expected) = if stale_failed {
+                (
+                    HashMap::from([("second".into(), vec!["accepted".into()])]),
+                    HashMap::from([("first".into(), "stale failure".into())]),
+                    ModelRefreshSummary {
+                        model_count: 1,
+                        provider_count: 1,
+                        error_count: 0,
+                    },
+                )
+            } else {
+                (
+                    HashMap::from([("first".into(), vec!["stale-one".into(), "stale-two".into()])]),
+                    HashMap::from([("second".into(), "accepted failure".into())]),
+                    ModelRefreshSummary {
+                        model_count: 0,
+                        provider_count: 0,
+                        error_count: 1,
+                    },
+                )
+            };
+            let summary = manager.finish_model_refresh(&both, older_generation, models, errors);
+            assert_eq!(summary, Some(expected));
+            assert_eq!(manager.models_for("first"), vec!["current"]);
+            if stale_failed {
+                assert!(manager.startup_errors.is_empty());
+                assert_eq!(manager.models_for("second"), vec!["accepted"]);
+            } else {
+                assert_eq!(manager.startup_errors, vec!["accepted failure"]);
+                assert_eq!(
+                    manager.model_statuses()[1].state,
+                    ProviderModelState::Failed
+                );
+            }
+        }
     }
 
     /// Startup must never hang on model discovery: an unreachable provider

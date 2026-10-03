@@ -80,6 +80,11 @@ pub(crate) struct CheckpointStore {
 }
 
 impl CheckpointStore {
+    #[cfg(test)]
+    pub(crate) fn for_test(root: PathBuf) -> Self {
+        Self::at(root)
+    }
+
     pub(crate) fn for_session(uuid: &str) -> Option<Self> {
         let root = dirs::config_dir()?
             .join("programmer")

@@ -15,8 +15,6 @@
 
 use crate::response::message_item::MessageItem;
 use crate::response::partial_response::PartialResponse;
-use async_openai::error::OpenAIError;
-use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{InputParam, OutputItem, ResponseStreamEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -34,35 +32,7 @@ use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
 
-/// The active work phase of a turn. Exactly one is in effect at a time; the
-/// old design tracked these as separate booleans that could, in principle,
-/// contradict each other. "Thinking" is intentionally absent — it is derived
-/// from [`ActivePhase::None`] plus an in-flight `receiving_response`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ActivePhase {
-    /// Neither outputting, calling tools, nor classifying. When a response is
-    /// still streaming this reads as "Thinking"; otherwise the turn is idle.
-    #[default]
-    None,
-    /// The model is streaming a normal text message.
-    Outputting,
-    /// The model is streaming tool-call arguments.
-    CreatingToolCall,
-    /// Tool calls are executing in the background.
-    ToolRunning,
-    /// The Auto-mode LLM classifier is deciding tool-call approvals.
-    Classifying,
-    /// The memory model is selecting relevant memories.
-    Associating,
-    /// Diagnostics checkers are running after an edit.
-    Checking,
-    /// `/compact` is summarizing the conversation to shrink the context.
-    Compacting,
-    /// The user pressed Esc; the runner has been signalled to cancel but
-    /// hasn't finished yet. The UI stays in this state until the matching
-    /// `TurnFinished` event arrives.
-    Cancelling,
-}
+pub use crate::execution::ActivePhase;
 
 /// Base rows scrolled per mouse-wheel notch.
 const SCROLL_LINES_BASE: usize = 1;
@@ -665,16 +635,17 @@ impl ConversationPanel {
 
     /// Handles a left click at the given screen coordinates: if it lands on a
     /// foldable item (finished or live), toggle that item's expanded state.
-    pub fn handle_click(&mut self, column: u16, row: u16) {
+    pub fn handle_click(&mut self, column: u16, row: u16) -> Result<(), &'static str> {
         if let Some((x_rel, buffer_y)) = self.to_buffer_pos(column, row, false) {
-            self.handle_buffer_click(x_rel, buffer_y);
+            return self.handle_buffer_click(x_rel, buffer_y);
         }
+        Ok(())
     }
 
     /// Handles a click already mapped into scroll-buffer coordinates. Mouse
     /// releases use the position captured on button-down so a render between
     /// down and up cannot redirect the click to a different item.
-    pub fn handle_buffer_click(&mut self, x_rel: u16, buffer_y: u16) {
+    pub fn handle_buffer_click(&mut self, x_rel: u16, buffer_y: u16) -> Result<(), &'static str> {
         // Live groups sit after finished content in the scroll buffer; check
         // their member hit regions before the flat live-item layout so a click
         // on the header row toggles the group and a click on a member row
@@ -708,7 +679,7 @@ impl ConversationPanel {
                     self.expanded_items.insert(index);
                 }
             }
-            return;
+            return Ok(());
         }
 
         // Live items sit after finished items in the scroll buffer; check them
@@ -726,13 +697,12 @@ impl ConversationPanel {
                     paragraph.copy_button(buttons, buffer_y - top, x_rel)
                 });
             if let Some(content) = hit {
-                self.copy_code_block(&content);
-                return;
+                return Self::copy_code_block(&content);
             }
             if !self.live_expanded_items.remove(&live_idx) {
                 self.live_expanded_items.insert(live_idx);
             }
-            return;
+            return Ok(());
         }
 
         // A grouped entry owns its full extent. The first row toggles the
@@ -758,7 +728,7 @@ impl ConversationPanel {
                     self.expanded_items.insert(index);
                 }
             }
-            return;
+            return Ok(());
         }
 
         if let Some(&(index, top, _)) = self
@@ -772,8 +742,7 @@ impl ConversationPanel {
                     .copy_button(&entry.copy_buttons, buffer_y - top, x_rel)
             });
             if let Some(content) = hit {
-                self.copy_code_block(&content);
-                return;
+                return Self::copy_code_block(&content);
             }
             if self
                 .conversation
@@ -790,13 +759,15 @@ impl ConversationPanel {
                 self.expanded_items.insert(index);
             }
         }
+        Ok(())
     }
 
     /// Copies a code block's content to the clipboard, reporting failure.
-    fn copy_code_block(&mut self, content: &str) {
+    fn copy_code_block(content: &str) -> Result<(), &'static str> {
         if !crate::clipboard::copy(content) {
-            self.add_error_string("failed to copy code block to clipboard");
+            return Err("failed to copy code block to clipboard");
         }
+        Ok(())
     }
 
     /// Maps screen coordinates into scroll-buffer coordinates, clamping into
@@ -1085,169 +1056,16 @@ impl ConversationPanel {
         self.conversation.clone()
     }
 
-    /// Appends a tool result so it is both rendered and sent back to the model
-    /// on the next request. Delegates to [`crate::conversation::Conversation::add_tool_output`].
-    pub fn add_tool_output(&mut self, output: crate::tools::ToolOutput) {
-        self.conversation.lock().unwrap().add_tool_output(output);
-    }
-
-    pub fn add_input_message(&mut self, input_message_item: ApiMessageItem) {
-        self.conversation
-            .lock()
-            .unwrap()
-            .add_input_message(input_message_item);
-        // A new user message should always bring the view back to the bottom.
-        self.stick_to_bottom = true;
-    }
-
-    pub fn add_error(&mut self, openai_error: OpenAIError) {
-        self.conversation.lock().unwrap().add_error(openai_error);
-        self.stick_to_bottom = true;
-    }
-
-    pub fn add_error_string(&mut self, message: impl Into<String>) {
-        self.conversation.lock().unwrap().add_error_string(message);
-        self.stick_to_bottom = true;
-    }
-
-    pub fn add_info_string(&mut self, message: impl Into<String>) {
-        self.conversation.lock().unwrap().add_info_string(message);
-        self.stick_to_bottom = true;
-    }
-
-    /// Update an exchange in its original slot, preserving its fold state.
-    pub fn upsert_peer_exchange(
-        &mut self,
-        id: impl Into<String>,
-        from: impl Into<String>,
-        question: impl Into<String>,
-        answer: Option<String>,
-    ) {
-        let id = id.into();
-        let mut conversation = self.conversation.lock().unwrap();
-        let index = conversation.items.iter().position(|item| {
-            matches!(item, MessageItem::PeerExchange { id: existing, .. } if existing == &id)
-        });
-        let item = MessageItem::PeerExchange {
-            id,
-            from: from.into(),
-            question: question.into(),
-            answer,
-        };
-        if let Some(index) = index {
-            conversation.items[index] = item;
-            conversation.mutation_version = conversation.mutation_version.wrapping_add(1);
-        } else {
-            conversation.items.push(item);
-        }
-    }
-
-    /// Update a lifecycle observation without moving its slot or changing its fold.
-    pub fn upsert_peer_delegation(
-        &mut self,
-        id: String,
-        from: String,
-        body: Option<String>,
-        state: crate::response::message_item::PeerDelegationState,
-    ) {
-        let mut conversation = self.conversation.lock().unwrap();
-        if let Some(MessageItem::PeerDelegation {
-            from: saved_from,
-            body: saved_body,
-            state: saved_state,
-            ..
-        }) = conversation.items.iter_mut().find(|item| {
-            matches!(item,
-                MessageItem::PeerDelegation { id: existing, .. } if existing == &id)
-        }) {
-            if *saved_from != from
-                || body
-                    .as_ref()
-                    .zip(saved_body.as_ref())
-                    .is_some_and(|(new_body, existing_body)| new_body != existing_body)
-            {
-                return;
-            }
-            if matches!(
-                *saved_state,
-                crate::response::message_item::PeerDelegationState::Started
-                    | crate::response::message_item::PeerDelegationState::Rejected
-                    | crate::response::message_item::PeerDelegationState::Cancelled
-            ) && *saved_state != state
-            {
-                return;
-            }
-            if *saved_from == from
-                && (body.is_none() || *saved_body == body)
-                && *saved_state == state
-            {
-                return;
-            }
-            *saved_from = from;
-            if body.is_some() {
-                *saved_body = body;
-            }
-            *saved_state = state;
-            conversation.mutation_version = conversation.mutation_version.wrapping_add(1);
-        } else {
-            conversation.items.push(MessageItem::PeerDelegation {
-                id,
-                from,
-                body,
-                state,
-            });
-        }
-    }
-
-    pub fn insert_info_string(&mut self, index: usize, message: impl Into<String>) {
-        self.conversation
-            .lock()
-            .unwrap()
-            .insert_info_string(index, message);
-        self.stick_to_bottom = true;
-    }
-
-    pub fn add_meta(&mut self, label: impl Into<String>, text: impl Into<String>) {
-        self.conversation.lock().unwrap().add_meta(label, text);
-        self.stick_to_bottom = true;
-    }
-
-    pub fn add_warning_string(&mut self, message: impl Into<String>) {
-        self.conversation
-            .lock()
-            .unwrap()
-            .add_warning_string(message);
-        self.stick_to_bottom = true;
-    }
-
-    pub fn remove_warning_string(&mut self, message: &str) {
-        if self
-            .conversation
-            .lock()
-            .unwrap()
-            .remove_warning_string(message)
-        {
-            // Removing an item shifts every later index used by the expansion state.
-            self.expanded_items.clear();
-            // The asynchronous history map is also index-keyed; discard it
-            // rather than allowing a completed worker result to land on the
-            // item that shifted into the old slot.
-            self.invalidate_live_markdown();
-        }
+    /// History indices changed; discard index-keyed display state only.
+    pub fn history_indices_changed(&mut self) {
+        self.expanded_items.clear();
+        self.invalidate_live_markdown();
     }
 
     /// Whether there is API-visible history worth compacting: any input/output
     /// item after the last `/compact` boundary.
     pub fn has_compactable_history(&self) -> bool {
         self.conversation.lock().unwrap().has_compactable_history()
-    }
-
-    /// Record a finished `/compact`: push the boundary carrying `summary`.
-    /// History before it stays visible in the UI but stops being sent to the
-    /// API (see [`crate::conversation::Conversation::to_input_param`]).
-    pub fn apply_compaction(&mut self, summary: String) {
-        self.conversation.lock().unwrap().apply_compaction(summary);
-        self.stick_to_bottom = true;
     }
 
     pub fn response_started(&self) -> bool {
@@ -1300,44 +1118,17 @@ impl ConversationPanel {
         )
     }
 
-    pub fn apply_compaction_at(&mut self, cutoff: usize, summary: String) -> bool {
-        let applied = self
-            .conversation
-            .lock()
-            .unwrap()
-            .apply_compaction_at(cutoff, summary);
-        if applied {
-            self.expanded_items.clear();
-            self.expanded_tool_groups.clear();
-            // Compaction inserts a summary at `cutoff` and shifts every later
-            // absolute index, so any in-flight history hand-off is stale.
-            self.invalidate_live_markdown();
-            self.stick_to_bottom = true;
-        }
-        applied
+    /// A summary was installed in history, shifting subsequent display indices.
+    pub fn history_compacted(&mut self) {
+        self.expanded_items.clear();
+        self.expanded_tool_groups.clear();
+        self.invalidate_live_markdown();
+        self.stick_to_bottom = true;
     }
 
-    pub fn add_usage(&mut self, input_tokens: u32, output_tokens: u32, cached_input_tokens: u32) {
-        self.conversation.lock().unwrap().add_usage(
-            input_tokens,
-            output_tokens,
-            cached_input_tokens,
-        );
-    }
-
-    /// Flush the accumulated usage as a message and reset the counter.
-    pub fn flush_usage(&mut self) {
-        self.conversation.lock().unwrap().flush_usage();
-    }
-
-    /// Reset the accumulated usage counter (on /clear, new session, etc.).
-    pub fn reset_accumulated_usage(&mut self) {
-        self.conversation.lock().unwrap().reset_accumulated_usage();
-    }
-
-    /// Clear all conversation history and pending state.
-    pub fn clear_messages(&mut self) {
-        self.conversation.lock().unwrap().clear();
+    /// Clear pending display state after the domain history was cleared.
+    pub fn clear_view(&mut self) {
+        self.render_cache = RenderCache::default();
         self.pending_message = None;
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
@@ -1349,17 +1140,16 @@ impl ConversationPanel {
         self.stick_to_bottom = true;
     }
 
-    /// Restore a previous session's items into the conversation.
-    pub fn restore_items(&mut self, items: Vec<MessageItem>) {
-        self.conversation.lock().unwrap().restore_items(items);
+    /// Reset display caches after replacing the domain history.
+    pub fn history_restored(&mut self) {
+        self.render_cache = RenderCache::default();
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
         self.invalidate_live_markdown();
         self.stick_to_bottom = true;
     }
 
-    pub fn truncate(&mut self, cutoff: usize) {
-        self.conversation.lock().unwrap().truncate(cutoff);
+    pub fn history_truncated(&mut self) {
         self.abort_receiving();
         // `abort_receiving` intentionally preserves committed hand-offs when
         // there is no active response. Truncation changes absolute item
@@ -1766,61 +1556,56 @@ impl ConversationPanel {
         self.prune_live_markdown_history();
     }
 
-    /// Ends the in-flight response (stream error / cancellation), salvaging
-    /// whatever was produced so far into the conversation — the runner commits
-    /// nothing for a response that errored or was cancelled mid-stream — and
-    /// clearing the "receiving" state so the turn is no longer considered busy.
-    pub fn abort_receiving(&mut self) {
+    /// Transfer display caches using the runner's authoritative archive mapping.
+    /// Filtering can move items; keys still address their original live slots.
+    pub fn commit_aborted_live(&mut self, start: usize, retained_indices: &[usize]) {
         self.live_render_cache = None;
-        // TurnFinished is also emitted after ResponseCommitted. In that
-        // normal path there is no live response left to abort; preserve the
-        // committed front/history hand-off until its worker result is used.
         let Some(partial) = self.receiving_response.take() else {
             return;
         };
-        self.invalidate_active_live_markdown();
-        // Transfer live expanded state before items become historical,
-        // so reasoning/tool-call items the user expanded during streaming
-        // stay expanded instead of auto-collapsing.
-        let base_index = self.conversation.lock().unwrap().items.len();
-        for &live_idx in &self.live_expanded_items {
-            self.expanded_items.insert(base_index + live_idx);
+        let items: Vec<_> = partial.items.iter().flatten().collect();
+        let revisions: std::collections::HashMap<_, _> = partial
+            .markdown_items()
+            .map(|(index, _, _, revision)| (index, revision))
+            .collect();
+        for (offset, &live_index) in retained_indices.iter().enumerate() {
+            let Some(item) = items.get(live_index) else {
+                continue;
+            };
+            let history_index = start + offset;
+            if let Some(key) =
+                live_response_message_key(item, live_index, self.live_markdown_generation)
+            {
+                self.live_markdown_history_keys.insert(history_index, key);
+                self.live_markdown_history_revisions.insert(
+                    history_index,
+                    revisions.get(&live_index).copied().unwrap_or(0),
+                );
+            }
+            if self.live_expanded_items.contains(&live_index) {
+                self.expanded_items.insert(history_index);
+            }
         }
         self.expanded_tool_groups
             .extend(self.live_expanded_groups.drain());
-        let cancelled = partial.cancelled.is_cancelled();
-        let items: Vec<OutputItem> = if cancelled {
-            // When the user cancelled, drop all function calls so they
-            // aren't shown and won't execute.
-            partial
-                .items
-                .into_iter()
-                .flatten()
-                .filter(|item| !matches!(item, OutputItem::FunctionCall(_)))
-                .collect()
-        } else {
-            partial.into_aborted_items()
-        };
-        // Salvaged Markdown is historical just like a normally committed
-        // response. Give it a hand-off key as well, so a stream error or
-        // cancellation cannot reintroduce a synchronous full-document parse
-        // on the first post-abort frame.
-        for (index, item) in items.iter().enumerate() {
-            if matches!(item, OutputItem::Message(_) | OutputItem::Reasoning(_))
-                && let Some(key) =
-                    live_response_message_key(item, index, self.live_markdown_generation)
-            {
-                let history_index = base_index + index;
-                self.live_markdown_history_keys.insert(history_index, key);
-                self.live_markdown_history_revisions
-                    .insert(history_index, 0);
-            }
-        }
+        self.live_expanded_items.clear();
+        self.live_markdown_last_job.clear();
+        self.live_markdown_finished_job.clear();
+        self.live_markdown_history_last_job.clear();
+        self.live_markdown_history_dirty.clear();
         self.prune_live_markdown_history();
-        let mut conv = self.conversation.lock().unwrap();
-        for item in items {
-            conv.add_output(item);
+    }
+
+    /// Drop an uncommitted display copy. Only the runner archives model output.
+    pub fn abort_receiving(&mut self) {
+        self.live_render_cache = None;
+        // TurnFinished also follows commit notifications; retain their hand-off.
+        if self.receiving_response.take().is_none() {
+            return;
         }
+        self.invalidate_active_live_markdown();
+        self.live_expanded_items.clear();
+        self.live_expanded_groups.clear();
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -1986,6 +1771,8 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget;
 
+    use async_openai::types::responses::MessageItem as ApiMessageItem;
+
     fn user_message(text: &str) -> ApiMessageItem {
         ApiMessageItem::Input(InputMessage {
             content: vec![InputContent::InputText(text.into())],
@@ -1998,7 +1785,12 @@ mod tests {
     fn render_does_not_panic_and_scroll_up_moves_the_view() {
         let mut panel = ConversationPanel::new();
         for i in 0..40 {
-            panel.add_input_message(user_message(&format!("message number {i}")));
+            panel
+                .conversation
+                .lock()
+                .unwrap()
+                .add_input_message(user_message(&format!("message number {i}")));
+            panel.scroll_to_bottom();
         }
 
         let area = Rect::new(0, 0, 40, 10);
@@ -2022,10 +1814,81 @@ mod tests {
     }
 
     #[test]
+    fn replacing_history_drops_cache_even_when_versions_match() {
+        for clear in [true, false] {
+            let mut panel = ConversationPanel::new();
+            panel.conversation.lock().unwrap().restore_items(Vec::new());
+            panel
+                .conversation
+                .lock()
+                .unwrap()
+                .add_input_message(user_message("old text"));
+            let area = Rect::new(0, 0, 60, 20);
+            (&mut panel).render(area, &mut Buffer::empty(area));
+            assert!(!panel.render_cache.entries.is_empty());
+            let mut replacement = crate::conversation::Conversation::new();
+            replacement.restore_items(Vec::new());
+            replacement.add_input_message(user_message("new text"));
+            assert_eq!(
+                replacement.mutation_version,
+                panel.conversation.lock().unwrap().mutation_version
+            );
+            panel.conversation = Arc::new(std::sync::Mutex::new(replacement));
+            if clear {
+                panel.clear_view();
+            } else {
+                panel.history_restored();
+            }
+            assert!(panel.render_cache.entries.is_empty());
+            let mut buffer = Buffer::empty(area);
+            (&mut panel).render(area, &mut buffer);
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("new text"));
+            assert!(!text.contains("old text"));
+        }
+    }
+
+    #[test]
+    fn view_notifications_preserve_history_and_usage() {
+        let conversation = Arc::new(std::sync::Mutex::new(
+            crate::conversation::Conversation::new(),
+        ));
+        {
+            let mut history = conversation.lock().unwrap();
+            history.add_input_message(user_message("retained input"));
+            history.add_warning_string("retained warning");
+            history.add_usage(13, 7, 5);
+            history.record_response_usage(None);
+            history.recalled_memories = Some(2);
+        }
+        let before = format!("{:?}", conversation.lock().unwrap());
+        let mut panel = ConversationPanel::from_shared(conversation.clone());
+        panel.expanded_items.insert(0);
+        panel.expanded_tool_groups.insert("group".into());
+        panel.live_markdown_history_keys.insert(0, "stale".into());
+        panel.scroll_to_bottom();
+        panel.history_indices_changed();
+        assert!(panel.expanded_items.is_empty());
+        assert!(panel.live_markdown_history_keys.is_empty());
+        panel.history_compacted();
+        assert!(panel.expanded_tool_groups.is_empty());
+        panel.history_restored();
+        panel.history_truncated();
+        panel.clear_view();
+        assert!(panel.stick_to_bottom);
+        assert_eq!(format!("{:?}", conversation.lock().unwrap()), before);
+    }
+
+    #[test]
     fn flushing_usage_preserves_manual_scroll_position() {
         let mut panel = ConversationPanel::new();
         for i in 0..40 {
-            panel.add_input_message(user_message(&format!("message number {i}")));
+            panel
+                .conversation
+                .lock()
+                .unwrap()
+                .add_input_message(user_message(&format!("message number {i}")));
+            panel.scroll_to_bottom();
         }
         let area = Rect::new(0, 0, 40, 10);
 
@@ -2034,8 +1897,8 @@ mod tests {
         (&mut panel).render(area, &mut Buffer::empty(area));
         let before = panel.scroll_view_state.offset().y;
 
-        panel.add_usage(13, 7, 5);
-        panel.flush_usage();
+        panel.conversation.lock().unwrap().add_usage(13, 7, 5);
+        panel.conversation.lock().unwrap().flush_usage();
         (&mut panel).render(area, &mut Buffer::empty(area));
 
         assert!(!panel.stick_to_bottom);
@@ -2090,7 +1953,7 @@ mod tests {
             panic!("stationary release should remain a click");
         };
         assert_eq!((column, row), (3, 24));
-        panel.handle_buffer_click(column, row);
+        panel.handle_buffer_click(column, row).unwrap();
         assert!(panel.expanded_items.contains(&7));
         assert!(!panel.expanded_items.contains(&9));
     }
@@ -2184,6 +2047,60 @@ mod tests {
             panel.live_markdown_history_last_job.get(&0),
             Some(&(80, false))
         );
+    }
+
+    #[test]
+    fn abort_display_copy_never_writes_history() {
+        let mut panel = ConversationPanel::new();
+        let mut partial = PartialResponse::new(CancellationToken::new());
+        partial
+            .items
+            .push(Some(OutputItem::Reasoning(ReasoningItem {
+                id: Some("discarded".into()),
+                summary: vec![],
+                content: None,
+                encrypted_content: None,
+                status: None,
+            })));
+        partial.usage = Some((100, 20, 0));
+        panel.receiving_response = Some(partial);
+        panel.abort_receiving();
+        assert!(panel.items_snapshot().is_empty());
+        assert_eq!(panel.usage_summary().total_tokens(), 0);
+    }
+
+    #[test]
+    fn aborted_archive_handoff_uses_runner_indices_without_recommitting() {
+        let mut panel = ConversationPanel::new();
+        let reasoning = OutputItem::Reasoning(ReasoningItem {
+            id: Some("kept".into()),
+            summary: vec![],
+            content: None,
+            encrypted_content: None,
+            status: None,
+        });
+        let mut partial = PartialResponse::new(CancellationToken::new());
+        // The first live slot was filtered by the runner. A hole does not
+        // consume a compact live index.
+        partial.items = vec![Some(reasoning.clone()), None, Some(reasoning.clone())];
+        panel.receiving_response = Some(partial);
+        panel.live_expanded_items.insert(1);
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_output(reasoning.clone());
+        panel.commit_aborted_live(0, &[1]);
+        assert_eq!(panel.items_snapshot().len(), 1);
+        assert!(panel.expanded_items.contains(&0));
+        assert_eq!(
+            panel.live_markdown_history_keys.get(&0),
+            live_response_message_key(&reasoning, 1, panel.live_markdown_generation).as_ref()
+        );
+        panel.abort_receiving();
+        panel.commit_aborted_live(0, &[1]);
+        assert_eq!(panel.items_snapshot().len(), 1);
+        assert!(panel.live_markdown_history_keys.contains_key(&0));
     }
 
     #[test]

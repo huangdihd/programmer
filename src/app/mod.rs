@@ -31,9 +31,7 @@ pub(crate) mod surface;
 use crate::cancel::{CancellationToken, OperationId};
 use crate::classifier::WorkMode;
 use crate::config::programmer_config::ProgrammerConfig;
-use crate::mcp::McpServerStatus;
-use crate::providers::{ProviderManager, ProviderModelStatus};
-use crate::response::message_item::MessageItem;
+use crate::providers::ProviderManager;
 use crate::session::{AutoCompactOverride, ModelOverride, SessionManager};
 use crate::ui::components::conversation_panel::conversation_panel::ConversationPanel;
 use crate::ui::components::diagnostics_panel::DiagnosticsPanel;
@@ -51,7 +49,6 @@ use crate::ui::event::{Event, EventHandler};
 use async_openai::types::responses::FunctionToolCall;
 use crossterm::event::KeyEvent;
 use ratatui::DefaultTerminal;
-use ratatui::layout::Rect;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -118,14 +115,6 @@ pub(crate) struct PendingReview {
     pub(crate) agent_generation: Option<u64>,
 }
 
-/// UI-only diagnostics bookkeeping. The mutable state (baseline + edit-turn
-/// counter) lives in [`App::diagnostics_state`], shared with the runner, so the
-/// runner's post-edit feedback loop sees the same baseline the sidebar renders.
-pub(crate) struct DiagnosticsState {
-    /// Whether the project's diagnostics profile declares an LSP checker.
-    pub(crate) lsp_configured: bool,
-}
-
 /// Cancellation-related tokens for the current request lifecycle.
 pub(crate) struct CancelState {
     /// The current turn's root cancel token. Every phase (stream,
@@ -164,8 +153,17 @@ pub(crate) struct ActiveUserRequest {
     pub(crate) history_text: String,
 }
 
-/// Session identity, persistence handle, and the deferred-save dirty flag.
+/// Stopping is retryable, but never admits work again, even after a failed save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionLifecycle {
+    Running,
+    Stopping,
+}
+
+/// Session identity, execution settings, shared resources, and persistence state.
 pub(crate) struct SessionState {
+    pub(crate) lifecycle: SessionLifecycle,
+    pub(crate) conversation: Arc<Mutex<crate::conversation::Conversation>>,
     /// Session UUID.
     pub(crate) uuid: String,
     /// Whether the session was actually saved at least once during this run
@@ -189,6 +187,24 @@ pub(crate) struct SessionState {
     pub(crate) compact_model_override: ModelOverride,
     pub(crate) auto_compact_override: AutoCompactOverride,
     pub(crate) compact_keep_recent_turns_override: Option<usize>,
+    pub(crate) tasks: crate::tasks::TaskManager,
+    /// Currently active model in `provider/model` format.
+    pub current_model: String,
+    /// Whether supported `@image` references are sent as multimodal inputs.
+    pub vision_enabled: bool,
+    /// Reasoning effort for main chat and compaction requests.
+    pub(crate) thinking_level: crate::thinking::ThinkingLevel,
+    /// Per-application in-process sub-agent registry.
+    pub(crate) agents: crate::agents::AgentManager,
+    /// Shared per-session todo state used by the model's `todo` tool.
+    pub(crate) todo_store: Arc<Mutex<crate::todos::TodoList>>,
+    /// Current safety/work mode.
+    pub work_mode: WorkMode,
+    /// Shared diagnostics state the runner also reads/writes for post-edit
+    /// feedback (baseline + edit-turn counter). The TUI holds this so it
+    /// persists across per-turn engines.
+    pub(crate) diagnostics_state: Arc<std::sync::Mutex<crate::runner::DiagnosticsState>>,
+    pub(crate) checkpoint_store: Option<Arc<Mutex<crate::checkpoint::CheckpointStore>>>,
 }
 
 #[derive(Debug, Default)]
@@ -292,34 +308,13 @@ impl TaskNotificationState {
     }
 }
 
-/// Application.
-pub struct App<'a> {
-    pub(crate) tasks: crate::tasks::TaskManager,
-    /// Is the application running?
-    pub running: bool,
+/// Presentation state grouped without changing component or conversation ownership.
+pub struct UiState<'a> {
     /// Time of the first Ctrl+C press while waiting for exit confirmation.
     pub(crate) quit_requested_at: Option<std::time::Instant>,
-    /// Multi-provider manager (replaces the single OpenAI client).
-    pub provider_manager: ProviderManager,
-    /// Per-provider model-list state rendered in the right sidebar.
-    pub(crate) provider_model_statuses: Vec<ProviderModelStatus>,
-    /// Currently active model in `provider/model` format.
-    pub current_model: String,
-    /// Whether supported `@image` references are sent as multimodal inputs.
-    pub vision_enabled: bool,
     /// Whether the terminal emulator owns mouse drags for native text
     /// selection instead of the TUI receiving mouse events.
     pub(crate) native_selection_mode: bool,
-    /// Reasoning effort for main chat and compaction requests.
-    pub(crate) thinking_level: crate::thinking::ThinkingLevel,
-    /// Retry policy selected by `/keepretry` for main model turns.
-    /// Images belonging to the queued follow-up message while a turn is busy.
-    pub(crate) peers: peers::PeerState,
-    pub(crate) pending_images: Vec<async_openai::types::responses::InputImageContent>,
-    /// Event handler.
-    pub events: EventHandler,
-    /// Application configuration.
-    pub config: ProgrammerConfig,
     pub input_panel: InputPanel<'a>,
     pub conversation_panel: ConversationPanel,
     pub footer: Footer,
@@ -335,6 +330,7 @@ pub struct App<'a> {
     pub security_panel: Option<SecurityPanel>,
     /// Modal question panel shown when the model calls `ask_user`.
     pub question_panel: Option<QuestionPanel>,
+    pub(crate) runner_prompts: VecDeque<(OperationId, QuestionPanel)>,
     /// Todo-list panel shown with `/todo`.
     pub todo_panel: Option<TodoPanel>,
     /// Full-screen checkpoint selector opened by `/rewind`.
@@ -343,35 +339,43 @@ pub struct App<'a> {
     pub terminal_pane: Option<crate::ui::components::terminal_panel::TerminalPane>,
     /// Full-screen read-only child conversation, opened from the Agents sidebar.
     pub(crate) agent_panel: Option<crate::ui::components::agent_panel::AgentPanel>,
-    pub(crate) activity_panel: Option<crate::ui::components::activity_panel::ActivityPanel>,
-    pub(crate) activity_view: Option<activity::ActivityView>,
-    /// Terminal task events waiting to be delivered to the agent.
-    pub(crate) task_notifications: TaskNotificationState,
-    /// Completed sub-agents waiting to be delivered to the parent agent.
-    pub(crate) agent_notifications: AgentNotificationState,
-    /// Per-application in-process sub-agent registry.
-    pub(crate) agents: crate::agents::AgentManager,
+    pub(crate) activity_page: Option<activity::ActivityPage>,
     /// Right-hand sidebar panel (toggled with Ctrl+B).
     pub sidebar: Option<Sidebar>,
     /// The sidebar's screen area from the last render, used to route mouse
     /// scroll events to the correct panel.
-    pub sidebar_area: Option<Rect>,
+    /// Tracks whether the current mouse-drag started in the sidebar area.
+    pub(crate) sidebar_click_active: bool,
     /// UI snapshot of the current session's todo list.
     pub todo_list: crate::todos::TodoList,
-    /// Shared per-session todo state used by the model's `todo` tool.
-    pub(crate) todo_store: Arc<Mutex<crate::todos::TodoList>>,
+    /// Operation whose completed turn is currently generating an input hint.
+    pub(crate) active_suggestion_operation_id: Option<OperationId>,
+    /// Cancels obsolete hint requests when another user turn starts.
+    pub(crate) input_suggestion_cancel: Option<crate::cancel::CancellationToken>,
+    /// Which option is highlighted in the plan review bar.
+    pub(crate) plan_review_selected: usize,
+}
+
+/// Runtime state of the foreground agent loop.
+pub(crate) struct LoopState {
+    pub(crate) background_handles: Vec<tokio::task::JoinHandle<()>>,
+    pub(crate) runner: Option<Arc<crate::runner::TurnRunner>>,
+    pub(crate) peer_inbox: peers::PeerInbox,
+    pub(crate) runner_handles: Vec<tokio::task::JoinHandle<()>>,
+    pub(crate) pending_request: Option<scheduling::UserRequest>,
+    pub(crate) phase: crate::execution::ActivePhase,
+    /// Local authorization is intentionally never restored from disk.
+    pub(crate) peer_delegations: std::collections::HashMap<String, peers::DelegationState>,
+    pub(crate) peer_consent: Option<(
+        crate::peers::PeerEnvelope,
+        tokio::sync::oneshot::Receiver<String>,
+    )>,
+    /// Terminal task events waiting to be delivered to the agent.
+    pub(crate) task_notifications: TaskNotificationState,
+    /// Completed sub-agents waiting to be delivered to the parent agent.
+    pub(crate) agent_notifications: AgentNotificationState,
     /// Loaded agent skills, with activation state.
     pub(crate) skill_registry: crate::skills::SkillRegistry,
-    /// MCP server manager (None if no servers configured).
-    pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
-    /// Per-server MCP connection state shown while the manager is loading.
-    pub(crate) mcp_server_statuses: Vec<McpServerStatus>,
-    /// Identifies the latest background MCP reload so stale results are ignored.
-    pub(crate) mcp_reload_generation: u64,
-    /// Current safety/work mode.
-    pub work_mode: WorkMode,
-    /// Live security policy shared by the UI and every local tool provider.
-    pub(crate) security: Arc<crate::security::SecurityHandle>,
     /// Manual-mode pending tool-call review (per-call, no batch). `None` when
     /// no review is in progress.
     pub(crate) pending_review: Option<PendingReview>,
@@ -380,28 +384,35 @@ pub struct App<'a> {
     /// Classifier models discovered not to support logprobs, so Auto mode skips
     /// the single-token fast path and goes straight to the merged reasoned call.
     pub(crate) classifier_no_logprobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    /// Diagnostics baseline and edit-turn bookkeeping.
-    pub(crate) diag: DiagnosticsState,
-    /// Shared diagnostics state the runner also reads/writes for post-edit
-    /// feedback (baseline + edit-turn counter). The TUI holds this so it
-    /// persists across per-turn engines.
-    pub(crate) diagnostics_state: Arc<std::sync::Mutex<crate::runner::DiagnosticsState>>,
-    /// Tracks whether the current mouse-drag started in the sidebar area.
-    pub(crate) sidebar_click_active: bool,
     /// Cancellation tokens for the current request lifecycle.
     pub(crate) cancel: CancelState,
-    /// Session identity, persistence handle, and deferred-save flag.
+    /// Session settings, resources, and persistence owned by this loop.
     pub(crate) session: SessionState,
     /// Background automatic compaction bookkeeping. This is deliberately
     /// independent from the foreground turn phase and cancellation token.
     pub(crate) auto_compact: AutoCompactState,
     pub(crate) waiting_for_subagents: bool,
-    /// Operation whose completed turn is currently generating an input hint.
-    pub(crate) active_suggestion_operation_id: Option<OperationId>,
-    /// Cancels obsolete hint requests when another user turn starts.
-    pub(crate) input_suggestion_cancel: Option<crate::cancel::CancellationToken>,
-    pub(crate) checkpoint_store: Option<Arc<Mutex<crate::checkpoint::CheckpointStore>>>,
     pub(crate) current_checkpoint_id: Option<u64>,
+    /// Plan mode sub-phase. Only meaningful when `session.work_mode == WorkMode::Plan`.
+    pub(crate) plan_phase: crate::classifier::PlanPhase,
+}
+
+/// Application.
+pub struct App<'a> {
+    /// Presentation state and UI components owned by this application.
+    pub ui: UiState<'a>,
+    /// Is the application running?
+    pub running: bool,
+    /// Multi-provider manager (replaces the single OpenAI client).
+    pub provider_manager: ProviderManager,
+    /// Event handler.
+    pub events: EventHandler,
+    /// Application configuration.
+    pub config: ProgrammerConfig,
+    /// Stable owner of MCP reload state and replaceable connection snapshots.
+    pub(crate) mcp_runtime: crate::mcp::runtime::McpRuntime,
+    /// Live security policy shared by the UI and every local tool provider.
+    pub(crate) security: Arc<crate::security::SecurityHandle>,
     /// Live Dream inputs (settings + resolved memory model) read by the worker.
     pub(crate) dream_runtime: Arc<std::sync::Mutex<crate::memory::dream::DreamRuntime>>,
     /// Background consolidation worker, stopped when the application exits.
@@ -412,10 +423,9 @@ pub struct App<'a> {
     pub(crate) dream_active: Arc<std::sync::atomic::AtomicBool>,
     /// Project directory name for the terminal title.
     pub(crate) project_name: String,
-    /// Plan mode sub-phase. Only meaningful when `work_mode == WorkMode::Plan`.
-    pub(crate) plan_phase: crate::classifier::PlanPhase,
-    /// Which option is highlighted in the plan review bar.
-    pub(crate) plan_review_selected: usize,
+
+    pub(crate) agent_loop: LoopState,
+    pub(crate) task_event_generation: u64,
 }
 
 impl std::fmt::Debug for App<'_> {
@@ -423,11 +433,11 @@ impl std::fmt::Debug for App<'_> {
         f.debug_struct("App")
             .field("running", &self.running)
             .field("provider_manager", &self.provider_manager)
-            .field("current_model", &self.current_model)
+            .field("current_model", &self.agent_loop.session.current_model)
             .field("config", &self.config)
-            .field("input_panel", &self.input_panel)
-            .field("conversation_panel", &self.conversation_panel)
-            .field("footer", &self.footer)
+            .field("input_panel", &self.ui.input_panel)
+            .field("conversation_panel", &self.ui.conversation_panel)
+            .field("footer", &self.ui.footer)
             .finish()
     }
 }
@@ -441,17 +451,11 @@ impl App<'_> {
     }
 
     /// Constructs a new instance of [`App`].
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         mut config: ProgrammerConfig,
-        saved_items: Vec<MessageItem>,
-        saved_history: Vec<String>,
-        saved_todos: Vec<crate::todos::Todo>,
-        saved_agents: Vec<crate::agents::PersistedAgent>,
-        tasks: crate::tasks::TaskManager,
-        session_uuid: String,
+        seed: session::SessionSeed,
         session_mgr: Option<SessionManager>,
-        mut startup_messages: Vec<String>,
+        startup_messages: Vec<String>,
         open_provider_panel: bool,
         project_name: String,
     ) -> Self {
@@ -472,22 +476,26 @@ impl App<'_> {
         let mut saved_activated_skills: Option<Vec<String>> = None;
         let mut saved_file_snapshots: Vec<crate::security::policy::PersistedFileSnapshot> =
             Vec::new();
-        let mut persistence = session::PersistenceState::default();
-        let restored_session = match session_mgr
-            .as_ref()
-            .map(|manager| manager.load(&session_uuid))
-            .transpose()
-        {
-            Ok(saved) => saved.flatten(),
-            Err(error) => {
-                startup_messages.push(format!(
-                    "Session restore failed; saving is blocked: {error}"
-                ));
-                persistence.load_error = Some(error.to_string());
-                None
-            }
+        let persistence = session::PersistenceState::default();
+        let tasks = crate::tasks::TaskManager::default();
+        let mut saved_items = Vec::new();
+        let mut saved_history = Vec::new();
+        let mut saved_todos = Vec::new();
+        let mut saved_agents = Vec::new();
+        let (session_uuid, restored_session) = match seed {
+            session::SessionSeed::Fresh { uuid } => (uuid, None),
+            session::SessionSeed::Restored(snapshot) => (snapshot.uuid.clone(), Some(snapshot)),
         };
         if let Some(saved) = restored_session {
+            tasks.restore(&saved.tasks);
+            saved_items = saved
+                .items
+                .into_iter()
+                .map(crate::response::message_item::MessageItem::from)
+                .collect();
+            saved_history = saved.history;
+            saved_todos = saved.todos;
+            saved_agents = saved.agents;
             if let Some(wm) = saved.work_mode {
                 work_mode = wm;
             }
@@ -510,18 +518,19 @@ impl App<'_> {
                 saved_activated_skills = Some(saved.activated_skills);
             }
         }
-        let mut conversation_panel = ConversationPanel::new();
+        let conversation = Arc::new(Mutex::new(crate::conversation::Conversation::new()));
+        let mut conversation_panel = ConversationPanel::from_shared(conversation.clone());
         conversation_panel.tasks = tasks.clone();
-        conversation_panel.restore_items(saved_items);
-        if let Ok(mut conversation) = conversation_panel.conversation.lock() {
-            conversation.last_request_input_tokens = saved_last_request_input_tokens;
-        }
-        events::remove_quit_confirmation_warning(&mut conversation_panel);
+        conversation.lock().unwrap().restore_items(saved_items);
+        conversation_panel.history_restored();
+        conversation.lock().unwrap().last_request_input_tokens = saved_last_request_input_tokens;
+        events::remove_quit_confirmation_warning(&conversation, &mut conversation_panel);
         for msg in startup_messages {
-            conversation_panel.add_info_string(msg);
+            conversation.lock().unwrap().add_info_string(msg);
+            conversation_panel.scroll_to_bottom();
         }
         if config.providers.is_empty() {
-            conversation_panel.add_warning_string(
+            conversation.lock().unwrap().add_warning_string(
                 "no providers configured — press / then type 'providers manage' to add one, \
                  or restart with the --providers flag",
             );
@@ -540,112 +549,119 @@ impl App<'_> {
         crate::security::install_active(security_manager.clone());
         security_manager.restore_snapshots(&saved_file_snapshots);
         let security = Arc::new(crate::security::SecurityHandle::new(security_manager));
-        let mcp_server_statuses = config
-            .mcp_servers
-            .iter()
-            .map(|server| McpServerStatus::connecting(server.name.clone()))
-            .collect();
-        let provider_model_statuses = ProviderModelStatus::from_config(&config);
+        let mut mcp_runtime = crate::mcp::runtime::McpRuntime::default();
+        mcp_runtime.begin_reload(&config.mcp_servers);
         let agents = crate::agents::AgentManager::default();
         agents.restore(&saved_agents);
         let checkpoint_store = crate::checkpoint::CheckpointStore::for_session(&session_uuid)
             .map(|store| Arc::new(Mutex::new(store)));
         let mut app = Self {
+            ui: UiState {
+                quit_requested_at: None,
+                native_selection_mode: false,
+                input_panel,
+                conversation_panel,
+                footer: Footer::new(),
+                provider_panel: open_provider_panel.then(ProviderPanel::new),
+                skills_panel: None,
+                mcp_panel: None,
+                diagnostics_panel: None,
+                security_panel: None,
+                question_panel: None,
+                runner_prompts: VecDeque::new(),
+                todo_panel: None,
+                rewind_panel: None,
+                terminal_pane: None,
+                agent_panel: None,
+                activity_page: None,
+                sidebar: Some(Sidebar::new()),
+                sidebar_click_active: false,
+                todo_list,
+                active_suggestion_operation_id: None,
+                input_suggestion_cancel: None,
+                plan_review_selected: 0,
+            },
             running: true,
-            quit_requested_at: None,
             provider_manager,
-            provider_model_statuses,
-            current_model,
-            vision_enabled,
-            native_selection_mode: false,
-            thinking_level,
-            peers: peers::PeerState::default(),
-            pending_images: Vec::new(),
             events: EventHandler::new(),
             config,
-            input_panel,
-            conversation_panel,
-            tasks,
-            footer: Footer::new(),
-            provider_panel: open_provider_panel.then(ProviderPanel::new),
-            skills_panel: None,
-            mcp_panel: None,
-            diagnostics_panel: None,
-            security_panel: None,
-            question_panel: None,
-            todo_panel: None,
-            rewind_panel: None,
-            terminal_pane: None,
-            agent_panel: None,
-            activity_panel: None,
-            activity_view: None,
-            task_notifications: TaskNotificationState::new(),
-            agent_notifications: AgentNotificationState::new(),
-            agents,
-            sidebar: Some(Sidebar::new()),
-            sidebar_area: None,
-            todo_list,
-            todo_store,
-            work_mode,
             security,
-            pending_review: None,
-            review_queue: VecDeque::new(),
-            classifier_no_logprobs: Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
-            diag: DiagnosticsState {
-                lsp_configured: helpers::lsp_checker_configured(),
-            },
-            diagnostics_state: Arc::new(std::sync::Mutex::new(
-                crate::runner::DiagnosticsState::default(),
-            )),
-            sidebar_click_active: false,
-            cancel: CancelState {
-                active: CancellationToken::new(),
-                next_id: 0,
-                active_id: None,
-                activity: None,
-                turn_conversation_cutoff: None,
-                stream_retrying: Arc::new(AtomicBool::new(false)),
-                response_started: false,
-                active_user_request: None,
-            },
-            session: SessionState {
-                uuid: session_uuid,
-                mgr: session_mgr,
-                dirty: false,
-                persistence,
-                did_save: false,
-                title_generation_started: !session_title.is_empty(),
-                title_generation_id: 0,
-                title: session_title,
-                classifier_model_override,
-                compact_model_override,
-                auto_compact_override,
-                compact_keep_recent_turns_override,
-            },
-            auto_compact: AutoCompactState::default(),
-            waiting_for_subagents: false,
-            active_suggestion_operation_id: None,
-            input_suggestion_cancel: None,
-            checkpoint_store,
-            current_checkpoint_id: None,
             dream_runtime: Arc::new(std::sync::Mutex::new(
                 crate::memory::dream::DreamRuntime::default(),
             )),
             dream_worker: None,
+            task_event_generation: 0,
             dream_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            skill_registry: crate::skills::SkillRegistry::load(),
-            mcp_manager: None,
-            mcp_server_statuses,
-            mcp_reload_generation: 0,
-            plan_phase: crate::classifier::PlanPhase::default(),
-            plan_review_selected: 0,
+            mcp_runtime,
+
+            agent_loop: LoopState {
+                background_handles: Vec::new(),
+                runner: None,
+                peer_inbox: peers::PeerInbox::default(),
+                runner_handles: Vec::new(),
+                pending_request: None,
+                phase: crate::execution::ActivePhase::None,
+                peer_delegations: std::collections::HashMap::new(),
+                peer_consent: None,
+                task_notifications: TaskNotificationState::new(),
+                agent_notifications: AgentNotificationState::new(),
+                pending_review: None,
+                review_queue: VecDeque::new(),
+                classifier_no_logprobs: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
+                cancel: CancelState {
+                    active: CancellationToken::new(),
+                    next_id: 0,
+                    active_id: None,
+                    activity: None,
+                    turn_conversation_cutoff: None,
+                    stream_retrying: Arc::new(AtomicBool::new(false)),
+                    response_started: false,
+                    active_user_request: None,
+                },
+                session: SessionState {
+                    lifecycle: SessionLifecycle::Running,
+                    conversation,
+                    uuid: session_uuid,
+                    mgr: session_mgr,
+                    dirty: false,
+                    persistence,
+                    did_save: false,
+                    title_generation_started: !session_title.is_empty(),
+                    title_generation_id: 0,
+                    title: session_title,
+                    classifier_model_override,
+                    compact_model_override,
+                    auto_compact_override,
+                    compact_keep_recent_turns_override,
+                    current_model,
+                    vision_enabled,
+                    thinking_level,
+                    tasks,
+                    agents,
+                    todo_store,
+                    work_mode,
+                    diagnostics_state: Arc::new(std::sync::Mutex::new({
+                        let mut state = crate::runner::DiagnosticsState::default();
+                        state.lsp_configured = helpers::lsp_checker_configured();
+                        state
+                    })),
+                    checkpoint_store,
+                },
+                auto_compact: AutoCompactState::default(),
+                waiting_for_subagents: false,
+                current_checkpoint_id: None,
+                skill_registry: crate::skills::SkillRegistry::load(),
+                plan_phase: crate::classifier::PlanPhase::default(),
+            },
             project_name,
         };
 
         if let Some(saved_activated_skills) = saved_activated_skills {
-            app.skill_registry.set_activated(&saved_activated_skills);
+            app.agent_loop
+                .skill_registry
+                .set_activated(&saved_activated_skills);
         }
 
         if app
@@ -664,21 +680,7 @@ impl App<'_> {
             app.events.send(crate::ui::event::AppEvent::McpChanged);
         }
 
-        let (task_event_tx, mut task_event_rx) = tokio::sync::mpsc::unbounded_channel();
-        app.tasks.install_event_sink(task_event_tx);
-        let app_event_tx = app.events.sender.clone();
-        tokio::spawn(async move {
-            while let Some(event) = task_event_rx.recv().await {
-                if app_event_tx
-                    .send(Event::App(crate::ui::event::AppEvent::TaskStateChanged(
-                        event,
-                    )))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        app.connect_task_events();
 
         app.start_auto_dream();
 
@@ -698,27 +700,22 @@ impl App<'_> {
     }
 
     pub(crate) fn sync_todos_from_store(&mut self) {
-        if let Ok(list) = self.todo_store.lock() {
-            self.todo_list = list.clone();
-        }
-    }
-
-    pub(crate) fn sync_todos_to_store(&self) {
-        if let Ok(mut list) = self.todo_store.lock() {
-            *list = self.todo_list.clone();
+        self.ui.todo_list = self.agent_loop.session.todo_store.lock().unwrap().clone();
+        if let Some(panel) = &mut self.ui.todo_panel {
+            panel.replace_snapshot(self.ui.todo_list.clone());
         }
     }
 
     pub(crate) fn effective_classifier_model(&self) -> String {
         self.effective_model_override(
-            &self.session.classifier_model_override,
+            &self.agent_loop.session.classifier_model_override,
             self.config.classifier_model.as_deref(),
         )
     }
 
     pub(crate) fn effective_compact_model(&self) -> String {
         self.effective_model_override(
-            &self.session.compact_model_override,
+            &self.agent_loop.session.compact_model_override,
             self.config.compact_model.as_deref(),
         )
     }
@@ -727,14 +724,14 @@ impl App<'_> {
         self.config
             .title_model
             .clone()
-            .unwrap_or_else(|| self.current_model.clone())
+            .unwrap_or_else(|| self.agent_loop.session.current_model.clone())
     }
 
     pub(crate) fn effective_suggestion_model(&self) -> String {
         self.config
             .suggestion_model
             .clone()
-            .unwrap_or_else(|| self.current_model.clone())
+            .unwrap_or_else(|| self.agent_loop.session.current_model.clone())
     }
 
     pub(crate) fn mandatory_compact_tokens(&self) -> Option<u32> {
@@ -742,7 +739,7 @@ impl App<'_> {
     }
 
     pub(crate) fn effective_auto_compact_tokens(&self) -> Option<u32> {
-        match self.session.auto_compact_override {
+        match self.agent_loop.session.auto_compact_override {
             AutoCompactOverride::Inherit => {
                 (self.config.auto_compact_tokens > 0).then_some(self.config.auto_compact_tokens)
             }
@@ -752,15 +749,16 @@ impl App<'_> {
     }
 
     pub(crate) fn effective_compact_keep_recent_turns(&self) -> usize {
-        self.session
+        self.agent_loop
+            .session
             .compact_keep_recent_turns_override
             .unwrap_or(self.config.compact_keep_recent_turns)
     }
 
     pub(crate) fn checkpoint_recorder(&self) -> Option<crate::checkpoint::CheckpointRecorder> {
         Some(crate::checkpoint::CheckpointRecorder {
-            store: self.checkpoint_store.as_ref()?.clone(),
-            checkpoint_id: self.current_checkpoint_id?,
+            store: self.agent_loop.session.checkpoint_store.as_ref()?.clone(),
+            checkpoint_id: self.agent_loop.current_checkpoint_id?,
         })
     }
 
@@ -770,8 +768,10 @@ impl App<'_> {
         global: Option<&str>,
     ) -> String {
         match model_override {
-            ModelOverride::Inherit => global.unwrap_or(&self.current_model).to_string(),
-            ModelOverride::Current => self.current_model.clone(),
+            ModelOverride::Inherit => global
+                .unwrap_or(&self.agent_loop.session.current_model)
+                .to_string(),
+            ModelOverride::Current => self.agent_loop.session.current_model.clone(),
             ModelOverride::Model(model) => model.clone(),
         }
     }
@@ -787,8 +787,10 @@ impl App<'_> {
             LocalToolProvider, McpToolProvider, SkillToolProvider, ToolProvider, ToolRegistry,
         };
 
-        let (client, model_name) = self.provider_manager.resolve(&self.current_model)?;
-        let model_str = self.current_model.clone();
+        let (client, model_name) = self
+            .provider_manager
+            .resolve(&self.agent_loop.session.current_model)?;
+        let model_str = self.agent_loop.session.current_model.clone();
         // Keep the Dream worker's view of the memory model current: this runs at
         // the start of every turn, which is exactly when `/model`, provider
         // changes, and `/memory off` have already been applied to `self.config`.
@@ -798,24 +800,29 @@ impl App<'_> {
         // one provider, all connected MCP servers another.
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
             Arc::new(
-                LocalToolProvider::new(self.todo_store.clone(), self.security.clone())
-                    .with_diagnostics_state(self.diagnostics_state.clone())
-                    .with_tasks(self.tasks.clone())
-                    .with_checkpoint(self.checkpoint_recorder())
-                    .with_memory_enabled(self.config.memory.enabled)
-                    .with_memory_model(memory_model.clone())
-                    .with_conversation_history(Some(self.conversation_panel.shared_conversation())),
+                LocalToolProvider::new(
+                    self.agent_loop.session.todo_store.clone(),
+                    self.security.clone(),
+                )
+                .with_diagnostics_state(self.agent_loop.session.diagnostics_state.clone())
+                .with_tasks(self.agent_loop.session.tasks.clone())
+                .with_checkpoint(self.checkpoint_recorder())
+                .with_memory_enabled(self.config.memory.enabled)
+                .with_memory_model(memory_model.clone())
+                .with_conversation_history(Some(self.agent_loop.session.conversation.clone())),
             ),
-            Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
+            Arc::new(SkillToolProvider::new(
+                self.agent_loop.skill_registry.clone(),
+            )),
         ];
-        if let Some(mcp) = &self.mcp_manager {
+        if let Some(mcp) = self.mcp_runtime.connections() {
             base_providers.push(Arc::new(McpToolProvider::new(mcp.clone())));
         }
-        let (policy, child_policy) = match self.work_mode {
+        let (policy, child_policy) = match self.agent_loop.session.work_mode {
             WorkMode::Yolo => (RunnerPolicy::Yolo, crate::agents::AgentPolicyFactory::Yolo),
             WorkMode::Manual | WorkMode::Plan => (
-                RunnerPolicy::Sync(self.work_mode.classifier()),
-                crate::agents::AgentPolicyFactory::Sync(self.work_mode),
+                RunnerPolicy::Sync(self.agent_loop.session.work_mode.classifier()),
+                crate::agents::AgentPolicyFactory::Sync(self.agent_loop.session.work_mode),
             ),
             WorkMode::Auto => {
                 let model_str = self.effective_classifier_model();
@@ -826,51 +833,51 @@ impl App<'_> {
                         client: c_client.clone(),
                         model_name: c_model_name.clone(),
                         top_logprobs,
-                        no_logprobs: self.classifier_no_logprobs.clone(),
+                        no_logprobs: self.agent_loop.classifier_no_logprobs.clone(),
                     })),
                     crate::agents::AgentPolicyFactory::Llm(Box::new(LlmPolicy {
                         client: c_client.clone(),
                         model_name: c_model_name,
                         top_logprobs,
-                        no_logprobs: self.classifier_no_logprobs.clone(),
+                        no_logprobs: self.agent_loop.classifier_no_logprobs.clone(),
                     })),
                 )
             }
         };
 
         let child_runtime = crate::agents::AgentRuntime {
-            tasks: self.tasks.clone(),
+            tasks: self.agent_loop.session.tasks.clone(),
             events: self.events.sender.clone(),
             provider_manager: Arc::new(self.provider_manager.clone()),
             client: client.clone(),
             model_name: model_name.clone(),
             model_str: model_str.clone(),
-            todos: self.todo_store.clone(),
+            todos: self.agent_loop.session.todo_store.clone(),
             security: self.security.clone(),
-            mcp_manager: self.mcp_manager.clone(),
+            mcp_manager: self.mcp_runtime.connections().cloned(),
             policy: child_policy,
             soul: self.config.soul.clone(),
             coauthor: self.config.git_coauthor.clone(),
-            vision_enabled: self.vision_enabled,
-            thinking_level: self.thinking_level,
+            vision_enabled: self.agent_loop.session.vision_enabled,
+            thinking_level: self.agent_loop.session.thinking_level,
             memory_config: self.config.memory.clone(),
             memory_model: self.config.memory_model.clone(),
-            skill_registry: self.skill_registry.clone(),
-            skill_prompt: self.skill_registry.catalog_prompt(),
+            skill_registry: self.agent_loop.skill_registry.clone(),
+            skill_prompt: self.agent_loop.skill_registry.catalog_prompt(),
             approval_label: format!(
                 "{} approved by {} mode (sub-agent)",
-                self.work_mode.icon(),
-                self.work_mode.label()
+                self.agent_loop.session.work_mode.icon(),
+                self.agent_loop.session.work_mode.label()
             ),
             checkpoint: self.checkpoint_recorder(),
-            conversation_history: Some(self.conversation_panel.shared_conversation()),
+            conversation_history: Some(self.agent_loop.session.conversation.clone()),
         };
         base_providers.push(Arc::new(crate::tools::provider::AgentToolProvider::new(
-            self.agents.clone(),
+            self.agent_loop.session.agents.clone(),
             child_runtime,
         )));
         base_providers.push(Arc::new(crate::peers::PeerSessionProvider::new(
-            self.session.uuid.clone(),
+            self.agent_loop.session.uuid.clone(),
             self.provider_manager.clone(),
         )));
         let tools = Arc::new(ToolRegistry::new(base_providers));
@@ -883,11 +890,13 @@ impl App<'_> {
             policy,
             soul: self.config.soul.clone(),
             coauthor: self.config.git_coauthor.clone(),
-            vision_enabled: self.vision_enabled,
-            thinking_level: self.thinking_level,
+            vision_enabled: self.agent_loop.session.vision_enabled,
+            thinking_level: self.agent_loop.session.thinking_level,
             memory_model,
-            hooks: crate::runner::hooks::standard_hooks(self.diagnostics_state.clone()),
-            stream_retrying: self.cancel.stream_retrying.clone(),
+            hooks: crate::runner::hooks::standard_hooks(
+                self.agent_loop.session.diagnostics_state.clone(),
+            ),
+            stream_retrying: self.agent_loop.cancel.stream_retrying.clone(),
             stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: None,
         })
@@ -937,7 +946,7 @@ impl App<'_> {
                     // step without making background housekeeping run faster.
                     // Housekeeping includes peer inbox delivery while idle.
                     self.events.schedule_status_tick();
-                    if self.conversation_panel.selection_auto_scroll_active() {
+                    if self.ui.conversation_panel.selection_auto_scroll_active() {
                         self.events.schedule_selection_scroll();
                     }
                     if chunk_received {
@@ -957,7 +966,7 @@ impl App<'_> {
                         }
                         if let Some(latest_drag) = latest_drag {
                             self.handle_event(latest_drag).await?;
-                            if self.conversation_panel.selection_auto_scroll_active() {
+                            if self.ui.conversation_panel.selection_auto_scroll_active() {
                                 self.events.schedule_selection_scroll();
                             }
                         }
@@ -992,9 +1001,25 @@ impl App<'_> {
             Ok(())
         }
         .await;
+        let shutdown = self.close_session().await.and_then(|()| {
+            session::persist_session(&mut self).map(|saved| {
+                if saved {
+                    self.queue_current_session_for_dream();
+                }
+            })
+        });
+        crate::memory::dream::shutdown(&mut self.dream_worker);
+        let result = match (result, shutdown) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(color_eyre::eyre::eyre!(error)),
+            (Err(error), Err(shutdown)) => {
+                Err(error.wrap_err(format!("session shutdown: {shutdown}")))
+            }
+        };
         crate::diagnostics::shutdown_lsp().await;
-        let uuid = if self.session.did_save {
-            Some(self.session.uuid.clone())
+        let uuid = if result.is_ok() && self.agent_loop.session.did_save {
+            Some(self.agent_loop.session.uuid.clone())
         } else {
             None
         };
@@ -1046,7 +1071,7 @@ impl App<'_> {
             .config
             .memory_model
             .as_deref()
-            .unwrap_or(&self.current_model);
+            .unwrap_or(&self.agent_loop.session.current_model);
         self.provider_manager
             .resolve(target)
             .map(|(client, model)| crate::tools::memory::MemoryModel {
@@ -1074,23 +1099,144 @@ impl App<'_> {
         if !self.config.memory.enabled || !self.config.memory.dream_enabled {
             return;
         }
-        let transcript = dream_transcript(&self.conversation_panel.items_snapshot());
+        let transcript = dream_transcript(
+            &self
+                .agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .items
+                .clone(),
+        );
         if transcript.trim().is_empty() {
             return;
         }
         if let Ok(manager) = crate::memory::MemoryManager::for_current_dir() {
-            let _ = manager.enqueue_dream(&self.session.uuid.to_string(), &transcript);
+            let _ = manager.enqueue_dream(&self.agent_loop.session.uuid.to_string(), &transcript);
         }
     }
 
+    pub(crate) fn connect_task_events(&mut self) {
+        self.ui.conversation_panel.tasks = self.agent_loop.session.tasks.clone();
+        self.task_event_generation += 1;
+        let generation = self.task_event_generation;
+        let (task_event_tx, mut task_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.agent_loop
+            .session
+            .tasks
+            .install_event_sink(task_event_tx);
+        let app_event_tx = self.events.sender.clone();
+        self.agent_loop
+            .background_handles
+            .push(tokio::spawn(async move {
+                while let Some(mut event) = task_event_rx.recv().await {
+                    event.generation = generation;
+                    if app_event_tx
+                        .send(Event::App(crate::ui::event::AppEvent::TaskStateChanged(
+                            event,
+                        )))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+    }
+
+    /// Stop producers before saving or replacing their session-owned state.
+    /// Approval receivers must be released before awaiting workers: the event
+    /// loop cannot service prompts while this barrier is running.
+    pub(crate) fn session_accepts_work(&self) -> bool {
+        self.agent_loop.session.lifecycle == SessionLifecycle::Running
+    }
+
+    pub(crate) fn require_running_session(&mut self) -> bool {
+        if self.session_accepts_work() {
+            return true;
+        }
+        self.agent_loop.session.conversation.lock().unwrap().add_warning_string(
+        "Session is stopping; use /new to retry closing it, or quit. No new work can start.",
+        );
+        self.ui.conversation_panel.scroll_to_bottom();
+        false
+    }
+
+    pub(crate) async fn close_session(&mut self) -> Result<(), String> {
+        // Seal admission before the first await. Failed barriers/saves stay sealed.
+        self.agent_loop.session.lifecycle = SessionLifecycle::Stopping;
+        self.agent_loop.cancel.cancel_current();
+        commands::invalidate_auto_compaction(self);
+        self.agent_loop.pending_review = None;
+        self.agent_loop.review_queue.clear();
+        self.ui.question_panel = None;
+        self.ui.runner_prompts.clear();
+        self.agent_loop.peer_consent = None;
+        self.agent_loop.peer_delegations.clear();
+        self.agent_loop.peer_inbox.close().await;
+        if let Some(cancel) = self.ui.input_suggestion_cancel.take() {
+            cancel.cancel();
+        }
+        // These jobs only forward events or produce model-derived metadata.
+        // They have no tool side effects and must not outlive their session.
+        for handle in &self.agent_loop.background_handles {
+            handle.abort();
+        }
+        for handle in self.agent_loop.background_handles.drain(..) {
+            let _ = handle.await;
+        }
+        let timeout = std::time::Duration::from_secs(10);
+        let (agents, tasks) = tokio::join!(
+            tokio::time::timeout(timeout, self.agent_loop.session.agents.shutdown()),
+            self.agent_loop.session.tasks.shutdown(timeout),
+        );
+        let mut errors = Vec::new();
+        match agents {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(_) => errors.push("sub-agent shutdown timed out; workers are still pending".into()),
+        }
+        if let Err(error) = tasks {
+            errors.push(error);
+        }
+        // Keep timed-out handles owned so a later close can retry. Aborting a
+        // runner here would disguise detached tool work as a completed barrier.
+        while let Some(handle) = self.agent_loop.runner_handles.last_mut() {
+            match tokio::time::timeout(timeout, handle).await {
+                Ok(result) => {
+                    self.agent_loop.runner_handles.pop();
+                    if let Err(error) = result {
+                        errors.push(format!("runner join failed: {error}"));
+                    }
+                }
+                Err(_) => {
+                    errors.push("runner shutdown timed out; session was not replaced".into());
+                    break;
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
+        if let Some(operation) = self.agent_loop.cancel.active_id {
+            self.agent_loop.cancel.finish(operation);
+        }
+        self.agent_loop.runner = None;
+        self.agent_loop.waiting_for_subagents = false;
+        self.ui.conversation_panel.abort_receiving();
+        self.agent_loop.phase =
+            crate::ui::components::conversation_panel::conversation_panel::ActivePhase::None;
+        self.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .flush_usage();
+        Ok(())
+    }
+
     pub fn quit(&mut self) {
-        self.agents.cancel_all();
-        session::save_session(self);
-        self.queue_current_session_for_dream();
-        // Stop consolidation after the queue is durable. A pass cut off here has
-        // already written memory synchronously and leaves its queue files, so it
-        // converges on the next launch.
-        crate::memory::dream::shutdown(&mut self.dream_worker);
+        // Both explicit quit and event-loop errors share the awaited run epilogue.
         self.running = false;
     }
 }
@@ -1297,12 +1443,9 @@ mod tests {
             Duration::from_secs(2),
             super::App::new(
                 config,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                crate::tasks::TaskManager::default(),
-                "startup-test".to_string(),
+                crate::app::session::SessionSeed::Fresh {
+                    uuid: "startup-test".to_string(),
+                },
                 None,
                 Vec::new(),
                 false,
@@ -1312,11 +1455,11 @@ mod tests {
         .await
         .expect("App::new must not wait for an MCP process or handshake");
 
-        assert!(app.mcp_manager.is_none());
-        assert_eq!(app.mcp_server_statuses.len(), 1);
-        assert_eq!(app.mcp_server_statuses[0].name, "slow");
+        assert!(app.mcp_runtime.connections().is_none());
+        assert_eq!(app.mcp_runtime.statuses().len(), 1);
+        assert_eq!(app.mcp_runtime.statuses()[0].name, "slow");
         assert!(matches!(
-            app.mcp_server_statuses[0].state,
+            app.mcp_runtime.statuses()[0].state,
             crate::mcp::McpConnectionState::Connecting
         ));
     }

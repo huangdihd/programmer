@@ -356,13 +356,13 @@ pub(super) fn check_directories(path: &Path, create: bool) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    struct TestStore(Store);
+    pub(crate) struct TestStore(pub(crate) Store);
 
     impl TestStore {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let root = std::env::temp_dir()
                 .canonicalize()
                 .unwrap()

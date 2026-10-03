@@ -22,6 +22,7 @@
 pub mod ui;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::Rect;
 use std::collections::HashSet;
 
 /// Identifies one collapsible section within the sidebar.
@@ -64,6 +65,7 @@ pub enum ClickTarget {
 /// The sidebar panel itself.
 #[derive(Debug)]
 pub struct Sidebar {
+    area: Option<Rect>,
     /// Ordered list of sections (top → bottom).
     sections: Vec<SectionState>,
     /// Vertical scroll offset in lines (for the entire sidebar content).
@@ -110,12 +112,23 @@ impl Sidebar {
             },
         ];
         Sidebar {
+            area: None,
             sections,
             scroll_offset: 0,
             has_focus: false,
             click_map: Vec::new(),
             expanded_tasks: std::collections::HashSet::new(),
         }
+    }
+
+    pub(crate) fn area(&self) -> Option<Rect> {
+        self.area
+    }
+
+    /// Hidden panels must not retain hit targets from the previous frame.
+    pub(crate) fn hide(&mut self) {
+        self.area = None;
+        self.click_map.clear();
     }
 
     /// Fixed width of the sidebar in columns.

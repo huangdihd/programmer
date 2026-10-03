@@ -1756,7 +1756,12 @@ mod tests {
             }
             conversation.items.push(MessageItem::Usage(10, 5, 0, None));
         }
-        panel.upsert_peer_exchange("exchange", "peer-marker", "question", None);
+        panel.conversation.lock().unwrap().upsert_peer_exchange(
+            "exchange",
+            "peer-marker",
+            "question",
+            None,
+        );
         // Nonzero origin catches accidental screen-relative padding/hit tests.
         let area = Rect::new(7, 3, 100, 40);
         for width in [100, 55, 100] {
@@ -1795,14 +1800,14 @@ mod tests {
                     text.contains("peer-marker")
                 })
                 .unwrap();
-            panel.handle_click(area.x + 1, peer_row);
+            panel.handle_click(area.x + 1, peer_row).unwrap();
             assert!(
                 panel.expanded_items.is_empty(),
                 "gutter must not toggle items"
             );
-            panel.handle_click(area.x + 2, peer_row);
+            panel.handle_click(area.x + 2, peer_row).unwrap();
             assert!(!panel.expanded_items.is_empty());
-            panel.handle_click(area.x + 2, peer_row);
+            panel.handle_click(area.x + 2, peer_row).unwrap();
         }
     }
 
@@ -1860,7 +1865,7 @@ mod tests {
                     .contains("189135 tokens")
             })
             .unwrap();
-        panel.handle_click(2, top);
+        panel.handle_click(2, top).unwrap();
         assert!(panel.expanded_items.contains(&3));
         panel.render(area, &mut buffer);
         let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
@@ -1875,9 +1880,9 @@ mod tests {
                     .contains("189135 tokens")
             })
             .unwrap();
-        panel.handle_click(2, top + 1);
+        panel.handle_click(2, top + 1).unwrap();
         assert!(panel.expanded_items.contains(&3));
-        panel.handle_click(2, top);
+        panel.handle_click(2, top).unwrap();
         assert!(!panel.expanded_items.contains(&3));
         let mut buffer = Buffer::empty(area);
         panel.render(area, &mut buffer);
@@ -1888,13 +1893,18 @@ mod tests {
     #[test]
     fn unavailable_usage_renders_after_reply_in_the_conversation() {
         let mut panel = ConversationPanel::new();
-        panel.add_info_string("Finished reply marker");
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_info_string("Finished reply marker");
+        panel.scroll_to_bottom();
         panel
             .conversation
             .lock()
             .unwrap()
             .record_response_usage(Some((0, 0, 0)));
-        panel.flush_usage();
+        panel.conversation.lock().unwrap().flush_usage();
         let area = Rect::new(0, 0, 180, 35);
         for theme in [
             crate::ui::theme::Theme::Dark,
@@ -2032,16 +2042,22 @@ mod tests {
                 0,
                 crate::tools::load_skill::NAME,
             )));
-        panel.add_tool_output(ToolOutput {
-            param: FunctionCallOutputItemParam {
-                call_id: "call-0".into(),
-                output: FunctionCallOutput::Text("very large private skill instructions".into()),
-                id: None,
-                status: None,
-            },
-            failed: false,
-            approval_label: None,
-        });
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_tool_output(ToolOutput {
+                param: FunctionCallOutputItemParam {
+                    call_id: "call-0".into(),
+                    output: FunctionCallOutput::Text(
+                        "very large private skill instructions".into(),
+                    ),
+                    id: None,
+                    status: None,
+                },
+                failed: false,
+                approval_label: None,
+            });
 
         let rendered = render_text(&mut panel, Rect::new(0, 0, 80, 24));
         assert!(!rendered.contains("load_skill"), "{rendered}");
@@ -2094,7 +2110,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("Exploring"))
             .unwrap() as u16;
-        panel.handle_click(2, group_row);
+        panel.handle_click(2, group_row).unwrap();
         assert!(panel.expanded_tool_groups.contains("call-0"));
         let expanded = render_text(&mut panel, area);
         assert!(expanded.contains("grep  {}"), "{expanded}");
@@ -2105,20 +2121,24 @@ mod tests {
             .lines()
             .position(|line| line.contains("grep  {}"))
             .unwrap() as u16;
-        panel.handle_click(2, first_call_row);
+        panel.handle_click(2, first_call_row).unwrap();
         assert!(panel.expanded_items.contains(&0));
 
         for index in 0..3 {
-            panel.add_tool_output(ToolOutput {
-                param: FunctionCallOutputItemParam {
-                    call_id: format!("call-{index}"),
-                    output: FunctionCallOutput::Text("done".into()),
-                    id: None,
-                    status: None,
-                },
-                failed: index == 1,
-                approval_label: None,
-            });
+            panel
+                .conversation
+                .lock()
+                .unwrap()
+                .add_tool_output(ToolOutput {
+                    param: FunctionCallOutputItemParam {
+                        call_id: format!("call-{index}"),
+                        output: FunctionCallOutput::Text("done".into()),
+                        id: None,
+                        status: None,
+                    },
+                    failed: index == 1,
+                    approval_label: None,
+                });
         }
         let completed = render_text(&mut panel, area);
         assert!(completed.contains("Explored · 1 failed"));
@@ -2136,18 +2156,22 @@ mod tests {
                     index,
                     crate::tools::command::NAME,
                 )));
-            panel.add_tool_output(ToolOutput {
-                param: FunctionCallOutputItemParam {
-                    call_id: format!("call-{index}"),
-                    output: FunctionCallOutput::Text(format!(
-                        "first-line-{index}\nfull-only-{index}"
-                    )),
-                    id: None,
-                    status: None,
-                },
-                failed: false,
-                approval_label: None,
-            });
+            panel
+                .conversation
+                .lock()
+                .unwrap()
+                .add_tool_output(ToolOutput {
+                    param: FunctionCallOutputItemParam {
+                        call_id: format!("call-{index}"),
+                        output: FunctionCallOutput::Text(format!(
+                            "first-line-{index}\nfull-only-{index}"
+                        )),
+                        id: None,
+                        status: None,
+                    },
+                    failed: false,
+                    approval_label: None,
+                });
         }
         let area = Rect::new(0, 0, 80, 24);
 
@@ -2156,7 +2180,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("Ran tools"))
             .expect("completed run header") as u16;
-        panel.handle_click(2, header_row);
+        panel.handle_click(2, header_row).unwrap();
         let expanded = render_text(&mut panel, area);
         assert!(expanded.contains("command  {}"), "{expanded}");
 
@@ -2164,7 +2188,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("command  {}"))
             .expect("first command header") as u16;
-        panel.handle_click(2, member_row);
+        panel.handle_click(2, member_row).unwrap();
         assert!(panel.expanded_items.contains(&0));
         let member_expanded = render_text(&mut panel, area);
         assert!(member_expanded.contains("full-only-0"), "{member_expanded}");
@@ -2173,7 +2197,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("command"))
             .expect("expanded command header") as u16;
-        panel.handle_click(2, expanded_header_row);
+        panel.handle_click(2, expanded_header_row).unwrap();
         assert!(!panel.expanded_items.contains(&0));
         let member_collapsed = render_text(&mut panel, area);
         assert!(
@@ -2185,7 +2209,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("Ran tools"))
             .expect("expanded run header") as u16;
-        panel.handle_click(2, header_row);
+        panel.handle_click(2, header_row).unwrap();
         let collapsed_again = render_text(&mut panel, area);
         assert!(
             !collapsed_again.contains("command  {}"),
@@ -2223,7 +2247,7 @@ mod tests {
         use crate::response::message_item::PeerDelegationState::*;
         let mut panel = ConversationPanel::new();
         let area = Rect::new(0, 0, 120, 24);
-        panel.upsert_peer_delegation(
+        panel.conversation.lock().unwrap().upsert_peer_delegation(
             "id".into(),
             "source-session".into(),
             Some("task excerpt\nfull-task-marker".into()),
@@ -2236,7 +2260,7 @@ mod tests {
             .lines()
             .position(|line| line.contains('↔'))
             .unwrap() as u16;
-        panel.handle_click(2, row);
+        panel.handle_click(2, row).unwrap();
         assert!(panel.expanded_items.contains(&0));
         for (state, label) in [
             (AcceptedQueued, "accepted · queued"),
@@ -2244,7 +2268,12 @@ mod tests {
             (AcceptedQueued, "accepted · queued"),
             (Cancelled, "cancelled"),
         ] {
-            panel.upsert_peer_delegation("id".into(), "source-session".into(), None, state);
+            panel.conversation.lock().unwrap().upsert_peer_delegation(
+                "id".into(),
+                "source-session".into(),
+                None,
+                state,
+            );
             assert_eq!(panel.items_snapshot().len(), 1);
             assert!(panel.expanded_items.contains(&0));
             let rendered = render_text(&mut panel, area);
@@ -2252,7 +2281,12 @@ mod tests {
             assert!(rendered.contains("full-task-marker"), "{rendered}");
         }
 
-        panel.upsert_peer_delegation("id".into(), "source-session".into(), None, AcceptedQueued);
+        panel.conversation.lock().unwrap().upsert_peer_delegation(
+            "id".into(),
+            "source-session".into(),
+            None,
+            AcceptedQueued,
+        );
         let rendered = render_text(&mut panel, area);
         assert!(rendered.contains("cancelled"), "{rendered}");
     }
@@ -2262,7 +2296,12 @@ mod tests {
         let mut panel = ConversationPanel::new();
         let area = Rect::new(0, 0, 100, 24);
         let source = "e172f842-2450-4ac5-88ec-691aef419bfa";
-        panel.upsert_peer_exchange("exchange", source, "question-body-marker", None);
+        panel.conversation.lock().unwrap().upsert_peer_exchange(
+            "exchange",
+            source,
+            "question-body-marker",
+            None,
+        );
         let collapsed = render_text(&mut panel, area);
         assert!(collapsed.contains("↔ e172f842 · pending"), "{collapsed}");
         assert!(!collapsed.contains("question-body-marker"));
@@ -2271,14 +2310,14 @@ mod tests {
             .lines()
             .position(|line| line.contains('↔'))
             .unwrap() as u16;
-        panel.handle_click(2, row);
+        panel.handle_click(2, row).unwrap();
         assert!(panel.expanded_items.contains(&0));
         let expanded = render_text(&mut panel, area);
         assert!(expanded.contains(source), "{expanded}");
         assert!(expanded.contains("question-body-marker"));
         assert!(expanded.contains("Pending reply…"));
 
-        panel.upsert_peer_exchange(
+        panel.conversation.lock().unwrap().upsert_peer_exchange(
             "exchange",
             source,
             "question-body-marker",
@@ -2295,12 +2334,17 @@ mod tests {
             .lines()
             .position(|line| line.contains('↔'))
             .unwrap() as u16;
-        panel.handle_click(2, row);
+        panel.handle_click(2, row).unwrap();
         let collapsed = render_text(&mut panel, area);
         assert!(!panel.expanded_items.contains(&0));
         assert!(!collapsed.contains("answer-body-marker"));
         assert!(collapsed.contains("answered"));
-        panel.upsert_peer_exchange("another", "other source", "another question", None);
+        panel.conversation.lock().unwrap().upsert_peer_exchange(
+            "another",
+            "other source",
+            "another question",
+            None,
+        );
         assert_eq!(panel.items_snapshot().len(), 2);
     }
 
@@ -2413,7 +2457,7 @@ mod tests {
         assert!(!completed.contains("✻ Thinking"), "{completed}");
 
         // Clicking the header expands the live group, showing the call.
-        panel.handle_click(2, header_row as u16);
+        panel.handle_click(2, header_row as u16).unwrap();
         let expanded = render_text(&mut panel, area);
         assert!(expanded.contains("grep  {}"), "{expanded}");
     }
@@ -2650,7 +2694,7 @@ mod tests {
             .position(|line| line.contains("Exploring"))
             .unwrap() as u16;
 
-        panel.handle_click(2, header_row);
+        panel.handle_click(2, header_row).unwrap();
         let mut expanded = render_text(&mut panel, area);
         for _ in 0..100 {
             if expanded.contains("cached reasoning") {
@@ -2736,14 +2780,14 @@ mod tests {
             .lines()
             .position(|line| line.contains("Running tools"))
             .expect("streaming run group") as u16;
-        panel.handle_click(2, group_row);
+        panel.handle_click(2, group_row).unwrap();
 
         let expanded = render_text(&mut panel, area);
         let second_call_row = expanded
             .lines()
             .position(|line| line.contains("command-marker-2"))
             .expect("second live command") as u16;
-        panel.handle_click(2, second_call_row);
+        panel.handle_click(2, second_call_row).unwrap();
         assert!(panel.live_expanded_items.contains(&2));
         let second_expanded = render_text(&mut panel, area);
         assert!(
@@ -2755,7 +2799,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("cmd: command-marker-2"))
             .expect("expanded command detail") as u16;
-        panel.handle_click(2, detail_row.saturating_sub(1));
+        panel.handle_click(2, detail_row.saturating_sub(1)).unwrap();
         assert!(!panel.live_expanded_items.contains(&2));
 
         let collapsed_member = render_text(&mut panel, area);
@@ -2763,7 +2807,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("Thinking") || line.contains("Thought"))
             .expect("live reasoning member") as u16;
-        panel.handle_click(2, reasoning_row);
+        panel.handle_click(2, reasoning_row).unwrap();
         assert!(panel.live_expanded_items.contains(&0));
         let mut reasoning_expanded = render_text(&mut panel, area);
         for _ in 0..100 {
@@ -2781,7 +2825,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("reasoning-body-marker"))
             .expect("expanded live reasoning header") as u16;
-        panel.handle_click(2, reasoning_header_row);
+        panel.handle_click(2, reasoning_header_row).unwrap();
         assert!(!panel.live_expanded_items.contains(&0));
     }
 
@@ -2800,18 +2844,22 @@ mod tests {
             .lock()
             .unwrap()
             .add_output(OutputItem::FunctionCall(committed_call));
-        panel.add_tool_output(ToolOutput {
-            param: FunctionCallOutputItemParam {
-                call_id: "call-0".into(),
-                output: FunctionCallOutput::Text(
-                    "committed-first-line\ncommitted-full-only".into(),
-                ),
-                id: None,
-                status: None,
-            },
-            failed: false,
-            approval_label: None,
-        });
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_tool_output(ToolOutput {
+                param: FunctionCallOutputItemParam {
+                    call_id: "call-0".into(),
+                    output: FunctionCallOutput::Text(
+                        "committed-first-line\ncommitted-full-only".into(),
+                    ),
+                    id: None,
+                    status: None,
+                },
+                failed: false,
+                approval_label: None,
+            });
 
         panel.receiving_response = Some(crate::response::partial_response::PartialResponse::new(
             CancellationToken::new(),
@@ -2847,14 +2895,14 @@ mod tests {
             .lines()
             .position(|line| line.contains("Running tools"))
             .expect("bridged running-tools header") as u16;
-        panel.handle_click(2, group_row);
+        panel.handle_click(2, group_row).unwrap();
 
         let expanded = render_text(&mut panel, area);
         let committed_row = expanded
             .lines()
             .position(|line| line.contains("committed-marker"))
             .expect("committed member") as u16;
-        panel.handle_click(2, committed_row);
+        panel.handle_click(2, committed_row).unwrap();
         assert!(panel.expanded_items.contains(&0));
         assert!(render_text(&mut panel, area).contains("committed-full-only"));
 
@@ -2863,7 +2911,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("live-marker-1"))
             .expect("live member") as u16;
-        panel.handle_click(2, live_row);
+        panel.handle_click(2, live_row).unwrap();
         assert!(panel.live_expanded_items.contains(&1));
     }
 
@@ -2893,16 +2941,20 @@ mod tests {
             .lock()
             .unwrap()
             .add_output(OutputItem::FunctionCall(tool_call(0, "grep")));
-        panel.add_tool_output(ToolOutput {
-            param: FunctionCallOutputItemParam {
-                call_id: "call-0".into(),
-                output: FunctionCallOutput::Text("done".into()),
-                id: None,
-                status: None,
-            },
-            failed: false,
-            approval_label: None,
-        });
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_tool_output(ToolOutput {
+                param: FunctionCallOutputItemParam {
+                    call_id: "call-0".into(),
+                    output: FunctionCallOutput::Text("done".into()),
+                    id: None,
+                    status: None,
+                },
+                failed: false,
+                approval_label: None,
+            });
 
         let area = Rect::new(0, 0, 80, 24);
         let committed = render_text(&mut panel, area);

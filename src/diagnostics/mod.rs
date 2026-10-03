@@ -39,6 +39,8 @@ use std::path::Path;
 /// Session-owned diagnostics state shared by tools, hooks and front-ends.
 #[derive(Default)]
 pub(crate) struct DiagnosticsState {
+    /// Whether the project's diagnostics profile declares an LSP checker.
+    pub lsp_configured: bool,
     pub baseline: Option<Vec<Diagnostic>>,
     pub mutating_turns: usize,
     generation: u64,
@@ -356,6 +358,25 @@ mod tests {
         state.reset();
         assert!(!state.publish(tool, Some(&Snapshot::default())));
         assert!(state.baseline.is_none());
+    }
+
+    #[test]
+    fn reset_preserves_lsp_configuration() {
+        let mut state = DiagnosticsState::default();
+        assert!(!state.lsp_configured);
+        for configured in [true, false] {
+            state.lsp_configured = configured;
+            state.baseline = Some(vec![]);
+            state.mutating_turns = 3;
+            let generation = state.begin_update();
+
+            state.reset();
+
+            assert_eq!(state.lsp_configured, configured);
+            assert!(state.baseline.is_none());
+            assert_eq!(state.mutating_turns, 0);
+            assert!(!state.is_current(generation));
+        }
     }
 
     #[test]

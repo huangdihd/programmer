@@ -166,7 +166,6 @@ impl TodoList {
         lines.push("-".repeat(120));
 
         for t in &self.todos {
-            let short_id = &t.id[..t.id.floor_char_boundary(10)];
             let desc = t
                 .description
                 .as_deref()
@@ -176,7 +175,7 @@ impl TodoList {
                 .collect::<String>();
             lines.push(format!(
                 "{:<12} {:<12} {:<50} {}",
-                short_id,
+                t.id,
                 t.status.label(),
                 truncate_str(&t.title, 50),
                 desc,

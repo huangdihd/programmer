@@ -66,6 +66,7 @@ impl Sidebar {
         tasks: &[SidebarTaskSnapshot],
         agents: &[AgentSnapshot],
     ) {
+        self.hide();
         let block = Block::default()
             .borders(Borders::LEFT)
             .border_style(Style::default().fg(role::DIVIDER));
@@ -76,6 +77,7 @@ impl Sidebar {
             self.click_map.clear();
             return;
         }
+        self.area = Some(area);
 
         // Build all lines + click targets before scrolling.
         let data = SidebarData {
@@ -896,6 +898,47 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn hidden_and_empty_sidebar_clear_rendered_hit_targets() {
+        let mut sidebar = Sidebar::new();
+        let area = Rect::new(10, 2, 32, 20);
+        let mut buffer = Buffer::empty(area);
+        let todos = crate::todos::TodoList::default();
+        let render = |sidebar: &mut Sidebar, area, buffer: &mut Buffer| {
+            sidebar.render(
+                area,
+                buffer,
+                &[],
+                false,
+                &[],
+                &[],
+                "",
+                &[],
+                &todos,
+                &[],
+                &[],
+            );
+        };
+
+        assert_eq!(sidebar.area(), None);
+        render(&mut sidebar, area, &mut buffer);
+        assert_eq!(sidebar.area(), Some(area));
+        assert!(!sidebar.click_map.is_empty());
+        sidebar.scroll_by(3);
+        sidebar.hide();
+        assert_eq!(sidebar.area(), None);
+        assert!(sidebar.click_map.is_empty());
+        assert_eq!(sidebar.scroll_offset(), 3);
+
+        render(&mut sidebar, area, &mut buffer);
+        assert_eq!(sidebar.area(), Some(area));
+        for empty_area in [Rect::new(10, 2, 1, 20), Rect::new(10, 2, 32, 0)] {
+            render(&mut sidebar, empty_area, &mut buffer);
+            assert_eq!(sidebar.area(), None);
+            assert!(sidebar.click_map.is_empty());
+        }
     }
 
     fn render_mcp_statuses(statuses: &[McpServerStatus]) -> String {

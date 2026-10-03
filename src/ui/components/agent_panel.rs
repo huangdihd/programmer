@@ -75,14 +75,15 @@ impl AgentPanel {
         self.conversation.render(inner, buf);
     }
 
-    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<(), &'static str> {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.conversation.scroll_up_by(3),
             MouseEventKind::ScrollDown => self.conversation.scroll_down_by(3),
             MouseEventKind::Up(MouseButton::Left) => {
-                self.conversation.handle_click(mouse.column, mouse.row)
+                return self.conversation.handle_click(mouse.column, mouse.row);
             }
             _ => {}
         }
+        Ok(())
     }
 }

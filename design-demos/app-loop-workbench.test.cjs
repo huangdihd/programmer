@@ -1,0 +1,57 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+const { chromium } = require('playwright');
+(async () => {
+ const browser = await chromium.launch();
+ try {
+  const page = await browser.newPage({ viewport: { width: 1600, height: 1100 } });
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  page.on('request', request => { if (/^https?:/.test(request.url())) errors.push(request.url()); });
+  await page.goto(pathToFileURL(path.resolve(__dirname, 'app-loop-workbench.html')).href);
+  // This is the preserved pre-refactor planning artifact, not the live implementation map.
+  const expected = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'app-loop-baseline-fields.json'), 'utf8')).fields;
+  assert.match(await page.locator('header').textContent(), /重构前快照/);
+  const actual = await page.evaluate(() => fields.filter(field => field.kind === 'App 直接字段').map(field => field.id));
+  assert.deepEqual(actual, expected);
+  assert.equal(await page.locator('[data-owner="ui"] [data-id="quit_requested_at"]').count(), 1);
+  await page.locator('[data-owner="loop"] [data-id="panel.conversation"] summary').click();
+  await page.locator('[data-access="panel.conversation"][data-consumer="ui"]').selectOption('read');
+  await page.locator('[data-access="panel.conversation"][data-consumer="runner"]').selectOption('write');
+  await page.reload();
+  assert.equal(await page.evaluate(() => access['panel.conversation'].ui), 'read');
+  assert.equal(await page.evaluate(() => access['panel.conversation'].runner), 'write');
+  assert.equal(await page.evaluate(() => assignments['panel.conversation']), 'loop');
+  await page.locator('#source-list [data-id="tasks"]').dragTo(page.locator('[data-owner="loop"]'));
+  assert.equal(await page.evaluate(() => assignments.tasks), 'loop');
+  await page.locator('#source-list [data-move="tasks"]').selectOption('runner');
+  assert.equal(await page.locator('[data-owner="runner"] [data-id="tasks"]').count(), 1);
+  await page.reload();
+  assert.equal(await page.evaluate(() => assignments.tasks), 'runner');
+  await page.locator('#source-list [data-move="runner"]').selectOption('app');
+  assert.equal(await page.locator('[data-owner="app"] [data-owner="runner"] [data-id="tasks"]').count(), 1);
+  await page.locator('#search').fill('no-match-1234');
+  assert.match(await page.locator('#source-list').textContent(), /没有匹配/);
+  await page.locator('#search').fill('');
+  const download = page.waitForEvent('download');
+  await page.locator('#export').click();
+  const file = await download;
+  const stream = await file.createReadStream();
+  let json = ''; for await (const chunk of stream) json += chunk;
+  const exported = JSON.parse(json);
+  assert.equal(exported.version, 2);
+  assert.deepEqual(exported.fields.find(field => field.id === 'panel.conversation').access, { ui: 'read', runner: 'write' });
+  assert.equal(exported.fields.find(field => field.id === 'tasks').target, 'runner');
+  page.once('dialog', dialog => dialog.dismiss()); await page.locator('#reset').click();
+  assert.equal(await page.evaluate(() => assignments.tasks), 'runner');
+  page.once('dialog', dialog => dialog.accept()); await page.locator('#reset').click();
+  assert.equal(await page.evaluate(() => assignments.tasks), 'app');
+  await page.screenshot({ path: path.resolve(__dirname, 'app-loop-workbench.png') });
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  assert.deepEqual(errors, []);
+  console.log(`PASS: ${expected.length} App fields, drag/drop, nested ownership, menus, persistence, search, export, reset, narrow layout, offline/browser errors`);
+ } finally { await browser.close(); }
+})().catch(error => { console.error(error); process.exitCode = 1; });

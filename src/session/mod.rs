@@ -250,7 +250,7 @@ pub(crate) struct SessionMeta {
 
 /// Full session stored on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Session {
+pub(crate) struct SessionSnapshot {
     pub(crate) uuid: String,
     #[serde(default)]
     pub(crate) title: String,
@@ -404,12 +404,12 @@ impl SessionManager {
     }
 
     /// Create a brand-new session with a random UUID.
-    pub(crate) fn create(&self) -> Session {
+    pub(crate) fn create(&self) -> SessionSnapshot {
         let uuid = uuid_v4();
         let now = now_secs();
         let working_dir =
             std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
-        Session {
+        SessionSnapshot {
             uuid,
             title: String::new(),
             first_message: String::new(),
@@ -440,7 +440,7 @@ impl SessionManager {
     }
 
     /// A missing file is `Ok(None)`; all other failures preserve the original file.
-    pub(crate) fn load(&self, uuid: &str) -> Result<Option<Session>, SessionLoadError> {
+    pub(crate) fn load(&self, uuid: &str) -> Result<Option<SessionSnapshot>, SessionLoadError> {
         let path = self.session_path(uuid);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -454,7 +454,7 @@ impl SessionManager {
 
     /// Save a session to its file atomically: write to a temp file first,
     /// then rename, so a crash mid-write never leaves a truncated file.
-    pub(crate) fn save(&self, session: &mut Session) -> Result<(), String> {
+    pub(crate) fn save(&self, session: &mut SessionSnapshot) -> Result<(), String> {
         self.ensure_dir()?;
         let mut snapshot = session.clone();
         snapshot.updated_at = now_secs();
@@ -518,7 +518,7 @@ impl SessionManager {
     }
 
     /// Clone a loaded conversation into a separately persisted session.
-    pub(crate) fn fork(&self, source: &Session) -> Result<Session, String> {
+    pub(crate) fn fork(&self, source: &SessionSnapshot) -> Result<SessionSnapshot, String> {
         let mut forked = source.clone();
         forked.uuid = uuid_v4();
         let now = now_secs();
@@ -533,12 +533,12 @@ impl SessionManager {
     }
 
     /// Convert session items into MessageItems.
-    pub(crate) fn into_items(session: Session) -> Vec<MessageItem> {
+    pub(crate) fn into_items(session: SessionSnapshot) -> Vec<MessageItem> {
         session.items.into_iter().map(MessageItem::from).collect()
     }
 
     /// Replace session items from MessageItems. Also updates message_count.
-    pub(crate) fn set_items(session: &mut Session, items: Vec<MessageItem>) {
+    pub(crate) fn set_items(session: &mut SessionSnapshot, items: Vec<MessageItem>) {
         session.message_count = items.len();
         session.items = items
             .into_iter()
@@ -1162,6 +1162,28 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_preserves_legacy_json_shape() {
+        let legacy = serde_json::json!({
+            "uuid": "legacy-session",
+            "first_message": "hello",
+            "created_at": 1,
+            "updated_at": 2,
+            "working_dir": "/legacy/workspace",
+            "message_count": 0,
+            "items": []
+        });
+        let snapshot: SessionSnapshot = serde_json::from_value(legacy.clone()).unwrap();
+        let serialized = serde_json::to_value(&snapshot).unwrap();
+        for (key, value) in legacy.as_object().unwrap() {
+            assert_eq!(&serialized[key], value, "legacy field {key} changed");
+        }
+        assert!(serialized.get("SessionSnapshot").is_none());
+        assert!(serialized.get("Session").is_none());
+        let restored: SessionSnapshot = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), serialized);
+    }
+
+    #[test]
     fn older_sessions_default_to_auto_thinking() {
         let sessions_dir =
             std::env::temp_dir().join(format!("programmer-session-test-{}", uuid_v4()));
@@ -1173,7 +1195,7 @@ mod tests {
             .remove("thinking_level")
             .unwrap();
 
-        let loaded: Session = serde_json::from_value(value).unwrap();
+        let loaded: SessionSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(loaded.thinking_level, crate::thinking::ThinkingLevel::Auto);
     }
 
@@ -1206,7 +1228,7 @@ mod tests {
             .remove("session_memory")
             .unwrap();
 
-        let loaded: Session = serde_json::from_value(value).unwrap();
+        let loaded: SessionSnapshot = serde_json::from_value(value).unwrap();
         assert!(loaded.session_memory.is_none());
     }
 
@@ -1222,7 +1244,7 @@ mod tests {
             .remove("input_suggestion")
             .unwrap();
 
-        let loaded: Session = serde_json::from_value(value).unwrap();
+        let loaded: SessionSnapshot = serde_json::from_value(value).unwrap();
         assert!(loaded.input_suggestion.is_none());
     }
 
@@ -1238,7 +1260,7 @@ mod tests {
             .remove("skill_selection_saved")
             .unwrap();
 
-        let loaded: Session = serde_json::from_value(value).unwrap();
+        let loaded: SessionSnapshot = serde_json::from_value(value).unwrap();
         assert!(!loaded.skill_selection_saved);
     }
 

@@ -33,8 +33,11 @@ use async_openai::types::responses::{
     FunctionToolCall, InputContent, InputMessage, InputRole, MessageItem as ApiMessageItem,
     OutputStatus,
 };
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -125,10 +128,14 @@ impl AgentEntry {
     }
 }
 
+type AgentCompletion = Shared<BoxFuture<'static, Result<(), Arc<tokio::task::JoinError>>>>;
+
 #[derive(Default)]
 struct AgentState {
     next_id: u64,
     entries: BTreeMap<u64, AgentEntry>,
+    closing: bool,
+    completions: Vec<AgentCompletion>,
 }
 
 #[derive(Clone)]
@@ -161,10 +168,9 @@ impl AgentManager {
         runtime: AgentRuntime,
         events: mpsc::UnboundedSender<Event>,
     ) -> Result<u64, String> {
-        let start = self.reserve(prompt.clone(), name)?;
-        let id = start.id;
         let manager = self.clone();
-        tokio::spawn(async move {
+        self.spawn_run(prompt.clone(), name, move |start| async move {
+            let id = start.id;
             seed_conversation(&start.conversation, prompt);
             let surface = SubagentSurface {
                 id,
@@ -187,12 +193,43 @@ impl AgentManager {
                 generation: manager.generation,
                 id,
             }));
-        });
+        })
+    }
+
+    fn spawn_run<F>(
+        &self,
+        prompt: String,
+        name: Option<String>,
+        run: impl FnOnce(AgentStart) -> F,
+    ) -> Result<u64, String>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        // Admission and join registration are atomic with respect to shutdown.
+        let mut state = self.state.lock().unwrap();
+        let start = Self::reserve_locked(&mut state, prompt, name)?;
+        let id = start.id;
+        let completion = tokio::spawn(run(start))
+            .map(|result| result.map_err(Arc::new))
+            .boxed()
+            .shared();
+        state.completions.push(completion);
         Ok(id)
     }
 
+    #[cfg(test)]
     fn reserve(&self, prompt: String, name: Option<String>) -> Result<AgentStart, String> {
-        let mut state = self.state.lock().unwrap();
+        Self::reserve_locked(&mut self.state.lock().unwrap(), prompt, name)
+    }
+
+    fn reserve_locked(
+        state: &mut AgentState,
+        prompt: String,
+        name: Option<String>,
+    ) -> Result<AgentStart, String> {
+        if state.closing {
+            return Err("error: sub-agent manager is shutting down".to_string());
+        }
         let running = state
             .entries
             .values()
@@ -409,6 +446,33 @@ impl AgentManager {
             if entry.status == AgentStatus::Running {
                 entry.cancel.cancel();
             }
+        }
+    }
+
+    /// Permanently close admission, cancel children, and join their entire runs,
+    /// including security-scope cleanup, finish, and the final state event.
+    /// Unlike `cancel_all`, this is a session-exit barrier, not an Esc action.
+    /// Concurrent/retried calls share joins; dropping a caller cannot detach them.
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
+        let completions = {
+            let mut state = self.state.lock().unwrap();
+            state.closing = true;
+            for entry in state.entries.values() {
+                if entry.status == AgentStatus::Running {
+                    entry.cancel.cancel();
+                }
+            }
+            state.completions.clone()
+        };
+        let mut failure = None;
+        for completion in completions {
+            if let Err(error) = completion.await {
+                failure.get_or_insert_with(|| format!("error: sub-agent task failed: {error}"));
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -690,6 +754,139 @@ mod tests {
             checkpoint: None,
             conversation_history: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_cleanup_and_finish_even_when_a_waiter_is_dropped() {
+        let manager = AgentManager::default();
+        let child_manager = manager.clone();
+        let (cancelled, cancellation_seen) = tokio::sync::oneshot::channel();
+        let (release, cleanup_allowed) = tokio::sync::oneshot::channel();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let child_cleaned = cleaned.clone();
+        let id = manager
+            .spawn_run("inspect".into(), None, move |start| async move {
+                start.cancel.wait().await;
+                cancelled.send(()).unwrap();
+                cleanup_allowed.await.unwrap();
+                child_cleaned.store(true, Ordering::Release);
+                child_manager.finish(start.id, Err(crate::runner::RunnerError::Cancelled));
+            })
+            .unwrap();
+
+        let mut shutdown = Box::pin(manager.shutdown());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        cancellation_seen.await.unwrap();
+        assert!(
+            manager
+                .spawn_run("late".into(), None, |_| async {})
+                .is_err()
+        );
+        let mut other_shutdown = Box::pin(manager.shutdown());
+        assert!(futures::poll!(&mut other_shutdown).is_pending());
+        drop(shutdown);
+        assert!(!cleaned.load(Ordering::Acquire));
+        assert_eq!(manager.snapshot(id).unwrap().status, AgentStatus::Running);
+
+        release.send(()).unwrap();
+        other_shutdown.await.unwrap();
+        assert!(cleaned.load(Ordering::Acquire));
+        assert_eq!(manager.snapshot(id).unwrap().status, AgentStatus::Cancelled);
+        manager.shutdown().await.unwrap();
+        assert!(
+            manager
+                .spawn_run("late".into(), None, |_| async {})
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_cancellation_does_not_close_admission() {
+        let manager = AgentManager::default();
+        let first = manager.reserve("one".into(), None).unwrap();
+        manager.cancel(first.id).unwrap();
+        assert!(first.cancel.is_cancelled());
+        let second = manager.reserve("two".into(), None).unwrap();
+        manager.cancel_all();
+        assert!(second.cancel.is_cancelled());
+        manager
+            .spawn_run("three".into(), None, |_| async {})
+            .unwrap();
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_other_runs_after_a_task_panics() {
+        let manager = AgentManager::default();
+        manager
+            .spawn_run("panic".into(), None, |_| async { panic!("test failure") })
+            .unwrap();
+        let (release, cleanup_allowed) = tokio::sync::oneshot::channel();
+        manager
+            .spawn_run("cleanup".into(), None, |_| async move {
+                cleanup_allowed.await.unwrap();
+            })
+            .unwrap();
+        let mut shutdown = Box::pin(manager.shutdown());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        release.send(()).unwrap();
+        assert!(shutdown.await.unwrap_err().contains("test failure"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn racing_spawns_are_either_rejected_or_joined() {
+        for _ in 0..32 {
+            let manager = AgentManager::default();
+            let producer = manager.clone();
+            let child_manager = manager.clone();
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let producer_barrier = barrier.clone();
+            let spawn = tokio::spawn(async move {
+                producer_barrier.wait().await;
+                producer.spawn_run("race".into(), None, move |start| async move {
+                    start.cancel.wait().await;
+                    tokio::task::yield_now().await;
+                    child_manager.finish(start.id, Err(crate::runner::RunnerError::Cancelled));
+                })
+            });
+            barrier.wait().await;
+            manager.shutdown().await.unwrap();
+            if let Ok(id) = spawn.await.unwrap() {
+                assert_eq!(manager.snapshot(id).unwrap().status, AgentStatus::Cancelled);
+            }
+            assert!(
+                manager
+                    .spawn_run("late".into(), None, |_| async {})
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_of_real_spawn_finishes_before_returning() {
+        let manager = AgentManager::default();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let id = manager
+            .spawn("inspect".into(), None, memory_runtime(false), events)
+            .unwrap();
+        // On the current-thread runtime cancellation precedes the runner's first poll,
+        // so this exercises the real run/cleanup/finish path without network I/O.
+        manager.shutdown().await.unwrap();
+        assert_eq!(manager.snapshot(id).unwrap().status, AgentStatus::Cancelled);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Event::App(AppEvent::AgentStateChanged { id: changed, .. }) if changed == id
+        ));
+        assert!(
+            manager
+                .spawn(
+                    "late".into(),
+                    None,
+                    memory_runtime(false),
+                    mpsc::unbounded_channel().0,
+                )
+                .is_err()
+        );
     }
 
     #[test]
