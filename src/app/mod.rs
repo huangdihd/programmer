@@ -211,6 +211,7 @@ pub(crate) struct SessionState {
 pub(crate) struct AutoCompactState {
     pub(crate) next_id: u64,
     pub(crate) active_id: Option<u64>,
+    pub(crate) cancellation: Option<CancellationToken>,
     pub(crate) history_epoch: u64,
     pub(crate) last_cutoff: Option<usize>,
     pub(crate) last_input_tokens: Option<u32>,

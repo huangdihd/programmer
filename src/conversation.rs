@@ -435,8 +435,8 @@ impl Conversation {
     }
 
     /// Like compaction_cutoff, but only considers the stable prefix before
-    /// stable_end. Automatic compaction passes the start of the in-flight turn
-    /// here so that turn is never summarized.
+    /// stable_end. Background compaction stops before the in-flight turn;
+    /// a runner paused after recording all tool outputs can include that turn.
     pub fn compaction_cutoff_before(
         &self,
         keep_recent_turns: usize,
@@ -467,7 +467,9 @@ impl Conversation {
                 in_initial_input_group = false;
             }
         }
-        if turn_starts.len() <= keep_recent_turns {
+        // After a mid-turn summary, the live suffix can contain only tool
+        // exchanges. Keeping zero turns must still consume that new history.
+        if keep_recent_turns > 0 && turn_starts.len() <= keep_recent_turns {
             return None;
         }
         let cutoff = if keep_recent_turns == 0 {
@@ -1440,6 +1442,30 @@ mod tests {
         let cutoff = conv.compaction_cutoff(1).expect("old prefix");
 
         assert_eq!(conv.compaction_turn_count(cutoff), 2);
+    }
+
+    #[test]
+    fn compaction_cutoff_advances_through_tool_only_continuations() {
+        let mut conversation = Conversation::new();
+        conversation.add_input_message(user_message("audit the entire history"));
+        let mut previous_cutoff = 0;
+        for index in 0..3 {
+            let call_id = format!("history_{index}");
+            conversation.add_output(call(&call_id));
+            conversation.add_tool_output(output(&call_id));
+            let end = conversation.items.len();
+            assert_eq!(conversation.compaction_cutoff_before(0, end), Some(end));
+            assert!(end > previous_cutoff);
+            let prefix = format!(
+                "{:?}",
+                conversation.input_param_for_prefix(end, "test/model", None, false)
+            );
+            assert!(prefix.contains(&call_id));
+            assert!(prefix.contains("FunctionCallOutput"));
+            assert!(conversation.apply_compaction_at(end, format!("summary {index}")));
+            assert_eq!(conversation.compaction_cutoff(0), None);
+            previous_cutoff = end;
+        }
     }
 
     #[test]

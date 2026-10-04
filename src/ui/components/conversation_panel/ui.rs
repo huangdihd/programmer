@@ -1705,6 +1705,61 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn expanded_compaction_summary_stays_at_historical_boundary() {
+        let mut panel = ConversationPanel::new();
+        {
+            let mut conversation = panel.conversation.lock().unwrap();
+            conversation.add_info_string("summarized-history-marker");
+            conversation.add_info_string("retained-history-marker");
+        }
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buffer = Buffer::empty(area);
+        // Warm index-keyed caches before inserting into the middle of history.
+        panel.render(area, &mut buffer);
+        {
+            let mut conversation = panel.conversation.lock().unwrap();
+            conversation.add_info_string("appended-during-compaction-marker");
+            assert!(conversation.apply_compaction_at(1, "summary-body-marker".into()));
+            conversation.add_info_string("compaction-completed-notice-marker");
+        }
+        panel.history_compacted();
+        buffer.reset();
+        panel.render(area, &mut buffer);
+        let row_text = |buffer: &Buffer, y| -> String {
+            (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let divider_row = (area.y..area.bottom())
+            .find(|&y| row_text(&buffer, y).contains("context compacted"))
+            .expect("the boundary must be visible");
+        assert!(
+            !(area.y..area.bottom()).any(|y| row_text(&buffer, y).contains("summary-body-marker"))
+        );
+        panel.handle_click(2, divider_row).unwrap();
+        buffer.reset();
+        panel.render(area, &mut buffer);
+        let markers = [
+            "summarized-history-marker",
+            "context compacted",
+            "summary-body-marker",
+            "retained-history-marker",
+            "appended-during-compaction-marker",
+            "compaction-completed-notice-marker",
+        ];
+        let rows: Vec<_> = markers
+            .iter()
+            .map(|marker| {
+                (area.y..area.bottom())
+                    .find(|&y| row_text(&buffer, y).contains(marker))
+                    .unwrap_or_else(|| panic!("missing {marker}"))
+            })
+            .collect();
+        assert!(rows.windows(2).all(|pair| pair[0] < pair[1]), "{rows:?}");
+        assert!(panel.expanded_items.contains(&1));
+    }
+
+    #[test]
     fn user_background_extends_into_gutter_without_changing_content_geometry() {
         use crate::ui::markdown_theme::palette;
         let panel = Rect::new(7, 3, 30, 8);

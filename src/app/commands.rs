@@ -1212,32 +1212,30 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> 
         .unwrap()
         .items
         .clone();
-    let stable_end = app
-        .agent_loop
-        .cancel
-        .turn_conversation_cutoff
-        .unwrap_or(snapshot.len())
-        .min(snapshot.len());
+    // The paused runner has recorded every tool output. Only at that safe
+    // point may the active turn join the stable prefix without splitting calls
+    // from their outputs; background compaction still stops before the turn.
+    let stable_end = if app.agent_loop.auto_compact.mandatory_resume.is_some() {
+        snapshot.len()
+    } else {
+        app.agent_loop
+            .cancel
+            .turn_conversation_cutoff
+            .unwrap_or(snapshot.len())
+            .min(snapshot.len())
+    };
+    let keep_recent_turns = if app.agent_loop.auto_compact.mandatory_waiting {
+        0
+    } else {
+        app.effective_compact_keep_recent_turns()
+    };
     let cutoff = app
         .agent_loop
         .session
         .conversation
         .lock()
         .unwrap()
-        .compaction_cutoff_before(app.effective_compact_keep_recent_turns(), stable_end)
-        .or_else(|| {
-            // A mandatory retry may need to summarize the summary installed by
-            // the previous attempt. Appending another boundary at the stable
-            // edge replaces that summary without touching the in-flight turn.
-            (app.agent_loop.auto_compact.mandatory_waiting
-                && snapshot[..stable_end].iter().any(|item| {
-                    matches!(
-                        item,
-                        crate::response::message_item::MessageItem::Compacted { .. }
-                    )
-                }))
-            .then_some(stable_end)
-        });
+        .compaction_cutoff_before(keep_recent_turns, stable_end);
     let Some(cutoff) = cutoff else {
         return false;
     };
@@ -1276,6 +1274,8 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> 
     let job_id = app.agent_loop.auto_compact.next_id;
     let history_epoch = app.agent_loop.auto_compact.history_epoch;
     app.agent_loop.auto_compact.active_id = Some(job_id);
+    let cancellation = crate::cancel::CancellationToken::new();
+    app.agent_loop.auto_compact.cancellation = Some(cancellation.clone());
     app.agent_loop.auto_compact.last_cutoff = Some(cutoff);
     let thinking_level = app.agent_loop.session.thinking_level;
     let sender = app.events.sender.clone();
@@ -1285,23 +1285,18 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> 
             let request = build_compact_request(input_items, model_name, thinking_level);
             // Keep the same job active during recovery: queued input must not be
             // left idle between a transient provider failure and its retry.
-            let result = stream_compact_response(
-                &client,
-                request.clone(),
-                crate::cancel::CancellationToken::new(),
-            )
-            .await;
+            let result =
+                stream_compact_response(&client, request.clone(), cancellation.clone()).await;
             let result = match result {
-                Ok(result) => Ok(result),
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    stream_compact_response(
-                        &client,
-                        request,
-                        crate::cancel::CancellationToken::new(),
-                    )
-                    .await
+                Err(_) if !cancellation.is_cancelled() => {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.wait() => return,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    }
+                    stream_compact_response(&client, request, cancellation).await
                 }
+                result => result,
             };
             let _ = sender.send(Event::App(AppEvent::AutoCompactFinished {
                 job_id,
@@ -1314,6 +1309,9 @@ pub(crate) fn maybe_start_auto_compact(app: &mut App<'_>, input_tokens: u32) -> 
 }
 
 pub(crate) fn invalidate_auto_compaction(app: &mut App<'_>) {
+    if let Some(cancellation) = app.agent_loop.auto_compact.cancellation.take() {
+        cancellation.cancel();
+    }
     app.agent_loop.auto_compact.history_epoch =
         app.agent_loop.auto_compact.history_epoch.wrapping_add(1);
     app.agent_loop.auto_compact.active_id = None;
@@ -1862,6 +1860,96 @@ pub(crate) mod tests {
             crate::checkpoint::CheckpointStore::for_test(root),
         )));
         app
+    }
+
+    fn append_compaction_test_turn(conversation: &mut crate::conversation::Conversation) {
+        conversation.add_input_message(ApiMessageItem::Input(InputMessage {
+            content: vec![InputContent::InputText("audit history".into())],
+            role: InputRole::User,
+            status: None,
+        }));
+    }
+
+    fn append_compaction_test_tools(
+        conversation: &mut crate::conversation::Conversation,
+        index: usize,
+    ) {
+        use async_openai::types::responses::{
+            FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, OutputItem,
+        };
+        let call_id = format!("history_{index}");
+        conversation.add_output(OutputItem::FunctionCall(FunctionToolCall {
+            arguments: "{}".into(),
+            call_id: call_id.clone(),
+            namespace: None,
+            name: "command".into(),
+            id: None,
+            status: None,
+        }));
+        conversation.add_tool_output(crate::tools::ToolOutput {
+            param: FunctionCallOutputItemParam {
+                call_id,
+                output: FunctionCallOutput::Text("large history output".repeat(1000)),
+                id: None,
+                status: None,
+            },
+            failed: false,
+            approval_label: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn auto_compact_paused_turn_advances_past_each_completed_tool_batch() {
+        let mut app = command_test_app().await;
+        app.config.compact_keep_recent_turns = 10;
+        app.agent_loop.cancel.turn_conversation_cutoff = Some(0);
+        app.agent_loop.auto_compact.mandatory_waiting = true;
+        let (resume, _receiver) = tokio::sync::oneshot::channel();
+        app.agent_loop.auto_compact.mandatory_resume = Some(resume);
+        let conversation = app.agent_loop.session.conversation.clone();
+        append_compaction_test_turn(&mut conversation.lock().unwrap());
+        let mut previous_cutoff = 0;
+        for index in 0..3 {
+            let end = {
+                let mut conversation = conversation.lock().unwrap();
+                append_compaction_test_tools(&mut conversation, index);
+                conversation.items.len()
+            };
+            // No provider is configured: selection is recorded without a network request.
+            assert!(!super::maybe_start_auto_compact(&mut app, u32::MAX));
+            assert_eq!(app.agent_loop.auto_compact.last_cutoff, Some(end));
+            assert!(end > previous_cutoff);
+            assert!(
+                conversation
+                    .lock()
+                    .unwrap()
+                    .apply_compaction_at(end, "summary".into())
+            );
+            app.agent_loop.auto_compact.last_cutoff = None;
+            assert!(!super::maybe_start_auto_compact(&mut app, u32::MAX));
+            assert_eq!(app.agent_loop.auto_compact.last_cutoff, None);
+            previous_cutoff = end;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_compact_background_never_selects_active_turn_tools() {
+        let mut app = command_test_app().await;
+        app.config.compact_keep_recent_turns = 0;
+        app.config.auto_compact_cooldown_turns = 0;
+        let conversation = app.agent_loop.session.conversation.clone();
+        let stable_end = {
+            let mut conversation = conversation.lock().unwrap();
+            append_compaction_test_turn(&mut conversation);
+            append_compaction_test_tools(&mut conversation, 0);
+            let stable_end = conversation.items.len();
+            append_compaction_test_turn(&mut conversation);
+            append_compaction_test_tools(&mut conversation, 1);
+            stable_end
+        };
+        app.agent_loop.cancel.turn_conversation_cutoff = Some(stable_end);
+        assert!(!super::maybe_start_auto_compact(&mut app, u32::MAX));
+        assert_eq!(app.agent_loop.auto_compact.last_cutoff, Some(stable_end));
     }
 
     #[tokio::test]

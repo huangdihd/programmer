@@ -617,7 +617,7 @@ impl DreamModel {
         )
         .await
         .map_err(|_| format!("Dream timed out after {}s", timeout_secs.max(1)))?
-        .map_err(|error| error.to_string())?;
+        .map_err(format_planning_error)?;
         let text = response_text(&response.output)?;
         let json = strip_json_fence(&text);
         #[derive(Deserialize)]
@@ -639,6 +639,48 @@ impl DreamModel {
             operations,
         })
     }
+}
+
+fn format_planning_error(error: async_openai::error::OpenAIError) -> String {
+    match error {
+        async_openai::error::OpenAIError::Reqwest(error) => {
+            let category = if error.is_timeout() {
+                "HTTP client timeout"
+            } else if error.is_connect() {
+                "HTTP connection failed"
+            } else if error.is_body() || error.is_decode() {
+                "HTTP response body failed"
+            } else {
+                "HTTP request failed"
+            };
+            // Request URLs may carry credentials in userinfo or query parameters.
+            // Display/source preserves causes without dumping headers or bodies.
+            let error = error.without_url();
+            format!(
+                "Dream planning: {category}: {}",
+                planning_error_chain(&error)
+            )
+        }
+        error => format!("Dream planning: {}", planning_error_chain(&error)),
+    }
+}
+
+fn planning_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    // Bound traversal even if a provider error exposes a cyclic source chain.
+    for _ in 0..8 {
+        let Some(cause) = source else {
+            return message;
+        };
+        message.push_str("; caused by: ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    if source.is_some() {
+        message.push_str("; further causes omitted");
+    }
+    message
 }
 
 /// Apply the persisted preview. This performs no model call and takes the same
@@ -1396,6 +1438,69 @@ mod tests {
         // The UI indicator must be down once the worker is stopped, even though
         // the pass failed.
         assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn planning_connection_error_preserves_causes_in_audit_and_status() {
+        let manager = manager();
+        manager
+            .enqueue_dream("session-1", "User: run cargo test")
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let model = DreamModel {
+            client: Client::with_config(
+                OpenAIConfig::new()
+                    .with_api_base(format!("http://{address}/v1"))
+                    .with_api_key("test-secret-key"),
+            )
+            .with_http_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+            model: "test-model".into(),
+        };
+        let configuration = DreamConfig {
+            min_sessions: 1,
+            min_interval_hours: 0,
+            timeout_secs: 3,
+            ..Default::default()
+        };
+        let error = model.run_auto(&manager, &configuration).await.unwrap_err();
+        assert!(error.contains("HTTP connection failed"), "{error}");
+        assert!(error.contains("caused by:"), "{error}");
+        assert!(!error.contains("test-secret-key"));
+        let history = manager.dream_history_list().unwrap();
+        assert_eq!(history[0].error.as_deref(), Some(error.as_str()));
+        let state = manager.load_dream_state().unwrap();
+        assert_eq!(state.last_error.as_deref(), Some(error.as_str()));
+        assert!(render_status(&state, 1, false).contains(&error));
+        assert_eq!(manager.load_pending().unwrap().len(), 1);
+        assert!(manager.list(None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn planning_client_timeout_is_distinct_and_omits_request_url_secrets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://{address}/?api_key=private-query-value"))
+            .send()
+            .await
+            .unwrap_err();
+        server.abort();
+        let message = format_planning_error(async_openai::error::OpenAIError::Reqwest(error));
+        assert!(message.contains("HTTP client timeout"), "{message}");
+        assert!(message.contains("caused by:"), "{message}");
+        assert!(!message.contains("private-query-value"), "{message}");
+        assert!(!message.contains("http://"), "{message}");
     }
 
     #[tokio::test]

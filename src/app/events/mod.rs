@@ -232,6 +232,9 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
             if !is_live_turn(app, op_id) {
                 return;
             }
+            // This usage belongs to the request that just reached its boundary,
+            // including requests made with an installed compaction summary.
+            app.agent_loop.auto_compact.last_input_tokens = Some(input_tokens);
             if app
                 .mandatory_compact_tokens()
                 .is_some_and(|limit| input_tokens >= limit)
@@ -455,6 +458,7 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 return;
             }
             app.agent_loop.auto_compact.active_id = None;
+            app.agent_loop.auto_compact.cancellation = None;
             if app.agent_loop.auto_compact.history_epoch != history_epoch {
                 return;
             }
@@ -484,13 +488,15 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 .unwrap()
                 .compaction_turn_count(cutoff);
             let details = compaction_details(turns, &compaction);
-            let applied = app
-                .agent_loop
-                .session
-                .conversation
-                .lock()
-                .unwrap()
-                .apply_compaction_at(cutoff, compaction.summary);
+            let (applied, replaced_full_context) = {
+                let mut conversation = app.agent_loop.session.conversation.lock().unwrap();
+                let replaced_full_context = app.agent_loop.auto_compact.mandatory_resume.is_some()
+                    && cutoff == conversation.items.len();
+                (
+                    conversation.apply_compaction_at(cutoff, compaction.summary),
+                    replaced_full_context,
+                )
+            };
             if !applied {
                 fail_mandatory_compaction(
                     app,
@@ -500,17 +506,17 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 return;
             }
             app.ui.conversation_panel.history_compacted();
-            if !app.agent_loop.auto_compact.mandatory_waiting {
-                app.agent_loop.auto_compact.last_completed_item_count = Some(
-                    app.agent_loop
-                        .session
-                        .conversation
-                        .lock()
-                        .unwrap()
-                        .items
-                        .len(),
-                );
-            }
+            // Mandatory passes also reset the soft-threshold cooldown. The
+            // hard-limit gate deliberately bypasses it if another pass is needed.
+            app.agent_loop.auto_compact.last_completed_item_count = Some(
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .items
+                    .len(),
+            );
             if let Some(stable_end) = app.agent_loop.cancel.turn_conversation_cutoff.as_mut()
                 && cutoff <= *stable_end
             {
@@ -555,8 +561,14 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 .auto_compact
                 .last_input_tokens
                 .unwrap_or(input_tokens);
-            let estimated_tokens =
-                estimated_tokens_after_compaction(previous_tokens, input_tokens, output_tokens);
+            // A suspended runner whose entire history was summarized has no
+            // retained tail. Subtracting counts from different providers would
+            // invent one and repeatedly compact an already-small summary.
+            let estimated_tokens = if replaced_full_context {
+                output_tokens
+            } else {
+                estimated_tokens_after_compaction(previous_tokens, input_tokens, output_tokens)
+            };
             app.agent_loop.auto_compact.last_input_tokens = Some(estimated_tokens);
             app.agent_loop.auto_compact.retry_blocked = false;
 
@@ -1037,6 +1049,23 @@ fn discard_reviews_for_agent(app: &mut App<'_>, generation: u64, agent_id: u64) 
 /// `TurnFinished` event will handle that once the runner actually stops.
 async fn handle_cancel(app: &mut App<'_>) {
     app.ui.runner_prompts.clear();
+    if app.agent_loop.auto_compact.active_id.is_some() {
+        // Compaction owns a separate task, including when no foreground turn
+        // exists. Invalidate its result before releasing its suspended runner.
+        commands::invalidate_auto_compaction(app);
+        app.agent_loop.auto_compact.retry_blocked = true;
+        app.agent_loop.session.conversation.lock().unwrap().add_info_string(
+            "Context compaction cancelled; queued input remains paused. Retry with /compact or edit and resend it with Up then Enter."
+                .to_string(),
+        );
+        app.ui.conversation_panel.scroll_to_bottom();
+        session::mark_dirty(app);
+    }
+    if app.agent_loop.phase == ActivePhase::Compacting {
+        // Cancelling /compact must not hand queued input straight back to the
+        // mandatory gate when its terminal event releases foreground ownership.
+        app.agent_loop.auto_compact.retry_blocked = true;
+    }
     // No active turn → nothing to cancel.
     if app.agent_loop.cancel.active_id.is_none() {
         return;
@@ -2106,6 +2135,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_safe_point_compaction_does_not_keep_a_phantom_uncompacted_tail() {
+        let mut app = cancellation_test_app().await;
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_info_string("completed long-turn history");
+        let cutoff = app
+            .agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .items
+            .len();
+        app.agent_loop.auto_compact.active_id = Some(1);
+        app.agent_loop.auto_compact.mandatory_waiting = true;
+        // Chat and compact providers can report different token counts for the
+        // same history. Replacing the whole prefix leaves no historical tail.
+        app.agent_loop.auto_compact.last_input_tokens = Some(500_000);
+        let (resume, receiver) = tokio::sync::oneshot::channel();
+        app.agent_loop.auto_compact.mandatory_resume = Some(resume);
+        finish_auto_compaction(&mut app, cutoff).await;
+        receiver.await.unwrap();
+        assert_eq!(app.agent_loop.auto_compact.last_input_tokens, Some(3_000));
+        assert!(!app.agent_loop.auto_compact.retry_blocked);
+        assert!(!app.agent_loop.cancel.active.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn mandatory_compaction_starts_the_soft_threshold_cooldown() {
+        let mut app = headless_test_app("mandatory-compaction-cooldown").await;
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_info_string("history to summarize");
+        app.agent_loop.auto_compact.active_id = Some(1);
+        app.agent_loop.auto_compact.mandatory_waiting = true;
+        app.agent_loop.auto_compact.last_input_tokens = Some(200_000);
+
+        finish_auto_compaction(&mut app, 1).await;
+
+        assert_eq!(app.agent_loop.auto_compact.last_input_tokens, Some(3_000));
+        assert!(!app.agent_loop.auto_compact.mandatory_waiting);
+        assert_eq!(
+            app.agent_loop.auto_compact.last_completed_item_count,
+            Some(
+                app.agent_loop
+                    .session
+                    .conversation
+                    .lock()
+                    .unwrap()
+                    .items
+                    .len()
+            ),
+            "a successful mandatory pass must also cool down soft compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_finished_does_not_restore_pre_compaction_usage() {
+        let mut app = headless_test_app("compaction-finished-usage").await;
+        app.agent_loop
+            .session
+            .conversation
+            .lock()
+            .unwrap()
+            .add_info_string("history");
+        app.agent_loop.cancel.active_id = Some(OperationId(9));
+        app.agent_loop.auto_compact.active_id = Some(1);
+        app.agent_loop.auto_compact.mandatory_waiting = true;
+        app.agent_loop.auto_compact.last_input_tokens = Some(200_000);
+        finish_auto_compaction(&mut app, 1).await;
+
+        handle_app_event(
+            &mut app,
+            AppEvent::TurnFinished(
+                OperationId(9),
+                Ok(crate::runner::TurnResult {
+                    final_text: String::new(),
+                    usage: (200_000, 100, 0),
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(app.agent_loop.auto_compact.last_input_tokens, Some(3_000));
+        assert!(app.agent_loop.auto_compact.active_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn usage_safe_point_refreshes_context_estimate_below_the_hard_limit() {
+        let mut app = headless_test_app("usage-safe-point-estimate").await;
+        app.agent_loop.cancel.active_id = Some(OperationId(9));
+        app.agent_loop.auto_compact.last_input_tokens = Some(200_000);
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+
+        handle_app_event(
+            &mut app,
+            AppEvent::UsageSafePoint(OperationId(9), 3_000, resume),
+        )
+        .await;
+
+        assert_eq!(app.agent_loop.auto_compact.last_input_tokens, Some(3_000));
+        assert!(resumed.await.is_ok());
+        assert!(!app.agent_loop.auto_compact.mandatory_waiting);
+        assert!(app.agent_loop.auto_compact.active_id.is_none());
+    }
+
+    #[tokio::test]
     async fn failed_mandatory_compaction_keeps_input_and_allows_explicit_retry() {
         let mut app = headless_test_app("compaction-failure-retry").await;
         app.agent_loop.auto_compact.active_id = Some(1);
@@ -2515,7 +2657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_safe_point_does_not_strand_queued_input_after_compaction() {
+    async fn cancelled_safe_point_retains_queued_input_despite_late_compaction() {
         use async_openai::types::responses::{InputContent, InputMessage, InputRole, OutputStatus};
         let mut app = cancellation_test_app().await;
         app.config.mandatory_compact_tokens = 100_000;
@@ -2557,10 +2699,11 @@ mod tests {
         assert!(app.agent_loop.pending_request.is_some());
         finish_auto_compaction(&mut app, 4).await;
         assert!(
-            app.agent_loop.pending_request.is_none(),
-            "completed compaction must hand off the queued successor, not a dead runner"
+            app.agent_loop.pending_request.is_some(),
+            "a cancelled compaction must not restart queued work through a late result"
         );
-        assert_eq!(app.agent_loop.cancel.next_id, 8);
+        assert!(app.agent_loop.auto_compact.retry_blocked);
+        assert_eq!(app.agent_loop.cancel.next_id, 7);
         assert!(app.agent_loop.auto_compact.mandatory_resume.is_none());
     }
 
@@ -2583,6 +2726,70 @@ mod tests {
         cancelled_terminal(&mut app, 7).await;
         assert_eq!(app.agent_loop.cancel.next_id, 8);
         assert!(app.agent_loop.pending_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_manual_compaction_does_not_restart_queued_work() {
+        let mut app = cancellation_test_app().await;
+        app.agent_loop.phase = ActivePhase::Compacting;
+        app.agent_loop.pending_request = Some(super::super::scheduling::UserRequest {
+            text: "queued input".into(),
+            images: Vec::new(),
+        });
+        let cancellation = app.agent_loop.cancel.active.clone();
+        handle_event(&mut app, Event::App(AppEvent::Cancel))
+            .await
+            .unwrap();
+        handle_event(
+            &mut app,
+            Event::App(AppEvent::CompactFinished(
+                OperationId(7),
+                0,
+                Ok(compaction_result()),
+                cancellation,
+            )),
+        )
+        .await
+        .unwrap();
+        assert!(app.agent_loop.cancel.active_id.is_none());
+        assert!(app.agent_loop.auto_compact.retry_blocked);
+        assert!(app.agent_loop.pending_request.is_some());
+        assert_eq!(app.agent_loop.cancel.next_id, 7);
+    }
+
+    #[tokio::test]
+    async fn cancelling_background_compaction_blocks_queued_retry_and_stale_completion() {
+        let mut app = headless_test_app("cancel-background-compaction").await;
+        app.agent_loop.auto_compact.active_id = Some(1);
+        let cancellation = crate::cancel::CancellationToken::new();
+        app.agent_loop.auto_compact.cancellation = Some(cancellation.clone());
+        app.agent_loop.auto_compact.mandatory_waiting = true;
+        app.agent_loop.pending_request = Some(super::super::scheduling::UserRequest {
+            text: "queued input".into(),
+            images: Vec::new(),
+        });
+        handle_event(&mut app, Event::App(AppEvent::Cancel))
+            .await
+            .unwrap();
+        assert!(app.agent_loop.auto_compact.active_id.is_none());
+        assert!(cancellation.is_cancelled());
+        assert!(!app.agent_loop.auto_compact.mandatory_waiting);
+        assert!(app.agent_loop.auto_compact.retry_blocked);
+        finish_auto_compaction(&mut app, 0).await;
+        for _ in 0..3 {
+            handle_event(&mut app, Event::Redraw).await.unwrap();
+        }
+        assert!(app.agent_loop.pending_request.is_some());
+        assert!(
+            !app.agent_loop
+                .session
+                .conversation
+                .lock()
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| matches!(item, MessageItem::Compacted { .. }))
+        );
     }
 
     #[tokio::test]

@@ -264,6 +264,7 @@ auto_compact_tokens = 100000
 mandatory_compact_tokens = 150000
 
 # Keep this many recent complete turns verbatim after compaction.
+# Mandatory hard-limit compaction overrides this retention.
 compact_keep_recent_turns = 2
 
 # After an automatic compaction, suppress another one for this many subsequent
@@ -357,7 +358,7 @@ api_key = "sk-your-key-here"
 | `suggestion_model` | (chat model) | `provider/model` used after successful turns to predict the next user message shown in the input placeholder. |
 | `auto_compact_tokens` | `100000` | Provider-reported input-token threshold for seamless background compaction. `0` disables it. Providers that do not report usage do not trigger it. |
 | `mandatory_compact_tokens` | `150000` | Hard provider-reported context limit. Programmer blocks further model requests until a proven-smaller compaction drops below it. `0` disables the gate. |
-| `compact_keep_recent_turns` | `2` | Number of recent complete turns kept verbatim when context is compacted. |
+| `compact_keep_recent_turns` | `2` | Number of recent complete turns kept verbatim; mandatory hard-limit compaction overrides this retention. |
 | `auto_compact_cooldown_turns` | `5` | Suppress another automatic compaction for this many subsequent user turns; manual and mandatory compaction bypass it. `0` disables the cooldown. |
 | `memory.enabled` | `true` | Enable the persistent-memory store, automatic association, and the `memory` tool. |
 | `memory.global_enabled` / `project_enabled` | `true` | Include cross-project preferences and current-project memories when recalling. |
@@ -905,8 +906,14 @@ been killed. Queued requests still wait for that terminal acknowledgement.
 
 Automatic compaction observes the real `input_tokens` returned after every API
 response. For tool-using responses it waits until all call outputs are recorded,
-then summarizes a stable prefix in the background. Input stays usable and new
-messages remain outside that prefix. Once the summary is installed, the session
+then summarizes a stable prefix in the background. Ordinary background passes
+leave the active turn untouched. At the mandatory limit, the runner pauses at a
+safe boundary and compaction can include the completed part of that same turn,
+including paired tool calls and outputs. This lets long tasks continue without
+repeatedly summarizing only history from before the task. Recent-turn retention
+yields to this hard-limit pass; summary-only history is not repeatedly compacted
+without new model-visible messages. Input stays usable and new messages remain
+outside the snapshotted prefix. Once the summary is installed, the session
 is saved immediately when idle (or at the next safe turn boundary), so reopening
 the conversation reuses the generated summary. When the summary lands while no
 turn is running, the input title announces that the next turn will use compacted
@@ -920,7 +927,10 @@ job active. When the foreground is idle, the footer shows `Compacting` until
 that job finishes. If mandatory compaction still fails, queued input is retained
 and further model requests remain blocked. Submitting a request again can retry the failed history
 prefix; idle polling does not repeatedly retry the same failure. You can also
-use `/compact` to compact manually.
+use `/compact` to compact manually. Esc also cancels background compaction,
+including its provider retry; late results are ignored. Cancelling either manual
+or background compaction leaves queued input paused until an explicit retry,
+rather than immediately starting another compaction.
 The read-only `conversation_history` tool is
 then exposed to the main agent and its sub-agents, allowing them to search the
 exact pre-compaction items and page through a matching message or tool result

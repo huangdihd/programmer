@@ -11,9 +11,43 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
+  gate:
+    name: Validate release SHA, CI and notes
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.validate.outputs.sha }}
+    steps:
+      - name: Checkout requested tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reject tracked local drafts and runtime files
+        run: python scripts/check_release_scope.py
+      - name: Offline release gate tests
+        run: python -m unittest discover -s scripts -p 'test_release*.py'
+      - name: Validate release
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python scripts/release_gate.py check --tag "$RELEASE_TAG"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -44,8 +78,11 @@ jobs:
             target: aarch64-apple-darwin
 
     steps:
-      - name: Checkout
+      - name: Checkout validated SHA
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -97,7 +134,7 @@ jobs:
           grep -Fq 'rules.insert(i64::from(sysno), Vec::new());' "$skarn_linux"
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -120,26 +157,49 @@ jobs:
           path: |
             programmer-${{ matrix.target }}.tar.gz
             programmer-${{ matrix.target }}.zip
-          if-no-files-found: warn
+          if-no-files-found: error
 
   release:
-    name: Create Release
+    name: Validate draft and publish
     runs-on: ubuntu-latest
-    needs: build
+    needs: [gate, build]
     permissions:
       contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_SHA: ${{ needs.gate.outputs.sha }}
 
     steps:
+      - name: Checkout validated SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: programmer-*
           merge-multiple: true
           path: dist
-
-      - name: Create GitHub Release
+      - name: Recheck CI, tag, notes and local archives
+        run: python scripts/release_gate.py prepare --tag "$RELEASE_TAG" --sha "$RELEASE_SHA"
+      - name: Create draft and upload archives
+        id: draft
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ needs.gate.outputs.sha }}
+          body_path: release-body.md
+          generate_release_notes: false
+          draft: true
+          fail_on_unmatched_files: true
           files: dist/*
-          generate_release_notes: true
+      - name: Verify uploaded assets and publish
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        run: python scripts/release_gate.py publish --tag "$RELEASE_TAG" --sha "$RELEASE_SHA" --release-id "$RELEASE_ID"

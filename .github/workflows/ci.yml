@@ -18,6 +18,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-policy:
+    name: release-policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reject tracked local drafts and runtime files
+        run: python scripts/check_release_scope.py
+      - name: Test release safeguards
+        run: python -m unittest discover -s scripts -p 'test_release*.py' -v
   fmt:
     name: fmt
     runs-on: ubuntu-latest

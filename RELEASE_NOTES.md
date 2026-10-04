@@ -1,3 +1,28 @@
+### programmer v0.2.25
+
+- Fix compaction during long, tool-heavy turns: mandatory safe-point compaction
+  includes completed work from the active turn, keeps tool calls paired with
+  their outputs, and advances the summary boundary as new history accumulates.
+- Stop repeatedly compacting summary-only history and correct full-history token
+  estimates so differences between chat and compact providers do not invent a
+  retained context tail. Refresh usage at safe points and start the soft-limit
+  cooldown after successful mandatory compaction.
+- Make background compaction and its provider retry cancellable with Esc. Ignore
+  late results and pause queued input after cancellation instead of immediately
+  restarting manual or automatic compaction.
+- Improve Dream planning diagnostics with categorized HTTP failures and bounded
+  cause chains, removing request URLs from transport errors to avoid exposing
+  URL credentials. Preserve pending input when planning fails.
+- Add release safeguards: exclude local drafts and runtime files, require green
+  CI on the exact release commit, pin builds to the validated SHA, and verify
+  complete release notes and all ten uploaded archives before public publication.
+- Expand regression coverage for long-turn compaction, cancellation, historical
+  summary placement, Dream failures, and release policy; update documentation.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.24...v0.2.25
+
+---
+
 ### programmer v0.2.24
 
 Includes the ownership and argument-generation changes listed below for the

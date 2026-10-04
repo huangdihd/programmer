@@ -2,7 +2,12 @@
 /.idea
 /.idea/*
 .codegraph/
-/.programmer/outputs/
+# Runtime data, logs and scratch files stay local; keep shared diagnostics.
+/.programmer/*
+!/.programmer/diagnostics.toml
+# Existing tracked demos remain tracked; new prototypes stay local.
+/design-demos/
+__pycache__/
 
 # Local architecture prototypes and acceptance notes (not release sources).
 /design-demos/app-loop-workbench.html
