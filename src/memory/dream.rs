@@ -1461,7 +1461,9 @@ mod tests {
         let configuration = DreamConfig {
             min_sessions: 1,
             min_interval_hours: 0,
-            timeout_secs: 3,
+            // Windows connection refusal and provider retries can exceed three
+            // seconds. Let the transport error win, not Dream's outer timeout.
+            timeout_secs: 30,
             ..Default::default()
         };
         let error = model.run_auto(&manager, &configuration).await.unwrap_err();
