@@ -998,6 +998,12 @@ hook or `--check` for an additional final snapshot. Other controls include
 `--classifier-model`, `--work-mode auto|plan|yolo`, `--cwd`,
 `--timeout`, `--max-steps`, and `--prompt-file`.
 
+`run` and `init` connect the configured `mcp_servers` before the first turn,
+so the agent and its sub-agents get the same `mcp__<server>__<tool>` tools as
+the TUI. Servers connect concurrently, and startup counts against `--timeout`.
+A server that fails to start is skipped with a warning on stderr; the run
+continues without it.
+
 `--format text` prints only the final answer to stdout, `json` emits one
 versioned result document, and `jsonl` emits progress events followed by a
 result event. Diagnostics from a text-mode final check go to stderr so stdout

@@ -163,6 +163,7 @@ src/
 ├── conversation.rs           # Shared conversation model and API-input projection
 ├── runner/                   # Shared turn execution for TUI, headless, and child agents
 │   ├── mod.rs                #   TurnRunner and execution events
+│   ├── assembly.rs           #   AgentSpec common providers/runner; PolicySpec and memory resolution
 │   ├── surface.rs            #   AgentSurface: host notifications, review, and interaction
 │   ├── hooks.rs              #   TurnHook: checks and feedback around tool batches
 │   ├── tools.rs              #   Ordered tool batches through ToolRegistry

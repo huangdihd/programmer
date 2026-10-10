@@ -211,8 +211,9 @@ impl McpServerStatus {
 }
 
 impl McpManager {
-    /// Initialise all configured MCP servers and report each completed
-    /// connection while the remaining servers continue loading.
+    /// Initialise all configured MCP servers concurrently and report each
+    /// connection as it completes, so one slow or hung server delays startup
+    /// by its own handshake timeout rather than adding to every other server's.
     pub(crate) async fn from_config_with_updates<F>(
         configs: &[McpServerConfig],
         workspace_root: &str,
@@ -221,24 +222,39 @@ impl McpManager {
     where
         F: FnMut(String, McpConnectionState),
     {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let mut pending: FuturesUnordered<_> = configs
+            .iter()
+            .enumerate()
+            .map(
+                |(index, cfg)| async move { (index, Self::connect_one(cfg, workspace_root).await) },
+            )
+            .collect();
+        let mut results: Vec<Option<Result<McpServer, String>>> =
+            configs.iter().map(|_| None).collect();
+        while let Some((index, result)) = pending.next().await {
+            let state = match &result {
+                Ok(server) => McpConnectionState::Connected {
+                    tool_count: server.tools.lock().unwrap().len(),
+                },
+                Err(e) => McpConnectionState::Failed { error: e.clone() },
+            };
+            on_update(configs[index].name.clone(), state);
+            results[index] = Some(result);
+        }
+
+        // Assemble in configuration order so errors are reported
+        // deterministically and a duplicated name resolves as before.
         let mut servers: HashMap<String, McpServer> = HashMap::new();
         let mut startup_errors: Vec<String> = Vec::new();
-
-        for cfg in configs {
-            let name = cfg.name.clone();
-            match Self::connect_one(cfg, workspace_root).await {
-                Ok(server) => {
-                    let tool_count = server.tools.lock().unwrap().len();
-                    on_update(name.clone(), McpConnectionState::Connected { tool_count });
-                    servers.insert(name.clone(), server);
+        for (cfg, result) in configs.iter().zip(results) {
+            match result {
+                Some(Ok(server)) => {
+                    servers.insert(cfg.name.clone(), server);
                 }
-                Err(e) => {
-                    on_update(
-                        name.clone(),
-                        McpConnectionState::Failed { error: e.clone() },
-                    );
-                    startup_errors.push(format!("MCP server '{name}': {e}"));
-                }
+                Some(Err(e)) => startup_errors.push(format!("MCP server '{}': {e}", cfg.name)),
+                None => {}
             }
         }
 
@@ -450,4 +466,4 @@ fn parse_fqn(fqn: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 #[path = "mcp_tests.rs"]
-mod tests;
+pub(crate) mod tests;

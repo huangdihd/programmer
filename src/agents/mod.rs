@@ -21,11 +21,8 @@
 //! the first implementation one level deep without prompt-only enforcement.
 
 use crate::cancel::CancellationToken;
-use crate::classifier::WorkMode;
 use crate::conversation::Conversation;
-use crate::runner::{
-    AgentSurface, LlmPolicy, ReviewDecision, RunnerEvent, RunnerPhase, RunnerPolicy, TurnRunner,
-};
+use crate::runner::{AgentSurface, ReviewDecision, RunnerEvent, RunnerPhase, TurnRunner};
 use crate::ui::event::{AppEvent, Event, ReplyTx};
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
@@ -492,22 +489,7 @@ impl AgentManager {
     }
 }
 
-#[derive(Clone)]
-pub(crate) enum AgentPolicyFactory {
-    Yolo,
-    Sync(WorkMode),
-    Llm(Box<LlmPolicy>),
-}
-
-impl AgentPolicyFactory {
-    fn build(&self) -> RunnerPolicy {
-        match self {
-            Self::Yolo => RunnerPolicy::Yolo,
-            Self::Sync(mode) => RunnerPolicy::Sync(mode.classifier()),
-            Self::Llm(policy) => RunnerPolicy::Llm(policy.clone()),
-        }
-    }
-}
+use crate::runner::assembly::PolicySpec;
 
 #[derive(Clone)]
 pub(crate) struct AgentRuntime {
@@ -521,7 +503,7 @@ pub(crate) struct AgentRuntime {
     pub(crate) todos: Arc<Mutex<crate::todos::TodoList>>,
     pub(crate) security: Arc<crate::security::SecurityHandle>,
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
-    pub(crate) policy: AgentPolicyFactory,
+    pub(crate) policy: PolicySpec,
     pub(crate) soul: Option<String>,
     pub(crate) coauthor: Option<String>,
     pub(crate) vision_enabled: bool,
@@ -568,53 +550,33 @@ impl AgentRuntime {
     }
 
     fn build_runner(&self, file_scope: u64, conversation: Arc<Mutex<Conversation>>) -> TurnRunner {
-        use crate::tools::provider::{
-            LocalToolProvider, McpToolProvider, SkillToolProvider, ToolProvider, ToolRegistry,
-        };
-
-        // Sub-agents recall memory exactly like the main session does: Claude
-        // Code starts its relevance prefetch inside the shared query loop with
-        // no agent guard, so a child that hits a stored gotcha sees it too.
-        // The memory model is independent of the sub-agent's own model, and a
-        // disabled memory store disables recall as well as the tool.
-        let memory_model = if self.memory_config.enabled {
-            self.provider_manager
-                .resolve(self.memory_model.as_deref().unwrap_or(&self.model_str))
-                .map(|(client, model)| crate::tools::memory::MemoryModel {
-                    client: client.clone(),
-                    model,
-                })
-        } else {
-            None
-        };
+        use crate::runner::assembly::{AgentSpec, resolve_memory_model};
+        use crate::tools::provider::LocalToolProvider;
+        let memory_model = resolve_memory_model(
+            &self.provider_manager,
+            self.memory_config.enabled,
+            self.memory_model.as_deref(),
+            &self.model_str,
+        );
         let diagnostics_state =
             Arc::new(Mutex::new(crate::diagnostics::DiagnosticsState::default()));
-        let mut providers: Vec<Arc<dyn ToolProvider>> = vec![
-            Arc::new(
-                LocalToolProvider::new_scoped(
-                    self.todos.clone(),
-                    self.security.clone(),
-                    file_scope,
-                )
+        let local =
+            LocalToolProvider::new_scoped(self.todos.clone(), self.security.clone(), file_scope)
                 .with_diagnostics_state(diagnostics_state.clone())
                 .with_tasks(self.tasks.clone())
                 .with_checkpoint(self.checkpoint.clone())
                 .with_memory_enabled(self.memory_config.enabled)
-                .with_memory_model(memory_model.clone())
                 .with_memory_context(Some(conversation))
-                .with_conversation_history(self.conversation_history.clone()),
-            ),
-            Arc::new(SkillToolProvider::new(self.skill_registry.clone())),
-        ];
-        if let Some(mcp) = &self.mcp_manager {
-            providers.push(Arc::new(McpToolProvider::new(mcp.clone())));
-        }
-        TurnRunner {
+                .with_conversation_history(self.conversation_history.clone());
+        AgentSpec {
             client: self.client.clone(),
             model_name: self.model_name.clone(),
             model_str: self.model_str.clone(),
-            tools: Arc::new(ToolRegistry::new(providers)),
-            policy: self.policy.build(),
+            local,
+            skills: self.skill_registry.clone(),
+            mcp: self.mcp_manager.clone(),
+            extra_providers: Vec::new(),
+            policy: self.policy.clone(),
             soul: self.soul.clone(),
             coauthor: self.coauthor.clone(),
             vision_enabled: self.vision_enabled,
@@ -622,9 +584,9 @@ impl AgentRuntime {
             memory_model,
             hooks: crate::runner::hooks::standard_hooks(diagnostics_state),
             stream_retrying: Arc::new(AtomicBool::new(false)),
-            stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: Some(DEFAULT_MAX_STEPS),
         }
+        .build()
     }
 }
 
@@ -741,7 +703,7 @@ mod tests {
             todos: Arc::new(Mutex::new(crate::todos::TodoList::default())),
             security: Arc::new(crate::security::SecurityHandle::new(Arc::new(security))),
             mcp_manager: None,
-            policy: AgentPolicyFactory::Yolo,
+            policy: PolicySpec::Yolo,
             soul: None,
             coauthor: None,
             vision_enabled: false,
