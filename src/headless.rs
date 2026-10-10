@@ -29,14 +29,31 @@ use crate::cli::{
 use crate::conversation::Conversation;
 use crate::diagnostics::{Diagnostic, Severity, Snapshot};
 use crate::runner::{
-    AgentSurface, DiagnosticsState, LlmPolicy, ReviewDecision, RunnerEvent, RunnerPhase,
-    RunnerPolicy, TurnResult, TurnRunner,
+    AgentSurface, DiagnosticsState, ReviewDecision, RunnerEvent, RunnerPhase, TurnResult,
+    TurnRunner,
 };
-use crate::tools::provider::{
-    AgentToolProvider, LocalToolProvider, SkillToolProvider, ToolProvider, ToolRegistry,
-};
+use crate::tools::provider::{AgentToolProvider, LocalToolProvider, ToolProvider};
+
+use crate::runner::assembly::{AgentSpec, PolicySpec, resolve_memory_model};
 
 const OUTPUT_SCHEMA_VERSION: u32 = 1;
+
+/// Connect the configured MCP servers for one headless run. Startup failures
+/// go to stderr so stdout keeps its text/JSON/JSONL contract; a server that
+/// fails is simply absent, matching the TUI. Child processes are killed when
+/// the last `Arc` is dropped at the end of the run.
+async fn connect_mcp(
+    configs: &[crate::mcp::types::McpServerConfig],
+) -> Option<Arc<crate::mcp::McpManager>> {
+    if configs.is_empty() {
+        return None;
+    }
+    let manager = crate::mcp::McpManager::from_config_with_updates(configs, ".", |_, _| {}).await;
+    for error in &manager.startup_errors {
+        eprintln!("warning: {error}");
+    }
+    Some(Arc::new(manager))
+}
 
 pub(crate) async fn run(args: RunArgs) -> color_eyre::Result<bool> {
     let RunArgs {
@@ -180,78 +197,44 @@ impl HeadlessAgent {
             .ok_or_else(|| {
                 color_eyre::eyre::eyre!("built-in initialize-project skill is unavailable")
             })?;
-        let memory_model_target = config.memory_model.as_deref().unwrap_or(&model);
-        // A disabled memory store disables automatic recall, matching the
-        // memory tool being unadvertised.
-        let memory_model = if config.memory.enabled {
-            provider_manager
-                .resolve(memory_model_target)
-                .map(
-                    |(memory_client, memory_name)| crate::tools::memory::MemoryModel {
-                        client: memory_client.clone(),
-                        model: memory_name,
-                    },
-                )
-        } else {
-            None
-        };
+        let memory_model = resolve_memory_model(
+            &provider_manager,
+            config.memory.enabled,
+            config.memory_model.as_deref(),
+            &model,
+        );
         let conversation = Arc::new(Mutex::new(Conversation::new()));
         let diagnostics_state = Arc::new(Mutex::new(DiagnosticsState::default()));
         let tasks = crate::tasks::TaskManager::default();
-        let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
-            Arc::new(
-                LocalToolProvider::new(todo_store.clone(), security.clone())
-                    .with_diagnostics_state(diagnostics_state.clone())
-                    .with_tasks(tasks.clone())
-                    .with_memory_enabled(config.memory.enabled)
-                    .with_memory_model(memory_model.clone())
-                    .with_memory_context(Some(conversation.clone())),
-            ),
-            Arc::new(SkillToolProvider::new(skill_registry.clone())),
-        ];
-
-        let (policy, child_policy) = match args.work_mode {
-            WorkMode::Yolo => (RunnerPolicy::Yolo, crate::agents::AgentPolicyFactory::Yolo),
-            WorkMode::Plan => (
-                RunnerPolicy::Sync(args.work_mode.classifier()),
-                crate::agents::AgentPolicyFactory::Sync(args.work_mode),
-            ),
-            WorkMode::Auto => {
-                let classifier_model = args
-                    .classifier_model
-                    .clone()
-                    .or_else(|| config.classifier_model.clone())
-                    .unwrap_or_else(|| model.clone());
-                let (classifier_client, classifier_name) = provider_manager
-                    .resolve(&classifier_model)
-                    .map(|(client, name)| (client.clone(), name))
-                    .ok_or_else(|| {
-                        color_eyre::eyre::eyre!(
-                            "unknown classifier provider/model: {classifier_model}"
-                        )
-                    })?;
-                let no_logprobs = Arc::new(Mutex::new(HashSet::new()));
-                (
-                    RunnerPolicy::Llm(Box::new(LlmPolicy {
-                        client: classifier_client.clone(),
-                        model_name: classifier_name.clone(),
-                        top_logprobs: config.classifier_top_logprobs,
-                        no_logprobs: no_logprobs.clone(),
-                    })),
-                    crate::agents::AgentPolicyFactory::Llm(Box::new(LlmPolicy {
-                        client: classifier_client,
-                        model_name: classifier_name,
-                        top_logprobs: config.classifier_top_logprobs,
-                        no_logprobs,
-                    })),
-                )
-            }
-            WorkMode::Manual => {
-                return Err(color_eyre::eyre::eyre!(
-                    "manual mode requires an interactive approval surface"
-                ));
-            }
-        };
+        let local = LocalToolProvider::new(todo_store.clone(), security.clone())
+            .with_diagnostics_state(diagnostics_state.clone())
+            .with_tasks(tasks.clone())
+            .with_memory_enabled(config.memory.enabled)
+            .with_memory_context(Some(conversation.clone()));
+        if args.work_mode == WorkMode::Manual {
+            return Err(color_eyre::eyre::eyre!(
+                "manual mode requires an interactive approval surface"
+            ));
+        }
+        let classifier_model = args
+            .classifier_model
+            .as_deref()
+            .or(config.classifier_model.as_deref())
+            .unwrap_or(&model);
+        let policy = PolicySpec::resolve(
+            args.work_mode,
+            &provider_manager,
+            classifier_model,
+            config.classifier_top_logprobs,
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!("unknown classifier provider/model: {classifier_model}")
+        })?;
+        // Connect only after the mode and classifier are validated, so a
+        // rejected run never spawns MCP server processes.
+        let mcp_manager = connect_mcp(&config.mcp_servers).await;
+        let mut base_providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
 
         let agents = crate::agents::AgentManager::default();
         let child_runtime = crate::agents::AgentRuntime {
@@ -263,15 +246,15 @@ impl HeadlessAgent {
             model_str: model.clone(),
             todos: todo_store,
             security,
-            mcp_manager: None,
-            policy: child_policy,
+            mcp_manager: mcp_manager.clone(),
+            policy: policy.clone(),
             soul: config.soul.clone(),
             coauthor: config.git_coauthor.clone(),
             vision_enabled: config.vision_enabled,
             thinking_level: args.thinking,
             memory_config: config.memory.clone(),
             memory_model: config.memory_model.clone(),
-            skill_registry,
+            skill_registry: skill_registry.clone(),
             skill_prompt: skill_prompt.clone(),
             approval_label: format!(
                 "{} approved by {} mode (headless sub-agent)",
@@ -285,7 +268,6 @@ impl HeadlessAgent {
             agents.clone(),
             child_runtime,
         )));
-        let tools = Arc::new(ToolRegistry::new(base_providers));
 
         let hooks: Vec<Arc<dyn crate::runner::hooks::TurnHook>> = if args.no_diagnostics {
             Vec::new()
@@ -293,11 +275,14 @@ impl HeadlessAgent {
             crate::runner::hooks::standard_hooks(diagnostics_state.clone())
         };
 
-        let runner = TurnRunner {
+        let runner = AgentSpec {
             client,
             model_name,
             model_str: model.clone(),
-            tools,
+            local,
+            skills: skill_registry,
+            mcp: mcp_manager,
+            extra_providers: base_providers,
             policy,
             soul: config.soul,
             coauthor: config.git_coauthor,
@@ -306,9 +291,9 @@ impl HeadlessAgent {
             memory_model,
             hooks,
             stream_retrying: Arc::new(AtomicBool::new(false)),
-            stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: args.max_steps,
-        };
+        }
+        .build();
 
         Ok(Self {
             runner,
@@ -713,6 +698,55 @@ fn count_severity(diagnostics: &[Diagnostic], severity: Severity) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::provider::{McpToolProvider, ToolRegistry};
+
+    fn http_server(name: &str, url: String) -> crate::mcp::types::McpServerConfig {
+        crate::mcp::types::McpServerConfig {
+            name: name.to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            url: Some(url),
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_without_mcp_config_starts_no_servers() {
+        assert!(connect_mcp(&[]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn headless_advertises_connected_mcp_tools_and_skips_failed_servers() {
+        let (url, server) = crate::mcp::tests::spawn_mock_http_server().await;
+        let configs = [
+            http_server("mock", url),
+            // Nothing listens on port 9: startup fails without aborting the run.
+            http_server("dead", "http://127.0.0.1:9/mcp".to_string()),
+        ];
+        let manager = tokio::time::timeout(Duration::from_secs(30), connect_mcp(&configs))
+            .await
+            .expect("MCP startup must finish")
+            .expect("configured servers yield a manager");
+        server.abort();
+
+        assert!(manager.has_server("mock"));
+        assert!(!manager.has_server("dead"));
+        assert_eq!(manager.startup_errors.len(), 1);
+
+        let registry = ToolRegistry::new(vec![Arc::new(McpToolProvider::new(manager))]);
+        let names: Vec<String> = registry
+            .tools()
+            .into_iter()
+            .filter_map(|tool| match tool {
+                async_openai::types::responses::Tool::Function(function) => Some(function.name),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "mcp__mock__echo"),
+            "advertised tools: {names:?}"
+        );
+    }
 
     fn diagnostic(severity: Severity) -> Diagnostic {
         Diagnostic {

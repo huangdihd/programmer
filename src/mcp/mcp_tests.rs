@@ -60,7 +60,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Minimal HTTP MCP server: JSON reply to `initialize` (issuing a session
 /// id), 202 to notifications, an SSE-framed reply to `tools/list`, and a
 /// session-checked JSON reply to `tools/call`.
-async fn spawn_mock_http_server() -> (String, tokio::task::JoinHandle<()>) {
+pub(crate) async fn spawn_mock_http_server() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
@@ -225,6 +225,48 @@ async fn initialize_mock_http_client(client: &McpHttpClient) {
         .send_notification("notifications/initialized", None)
         .await
         .expect("initialized notification");
+}
+
+fn http_config(name: &str, url: String) -> McpServerConfig {
+    McpServerConfig {
+        name: name.to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        env: HashMap::new(),
+        url: Some(url),
+    }
+}
+
+#[tokio::test]
+async fn servers_connect_concurrently_so_a_hung_one_does_not_block_others() {
+    // Accepts connections but never answers: its handshake only ends at the
+    // 30s timeout. Configured first, it used to hold up every later server.
+    let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hung_url = format!("http://{}/mcp", hung.local_addr().unwrap());
+    let hung_task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = hung.accept().await {
+            held.push(socket);
+        }
+    });
+    let (url, server) = spawn_mock_http_server().await;
+    let configs = [http_config("hung", hung_url), http_config("mock", url)];
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let startup = McpManager::from_config_with_updates(&configs, ".", move |name, state| {
+        let _ = tx.send((name, state));
+    });
+    tokio::pin!(startup);
+    let first = tokio::select! {
+        _ = &mut startup => panic!("startup must still be waiting on the hung server"),
+        update = tokio::time::timeout(Duration::from_secs(10), rx.recv()) => {
+            update.expect("the healthy server must connect without waiting").unwrap()
+        }
+    };
+    assert_eq!(first.0, "mock");
+    assert!(matches!(first.1, McpConnectionState::Connected { .. }));
+    hung_task.abort();
+    server.abort();
 }
 
 #[tokio::test]

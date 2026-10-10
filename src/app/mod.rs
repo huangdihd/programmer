@@ -781,12 +781,10 @@ impl App<'_> {
     /// Called at the start of every turn; the runner is immutable during a turn
     /// and is dropped when the spawned task finishes.
     pub(crate) fn build_runner(&self) -> Option<crate::runner::TurnRunner> {
-        use crate::runner::{LlmPolicy, RunnerPolicy, TurnRunner};
+        use crate::runner::assembly::{AgentSpec, PolicySpec};
         use std::sync::Arc;
 
-        use crate::tools::provider::{
-            LocalToolProvider, McpToolProvider, SkillToolProvider, ToolProvider, ToolRegistry,
-        };
+        use crate::tools::provider::{LocalToolProvider, ToolProvider};
 
         let (client, model_name) = self
             .provider_manager
@@ -799,52 +797,23 @@ impl App<'_> {
         let memory_model = self.effective_memory_model();
         // Unify every tool source behind the registry: the local built-ins are
         // one provider, all connected MCP servers another.
-        let mut base_providers: Vec<Arc<dyn ToolProvider>> = vec![
-            Arc::new(
-                LocalToolProvider::new(
-                    self.agent_loop.session.todo_store.clone(),
-                    self.security.clone(),
-                )
-                .with_diagnostics_state(self.agent_loop.session.diagnostics_state.clone())
-                .with_tasks(self.agent_loop.session.tasks.clone())
-                .with_checkpoint(self.checkpoint_recorder())
-                .with_memory_enabled(self.config.memory.enabled)
-                .with_memory_model(memory_model.clone())
-                .with_conversation_history(Some(self.agent_loop.session.conversation.clone())),
-            ),
-            Arc::new(SkillToolProvider::new(
-                self.agent_loop.skill_registry.clone(),
-            )),
-        ];
-        if let Some(mcp) = self.mcp_runtime.connections() {
-            base_providers.push(Arc::new(McpToolProvider::new(mcp.clone())));
-        }
-        let (policy, child_policy) = match self.agent_loop.session.work_mode {
-            WorkMode::Yolo => (RunnerPolicy::Yolo, crate::agents::AgentPolicyFactory::Yolo),
-            WorkMode::Manual | WorkMode::Plan => (
-                RunnerPolicy::Sync(self.agent_loop.session.work_mode.classifier()),
-                crate::agents::AgentPolicyFactory::Sync(self.agent_loop.session.work_mode),
-            ),
-            WorkMode::Auto => {
-                let model_str = self.effective_classifier_model();
-                let (c_client, c_model_name) = self.provider_manager.resolve(&model_str)?;
-                let top_logprobs = self.config.classifier_top_logprobs;
-                (
-                    RunnerPolicy::Llm(Box::new(LlmPolicy {
-                        client: c_client.clone(),
-                        model_name: c_model_name.clone(),
-                        top_logprobs,
-                        no_logprobs: self.agent_loop.classifier_no_logprobs.clone(),
-                    })),
-                    crate::agents::AgentPolicyFactory::Llm(Box::new(LlmPolicy {
-                        client: c_client.clone(),
-                        model_name: c_model_name,
-                        top_logprobs,
-                        no_logprobs: self.agent_loop.classifier_no_logprobs.clone(),
-                    })),
-                )
-            }
-        };
+        let local = LocalToolProvider::new(
+            self.agent_loop.session.todo_store.clone(),
+            self.security.clone(),
+        )
+        .with_diagnostics_state(self.agent_loop.session.diagnostics_state.clone())
+        .with_tasks(self.agent_loop.session.tasks.clone())
+        .with_checkpoint(self.checkpoint_recorder())
+        .with_memory_enabled(self.config.memory.enabled)
+        .with_conversation_history(Some(self.agent_loop.session.conversation.clone()));
+        let policy = PolicySpec::resolve(
+            self.agent_loop.session.work_mode,
+            &self.provider_manager,
+            &self.effective_classifier_model(),
+            self.config.classifier_top_logprobs,
+            self.agent_loop.classifier_no_logprobs.clone(),
+        )?;
+        let mut base_providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
 
         let child_runtime = crate::agents::AgentRuntime {
             tasks: self.agent_loop.session.tasks.clone(),
@@ -856,7 +825,7 @@ impl App<'_> {
             todos: self.agent_loop.session.todo_store.clone(),
             security: self.security.clone(),
             mcp_manager: self.mcp_runtime.connections().cloned(),
-            policy: child_policy,
+            policy: policy.clone(),
             soul: self.config.soul.clone(),
             coauthor: self.config.git_coauthor.clone(),
             vision_enabled: self.agent_loop.session.vision_enabled,
@@ -881,26 +850,29 @@ impl App<'_> {
             self.agent_loop.session.uuid.clone(),
             self.provider_manager.clone(),
         )));
-        let tools = Arc::new(ToolRegistry::new(base_providers));
-
-        Some(TurnRunner {
-            client: client.clone(),
-            model_name,
-            model_str,
-            tools,
-            policy,
-            soul: self.config.soul.clone(),
-            coauthor: self.config.git_coauthor.clone(),
-            vision_enabled: self.agent_loop.session.vision_enabled,
-            thinking_level: self.agent_loop.session.thinking_level,
-            memory_model,
-            hooks: crate::runner::hooks::standard_hooks(
-                self.agent_loop.session.diagnostics_state.clone(),
-            ),
-            stream_retrying: self.agent_loop.cancel.stream_retrying.clone(),
-            stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
-            max_steps: None,
-        })
+        Some(
+            AgentSpec {
+                client: client.clone(),
+                model_name,
+                model_str,
+                local,
+                skills: self.agent_loop.skill_registry.clone(),
+                mcp: self.mcp_runtime.connections().cloned(),
+                extra_providers: base_providers,
+                policy,
+                soul: self.config.soul.clone(),
+                coauthor: self.config.git_coauthor.clone(),
+                vision_enabled: self.agent_loop.session.vision_enabled,
+                thinking_level: self.agent_loop.session.thinking_level,
+                memory_model,
+                hooks: crate::runner::hooks::standard_hooks(
+                    self.agent_loop.session.diagnostics_state.clone(),
+                ),
+                stream_retrying: self.agent_loop.cancel.stream_retrying.clone(),
+                max_steps: None,
+            }
+            .build(),
+        )
     }
 
     /// Run the application's main loop. Returns the final session UUID.
@@ -1065,20 +1037,12 @@ impl App<'_> {
     /// configured. Shared by recall, association, and Dream so all three agree
     /// on which model memory work uses.
     pub(crate) fn effective_memory_model(&self) -> Option<crate::tools::memory::MemoryModel> {
-        if !self.config.memory.enabled {
-            return None;
-        }
-        let target = self
-            .config
-            .memory_model
-            .as_deref()
-            .unwrap_or(&self.agent_loop.session.current_model);
-        self.provider_manager
-            .resolve(target)
-            .map(|(client, model)| crate::tools::memory::MemoryModel {
-                client: client.clone(),
-                model,
-            })
+        crate::runner::assembly::resolve_memory_model(
+            &self.provider_manager,
+            self.config.memory.enabled,
+            self.config.memory_model.as_deref(),
+            &self.agent_loop.session.current_model,
+        )
     }
 
     fn start_auto_dream(&mut self) {

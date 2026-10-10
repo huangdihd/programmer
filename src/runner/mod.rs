@@ -20,6 +20,7 @@
 //! becomes reusable for headless CLI commands and, later, in-process sub-agents.
 
 mod argument_guard;
+pub(crate) mod assembly;
 pub(crate) mod classify;
 pub(crate) mod hooks;
 pub(crate) mod request;
