@@ -1,3 +1,29 @@
+### programmer v0.2.26
+
+- Connect the configured `mcp_servers` in headless `programmer run` and
+  `programmer init`, so the agent and its sub-agents get the same
+  `mcp__<server>__<tool>` tools as the TUI. Previously headless runs started no
+  MCP servers. Servers start after the work mode and classifier are validated;
+  one that fails is skipped with a warning on stderr and the run continues.
+- Connect MCP servers concurrently in both the TUI and headless runs. A slow or
+  hung server now costs only its own handshake timeout instead of delaying every
+  server configured after it. Startup errors keep configuration order, while
+  connection status updates arrive in completion order.
+- Share turn assembly between the TUI, headless runs, and sub-agents: one module
+  installs the common tool providers, resolves the approval policy once for a
+  parent and its children, and applies the same memory-model gate everywhere.
+- Add regressions for shared assembly, the memory and classifier gates, headless
+  MCP startup with a failing server, and concurrent startup past a hung server;
+  update usage and architecture documentation.
+
+Upgrade note: headless runs with `mcp_servers` configured now spend time
+starting those servers before the first turn, and that time counts against
+`--timeout`.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.25...v0.2.26
+
+---
+
 ### programmer v0.2.25
 
 - Fix compaction during long, tool-heavy turns: mandatory safe-point compaction
