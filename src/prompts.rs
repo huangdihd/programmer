@@ -218,6 +218,16 @@ You are in **Plan Mode**. You must NOT make any changes yet.
 
 Your response should end with a complete plan — not with a tool call.";
 
+/// Developer instruction used after approving a plan for Manual execution.
+pub(crate) const PLAN_APPROVED_MANUAL_PROMPT: &str = "The plan was approved by the user. Execute it now using the identified steps. Ask for approval before running commands or destructive edits.";
+
+/// Developer instruction used after approving a plan for Auto execution.
+pub(crate) const PLAN_APPROVED_AUTO_PROMPT: &str =
+    "The plan was approved by the user. Execute it now using the identified steps.";
+
+/// Developer instruction used after approving a plan for YOLO execution.
+pub(crate) const PLAN_APPROVED_YOLO_PROMPT: &str = "The plan was approved by the user. Execute it now using the identified steps. You have full autonomy.";
+
 // ---------------------------------------------------------------------------
 // Session titles
 // ---------------------------------------------------------------------------

@@ -841,6 +841,7 @@ impl App<'_> {
             ),
             checkpoint: self.checkpoint_recorder(),
             conversation_history: Some(self.agent_loop.session.conversation.clone()),
+            tool_filter: Default::default(),
         };
         base_providers.push(Arc::new(crate::tools::provider::AgentToolProvider::new(
             self.agent_loop.session.agents.clone(),

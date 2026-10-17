@@ -27,7 +27,7 @@
 //!    bubbles up and the runner waits for a decision. This is what a sub-agent
 //!    forwards to its parent, and ultimately to the human at the TUI.
 
-use super::RunnerEvent;
+use super::{RunnerError, RunnerEvent};
 use crate::cancel::OperationId;
 use crate::tools::ask_user::QuestionHandler;
 use async_openai::types::responses::FunctionToolCall;
@@ -55,9 +55,11 @@ pub(crate) trait AgentSurface: Send + Sync {
 
     /// Reach a response boundary where the front-end may need to compact
     /// before the runner sends another request. Non-interactive surfaces keep
-    /// the historical non-blocking behaviour.
-    async fn usage_safe_point(&self, input_tokens: u32) {
+    /// the historical non-blocking behaviour. An error stops the turn, including
+    /// at the final response boundary.
+    async fn usage_safe_point(&self, input_tokens: u32) -> Result<(), RunnerError> {
         self.on_event(RunnerEvent::UsageSafePoint { input_tokens });
+        Ok(())
     }
 
     /// A classifier `Ask` verdict needs a decision. `reason` is the classifier's
@@ -75,8 +77,14 @@ pub(crate) trait AgentSurface: Send + Sync {
     // --- Front-end context (defaulted; the headless surface takes the None /
     // headless answer). ---
 
+    /// Opt into serial execution and resumable input-required checkpoints.
+    /// The default preserves legacy review and question handling.
+    fn suspend_enabled(&self) -> bool {
+        false
+    }
+
     /// The front-end's question endpoint. Without it, interactive tools are
-    /// pre-denied instead of waiting for an answer that cannot arrive.
+    /// pre-denied unless resumable suspension is enabled.
     fn questions(&self) -> Option<QuestionHandler> {
         None
     }

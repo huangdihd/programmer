@@ -20,12 +20,16 @@
 //! becomes reusable for headless CLI commands and, later, in-process sub-agents.
 
 mod argument_guard;
+pub(crate) mod filter;
+pub(crate) use filter::ToolFilter;
 pub(crate) mod assembly;
 pub(crate) mod classify;
 pub(crate) mod hooks;
 pub(crate) mod request;
 pub(crate) mod stream;
 pub(crate) mod surface;
+mod suspension;
+pub use suspension::{Pending, PendingKind, RunnerCheckpoint};
 pub(crate) mod tools;
 
 #[cfg(test)]
@@ -46,7 +50,7 @@ use async_openai::types::responses::{
     OutputItem, OutputMessageContent, OutputStatus, ResponseStreamEvent,
 };
 use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The Auto-mode LLM classifier's inputs, boxed into [`RunnerPolicy::Llm`] so
@@ -108,13 +112,35 @@ pub(crate) struct TurnRunner {
     /// Maximum number of model responses in one turn. A tool-call response
     /// consumes one step; `None` leaves the agent loop unbounded.
     pub max_steps: Option<usize>,
+    pub tool_filter: ToolFilter,
+    /// Shared counters survive cancellation or dropping a timed-out turn future.
+    pub metrics: Arc<RunMetrics>,
 }
 
 pub(crate) use crate::diagnostics::DiagnosticsState;
 
+/// Counts observed model responses and requested tool calls, including denied calls.
+/// Reset at turn start; callers can clone the Arc before awaiting a turn.
+#[derive(Debug, Default)]
+pub struct RunMetrics {
+    pub steps: AtomicUsize,
+    pub tool_calls: AtomicUsize,
+}
+
+impl RunMetrics {
+    pub fn snapshot(&self) -> (usize, usize) {
+        (
+            self.steps.load(Ordering::Relaxed),
+            self.tool_calls.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// The result of a completed turn.
 #[derive(Debug)]
 pub struct TurnResult {
+    pub steps: usize,
+    pub tool_calls: usize,
     pub final_text: String,
     #[allow(dead_code)]
     pub usage: (u32, u32, u32),
@@ -130,6 +156,10 @@ pub enum RunnerError {
         code: Option<String>,
         message: String,
     },
+    #[error("compaction failed: {0}")]
+    Compaction(String),
+    #[error("input required")]
+    InputRequired { checkpoint: Box<RunnerCheckpoint> },
     #[error("cancelled")]
     Cancelled,
     #[error("the model returned no output")]
@@ -283,7 +313,7 @@ async fn poll_memory_association(
     )
 }
 
-fn ensure_tool_output_pairing(conversation: &Mutex<Conversation>) {
+pub(crate) fn ensure_tool_output_pairing(conversation: &Mutex<Conversation>) {
     use async_openai::types::responses::{FunctionCallOutput, OutputItem};
     use std::collections::HashSet;
 
@@ -369,6 +399,18 @@ fn commit_aborted_response(
 }
 
 impl TurnRunner {
+    /// Apply after assembly/MCP connection. Returned patterns match no registered
+    /// tool and should be surfaced as warnings by the caller.
+    pub(crate) fn set_tool_filter(&mut self, filter: ToolFilter) -> Vec<String> {
+        let unmatched = filter.unmatched_patterns(&self.tools.tools());
+        self.tool_filter = filter;
+        unmatched
+    }
+
+    pub(crate) fn available_tools(&self) -> Vec<async_openai::types::responses::Tool> {
+        self.tool_filter.select(self.tools.tools())
+    }
+
     /// Run a full turn: stream a response, run any tool calls it requests, and
     /// loop until the model answers with no tool calls (returning its text) or
     /// an error is hit. `conversation` is mutated in place with every
@@ -379,8 +421,36 @@ impl TurnRunner {
         cancel: &CancellationToken,
         surface: &dyn AgentSurface,
     ) -> Result<TurnResult, RunnerError> {
-        conversation.lock().unwrap().recalled_memories = Some(0);
+        self.run_turn_inner(conversation, cancel, surface, None)
+            .await
+    }
+
+    /// Continue a suspended turn without replaying completed calls.
+    pub(crate) async fn run_turn_from(
+        &self,
+        conversation: &Mutex<Conversation>,
+        cancel: &CancellationToken,
+        surface: &dyn AgentSurface,
+        checkpoint: RunnerCheckpoint,
+        answer: String,
+    ) -> Result<TurnResult, RunnerError> {
+        self.run_turn_inner(conversation, cancel, surface, Some((checkpoint, answer)))
+            .await
+    }
+
+    async fn run_turn_inner(
+        &self,
+        conversation: &Mutex<Conversation>,
+        cancel: &CancellationToken,
+        surface: &dyn AgentSurface,
+        resume: Option<(RunnerCheckpoint, String)>,
+    ) -> Result<TurnResult, RunnerError> {
+        if resume.is_none() {
+            conversation.lock().unwrap().recalled_memories = Some(0);
+        }
         let retrying = &self.stream_retrying;
+        self.metrics.steps.store(0, Ordering::Relaxed);
+        self.metrics.tool_calls.store(0, Ordering::Relaxed);
         let mut steps = 0usize;
         let mut argument_failures = 0usize;
         let mut post_edit_reminder_added = false;
@@ -389,16 +459,38 @@ impl TurnRunner {
         // Start association beside the first model request instead of putting
         // it on the first-token path. A result can join a later step after a
         // tool round; a one-response turn never waits for it.
-        let mut association = self.memory_model.as_ref().and_then(|memory_model| {
-            association_context(conversation).map(|(context, query)| {
-                spawn_memory_association(
-                    memory_model.clone(),
-                    context,
-                    query,
-                    conversation.lock().unwrap().context_memory_ids(),
-                )
-            })
-        });
+        let mut association = self
+            .memory_model
+            .as_ref()
+            .filter(|_| resume.is_none())
+            .and_then(|memory_model| {
+                association_context(conversation).map(|(context, query)| {
+                    spawn_memory_association(
+                        memory_model.clone(),
+                        context,
+                        query,
+                        conversation.lock().unwrap().context_memory_ids(),
+                    )
+                })
+            });
+        if let Some((mut checkpoint, answer)) = resume {
+            steps = checkpoint.steps;
+            self.metrics.steps.store(steps, Ordering::Relaxed);
+            self.metrics
+                .tool_calls
+                .store(checkpoint.tool_calls, Ordering::Relaxed);
+            association_grace_used = true;
+            self.run_suspendable_batch(
+                conversation,
+                cancel,
+                surface,
+                &mut checkpoint,
+                Some(answer),
+            )
+            .await?;
+            post_edit_reminder_added = checkpoint.post_edit_reminder_added;
+            programmer_md_edited = checkpoint.programmer_md_edited;
+        }
         loop {
             if cancel.is_cancelled() {
                 ensure_tool_output_pairing(conversation);
@@ -460,13 +552,15 @@ impl TurnRunner {
                     thinking_level: self.thinking_level,
                 };
                 let conv = conversation.lock().unwrap();
-                request::build_request(&conv, &ctx, self.model_name.clone(), self.tools.tools())
+                request::build_request(&conv, &ctx, self.model_name.clone(), self.available_tools())
             };
             surface.on_event(RunnerEvent::Phase(RunnerPhase::Streaming));
             let mut partial = PartialResponse::new(cancel.child());
             let mut stream_err: Option<OpenAIError> = None;
             let mut argument_guard = argument_guard::ArgumentGuard::default();
             let mut argument_failed = false;
+            let mut response_observed = false;
+            let mut observed_calls = 0;
             stream::stream_until(
                 &self.client,
                 &req,
@@ -476,7 +570,18 @@ impl TurnRunner {
                 |result| {
                     match result {
                         Ok(ev) => {
-                            if !argument_guard.accept(&ev) {
+                            if !response_observed {
+                                self.metrics.steps.fetch_add(1, Ordering::Relaxed);
+                                response_observed = true;
+                            }
+                            let accepted = argument_guard.accept(&ev);
+                            let call_count = argument_guard.calls.len();
+                            self.metrics.tool_calls.fetch_add(
+                                call_count.saturating_sub(observed_calls),
+                                Ordering::Relaxed,
+                            );
+                            observed_calls = call_count;
+                            if !accepted {
                                 argument_failed = true;
                                 return std::ops::ControlFlow::Break(());
                             }
@@ -614,10 +719,13 @@ impl TurnRunner {
                     surface.on_event(RunnerEvent::Activity(
                         "context usage safe point / compaction",
                     ));
-                    surface.usage_safe_point(input_tokens).await;
+                    surface.usage_safe_point(input_tokens).await?;
                 }
                 let usage = conversation.lock().unwrap().accumulated_usage;
+                let (steps, tool_calls) = self.metrics.snapshot();
                 return Ok(TurnResult {
+                    steps,
+                    tool_calls,
                     final_text: assistant_text,
                     usage,
                 });
@@ -626,6 +734,21 @@ impl TurnRunner {
             // ---- classify, then run the calls ----
             for call in &calls {
                 surface.on_event(RunnerEvent::ToolCall { name: &call.name });
+            }
+            if surface.suspend_enabled() {
+                let mut checkpoint = RunnerCheckpoint::new(
+                    calls,
+                    steps,
+                    self.metrics.snapshot().1,
+                    usage.map(|u| u.0),
+                    post_edit_reminder_added,
+                    programmer_md_edited,
+                );
+                self.run_suspendable_batch(conversation, cancel, surface, &mut checkpoint, None)
+                    .await?;
+                post_edit_reminder_added = checkpoint.post_edit_reminder_added;
+                programmer_md_edited = checkpoint.programmer_md_edited;
+                continue;
             }
             // Snapshot the batch metadata the hooks self-gate on — but only when
             // any are attached, so a hook-free headless run does no extra work. We need
@@ -707,7 +830,7 @@ impl TurnRunner {
                         surface.on_event(RunnerEvent::Activity(
                             "context usage safe point / compaction",
                         ));
-                        surface.usage_safe_point(input_tokens).await;
+                        surface.usage_safe_point(input_tokens).await?;
                     }
                 }
                 None => {
@@ -736,7 +859,12 @@ impl TurnRunner {
         let mut denied: Vec<crate::tools::ToolOutput> = Vec::new();
         let mut classifiable: Vec<FunctionToolCall> = Vec::new();
         for call in calls {
-            if let Err(reason) = self.tools.validate(&call) {
+            // Only an explicit per-run filter changes dispatch; unfiltered runs
+            // keep the registry's own validation and wording.
+            if !self.tool_filter.permits(&call.name) {
+                let reason = format!("tool not available in this run: {}", call.name);
+                denied.push(classify::invalid_tool_call_output(&call, &reason));
+            } else if let Err(reason) = self.tools.validate(&call) {
                 denied.push(classify::invalid_tool_call_output(&call, &reason));
             } else if self.tools.requires_interaction(&call.name) && questions.is_none() {
                 let reason = format!("{} is unavailable in non-interactive mode", call.name);
@@ -1859,6 +1987,8 @@ mod tests {
             stream_retrying: Arc::new(AtomicBool::new(false)),
             stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: None,
+            tool_filter: Default::default(),
+            metrics: Default::default(),
         }
     }
 
@@ -2244,6 +2374,61 @@ mod tests {
             .expect_err("a second model response should be rejected");
 
         assert!(matches!(error, RunnerError::StepLimit { limit: 1 }));
+        assert_eq!(runner.metrics.snapshot(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn filtered_and_hallucinated_calls_are_denied_and_counted() {
+        let body = format!(
+            "{}{}{}",
+            item_added_frame(
+                1,
+                0,
+                &call_item("c1", "read_file", "{\"path\":\"Cargo.toml\"}")
+            ),
+            item_added_frame(2, 1, &call_item("c2", "invented_tool", "{}")),
+            completed_frame(3)
+        );
+        let final_body = format!(
+            "{}{}",
+            item_added_frame(1, 0, &message_item("done")),
+            completed_frame(2)
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base, server) =
+            spawn_recorded_responses(vec![body, final_body], requests.clone()).await;
+        let mut runner = engine_for(&base);
+        assert!(
+            runner
+                .set_tool_filter(ToolFilter {
+                    allowed: vec!["read_*".into()],
+                    disallowed: vec!["read_file".into()],
+                })
+                .is_empty()
+        );
+        let conversation = Mutex::new(Conversation::new());
+        let result = runner
+            .run_turn(&conversation, &CancellationToken::new(), &HeadlessSurface)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!((result.steps, result.tool_calls), (2, 2));
+        assert_eq!(runner.metrics.snapshot(), (2, 2));
+        let history = format!(
+            "{:?}",
+            conversation.lock().unwrap().items().collect::<Vec<_>>()
+        );
+        assert!(history.contains("tool not available in this run: read_file"));
+        assert!(history.contains("tool not available in this run: invented_tool"));
+        for request in requests.lock().unwrap().iter() {
+            assert!(
+                !request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "read_file")
+            );
+        }
     }
 
     async fn assert_hanging_hook_cancels(after: bool) {
@@ -2304,6 +2489,9 @@ mod tests {
         })
         .await
         .expect("hook must be entered");
+        // These counters are readable even while the turn is suspended (or
+        // after a caller drops its future on timeout).
+        assert_eq!(runner.metrics.snapshot(), (1, 1));
         cancel.cancel();
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), &mut turn)
             .await
@@ -2453,6 +2641,76 @@ mod tests {
         assert_eq!(denied, 2, "both interactive tools should be denied");
     }
 
+    #[tokio::test]
+    async fn usage_safe_point_error_stops_turn_at_both_response_boundaries() {
+        struct FailingSurface;
+
+        #[async_trait::async_trait]
+        impl AgentSurface for FailingSurface {
+            fn on_event(&self, _event: RunnerEvent<'_>) {}
+
+            async fn usage_safe_point(&self, input_tokens: u32) -> Result<(), RunnerError> {
+                assert_eq!(input_tokens, 150_000);
+                Err(RunnerError::Compaction(
+                    "mandatory compaction failed".into(),
+                ))
+            }
+
+            async fn review(
+                &self,
+                call: &FunctionToolCall,
+                reason: &str,
+                position: (usize, usize),
+            ) -> ReviewDecision {
+                HeadlessSurface.review(call, reason, position).await
+            }
+        }
+
+        for tool_response in [false, true] {
+            let item = if tool_response {
+                call_item("a1", "ask_user", r#"{"question":"?","kind":"text"}"#)
+            } else {
+                message_item("done")
+            };
+            let completed = frame(serde_json::json!({
+                "type": "response.completed", "sequence_number": 2,
+                "response": {
+                    "created_at": 0, "id": "resp_1", "model": "mock",
+                    "object": "response", "output": [], "status": "completed",
+                    "usage": {
+                        "input_tokens": 150_000, "output_tokens": 1, "total_tokens": 150_001,
+                        "input_tokens_details": { "cached_tokens": 0 },
+                        "output_tokens_details": { "reasoning_tokens": 0 }
+                    }
+                }
+            }));
+            let body = format!("{}{}", item_added_frame(1, 0, &item), completed);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let (base, server) = spawn_recorded_responses(vec![body], requests.clone()).await;
+            let runner = engine_for(&base);
+            let mut c = Conversation::new();
+            c.add_input_message(user("go"));
+            let conv = Mutex::new(c);
+            let cancel = CancellationToken::new();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                runner.run_turn(&conv, &cancel, &FailingSurface),
+            )
+            .await
+            .expect("safe point failure must stop the turn");
+            server.abort();
+            let error = result.expect_err("mandatory compaction must fail even after final text");
+            assert!(
+                matches!(&error, RunnerError::Compaction(message) if message == "mandatory compaction failed")
+            );
+            assert_eq!(
+                error.to_string(),
+                "compaction failed: mandatory compaction failed"
+            );
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
     /// A surface that decides every `review` the same way and records the
     /// notifications it receives — a stand-in for the TUI / a parent agent.
     struct TestSurface {
@@ -2518,6 +2776,8 @@ mod tests {
             stream_retrying: Arc::new(AtomicBool::new(false)),
             stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: None,
+            tool_filter: Default::default(),
+            metrics: Default::default(),
         }
     }
 
@@ -2915,5 +3175,200 @@ mod tests {
             matches!(decision, crate::runner::ReviewDecision::Deny { .. }),
             "cancelled review should return Deny"
         );
+    }
+    struct SuspendSurface;
+    #[async_trait::async_trait]
+    impl AgentSurface for SuspendSurface {
+        fn on_event(&self, _: RunnerEvent<'_>) {}
+        fn suspend_enabled(&self) -> bool {
+            true
+        }
+        async fn review(&self, _: &FunctionToolCall, _: &str, _: (usize, usize)) -> ReviewDecision {
+            panic!("suspended reviews never reach the surface")
+        }
+    }
+
+    fn suspended(error: RunnerError) -> RunnerCheckpoint {
+        let RunnerError::InputRequired { checkpoint } = error else {
+            panic!("expected suspension: {error}")
+        };
+        serde_json::from_str(&serde_json::to_string(&checkpoint).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn suspension_batch_three_approve_and_deny_without_replay() {
+        use crate::tools::provider::{ToolCtx, ToolProvider, ToolRegistry};
+        struct Provider(Arc<Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl ToolProvider for Provider {
+            fn tools(&self) -> Vec<async_openai::types::responses::Tool> {
+                let mut tool = crate::tools::read_file::tool();
+                if let async_openai::types::responses::Tool::Function(ref mut function) = tool {
+                    function.name = "fake".into();
+                    function.parameters =
+                        Some(serde_json::json!({"type":"object", "properties": {}}));
+                }
+                vec![tool]
+            }
+            async fn call(
+                &self,
+                call: &FunctionToolCall,
+                _: &ToolCtx<'_>,
+            ) -> Result<async_openai::types::responses::FunctionCallOutput, String> {
+                self.0.lock().unwrap().push(call.call_id.clone());
+                Ok(async_openai::types::responses::FunctionCallOutput::Text(
+                    "done".into(),
+                ))
+            }
+        }
+        for answer in ["Approve", "Deny"] {
+            let executions = Arc::new(Mutex::new(vec![]));
+            let mut runner = sync_engine(crate::classifier::WorkMode::Manual);
+            runner.tools = Arc::new(ToolRegistry::new(vec![Arc::new(Provider(
+                executions.clone(),
+            ))]));
+            let calls = (1..=3)
+                .map(|i| match call_item(&i.to_string(), "fake", "{}") {
+                    OutputItem::FunctionCall(c) => c,
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            let conv = Mutex::new(Conversation::new());
+            for call in &calls {
+                conv.lock()
+                    .unwrap()
+                    .add_output(OutputItem::FunctionCall(call.clone()));
+            }
+            let cancel = CancellationToken::new();
+            let mut state = RunnerCheckpoint::new(calls, 1, 3, None, false, false);
+            state = suspended(
+                runner
+                    .run_suspendable_batch(&conv, &cancel, &SuspendSurface, &mut state, None)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(state.pending.call.call_id, "1");
+            state = suspended(
+                runner
+                    .run_suspendable_batch(
+                        &conv,
+                        &cancel,
+                        &SuspendSurface,
+                        &mut state,
+                        Some("Approve".into()),
+                    )
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(state.pending.call.call_id, "2");
+            assert_eq!(*executions.lock().unwrap(), vec!["1"]);
+            state = suspended(
+                runner
+                    .run_suspendable_batch(
+                        &conv,
+                        &cancel,
+                        &SuspendSurface,
+                        &mut state,
+                        Some(answer.into()),
+                    )
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(state.pending.call.call_id, "3");
+            runner
+                .run_suspendable_batch(
+                    &conv,
+                    &cancel,
+                    &SuspendSurface,
+                    &mut state,
+                    Some("Approve".into()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                *executions.lock().unwrap(),
+                if answer == "Approve" {
+                    vec!["1", "2", "3"]
+                } else {
+                    vec!["1", "3"]
+                }
+            );
+            assert_eq!(
+                conv.lock()
+                    .unwrap()
+                    .items()
+                    .filter(|i| matches!(i, MessageItem::ToolOutput { .. }))
+                    .count(),
+                3
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn suspension_real_questions_and_permission_grants() {
+        use crate::security::{SandboxMode, SecurityHandle, SecurityManager};
+        let security = Arc::new(SecurityHandle::new(Arc::new(
+            SecurityManager::standalone().unwrap(),
+        )));
+        security.set_sandbox_mode(SandboxMode::Restricted).unwrap();
+        let mut runner = engine_for("http://127.0.0.1:1");
+        runner.tools = Arc::new(crate::tools::provider::ToolRegistry::new(vec![Arc::new(
+            crate::tools::provider::LocalToolProvider::new(Default::default(), security.clone()),
+        )]));
+        for (name, args, answer, kind) in [
+            (
+                "ask_user",
+                r#"{"kind":"text","question":"Your name?","options":[]}"#,
+                "Ada",
+                PendingKind::Question,
+            ),
+            (
+                "request_permission",
+                r#"{"kind":"sandbox","mode":"network","reason":"test","operation":null,"path":null}"#,
+                "Deny",
+                PendingKind::Permission,
+            ),
+            (
+                "request_permission",
+                r#"{"kind":"sandbox","mode":"network","reason":"test","operation":null,"path":null}"#,
+                "Approve for this session",
+                PendingKind::Permission,
+            ),
+        ] {
+            let OutputItem::FunctionCall(call) = call_item("interactive", name, args) else {
+                unreachable!()
+            };
+            let conv = Mutex::new(Conversation::new());
+            conv.lock()
+                .unwrap()
+                .add_output(OutputItem::FunctionCall(call.clone()));
+            let cancel = CancellationToken::new();
+            let mut state = RunnerCheckpoint::new(vec![call], 1, 1, None, false, false);
+            state = suspended(
+                runner
+                    .run_suspendable_batch(&conv, &cancel, &SuspendSurface, &mut state, None)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(state.pending.kind, kind);
+            assert_eq!(
+                conv.lock().unwrap().items().count(),
+                1,
+                "no cancelled output on suspension"
+            );
+            assert_eq!(security.sandbox_mode(), SandboxMode::Restricted);
+            runner
+                .run_suspendable_batch(
+                    &conv,
+                    &cancel,
+                    &SuspendSurface,
+                    &mut state,
+                    Some(answer.into()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(conv.lock().unwrap().items().count(), 2);
+        }
+        assert_eq!(security.sandbox_mode(), SandboxMode::Network);
     }
 }

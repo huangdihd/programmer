@@ -1,3 +1,48 @@
+### programmer v0.2.27
+
+- Give headless `programmer run` and `programmer init` stable exit codes:
+  0 success, 1 runtime error, 2 usage error, 3 `--check` failed, 4 timeout,
+  5 `--max-steps` reached, 10 input required, 130 interrupted.
+- Add per-run security overrides that are never written back to the
+  configuration: `--security-profile`, `--sandbox restricted|network|off`,
+  `--allow-read`, `--allow-write`, `--deny-read`, `--deny-env` and
+  `--no-protect-file-changes`. They are also accepted by `diagnostics` and the
+  MCP server commands.
+- Add run options: `--config` (loaded read-only), `--append-prompt` and
+  `--append-prompt-file`, `--image`, `--vision`/`--no-vision`, `--no-memory`,
+  `--mcp`/`--no-mcp`, `--allowed-tools`/`--disallowed-tools`,
+  `--coauthor`/`--no-coauthor` and `--soul-file`. JSON and JSONL results now
+  include `stop_reason`, `work_mode`, `security`, `steps`, `tool_calls`,
+  `duration_ms`, `session_id` and `compactions`; JSONL adds `start`,
+  `compaction` and `input_required` events. `schema_version` stays 1.
+- Save and continue headless sessions with `--save-session`,
+  `--resume <UUID>`, `--continue`, `--fork` and `--no-save`. Headless runs
+  hold the same session lock as the TUI, so one session cannot be driven
+  twice at once.
+- Compact context during long headless runs, with `--compact-tokens`,
+  `--mandatory-compact-tokens` and `--no-compact` overrides. The TUI's
+  compaction logic moved to a shared module without behavior changes.
+- Suspend instead of failing when a run needs a person: manual approvals,
+  classifier Ask verdicts, `ask_user`, sandbox permission requests and plan
+  review save the session and exit with code 10. The result carries a
+  `pending` object with the question, options and a ready-to-copy
+  `resume_command`; continue with `--resume <UUID> --answer <ANSWER>` (or
+  `--answer-file`, optionally checked with `--answer-id`) from the original
+  workspace. `--work-mode manual` suspends automatically; other modes need
+  `--suspend`.
+- Add unit and binary regressions for exit codes, overrides that leave the
+  configuration untouched, sessions, compaction and suspension; update the
+  headless documentation.
+
+Upgrade note: scripts that treated any non-zero exit as one failure keep
+working, but usage errors now exit 2, timeouts 4 and step limits 5 instead
+of 1. A headless `--work-mode manual` run now exits 10 at the first approval
+instead of denying the tool call.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.26...v0.2.27
+
+---
+
 ### programmer v0.2.26
 
 - Connect the configured `mcp_servers` in headless `programmer run` and

@@ -21,6 +21,9 @@ use super::{command_handlers, diagnostics, session};
 use crate::cancel::OperationId;
 use crate::classifier::{PlanPhase, WorkMode};
 use crate::commands::Command;
+#[cfg(test)]
+use crate::compaction::compact_response_text;
+use crate::compaction::{build_compact_request, compact_input_items, stream_compact_response};
 use crate::ui::event::{AppEvent, Event};
 use async_openai::types::responses::MessageItem as ApiMessageItem;
 use async_openai::types::responses::{
@@ -946,128 +949,6 @@ fn normalize_input_suggestion(response: &str) -> Result<String, String> {
     } else {
         Ok(suggestion.chars().take(240).collect())
     }
-}
-
-/// Build the no-tools request shared by foreground and background compaction.
-fn build_compact_request(
-    input_items: Vec<async_openai::types::responses::InputItem>,
-    model_name: String,
-    thinking_level: crate::thinking::ThinkingLevel,
-) -> async_openai::types::responses::CreateResponse {
-    async_openai::types::responses::CreateResponse {
-        input: async_openai::types::responses::InputParam::Items(input_items),
-        model: Some(model_name),
-        reasoning: thinking_level.reasoning(),
-        ..Default::default()
-    }
-}
-
-fn compact_input_items(
-    input: async_openai::types::responses::InputParam,
-) -> Vec<async_openai::types::responses::InputItem> {
-    use async_openai::types::responses::{InputItem, InputParam, Item};
-    let mut items = match input {
-        InputParam::Items(items) => items,
-        InputParam::Text(text) => vec![InputItem::from(Item::Message(ApiMessageItem::Input(
-            InputMessage {
-                content: vec![InputContent::InputText(InputTextContent { text })],
-                role: InputRole::User,
-                status: Some(OutputStatus::Completed),
-            },
-        )))],
-    };
-    items.push(InputItem::from(Item::Message(ApiMessageItem::Input(
-        InputMessage {
-            content: vec![InputContent::InputText(InputTextContent {
-                text: crate::prompts::COMPACT_PROMPT.to_string(),
-            })],
-            role: InputRole::User,
-            status: Some(OutputStatus::Completed),
-        },
-    ))));
-    items
-}
-
-fn compact_response_text(
-    response: async_openai::types::responses::Response,
-) -> Result<String, String> {
-    use async_openai::types::responses::{OutputItem, OutputMessageContent};
-    let text = response
-        .output
-        .iter()
-        .filter_map(|item| match item {
-            OutputItem::Message(message) => {
-                Some(message.content.iter().filter_map(|content| match content {
-                    OutputMessageContent::OutputText(text) => Some(text.text.as_str()),
-                    _ => None,
-                }))
-            }
-            _ => None,
-        })
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.trim().is_empty() {
-        Err("the model returned an empty summary".to_string())
-    } else {
-        Ok(text)
-    }
-}
-
-/// Stream a compaction response so long summaries keep the provider connection
-/// active, then finalize the accumulated events through the same response
-/// machinery as a normal turn.
-async fn stream_compact_response(
-    client: &async_openai::Client<async_openai::config::OpenAIConfig>,
-    request: async_openai::types::responses::CreateResponse,
-    cancel: crate::cancel::CancellationToken,
-) -> Result<crate::ui::event::CompactionResult, String> {
-    let mut partial = crate::response::partial_response::PartialResponse::new(cancel.clone());
-    let mut stream_error = None;
-    let retrying = std::sync::atomic::AtomicBool::new(false);
-
-    crate::runner::stream::stream_with_retries(
-        client,
-        &request,
-        &cancel,
-        &retrying,
-        crate::consts::MAX_STREAM_RETRIES,
-        |event| match event {
-            Ok(event) => partial.handle_response_stream_event(event),
-            Err(error) => stream_error = Some(error),
-        },
-    )
-    .await;
-
-    if cancel.is_cancelled() {
-        return Err("cancelled".to_string());
-    }
-    if let Some(error) = stream_error {
-        return Err(error_chain(&error));
-    }
-
-    let usage = partial.usage;
-    let summary = partial
-        .finalize()
-        .map_err(|error| error_chain(&error))
-        .and_then(compact_response_text)?;
-    Ok(crate::ui::event::CompactionResult {
-        summary,
-        input_tokens: usage.map(|(input, _, _)| input),
-        output_tokens: usage.map(|(_, output, _)| output),
-    })
-}
-
-/// Include nested transport causes hidden by reqwest's top-level Display text.
-fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    message
 }
 
 pub(crate) fn start_compact(app: &mut App<'_>) {
@@ -2547,6 +2428,100 @@ pub(crate) mod tests {
                 ExpectedCommandEffect::TodoPanel => assert!(app.ui.todo_panel.is_some()),
                 ExpectedCommandEffect::Quit => assert!(!app.running),
             }
+        }
+    }
+
+    #[test]
+    fn compact_characterization_request_preserves_input_and_has_no_tools() {
+        use async_openai::types::responses::InputParam;
+        let items = super::compact_input_items(InputParam::Text("history".into()));
+        let expected = serde_json::to_value(&items).unwrap();
+        let request = build_compact_request(
+            items,
+            "test-model".into(),
+            crate::thinking::ThinkingLevel::Low,
+        );
+        assert_eq!(serde_json::to_value(&request.input).unwrap(), expected);
+        assert_eq!(request.model.as_deref(), Some("test-model"));
+        assert!(request.tools.is_none());
+        assert!(request.tool_choice.is_none());
+        assert_eq!(
+            serde_json::to_value(request.reasoning).unwrap()["effort"],
+            "low"
+        );
+    }
+
+    #[test]
+    fn compact_characterization_input_appends_prompt_and_preserves_items() {
+        use async_openai::types::responses::InputParam;
+        let text_items = super::compact_input_items(InputParam::Text("history".into()));
+        let value = serde_json::to_value(&text_items).unwrap();
+        assert_eq!(text_items.len(), 2);
+        assert_eq!(value[0]["content"][0]["text"], "history");
+        for index in 0..2 {
+            assert_eq!(value[index]["role"], "user");
+            assert_eq!(value[index]["status"], "completed");
+            assert_eq!(value[index]["content"][0]["type"], "input_text");
+        }
+        assert_eq!(
+            value[1]["content"][0]["text"],
+            crate::prompts::COMPACT_PROMPT
+        );
+        let appended = super::compact_input_items(InputParam::Items(text_items));
+        let appended = serde_json::to_value(appended).unwrap();
+        assert_eq!(appended.as_array().unwrap().len(), 3);
+        assert_eq!(appended[0], value[0]);
+        assert_eq!(appended[1], value[1]);
+        assert_eq!(appended[2], value[1]);
+        let empty = super::compact_input_items(InputParam::Items(Vec::new()));
+        assert_eq!(
+            serde_json::to_value(empty).unwrap(),
+            serde_json::json!([value[1]])
+        );
+    }
+
+    #[test]
+    fn compact_characterization_response_joins_only_text_without_trimming() {
+        let response = |output| {
+            serde_json::from_value(serde_json::json!({
+                "created_at": 0, "id": "compact-test", "model": "test",
+                "object": "response", "status": "completed", "output": output
+            }))
+            .unwrap()
+        };
+        let message = |content| {
+            serde_json::json!({
+                "type": "message", "id": "msg-test", "role": "assistant",
+                "status": "completed", "content": content
+            })
+        };
+        let text = |text| {
+            serde_json::json!({
+                "type": "output_text", "text": text, "annotations": []
+            })
+        };
+        let output = serde_json::json!([
+            {"type": "reasoning", "id": "reason-test", "summary": []},
+            message(serde_json::json!([
+                text("  first "), {"type": "refusal", "refusal": "ignored"}, text("second")
+            ])),
+            message(serde_json::json!([text("last\n")]))
+        ]);
+        assert_eq!(
+            super::compact_response_text(response(output)).unwrap(),
+            "  first \nsecond\nlast\n"
+        );
+        for output in [
+            serde_json::json!([]),
+            serde_json::json!([message(serde_json::json!([text(" \n\t")]))]),
+            serde_json::json!([message(
+                serde_json::json!([{"type": "refusal", "refusal": "no"}])
+            )]),
+        ] {
+            assert_eq!(
+                super::compact_response_text(response(output)),
+                Err("the model returned an empty summary".into())
+            );
         }
     }
 

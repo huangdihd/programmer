@@ -493,6 +493,8 @@ use crate::runner::assembly::PolicySpec;
 
 #[derive(Clone)]
 pub(crate) struct AgentRuntime {
+    /// Inherited capability filter; model overrides cannot broaden it.
+    pub(crate) tool_filter: crate::runner::ToolFilter,
     pub(crate) tasks: crate::tasks::TaskManager,
     /// Parent front-end notifications and reviews, bound when the runtime is built.
     pub(crate) events: mpsc::UnboundedSender<Event>,
@@ -568,7 +570,7 @@ impl AgentRuntime {
                 .with_memory_enabled(self.memory_config.enabled)
                 .with_memory_context(Some(conversation))
                 .with_conversation_history(self.conversation_history.clone());
-        AgentSpec {
+        let mut runner = AgentSpec {
             client: self.client.clone(),
             model_name: self.model_name.clone(),
             model_str: self.model_str.clone(),
@@ -586,7 +588,9 @@ impl AgentRuntime {
             stream_retrying: Arc::new(AtomicBool::new(false)),
             max_steps: Some(DEFAULT_MAX_STEPS),
         }
-        .build()
+        .build();
+        runner.set_tool_filter(self.tool_filter.clone());
+        runner
     }
 }
 
@@ -694,6 +698,7 @@ mod tests {
         }
         let security = crate::security::SecurityManager::standalone().unwrap();
         AgentRuntime {
+            tool_filter: Default::default(),
             tasks: crate::tasks::TaskManager::default(),
             events: mpsc::unbounded_channel().0,
             provider_manager: Arc::new(crate::providers::ProviderManager::from_config(&config)),
@@ -716,6 +721,28 @@ mod tests {
             checkpoint: None,
             conversation_history: None,
         }
+    }
+
+    #[test]
+    fn child_inherits_filter_and_disabled_memory_and_mcp() {
+        let mut runtime = memory_runtime(false);
+        runtime.tool_filter = crate::runner::ToolFilter {
+            allowed: vec!["read_*".into(), "memory".into(), "mcp__*".into()],
+            disallowed: vec!["read_image".into()],
+        };
+        let overridden = runtime.with_overrides(Some("openai/child"), None).unwrap();
+        let runner = overridden.build_runner(0, Arc::new(Mutex::new(Conversation::new())));
+        assert_eq!(runner.tool_filter, runtime.tool_filter);
+        assert!(runner.memory_model.is_none());
+        let names: Vec<_> = runner
+            .available_tools()
+            .into_iter()
+            .filter_map(|tool| match tool {
+                async_openai::types::responses::Tool::Function(f) => Some(f.name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["read_file"]);
     }
 
     #[tokio::test]
@@ -952,6 +979,8 @@ mod tests {
         manager.finish(
             first.id,
             Ok(crate::runner::TurnResult {
+                steps: 1,
+                tool_calls: 0,
                 final_text: "done".into(),
                 usage: (1, 2, 0),
             }),

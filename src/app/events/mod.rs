@@ -344,7 +344,9 @@ async fn handle_app_event(app: &mut App<'_>, app_event: AppEvent) {
                 }
                 Err(
                     e @ (crate::runner::RunnerError::EmptyResponse
-                    | crate::runner::RunnerError::StepLimit { .. }),
+                    | crate::runner::RunnerError::StepLimit { .. }
+                    | crate::runner::RunnerError::Compaction(_)
+                    | crate::runner::RunnerError::InputRequired { .. }),
                 ) => {
                     app.agent_loop
                         .session
@@ -2219,6 +2221,8 @@ mod tests {
                 Ok(crate::runner::TurnResult {
                     final_text: String::new(),
                     usage: (200_000, 100, 0),
+                    steps: 0,
+                    tool_calls: 0,
                 }),
             ),
         )

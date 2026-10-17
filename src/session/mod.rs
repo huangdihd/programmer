@@ -274,6 +274,9 @@ pub(crate) struct SessionSnapshot {
     /// Work mode in effect when the session was last saved, restored on resume.
     #[serde(default)]
     pub(crate) work_mode: Option<crate::classifier::WorkMode>,
+    /// Headless interaction checkpoint; absent in ordinary TUI sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) headless_pending: Option<serde_json::Value>,
     /// Chat model in use when last saved (`provider/model`), restored on resume.
     #[serde(default)]
     pub(crate) current_model: Option<String>,
@@ -331,6 +334,24 @@ impl Drop for SessionLock {
     }
 }
 
+/// Informational metadata; the OS lock remains authoritative. Metadata may be
+/// stale after release, and legacy lock files contain only a PID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionLockOwner {
+    pub(crate) pid: u32,
+    pub(crate) process_type: Option<String>,
+}
+
+impl SessionLockOwner {
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        Some(Self {
+            pid: lines.next()?.trim().parse().ok()?,
+            process_type: lines.next().map(str::to_owned),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum SessionLockError {
     InUse { pid: Option<u32> },
@@ -371,6 +392,13 @@ impl SessionManager {
 
     /// Create a new manager pointing at `~/.config/programmer/sessions/`.
     pub(crate) fn new() -> Option<Self> {
+        // Match load_config's debug-only integration-test isolation hook.
+        #[cfg(debug_assertions)]
+        if let Some(dir) = std::env::var_os("PROGRAMMER_TEST_CONFIG_DIR") {
+            return Some(Self {
+                sessions_dir: PathBuf::from(dir).join("sessions"),
+            });
+        }
         let dir = dirs::config_dir()?.join("programmer").join("sessions");
         Some(SessionManager { sessions_dir: dir })
     }
@@ -422,6 +450,7 @@ impl SessionManager {
             history: Vec::new(),
             input_suggestion: None,
             work_mode: None,
+            headless_pending: None,
             current_model: None,
             last_request_input_tokens: None,
             vision_enabled: false,
@@ -481,6 +510,24 @@ impl SessionManager {
     /// Try to exclusively lock a session. The lock file contains the owning PID
     /// for a useful conflict message; the OS lock, not that PID, is authoritative.
     pub(crate) fn try_lock(&self, uuid: &str) -> Result<SessionLock, SessionLockError> {
+        self.try_lock_as(uuid, "tui")
+    }
+
+    /// Read advisory owner metadata (possibly stale or unavailable on Windows).
+    pub(crate) fn lock_owner(&self, uuid: &str) -> Option<SessionLockOwner> {
+        let text = std::fs::read_to_string(self.sessions_dir.join(format!("{uuid}.lock"))).ok()?;
+        SessionLockOwner::parse(&text)
+    }
+
+    /// Lock with a surface label while preserving the PID-only conflict API.
+    pub(crate) fn try_lock_as(
+        &self,
+        uuid: &str,
+        process_type: &str,
+    ) -> Result<SessionLock, SessionLockError> {
+        if process_type.is_empty() || process_type.contains(['\r', '\n']) {
+            return Err(SessionLockError::Io("invalid lock process type".into()));
+        }
         self.ensure_dir().map_err(SessionLockError::Io)?;
         let path = self.sessions_dir.join(format!("{uuid}.lock"));
         let mut file = std::fs::OpenOptions::new()
@@ -501,7 +548,7 @@ impl SessionManager {
                 || cfg!(windows) && error.raw_os_error() == Some(33);
             if contended {
                 return Err(SessionLockError::InUse {
-                    pid: owner.trim().parse().ok(),
+                    pid: SessionLockOwner::parse(&owner).map(|owner| owner.pid),
                 });
             }
             return Err(SessionLockError::Io(format!(
@@ -511,7 +558,7 @@ impl SessionManager {
         }
         file.set_len(0)
             .and_then(|()| file.rewind())
-            .and_then(|()| writeln!(file, "{}", std::process::id()))
+            .and_then(|()| writeln!(file, "{}\n{process_type}", std::process::id()))
             .and_then(|()| file.sync_data())
             .map_err(|error| SessionLockError::Io(format!("write {}: {error}", path.display())))?;
         Ok(SessionLock { file })
@@ -556,7 +603,10 @@ impl SessionManager {
 // Interactive session picker (TUI)
 // ---------------------------------------------------------------------------
 
-fn sessions_for_working_dir(sessions: &[SessionMeta], working_dir: &Path) -> Vec<SessionMeta> {
+pub(crate) fn sessions_for_working_dir(
+    sessions: &[SessionMeta],
+    working_dir: &Path,
+) -> Vec<SessionMeta> {
     let working_dir = working_dir
         .canonicalize()
         .unwrap_or_else(|_| working_dir.to_path_buf());
@@ -1337,6 +1387,15 @@ mod tests {
         let reacquired = mgr.try_lock(&session.uuid).unwrap();
         drop(reacquired);
         std::fs::remove_dir_all(sessions_dir).unwrap();
+    }
+
+    #[test]
+    fn lock_owner_supports_legacy_and_surface_labels() {
+        assert_eq!(SessionLockOwner::parse("123\n").unwrap().process_type, None);
+        let owner = SessionLockOwner::parse("123\nheadless\n").unwrap();
+        assert_eq!(owner.pid, 123);
+        assert_eq!(owner.process_type.as_deref(), Some("headless"));
+        assert!(SessionLockOwner::parse("invalid").is_none());
     }
 
     #[test]

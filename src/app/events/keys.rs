@@ -1215,31 +1215,31 @@ async fn handle_plan_review_key(app: &mut App<'_>, key_event: KeyEvent) -> color
         KeyCode::Enter => match app.ui.plan_review_selected {
             0 => {
                 approve_plan(
-                        app,
-                        WorkMode::Manual,
-                        "Plan approved — executing with Manual mode.",
-                        "The plan was approved by the user. Execute it now using the identified steps. Ask for approval before running commands or destructive edits.",
-                    )
-                    .await;
+                    app,
+                    WorkMode::Manual,
+                    "Plan approved — executing with Manual mode.",
+                    crate::prompts::PLAN_APPROVED_MANUAL_PROMPT,
+                )
+                .await;
             }
             1 => {
                 approve_plan(
                     app,
                     WorkMode::Auto,
                     "Plan approved — executing with Auto mode.",
-                    "The plan was approved by the user. Execute it now using the identified steps.",
+                    crate::prompts::PLAN_APPROVED_AUTO_PROMPT,
                 )
                 .await;
             }
             2 => {
                 if app.config.allow_yolo {
                     approve_plan(
-                            app,
-                            WorkMode::Yolo,
-                            "Plan approved — executing with YOLO mode.",
-                            "The plan was approved by the user. Execute it now using the identified steps. You have full autonomy.",
-                        )
-                        .await;
+                        app,
+                        WorkMode::Yolo,
+                        "Plan approved — executing with YOLO mode.",
+                        crate::prompts::PLAN_APPROVED_YOLO_PROMPT,
+                    )
+                    .await;
                 } else {
                     propose_plan_changes(app);
                 }

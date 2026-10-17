@@ -18,7 +18,7 @@
 //! app's event channel. A fresh instance is built for each turn.
 
 use crate::cancel::{CancellationToken, OperationId};
-use crate::runner::{AgentSurface, ReviewDecision, RunnerEvent};
+use crate::runner::{AgentSurface, ReviewDecision, RunnerError, RunnerEvent};
 use crate::ui::event::{AppEvent, Event, ReplyTx};
 use async_openai::types::responses::FunctionToolCall;
 use tokio::sync::mpsc;
@@ -69,7 +69,7 @@ impl AgentSurface for TuiSurface {
         let _ = self.tx.send(Event::App(app_ev));
     }
 
-    async fn usage_safe_point(&self, input_tokens: u32) {
+    async fn usage_safe_point(&self, input_tokens: u32) -> Result<(), RunnerError> {
         let (resume_tx, resume_rx) = oneshot::channel();
         let _ = self.tx.send(Event::App(AppEvent::UsageSafePoint(
             self.operation_id,
@@ -77,6 +77,7 @@ impl AgentSurface for TuiSurface {
             resume_tx,
         )));
         let _ = self.cancel.wait_or(resume_rx).await;
+        Ok(())
     }
 
     async fn review(
@@ -247,6 +248,6 @@ mod tests {
         assert_eq!(tokens, 150_000);
         assert!(!waiter.is_finished());
         resume.send(()).expect("resume runner");
-        waiter.await.expect("runner resumed");
+        waiter.await.expect("runner resumed").expect("safe point");
     }
 }
