@@ -239,15 +239,18 @@ mod tests {
             ..Default::default()
         };
         let result = resolve_security(&config, &args, Path::new("/")).unwrap();
+        // Canonical roots differ per platform (`/` vs. a verbatim `\\?\D:\`).
+        let root = Path::new("/").canonicalize().unwrap();
         assert_eq!(
             result.sandbox.readable_paths,
-            ["/existing", "/relative", "/absolute"].map(PathBuf::from)
+            [
+                PathBuf::from("/existing"),
+                root.join("relative"),
+                root.join("absolute")
+            ]
         );
-        assert_eq!(result.sandbox.writable_paths, [PathBuf::from("/output")]);
-        assert_eq!(
-            result.sandbox.denied_read_paths,
-            [PathBuf::from("/private")]
-        );
+        assert_eq!(result.sandbox.writable_paths, [root.join("output")]);
+        assert_eq!(result.sandbox.denied_read_paths, [root.join("private")]);
         assert_eq!(result.sandbox.denied_environment, ["OLD_*", "NEW_*"]);
         assert_eq!(result.rules.len(), config.security.rules.len() + 4);
     }
@@ -292,7 +295,12 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("programmer-overrides-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");
-        let literal = root.join("data[1]*{x}?");
+        // `*` and `?` are not valid in Windows file names.
+        let literal = root.join(if cfg!(windows) {
+            "data[1]{x}"
+        } else {
+            "data[1]*{x}?"
+        });
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&literal).unwrap();
         let args = SecurityArgs {
@@ -307,7 +315,11 @@ mod tests {
             assert!(manager.authorize_path(AccessKind::Write, &path).is_ok());
             assert!(manager.authorize_path(AccessKind::Read, &path).is_err());
         }
-        for path in [root.join("data1ZZxQ"), root.join("unrelated/file")] {
+        for path in [
+            root.join("data1ZZxQ"),
+            root.join("data1x"),
+            root.join("unrelated/file"),
+        ] {
             assert!(manager.authorize_path(AccessKind::Write, &path).is_err());
             assert!(manager.authorize_path(AccessKind::Read, &path).is_ok());
         }
