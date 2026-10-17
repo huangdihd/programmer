@@ -59,7 +59,7 @@ fn asset_target() -> Result<&'static str> {
         ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
         ("windows", "x86") => Ok("i686-pc-windows-msvc"),
-        _ => bail!("no prebuilt release asset for {os}/{arch}"),
+        _ => Err(eyre!("no prebuilt release asset for {os}/{arch}")),
     }
 }
 

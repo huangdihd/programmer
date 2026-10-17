@@ -28,12 +28,16 @@ mod classifier;
 mod cli;
 mod clipboard;
 mod commands;
+mod compaction;
 mod config;
 mod consts;
 mod conversation;
 mod diagnostics;
 mod execution;
 mod headless;
+mod headless_interaction;
+mod headless_security;
+mod headless_session;
 mod mcp;
 mod memory;
 mod peers;
@@ -56,13 +60,14 @@ mod upgrade;
 /// to classify tool calls: the configured classifier model, else the default
 /// model. Returns `None` when no provider resolves (auto mode then refuses
 /// dangerous tools).
-async fn build_mcp_classifier() -> Option<(
+async fn build_mcp_classifier(
+    config: &ProgrammerConfig,
+) -> Option<(
     async_openai::Client<async_openai::config::OpenAIConfig>,
     String,
     u8,
 )> {
-    let (config, _) = load_config().ok()?;
-    let pm = crate::providers::ProviderManager::new(&config).await;
+    let pm = crate::providers::ProviderManager::new(config).await;
     let model = config
         .classifier_model
         .clone()
@@ -239,10 +244,41 @@ fn prompt_session_fork(pid: Option<u32>) -> bool {
     }
 }
 
+/// Explicit files are required and read-only: no migration or first-run writes.
+/// Relative paths are resolved against the current working directory.
+pub(crate) fn load_config_from(
+    path: Option<&Path>,
+) -> color_eyre::Result<(ProgrammerConfig, std::path::PathBuf)> {
+    let Some(path) = path else {
+        return load_config();
+    };
+    let mut config: ProgrammerConfig = Config::builder()
+        .add_source(File::from(path).required(true))
+        .add_source(Environment::with_prefix("Programmer"))
+        .build()?
+        .try_deserialize()?;
+    // Migrate in memory only: the active security profile must still be
+    // copied into `security`, but an explicit file is never rewritten.
+    config.migrate_if_needed();
+    Ok((config, path.to_path_buf()))
+}
+
 fn load_config() -> color_eyre::Result<(ProgrammerConfig, std::path::PathBuf)> {
-    let config_path = dirs::config_dir()
-        .map(|d| d.join("programmer").join("config.toml"))
-        .unwrap_or_else(|| Path::new("config.toml").to_path_buf());
+    let config_path = {
+        // Debug-only isolation for CLI integration tests; release config selection
+        // deliberately ignores this environment variable.
+        #[cfg(debug_assertions)]
+        let test_dir = std::env::var_os("PROGRAMMER_TEST_CONFIG_DIR");
+        #[cfg(not(debug_assertions))]
+        let test_dir: Option<std::ffi::OsString> = None;
+        test_dir
+            .map(|d| std::path::PathBuf::from(d).join("config.toml"))
+            .unwrap_or_else(|| {
+                dirs::config_dir()
+                    .map(|d| d.join("programmer").join("config.toml"))
+                    .unwrap_or_else(|| Path::new("config.toml").to_path_buf())
+            })
+    };
 
     let mut programmer_config: ProgrammerConfig = Config::builder()
         .add_source(File::from(config_path.clone()).required(false))
@@ -274,23 +310,37 @@ fn main() -> color_eyre::Result<()> {
         .block_on(async_main(args))
 }
 
+fn legacy_outcome(passed: bool) -> headless::HeadlessOutcome {
+    if passed {
+        headless::HeadlessOutcome::Completed
+    } else {
+        headless::HeadlessOutcome::Error
+    }
+}
+
 async fn async_main(mut args: cli::Args) -> color_eyre::Result<()> {
     if let Some(command) = args.command.take() {
-        let passed = match command {
-            cli::Command::Run(run) => headless::run(run).await?,
-            cli::Command::Init(init) => headless::init(init).await?,
-            cli::Command::Diagnostics(diagnostics) => headless::diagnostics(diagnostics).await?,
-            cli::Command::Mcp(mcp) => {
-                run_mcp(mcp).await?;
-                true
-            }
-            cli::Command::Upgrade(upgrade_args) => crate::upgrade::upgrade(upgrade_args).await?,
-            cli::Command::Uninstall(uninstall_args) => {
-                crate::upgrade::uninstall(uninstall_args).await?
+        let result = match command {
+            cli::Command::Run(run) => headless::run(run).await,
+            cli::Command::Init(init) => headless::init(init).await,
+            cli::Command::Diagnostics(diagnostics) => headless::diagnostics(diagnostics).await,
+            cli::Command::Mcp(mcp) => run_mcp(mcp)
+                .await
+                .map(|_| headless::HeadlessOutcome::Completed),
+            cli::Command::Upgrade(args) => crate::upgrade::upgrade(args).await.map(legacy_outcome),
+            cli::Command::Uninstall(args) => {
+                crate::upgrade::uninstall(args).await.map(legacy_outcome)
             }
         };
-        if !passed {
-            std::process::exit(1);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("{error:#}");
+                headless::HeadlessOutcome::from_error(&error)
+            }
+        };
+        if outcome.exit_code() != 0 {
+            std::process::exit(outcome.exit_code());
         }
         return Ok(());
     }
@@ -345,19 +395,23 @@ async fn run_mcp(args: cli::McpArgs) -> color_eyre::Result<()> {
     match args.command {
         cli::McpCommand::Stdio(args) => {
             headless::set_working_directory(args.cwd.as_deref())?;
-            let classifier = build_mcp_classifier().await;
-            let (config, _) = load_config()?;
-            let security = install_security_for_current_dir(&config)?;
+            let (config, _) = load_config_from(args.config.as_deref())?;
+            let classifier = build_mcp_classifier(&config).await;
+            let security = install_security_with_overrides(&config, &args.security)?;
             mcp::server::McpServer::with_security(args.work_mode, classifier, security)
                 .run()
                 .await?;
         }
         cli::McpCommand::Http(args) => {
             headless::set_working_directory(args.cwd.as_deref())?;
-            let classifier = build_mcp_classifier().await;
-            let config = load_config().map(|(config, _)| config).unwrap_or_default();
+            let config = if args.config.is_some() {
+                load_config_from(args.config.as_deref())?.0
+            } else {
+                load_config().map(|(config, _)| config).unwrap_or_default()
+            };
+            let classifier = build_mcp_classifier(&config).await;
             let allow_yolo = config.allow_yolo;
-            let security = install_security_for_current_dir(&config)?;
+            let security = install_security_with_overrides(&config, &args.security)?;
             mcp::http_server::serve(args.work_mode, classifier, args.addr, allow_yolo, security)
                 .await?;
         }
@@ -365,12 +419,61 @@ async fn run_mcp(args: cli::McpArgs) -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn install_security_for_current_dir(
+fn install_security_with_overrides(
     config: &ProgrammerConfig,
+    args: &cli::SecurityArgs,
 ) -> color_eyre::Result<std::sync::Arc<crate::security::SecurityManager>> {
-    let security = crate::security::SecurityManager::for_current_dir(config.security.clone())
+    let cwd = std::env::current_dir()?;
+    let resolved = headless_security::resolve_security(config, args, &cwd)?;
+    if !resolved.enabled && args.has_overrides() {
+        eprintln!(
+            "warning: security is disabled in the resolved profile; filesystem policy overrides will not be enforced"
+        );
+    }
+    let security = crate::security::SecurityManager::new(resolved, cwd)
         .map_err(|error| color_eyre::eyre::eyre!(error))?;
     let security = std::sync::Arc::new(security);
     crate::security::install_active(security.clone());
     Ok(security)
+}
+
+#[cfg(test)]
+mod config_loading_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_config_is_required_and_never_written() {
+        let dir = std::env::temp_dir().join(format!(
+            "programmer-explicit-config-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let path = dir.join("config.toml");
+        assert!(load_config_from(Some(&path)).is_err());
+        assert!(
+            !dir.exists(),
+            "missing explicit config must not create parents"
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        // Legacy keys would be migrated by the default loader.
+        let original = "# keep this comment\nmodel = 'legacy-model'\n";
+        std::fs::write(&path, original).unwrap();
+        let (_, loaded_path) = load_config_from(Some(&path)).unwrap();
+        assert_eq!(loaded_path, path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // The active profile is applied in memory without rewriting the file.
+        let profiles = "active_security_profile = 'strict'\n\
+            [security_profiles.default]\nenabled = true\n\
+            [security_profiles.strict]\nenabled = true\nprotect_file_changes = false\n";
+        std::fs::write(&path, profiles).unwrap();
+        let (config, _) = load_config_from(Some(&path)).unwrap();
+        assert_eq!(config.active_security_profile, "strict");
+        assert!(!config.security.protect_file_changes);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), profiles);
+        std::fs::write(&path, "not valid = [toml").unwrap();
+        assert!(load_config_from(Some(&path)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not valid = [toml");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
 }

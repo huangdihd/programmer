@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::cancel::{CancellationToken, OperationId};
+pub(crate) use crate::compaction::CompactionResult;
 use crate::tools::ask_user::Question;
 use async_openai::types::responses::{FunctionToolCall, ResponseStreamEvent};
 use color_eyre::eyre::OptionExt;
@@ -41,14 +42,6 @@ pub enum Event {
     ///
     /// Use this event to emit custom events that are specific to your application.
     App(AppEvent),
-}
-
-/// A completed context-compaction request and its provider-reported token
-/// usage.
-pub struct CompactionResult {
-    pub(crate) summary: String,
-    pub(crate) input_tokens: Option<u32>,
-    pub(crate) output_tokens: Option<u32>,
 }
 
 /// Application events.

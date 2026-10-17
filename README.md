@@ -995,8 +995,159 @@ hidden Developer turn, then sends the user prompt in the same conversation.
 Automatic post-edit diagnostics are enabled whenever
 `.programmer/diagnostics.toml` exists; use `--no-diagnostics` to disable the
 hook or `--check` for an additional final snapshot. Other controls include
-`--classifier-model`, `--work-mode auto|plan|yolo`, `--cwd`,
+`--classifier-model`, `--work-mode manual|auto|plan|yolo`, `--cwd`,
 `--timeout`, `--max-steps`, and `--prompt-file`.
+
+#### Saving and continuing headless sessions
+
+A fresh `run` is ephemeral by default. Use `--save-session` to keep its
+conversation, or resume a saved conversation with a new prompt:
+
+```sh
+programmer run --save-session 'investigate the failing tests'
+programmer run --resume 12345678-1234-4234-8234-123456789abc 'implement the fix'
+programmer run --continue 'run the tests again'
+programmer run --continue --fork 'try an alternative fix'
+programmer run --continue --no-save 'summarize the investigation'
+```
+
+| Flag (`run` only) | Effect |
+|------|--------|
+| `--save-session` | Persist a new conversation. |
+| `--resume UUID` | Resume a specific saved session; a valid UUID is required, with no interactive picker. |
+| `--continue` | Resume the most recently updated session for the current project (`--cwd` when supplied). |
+| `--fork` | Resume into a new session, leaving the source session unchanged. Requires `--resume` or `--continue`. |
+| `--no-save` | Do not persist the resumed conversation's changes. Requires `--resume` or `--continue`; conflicts with `--save-session` and `--fork`. |
+
+Resumed conversations are saved by default. `--resume` and `--continue` are
+mutually exclusive, and neither can be combined with `--init`. A new prompt
+(or `--prompt-file`) is required unless answering a pending interaction. These argument errors exit with code `2`.
+The TUI's top-level `programmer --resume [UUID]` remains separate and cannot
+be combined with a subcommand.
+
+Omitted `--model`, `--thinking`, `--work-mode`, and vision flags retain the resumed session's settings;
+new conversations use their normal defaults. Explicit values, including
+`--thinking auto` and `--work-mode auto`, override those settings. Manual mode
+implicitly enables suspension for `run` (it remains unavailable for `init` and MCP). `--no-save` affects conversation
+persistence, not tool side effects such as file edits.
+
+Saved sessions can also be opened with `programmer --resume UUID` in the TUI.
+Turns and partial progress on early stops are saved with paired tool results.
+JSON/JSONL results and JSONL start events include `session_id` (null for
+transient/read-only runs); text mode prints `session: UUID` to stderr.
+A locked session fails with code `1`, identifies its owner, and suggests
+`--fork`, which reads the last saved snapshot without changing the source.
+Titles use the prompt's truncated first line, without an extra model request.
+Saved runs use their UUID for Dream queueing unless `--no-memory` is set.
+
+#### Suspending for user input
+
+`run --suspend` saves and exits with **10** when a tool needs approval, a tool
+asks a question or permission, or a plan is ready for review. Manual mode
+implies `--suspend`. A session is created automatically; `--no-save` conflicts.
+Without this opt-in, existing auto/yolo/plan runs still reject interactions and
+plan mode finishes normally. Child agents retain their existing behavior.
+
+```sh
+programmer run --suspend 'investigate and propose a fix'
+programmer run --resume UUID --answer-id ID --answer approve
+programmer run --resume UUID --answer-file answer.txt
+```
+
+Answers are `approve`, `deny`, or `deny:reason` for tool approvals; `allow`,
+`deny`, or `deny:reason` for permissions; a 1-based option number, option text,
+or free text for questions; and `manual`, `auto`, `yolo`, or `revise:feedback`
+for plans. Plan execution in yolo requires `allow_yolo = true`.
+`--answer` and `--answer-file` are mutually exclusive and require a resumed
+session. Optional `--answer-id` guards against answering the wrong interaction.
+Invalid or missing answers exit with 2 without changing the pending session.
+An additional prompt runs after the resumed turn finishes.
+
+Completed tool calls are not replayed; remaining calls resume in their original
+order. JSON results carry `stop_reason: "input_required"` and `pending`;
+JSONL additionally emits `input_required` before its final `result`. Text prints
+the question to stdout and a continuation command to stderr. Opening a suspended
+session in the TUI does not answer its pending question; the normal API history
+builder supplies cancellation results for unmatched calls.
+
+#### Context compaction
+
+Headless `run` and `init` compact context synchronously at safe boundaries;
+model execution waits for the summary rather than starting a background pass.
+The summarizer uses `compact_model` when configured, otherwise the active chat
+model. Automatic compaction retains `compact_keep_recent_turns` recent turns;
+mandatory compaction can include completed work in the active turn when needed.
+After each compaction attempt, automatic compaction has a fixed cooldown of **4
+model responses** (also avoiding repeated failed attempts). Mandatory compaction bypasses this cooldown.
+
+`--compact-tokens TOKENS` overrides the automatic threshold and
+`--mandatory-compact-tokens TOKENS` overrides the mandatory threshold. A value
+of `0` disables only that threshold. `--no-compact` disables both and conflicts
+with either threshold flag, even when its value is zero (exit `2`). These are
+invocation-only overrides and never rewrite configuration.
+
+An automatic compaction failure emits a notice and execution continues. A
+mandatory compaction failure stops the run with a runtime error (exit `1`).
+JSONL exposes compaction phases, and JSON/JSONL results include a `compactions`
+counter. Saved compacted conversations use the normal session format, including
+summaries and preserved pre-compaction history, and remain resumable in the TUI.
+This policy applies to the top-level headless agent, not child agents.
+
+`run` and `init` also accept these session-only controls (configuration is not
+written back):
+
+| Flag | Effect |
+|------|--------|
+| `--config PATH` | Load an explicit TOML config with in-memory migration only, without creating or rewriting it; `PROGRAMMER_*` environment overrides still apply. Missing or invalid files exit with code `1`. Also available on `diagnostics` and MCP commands. |
+| `--vision` / `--no-vision` | Override image input for this invocation. |
+| `--no-memory` | Disable persistent memory for this invocation. |
+| `--compact-tokens TOKENS` | Override automatic compaction threshold; `0` disables it. |
+| `--mandatory-compact-tokens TOKENS` | Override mandatory compaction threshold; `0` disables it. |
+| `--no-compact` | Disable both compaction thresholds; conflicts with either threshold flag. |
+| `--mcp NAME` / `--no-mcp` | Select configured MCP servers by name (repeatable), or disable all MCP clients. Unknown names exit with code `2` and list available servers. |
+| `--allowed-tools TOOLS` | Allow only matching tools; comma-separated and repeatable. |
+| `--disallowed-tools TOOLS` | Deny matching tools; comma-separated and repeatable. Denial takes precedence. |
+| `--coauthor IDENTITY` / `--no-coauthor` | Override or disable the git co-author trailer. |
+| `--soul-file PATH` | Load the agent personality from a UTF-8 file. |
+
+Opposing switches such as `--vision --no-vision`, `--mcp NAME --no-mcp`,
+and `--coauthor IDENTITY --no-coauthor` are usage errors (exit `2`). Tool
+filters support wildcard patterns, including MCP names such as
+`mcp__filesystem__*`, and are inherited by sub-agents.
+
+For `run`, repeatable `--append-prompt TEXT` and `--append-prompt-file PATH`
+add instructions: all text values come first in their supplied order, followed
+by all UTF-8 file contents in their supplied order, regardless of flag interleaving.
+Repeatable `--image PATH` attaches local images to the user message. As in the
+TUI, supported encodings are PNG, JPEG, WEBP, and non-animated GIF, with a
+20 MiB per-image limit and per-message limits of 20 images and 50 MiB total.
+Attachments exceeding the per-message limits are dropped with a warning on
+stderr; unreadable, unsupported, or individually oversized images are runtime
+errors. Images with vision disabled (including through config) are usage errors;
+use `--vision` to enable them explicitly.
+
+```sh
+programmer run --config ci.toml --no-memory --no-mcp \
+  --allowed-tools 'read_*,grep' --append-prompt 'Do not edit files.' \
+  --append-prompt-file review-rules.txt 'review this module'
+programmer run --vision --image screenshot.png 'explain this error'
+```
+
+Security overrides are session-only and never saved to configuration. `run`,
+`init`, `diagnostics`, and MCP commands accept these seven controls:
+
+| Flag | Effect |
+|------|--------|
+| `--security-profile NAME` | Select a configured profile; unknown names report available profiles. |
+| `--sandbox restricted\|network\|off` | Override process isolation independently of filesystem policy. |
+| `--allow-read PATH` | Add a process-readable path (repeatable). |
+| `--allow-write PATH` | Allow process and direct file writes to a path and its descendants (repeatable). |
+| `--deny-read PATH` | Deny process and direct file reads of a path and its descendants (repeatable). |
+| `--deny-env GLOB` | Remove matching subprocess environment variables (repeatable). |
+| `--no-protect-file-changes` | Disable the read-before-write/conflict protection for this invocation. |
+
+Relative paths resolve against the effective `--cwd` directory. Overrides applied
+to a disabled security policy produce a warning on stderr.
 
 `run` and `init` connect the configured `mcp_servers` before the first turn,
 so the agent and its sub-agents get the same `mcp__<server>__<tool>` tools as
@@ -1006,8 +1157,14 @@ continues without it.
 
 `--format text` prints only the final answer to stdout, `json` emits one
 versioned result document, and `jsonl` emits progress events followed by a
-result event. Diagnostics from a text-mode final check go to stderr so stdout
-remains pipe-friendly.
+result event. Structured agent results include `stop_reason`, lowercase `work_mode`,
+`steps`, `tool_calls`, `compactions`, `duration_ms`, and `security` (`profile`, `sandbox`,
+`overrides`). JSONL starts with a `start`
+event containing that metadata and `model`. Timeout, step-limit, and interruption
+results retain the latest available assistant text. stdout remains machine-readable,
+with warnings and errors on stderr.
+Diagnostics from a text-mode final check also go to stderr so stdout remains
+pipe-friendly.
 
 Project setup and model-free checks are also standalone commands:
 
@@ -1021,6 +1178,19 @@ programmer diagnostics --format json --fail-on warning
 initializing an LLM provider. It exits unsuccessfully when a checker fails, no
 profile exists, or a finding meets the `--fail-on error|warning|lint`
 threshold.
+
+Headless exit codes are stable for scripts:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Completed successfully. |
+| `1` | Runtime/provider error. |
+| `2` | Invalid arguments or unknown security profile. |
+| `3` | Diagnostics missing, checker failed, or threshold reached. |
+| `4` | Timeout. |
+| `5` | Model-step limit reached. |
+| `10` | Reserved for a future resumable input request. |
+| `130` | Interrupted/cancelled. |
 
 ### As an MCP server
 

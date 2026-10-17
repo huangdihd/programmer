@@ -113,6 +113,8 @@ impl AgentSpec {
             stream_retrying: self.stream_retrying,
             stream_retry_limit: crate::consts::MAX_STREAM_RETRIES,
             max_steps: self.max_steps,
+            tool_filter: Default::default(),
+            metrics: Default::default(),
         }
     }
 }

@@ -6,6 +6,21 @@
 - Wait for every CI job on the exact release commit to succeed and review a complete, self-contained version section in `RELEASE_NOTES.md` before publishing. Do not move published tags.
 - Release automation must pin the validated SHA, verify notes and all ten artifacts in a draft, and recheck CI before publication. Test policy scripts with `python3 -m unittest discover -s scripts -p 'test_release*.py' -v`.
 
+## Headless execution
+
+- `src/cli.rs` defines shared `SecurityArgs`; `src/headless_security.rs` resolves invocation-only profile/sandbox/path overrides without saving configuration. Direct write grants and read denials include both the path and its descendants.
+- `src/headless.rs` owns stable outcome codes (0/1/2/3/4/5/10 input required/130), partial assistant output, and version-1 JSON/JSONL metadata. `src/main.rs` maps outcomes to process exits; TUI policy is unchanged.
+- Debug builds accept `PROGRAMMER_TEST_CONFIG_DIR` to isolate `load_config` and session storage in binary integration tests. Release builds ignore it.
+- Headless `--config` uses `load_config_from` with in-memory migration but no writes, retaining environment overrides. Agent overrides are applied only to the loaded in-memory config; filtered MCP connections and disabled memory propagate to child agents.
+- `src/runner/filter.rs` selects tools after provider assembly and gates execution; child runners inherit the same filter. Runner metrics retain response/tool-call counts on early termination; headless JSON results add `steps`, `tool_calls`, and `duration_ms` without changing schema version 1.
+- Headless run inputs support ordered Developer additions (all text flags, then files) and shared TUI image encoding/attachment limits. `--no-memory` also suppresses Dream queueing.
+
+- `src/headless_session.rs` adapts ordinary `SessionManager` snapshots and lifetime locks for `run --save-session/--resume/--continue/--fork/--no-save`. Resume inherits unspecified model, thinking, mode and vision; saves occur after turns and on early stops, with tool-output pairing repaired. Writable sessions use their UUID for Dream and output `session_id`; read-only runs report null. Lock metadata retains a PID first line and adds an advisory process type.
+
+- `src/compaction.rs` shares no-tools summary request/stream handling between TUI and headless. `src/headless_compaction.rs` synchronously compacts at runner safe points, with a four-response automatic-attempt cooldown and mandatory bypass (including completed active-turn work). Mandatory errors propagate through `RunnerError::Compaction`; retained history uses ordinary `Conversation::apply_compaction_at` boundaries. CLI thresholds are invocation-only; JSONL emits compaction phases and results count successful compactions. Child agents do not compact.
+
+- `run --suspend` (implicit in manual mode) persists `headless_pending` in ordinary session snapshots. `src/runner/suspension.rs` owns sequential batch checkpoints and `run_turn_from`; completed outputs are committed once and pending calls never receive synthetic cancellation outputs on headless save. `src/headless_pending.rs` provides the output/persistence envelope, and `src/headless_interaction.rs` validates plan answers. `--answer`/`--answer-file` and optional `--answer-id` resume without a new user turn. TUI API conversion safely pairs unmatched calls but does not answer headless pending interactions; child agents and MCP retain their existing approval behavior.
+
 ## Overview
 
 **programmer** is a terminal-based AI coding agent TUI written in Rust. It

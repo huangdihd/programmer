@@ -16,6 +16,9 @@
 //! Project-wide tunable constants, gathered in one place so the values that
 //! shape runtime behaviour are easy to find and adjust.
 
+/// Minimum model-response spacing between headless automatic compaction attempts.
+pub(crate) const HEADLESS_COMPACT_COOLDOWN_RESPONSES: usize = 4;
+
 /// Maximum characters of a single tool's output sent inline. Longer output is
 /// archived under `.programmer/outputs/` before the inline copy is truncated.
 pub(crate) const MAX_OUTPUT_LENGTH: usize = 8000;

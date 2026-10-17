@@ -118,8 +118,19 @@ pub(crate) async fn classify_llm(
     calls: Vec<FunctionToolCall>,
     cancel: &CancellationToken,
 ) -> Option<ClassificationOutcome> {
+    classify_llm_with_ask(ctx, no_logprobs, calls, cancel, false).await
+}
+
+pub(crate) async fn classify_llm_with_ask(
+    ctx: &ClassifyContext<'_>,
+    no_logprobs: &Arc<Mutex<HashSet<String>>>,
+    calls: Vec<FunctionToolCall>,
+    cancel: &CancellationToken,
+    preserve_ask: bool,
+) -> Option<ClassificationOutcome> {
     enum Decision {
         Allow(FunctionToolCall),
+        Ask(FunctionToolCall, String),
         Deny(crate::tools::ToolOutput),
     }
 
@@ -142,6 +153,7 @@ pub(crate) async fn classify_llm(
 
             Some(match outcome.verdict {
                 Verdict::Allow => Decision::Allow(call),
+                Verdict::Ask { reason } if preserve_ask => Decision::Ask(call, reason),
                 Verdict::Deny { reason } | Verdict::Ask { reason } => {
                     Decision::Deny(classifier_denied_output(&call, &reason))
                 }
@@ -159,6 +171,7 @@ pub(crate) async fn classify_llm(
     for decision in decisions.into_iter().flatten() {
         match decision {
             Decision::Allow(call) => outcome.allowed.push(call),
+            Decision::Ask(call, reason) => outcome.ask.push((call, reason)),
             Decision::Deny(output) => outcome.denied.push(output),
         }
     }

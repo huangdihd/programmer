@@ -36,6 +36,13 @@ use crate::tools::provider::{AgentToolProvider, LocalToolProvider, ToolProvider}
 
 use crate::runner::assembly::{AgentSpec, PolicySpec, resolve_memory_model};
 
+#[path = "headless_compaction.rs"]
+mod compaction;
+
+#[path = "headless_pending.rs"]
+mod pending;
+use crate::headless_interaction as interaction;
+
 const OUTPUT_SCHEMA_VERSION: u32 = 1;
 
 /// Connect the configured MCP servers for one headless run. Startup failures
@@ -55,106 +62,426 @@ async fn connect_mcp(
     Some(Arc::new(manager))
 }
 
-pub(crate) async fn run(args: RunArgs) -> color_eyre::Result<bool> {
-    let RunArgs {
-        prompt,
-        prompt_file,
-        init: run_init,
-        check,
-        fail_on: threshold,
-        format,
-        agent: agent_args,
-    } = args;
-    set_working_directory(agent_args.cwd.as_deref())?;
-    let prompt = read_prompt(prompt, prompt_file).await?;
-    let cancel = cancellation_token();
-    let timeout = agent_args.timeout;
+/// Stable process outcomes; values are an external scripting contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadlessOutcome {
+    Completed,
+    Error,
+    Usage,
+    CheckFailed,
+    Timeout,
+    MaxSteps,
+    #[allow(dead_code)] // Reserved for resumable interactive suspension.
+    NeedsInput,
+    Interrupted,
+}
 
+impl HeadlessOutcome {
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            Self::Completed => 0,
+            Self::Error => 1,
+            Self::Usage => 2,
+            Self::CheckFailed => 3,
+            Self::Timeout => 4,
+            Self::MaxSteps => 5,
+            Self::NeedsInput => 10,
+            Self::Interrupted => 130,
+        }
+    }
+
+    fn stop_reason(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::CheckFailed => "check_failed",
+            Self::Timeout => "timeout",
+            Self::MaxSteps => "max_steps",
+            Self::Interrupted => "interrupted",
+            Self::NeedsInput => "input_required",
+            Self::Error | Self::Usage => "error",
+        }
+    }
+
+    pub(crate) fn from_error(error: &color_eyre::Report) -> Self {
+        if error
+            .downcast_ref::<crate::headless_security::UsageError>()
+            .is_some()
+        {
+            return Self::Usage;
+        }
+        match error.downcast_ref::<crate::runner::RunnerError>() {
+            Some(crate::runner::RunnerError::StepLimit { .. }) => Self::MaxSteps,
+            Some(crate::runner::RunnerError::Cancelled) => Self::Interrupted,
+            _ => Self::Error,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Progress {
+    text: String,
+    streaming: String,
+    usage: (u32, u32, u32),
+    compactions: usize,
+    completed_steps: usize,
+    completed_tool_calls: usize,
+}
+
+pub(crate) async fn run(args: RunArgs) -> color_eyre::Result<HeadlessOutcome> {
+    let session_options = SessionOptions {
+        suspend: args.suspend || args.agent.work_mode == Some(WorkMode::Manual),
+        answer: args.answer,
+        answer_file: args.answer_file,
+        answer_id: args.answer_id,
+        resume: args.resume,
+        continue_session: args.continue_session,
+        fork: args.fork,
+        no_save: args.no_save,
+        save_session: args.save_session,
+    };
+    let inputs = RunInputs {
+        prompt: args.prompt,
+        prompt_file: args.prompt_file,
+        append_prompt: args.append_prompt,
+        append_prompt_file: args.append_prompt_file,
+        images: args.image,
+    };
+    execute(
+        args.agent,
+        args.format,
+        Some(inputs),
+        args.init,
+        args.check.then_some(args.fail_on),
+        session_options,
+    )
+    .await
+}
+
+pub(crate) async fn init(args: InitArgs) -> color_eyre::Result<HeadlessOutcome> {
+    execute(
+        args.agent,
+        args.format,
+        None,
+        true,
+        None,
+        SessionOptions::default(),
+    )
+    .await
+}
+
+#[derive(Default)]
+struct SessionOptions {
+    suspend: bool,
+    answer: Option<String>,
+    answer_file: Option<PathBuf>,
+    answer_id: Option<String>,
+    resume: Option<String>,
+    continue_session: bool,
+    fork: bool,
+    no_save: bool,
+    save_session: bool,
+}
+
+#[derive(Default)]
+struct RunInputs {
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    append_prompt: Vec<String>,
+    append_prompt_file: Vec<PathBuf>,
+    images: Vec<PathBuf>,
+}
+
+async fn execute(
+    mut args: AgentArgs,
+    format: AgentOutputFormat,
+    prompt: Option<RunInputs>,
+    initialize: bool,
+    check: Option<DiagnosticThreshold>,
+    session_options: SessionOptions,
+) -> color_eyre::Result<HeadlessOutcome> {
+    let started = std::time::Instant::now();
+    set_working_directory(args.cwd.as_deref())?;
+    let cancel = cancellation_token();
+    let progress = Arc::new(Mutex::new(Progress::default()));
+    let mut agent = None;
+    let mut report = None;
+    let mut metadata = None;
+    let mut pending_output: Option<pending::Pending> = None;
+    let session = Arc::new(Mutex::new(None::<crate::headless_session::HeadlessSession>));
+    let timeout = args.timeout;
     let operation = async {
-        let agent = HeadlessAgent::build(&agent_args, cancel.clone()).await?;
-        if !agent_args.no_diagnostics {
+        let (mut config, _) = crate::load_config_from(args.config.as_deref())?;
+        if session_options.suspend
+            || session_options.save_session
+            || session_options.resume.is_some()
+            || session_options.continue_session
+        {
+            let manager = crate::session::SessionManager::new()
+                .ok_or_else(|| color_eyre::eyre::eyre!("session persistence unavailable"))?;
+            *session.lock().unwrap() = crate::headless_session::HeadlessSession::open(
+                manager,
+                session_options.resume.as_deref(),
+                session_options.continue_session,
+                session_options.fork,
+                session_options.no_save,
+                session_options.save_session || session_options.suspend,
+            )?;
+            if let Some(saved) = session.lock().unwrap().as_ref() {
+                saved.inherit_args(&mut args, &mut config);
+            }
+        }
+        let stored_pending = session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.snapshot.headless_pending.clone())
+            .map(serde_json::from_value::<pending::Pending>)
+            .transpose()?;
+        pending_output = stored_pending.clone();
+        let saved_dir = session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|s| s.restored())
+            .map(|s| PathBuf::from(&s.snapshot.working_dir));
+        if let Some(saved_dir) = saved_dir
+            && !same_dir(&saved_dir, &current_dir())
+        {
+            // Answering re-runs the pending call with its original, possibly
+            // relative, arguments, so it must happen in the original workspace.
+            if stored_pending.is_some() {
+                return Err(crate::headless_security::UsageError(format!(
+                    "this session is waiting for input in {}; rerun with --cwd {}",
+                    saved_dir.display(),
+                    saved_dir.display()
+                ))
+                .into());
+            }
+            eprintln!(
+                "warning: resuming a session from {} in a different directory ({})",
+                saved_dir.display(),
+                current_dir().display()
+            );
+        }
+        let answer = match &session_options.answer_file {
+            Some(path) => Some(std::fs::read_to_string(path)?.trim_end().to_string()),
+            None => session_options.answer.clone(),
+        };
+        validate_answer(
+            stored_pending.as_ref(),
+            answer.as_deref(),
+            session_options.answer_id.as_deref(),
+            config.allow_yolo,
+        )?;
+        let suspend = session_options.suspend
+            || stored_pending.is_some()
+            || args.work_mode == Some(WorkMode::Manual);
+        if suspend && session_options.no_save {
+            return Err(crate::headless_security::UsageError(
+                "suspension conflicts with --no-save".into(),
+            )
+            .into());
+        }
+        if let (Some(pending), Some(answer)) = (&stored_pending, &answer)
+            && pending.kind == "plan_review"
+        {
+            match interaction::parse_plan_answer(answer, config.allow_yolo)
+                .map_err(|e| crate::headless_security::UsageError(e.into()))?
+            {
+                interaction::PlanAnswer::Manual => args.work_mode = Some(WorkMode::Manual),
+                interaction::PlanAnswer::Auto => args.work_mode = Some(WorkMode::Auto),
+                interaction::PlanAnswer::Yolo => args.work_mode = Some(WorkMode::Yolo),
+                interaction::PlanAnswer::Revise => args.work_mode = Some(WorkMode::Plan),
+            }
+        }
+        if answer.is_none()
+            && prompt
+                .as_ref()
+                .is_some_and(|input| input.prompt.is_none() && input.prompt_file.is_none())
+        {
+            return Err(crate::headless_security::UsageError(
+                "a prompt is required when there is no pending answer".into(),
+            )
+            .into());
+        }
+        apply_overrides(&mut config, &args)?;
+        let inputs = prepare_inputs(prompt, config.vision_enabled).await?;
+        if let Some(saved) = session.lock().unwrap().as_mut()
+            && let Some(model) = &args.classifier_model
+        {
+            saved.snapshot.classifier_model_override =
+                crate::session::ModelOverride::Model(model.clone());
+        }
+        let resolved =
+            crate::headless_security::resolve_security(&config, &args.security, &current_dir())?;
+        metadata = Some(crate::headless_security::security_metadata(
+            &config,
+            &args.security,
+            &resolved,
+        ));
+        agent = Some(
+            HeadlessAgent::build(
+                &args,
+                config,
+                cancel.clone(),
+                progress.clone(),
+                format,
+                metadata.as_ref(),
+                session.clone(),
+                suspend,
+            )
+            .await?,
+        );
+        let agent = agent.as_ref().expect("agent was built");
+        if !args.no_diagnostics {
             agent.seed_diagnostics_baseline().await;
         }
-
-        if run_init {
+        if let (Some(pending), Some(answer)) = (stored_pending, answer) {
+            agent.resume(pending, answer, format).await?;
+            pending_output = None;
+            if agent.pending.lock().unwrap().is_some() {
+                return Ok(HeadlessOutcome::NeedsInput);
+            }
+        }
+        if initialize {
             agent
                 .run_turn(
                     agent.initialization_prompt.clone(),
                     InputRole::Developer,
-                    AgentOutputFormat::Text,
+                    if inputs.is_some() {
+                        AgentOutputFormat::Text
+                    } else {
+                        format
+                    },
                 )
                 .await?;
-            if !agent_args.no_diagnostics {
+            if inputs.is_some() && !args.no_diagnostics {
                 agent.refresh_diagnostics_baseline().await;
             }
         }
-
-        let result = agent.run_turn(prompt, InputRole::User, format).await?;
-        agent.queue_for_dream();
-        let diagnostics = if check {
-            Some(collect_report(threshold, &cancel).await)
-        } else {
-            None
-        };
-        let passed = diagnostics.as_ref().is_none_or(|report| report.passed);
-        emit_agent_result(format, &agent.model, result, diagnostics.as_ref())?;
-        Ok(passed)
-    };
-
-    let result = run_with_timeout(operation, timeout, &cancel).await;
-    crate::diagnostics::shutdown_lsp().await;
-    result
-}
-
-pub(crate) async fn init(args: InitArgs) -> color_eyre::Result<bool> {
-    let InitArgs {
-        format,
-        agent: agent_args,
-    } = args;
-    set_working_directory(agent_args.cwd.as_deref())?;
-    let cancel = cancellation_token();
-    let timeout = agent_args.timeout;
-
-    let operation = async {
-        let agent = HeadlessAgent::build(&agent_args, cancel.clone()).await?;
-        if !agent_args.no_diagnostics {
-            agent.seed_diagnostics_baseline().await;
+        if let Some((instructions, message)) = inputs {
+            {
+                let mut conversation = agent.conversation.lock().unwrap();
+                for instruction in instructions {
+                    conversation
+                        .add_input_message(input_message(instruction, InputRole::Developer));
+                }
+            }
+            agent.run_message(message, format).await?;
         }
-        let result = agent
-            .run_turn(
-                agent.initialization_prompt.clone(),
-                InputRole::Developer,
-                format,
-            )
-            .await?;
-        emit_agent_result(format, &agent.model, result, None)?;
-        Ok(true)
+        if agent.pending.lock().unwrap().is_some() {
+            return Ok(HeadlessOutcome::NeedsInput);
+        }
+        if let Some(threshold) = check {
+            report = Some(collect_report(threshold, &cancel).await);
+        }
+        Ok(if report.as_ref().is_none_or(|r| r.passed) {
+            HeadlessOutcome::Completed
+        } else {
+            HeadlessOutcome::CheckFailed
+        })
     };
-
-    let result = run_with_timeout(operation, timeout, &cancel).await;
+    let mut result = run_with_timeout(operation, timeout, &cancel).await;
+    if let Some(agent) = &agent {
+        pending_output = agent.pending.lock().unwrap().clone();
+        if let Err(error) = agent.save_session() {
+            eprintln!("cannot save session: {error}");
+            result = Err(error);
+        }
+        agent.queue_for_dream();
+    }
     crate::diagnostics::shutdown_lsp().await;
+    if pending_output.is_some()
+        && result.as_ref().err().is_some_and(|error| {
+            matches!(
+                error.downcast_ref::<crate::runner::RunnerError>(),
+                Some(crate::runner::RunnerError::InputRequired { .. })
+            )
+        })
+    {
+        result = Ok(HeadlessOutcome::NeedsInput);
+    }
+    if pending_output.is_some() && result.is_ok() {
+        result = Ok(HeadlessOutcome::NeedsInput);
+    }
+    let outcome = match &result {
+        Ok(outcome) => *outcome,
+        Err(error) => HeadlessOutcome::from_error(error),
+    };
+    if matches!(
+        outcome,
+        HeadlessOutcome::Timeout | HeadlessOutcome::Interrupted
+    ) {
+        eprintln!("headless operation stopped: {}", outcome.stop_reason());
+    }
+    let model = agent
+        .as_ref()
+        .map(|a| a.model.as_str())
+        .or(args.model.as_deref())
+        .unwrap_or("");
+    let mut progress = progress.lock().unwrap();
+    if let Some(agent) = &agent {
+        progress.usage = agent.conversation.lock().unwrap().accumulated_usage;
+    }
+    let (active_steps, active_tool_calls) = agent
+        .as_ref()
+        .map(|a| a.runner.metrics.snapshot())
+        .unwrap_or_default();
+    emit_agent_result(
+        format,
+        model,
+        TurnResult {
+            final_text: progress.text.clone(),
+            usage: progress.usage,
+            steps: progress.completed_steps + active_steps,
+            tool_calls: progress.completed_tool_calls + active_tool_calls,
+        },
+        report.as_ref(),
+        outcome,
+        args.work_mode.unwrap_or(WorkMode::Auto),
+        metadata.as_ref(),
+        started.elapsed().as_millis(),
+        progress.compactions,
+        session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.session_id())
+            .map(str::to_owned)
+            .as_deref(),
+        pending_output.as_ref(),
+    )?;
     result
 }
 
-pub(crate) async fn diagnostics(args: DiagnosticsArgs) -> color_eyre::Result<bool> {
+pub(crate) async fn diagnostics(args: DiagnosticsArgs) -> color_eyre::Result<HeadlessOutcome> {
     set_working_directory(args.cwd.as_deref())?;
-    install_security()?;
+    let (config, _) = crate::load_config_from(args.config.as_deref())?;
+    crate::install_security_with_overrides(&config, &args.security)?;
     let cancel = cancellation_token();
     let report = collect_report(args.fail_on, &cancel).await;
-
     match args.format {
         DiagnosticsOutputFormat::Text => println!("{}", report.render()),
-        DiagnosticsOutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
+        DiagnosticsOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
     }
-
     crate::diagnostics::shutdown_lsp().await;
-    Ok(report.passed)
+    Ok(if cancel.is_cancelled() {
+        HeadlessOutcome::Interrupted
+    } else if report.passed {
+        HeadlessOutcome::Completed
+    } else {
+        HeadlessOutcome::CheckFailed
+    })
+}
+
+fn mode_label(mode: WorkMode) -> String {
+    mode.label().to_ascii_lowercase()
 }
 
 struct HeadlessAgent {
+    compactor: Arc<compaction::Compactor>,
     runner: TurnRunner,
+    progress: Arc<Mutex<Progress>>,
     conversation: Arc<Mutex<Conversation>>,
     diagnostics_state: Arc<Mutex<DiagnosticsState>>,
     cancel: CancellationToken,
@@ -165,6 +492,14 @@ struct HeadlessAgent {
     agents: crate::agents::AgentManager,
     /// Identity used when queueing this run for background consolidation.
     dream_session_id: String,
+    memory_enabled: bool,
+    session: Arc<Mutex<Option<crate::headless_session::HeadlessSession>>>,
+    todos: Arc<Mutex<crate::todos::TodoList>>,
+    tasks: crate::tasks::TaskManager,
+    security: Arc<crate::security::SecurityHandle>,
+    activated_skills: Vec<String>,
+    suspend: bool,
+    pending: Mutex<Option<pending::Pending>>,
 }
 
 impl Drop for HeadlessAgent {
@@ -174,23 +509,57 @@ impl Drop for HeadlessAgent {
 }
 
 impl HeadlessAgent {
-    async fn build(args: &AgentArgs, cancel: CancellationToken) -> color_eyre::Result<Self> {
-        let (config, _) = crate::load_config()?;
-        let security = crate::install_security_for_current_dir(&config)?;
+    #[allow(clippy::too_many_arguments)]
+    async fn build(
+        args: &AgentArgs,
+        config: crate::config::programmer_config::ProgrammerConfig,
+        cancel: CancellationToken,
+        progress: Arc<Mutex<Progress>>,
+        format: AgentOutputFormat,
+        metadata: Option<&crate::headless_security::SecurityMetadata>,
+        session: Arc<Mutex<Option<crate::headless_session::HeadlessSession>>>,
+        suspend: bool,
+    ) -> color_eyre::Result<Self> {
+        let security = crate::install_security_with_overrides(&config, &args.security)?;
+        let saved = session.lock().unwrap().as_ref().map(|s| s.snapshot.clone());
+        let session_id = session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.session_id())
+            .map(str::to_owned);
+        if let Some(saved) = &saved {
+            security.restore_snapshots(&saved.file_snapshots);
+        }
 
         let provider_manager = crate::providers::ProviderManager::new(&config).await;
         let model = args
             .model
             .clone()
             .unwrap_or_else(|| provider_manager.default_model());
+        if format == AgentOutputFormat::Jsonl {
+            println!(
+                "{}",
+                json!({"schema_version": OUTPUT_SCHEMA_VERSION, "type": "start",
+                "model": model, "work_mode": mode_label(args.work_mode.unwrap_or(WorkMode::Auto)), "security": metadata, "session_id": session_id})
+            );
+        }
         let (client, model_name) = provider_manager
             .resolve(&model)
             .map(|(client, name)| (client.clone(), name))
             .ok_or_else(|| color_eyre::eyre::eyre!("unknown provider/model: {model}"))?;
 
-        let todo_store = Arc::new(Mutex::new(Default::default()));
+        let todo_store = Arc::new(Mutex::new(crate::todos::TodoList {
+            todos: saved.as_ref().map(|s| s.todos.clone()).unwrap_or_default(),
+        }));
         let security = Arc::new(crate::security::SecurityHandle::new(security));
-        let skill_registry = crate::skills::SkillRegistry::load();
+        let mut skill_registry = crate::skills::SkillRegistry::load();
+        if let Some(saved) = &saved
+            && (saved.skill_selection_saved || !saved.activated_skills.is_empty())
+        {
+            skill_registry.set_activated(&saved.activated_skills);
+        }
+        let activated_skills = skill_registry.activated_names().to_vec();
         let skill_prompt = skill_registry.catalog_prompt();
         let initialization_prompt = skill_registry
             .prompt(crate::skills::INITIALIZE_PROJECT_SKILL)
@@ -204,25 +573,28 @@ impl HeadlessAgent {
             &model,
         );
         let conversation = Arc::new(Mutex::new(Conversation::new()));
+        if let Some(saved) = &saved {
+            let mut conv = conversation.lock().unwrap();
+            conv.restore_items(crate::session::SessionManager::into_items(saved.clone()));
+            conv.last_request_input_tokens = saved.last_request_input_tokens;
+        }
         let diagnostics_state = Arc::new(Mutex::new(DiagnosticsState::default()));
         let tasks = crate::tasks::TaskManager::default();
+        if let Some(saved) = &saved {
+            tasks.restore(&saved.tasks);
+        }
         let local = LocalToolProvider::new(todo_store.clone(), security.clone())
             .with_diagnostics_state(diagnostics_state.clone())
             .with_tasks(tasks.clone())
             .with_memory_enabled(config.memory.enabled)
             .with_memory_context(Some(conversation.clone()));
-        if args.work_mode == WorkMode::Manual {
-            return Err(color_eyre::eyre::eyre!(
-                "manual mode requires an interactive approval surface"
-            ));
-        }
         let classifier_model = args
             .classifier_model
             .as_deref()
             .or(config.classifier_model.as_deref())
             .unwrap_or(&model);
         let policy = PolicySpec::resolve(
-            args.work_mode,
+            args.work_mode.unwrap_or(WorkMode::Auto),
             &provider_manager,
             classifier_model,
             config.classifier_top_logprobs,
@@ -236,7 +608,14 @@ impl HeadlessAgent {
         let mcp_manager = connect_mcp(&config.mcp_servers).await;
         let mut base_providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
 
+        let tool_filter = crate::runner::ToolFilter {
+            allowed: args.allowed_tools.clone(),
+            disallowed: args.disallowed_tools.clone(),
+        };
         let agents = crate::agents::AgentManager::default();
+        if let Some(saved) = &saved {
+            agents.restore(&saved.agents);
+        }
         let child_runtime = crate::agents::AgentRuntime {
             tasks: tasks.clone(),
             events: tokio::sync::mpsc::unbounded_channel().0,
@@ -244,25 +623,26 @@ impl HeadlessAgent {
             client: client.clone(),
             model_name: model_name.clone(),
             model_str: model.clone(),
-            todos: todo_store,
-            security,
+            todos: todo_store.clone(),
+            security: security.clone(),
             mcp_manager: mcp_manager.clone(),
             policy: policy.clone(),
             soul: config.soul.clone(),
             coauthor: config.git_coauthor.clone(),
             vision_enabled: config.vision_enabled,
-            thinking_level: args.thinking,
+            thinking_level: args.thinking.unwrap_or_default(),
             memory_config: config.memory.clone(),
             memory_model: config.memory_model.clone(),
             skill_registry: skill_registry.clone(),
             skill_prompt: skill_prompt.clone(),
             approval_label: format!(
                 "{} approved by {} mode (headless sub-agent)",
-                args.work_mode.icon(),
-                args.work_mode.label()
+                args.work_mode.unwrap_or(WorkMode::Auto).icon(),
+                args.work_mode.unwrap_or(WorkMode::Auto).label()
             ),
             checkpoint: None,
             conversation_history: None,
+            tool_filter: tool_filter.clone(),
         };
         base_providers.push(Arc::new(AgentToolProvider::new(
             agents.clone(),
@@ -275,7 +655,13 @@ impl HeadlessAgent {
             crate::runner::hooks::standard_hooks(diagnostics_state.clone())
         };
 
-        let runner = AgentSpec {
+        let compactor = Arc::new(compaction::Compactor::new(
+            &config,
+            &model,
+            &provider_manager,
+            args.thinking.unwrap_or_default(),
+        ));
+        let mut runner = AgentSpec {
             client,
             model_name,
             model_str: model.clone(),
@@ -287,22 +673,42 @@ impl HeadlessAgent {
             soul: config.soul,
             coauthor: config.git_coauthor,
             vision_enabled: config.vision_enabled,
-            thinking_level: args.thinking,
+            thinking_level: args.thinking.unwrap_or_default(),
             memory_model,
             hooks,
             stream_retrying: Arc::new(AtomicBool::new(false)),
             max_steps: args.max_steps,
         }
         .build();
+        for pattern in runner.set_tool_filter(tool_filter) {
+            eprintln!("warning: tool pattern '{pattern}' matches no available tools");
+        }
 
         Ok(Self {
+            suspend,
+            pending: Mutex::new(
+                saved
+                    .as_ref()
+                    .and_then(|s| s.headless_pending.clone())
+                    .map(serde_json::from_value)
+                    .transpose()?,
+            ),
+            compactor,
+            progress,
             runner,
-            dream_session_id: format!("headless-{}", uuid::Uuid::new_v4().simple()),
+            memory_enabled: config.memory.enabled,
+            dream_session_id: session_id
+                .unwrap_or_else(|| format!("headless-{}", uuid::Uuid::new_v4().simple())),
+            session,
+            todos: todo_store,
+            tasks,
+            security,
+            activated_skills,
             conversation,
             diagnostics_state,
             cancel,
             model,
-            mode: args.work_mode,
+            mode: args.work_mode.unwrap_or(WorkMode::Auto),
             skill_prompt,
             initialization_prompt,
             agents,
@@ -315,11 +721,52 @@ impl HeadlessAgent {
         role: InputRole,
         format: AgentOutputFormat,
     ) -> color_eyre::Result<TurnResult> {
-        self.conversation
-            .lock()
-            .unwrap()
-            .add_input_message(input_message(text, role));
+        self.run_message(input_message(text, role), format).await
+    }
+
+    async fn run_message(
+        &self,
+        message: ApiMessageItem,
+        format: AgentOutputFormat,
+    ) -> color_eyre::Result<TurnResult> {
+        // Preserve earlier initialization-turn counts before the runner resets
+        // its current-turn counters; the active counters remain readable on cancellation.
+        let (steps, tool_calls) = self.runner.metrics.snapshot();
+        {
+            let mut progress = self.progress.lock().unwrap();
+            progress.completed_steps += steps;
+            progress.completed_tool_calls += tool_calls;
+        }
+        if let ApiMessageItem::Input(input) = &message
+            && let Some(text) = input.content.iter().find_map(|content| match content {
+                InputContent::InputText(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            && let Some(saved) = self.session.lock().unwrap().as_mut()
+        {
+            if saved.snapshot.title.is_empty() {
+                saved.snapshot.title = crate::session::truncate_first_line(&text, 80);
+                saved.snapshot.first_message = saved.snapshot.title.clone();
+            }
+            saved.snapshot.history.push(text);
+        }
+        self.conversation.lock().unwrap().add_input_message(message);
+        self.drive(None, format).await
+    }
+
+    async fn drive(
+        &self,
+        resume: Option<(crate::runner::RunnerCheckpoint, String)>,
+        format: AgentOutputFormat,
+    ) -> color_eyre::Result<TurnResult> {
         let surface = CliSurface {
+            suspend: self.suspend,
+            compaction: Some((
+                self.compactor.clone(),
+                self.conversation.clone(),
+                self.cancel.clone(),
+            )),
+            progress: self.progress.clone(),
             jsonl: format == AgentOutputFormat::Jsonl,
             plan: self.mode == WorkMode::Plan,
             skill_prompt: self.skill_prompt.clone(),
@@ -329,10 +776,79 @@ impl HeadlessAgent {
                 self.mode.label()
             ),
         };
-        self.runner
-            .run_turn(&self.conversation, &self.cancel, &surface)
-            .await
-            .map_err(Into::into)
+        let result = if let Some((checkpoint, answer)) = resume {
+            self.runner
+                .run_turn_from(
+                    &self.conversation,
+                    &self.cancel,
+                    &surface,
+                    checkpoint,
+                    answer,
+                )
+                .await
+        } else {
+            self.runner
+                .run_turn(&self.conversation, &self.cancel, &surface)
+                .await
+        };
+        if let Err(crate::runner::RunnerError::InputRequired { checkpoint }) = &result {
+            *self.pending.lock().unwrap() = Some(pending::Pending::tool(
+                (**checkpoint).clone(),
+                self.dream_session_id.clone(),
+            ));
+        } else if let Ok(result) = &result
+            && self.suspend
+            && self.mode == WorkMode::Plan
+        {
+            *self.pending.lock().unwrap() = Some(pending::Pending::plan(
+                result.final_text.clone(),
+                self.dream_session_id.clone(),
+            ));
+        }
+        self.progress.lock().unwrap().usage = self.conversation.lock().unwrap().accumulated_usage;
+        if let Ok(result) = &result {
+            self.progress.lock().unwrap().text = result.final_text.clone();
+        }
+        self.save_session()?;
+        result.map_err(Into::into)
+    }
+
+    fn save_session(&self) -> color_eyre::Result<()> {
+        let mut session = self.session.lock().unwrap();
+        let Some(session) = session.as_mut() else {
+            return Ok(());
+        };
+        if session.session_id().is_none() {
+            return Ok(());
+        }
+        let pending = self.pending.lock().unwrap();
+        session.snapshot.headless_pending =
+            pending.as_ref().map(serde_json::to_value).transpose()?;
+        if pending.is_none() {
+            crate::runner::ensure_tool_output_pairing(&self.conversation);
+        }
+        let conversation = self.conversation.lock().unwrap();
+        let items: Vec<_> = conversation.items().cloned().collect();
+        let snapshot = &mut session.snapshot;
+        if snapshot.first_message.is_empty()
+            && let Some(text) = crate::app::helpers::first_user_text(&items)
+        {
+            snapshot.first_message = crate::session::truncate_first_line(&text, 80);
+            snapshot.title = snapshot.first_message.clone();
+        }
+        snapshot.last_request_input_tokens = conversation.usage_summary().last_request_input_tokens;
+        crate::session::SessionManager::set_items(snapshot, items);
+        snapshot.current_model = Some(self.model.clone());
+        snapshot.work_mode = Some(self.mode);
+        snapshot.thinking_level = self.runner.thinking_level;
+        snapshot.vision_enabled = self.runner.vision_enabled;
+        snapshot.todos = self.todos.lock().unwrap().todos.clone();
+        snapshot.tasks = self.tasks.persist_all();
+        snapshot.agents = self.agents.persist_all();
+        snapshot.activated_skills = self.activated_skills.clone();
+        snapshot.skill_selection_saved = true;
+        snapshot.file_snapshots = self.security.snapshot().persisted_snapshots();
+        session.save()
     }
 
     /// Queue this headless run's user/assistant prose for background
@@ -340,6 +856,9 @@ impl HeadlessAgent {
     /// an interactive one; the same content-hash dedup makes a repeated
     /// identical run a no-op.
     fn queue_for_dream(&self) {
+        if !self.memory_enabled {
+            return;
+        }
         let items = self
             .conversation
             .lock()
@@ -353,6 +872,35 @@ impl HeadlessAgent {
         }
         if let Ok(manager) = crate::memory::MemoryManager::for_current_dir() {
             let _ = manager.enqueue_dream(&self.dream_session_id, &transcript);
+        }
+    }
+
+    async fn resume(
+        &self,
+        pending: pending::Pending,
+        answer: String,
+        format: AgentOutputFormat,
+    ) -> color_eyre::Result<TurnResult> {
+        *self.pending.lock().unwrap() = None;
+        if let Some(checkpoint) = pending.checkpoint {
+            let answer = normalize_answer(&checkpoint.pending, &answer);
+            self.drive(Some((checkpoint, answer)), format).await
+        } else {
+            if let Some(feedback) = answer.strip_prefix("revise:") {
+                return self
+                    .run_turn(feedback.trim().to_string(), InputRole::User, format)
+                    .await;
+            }
+            let instruction = {
+                match self.mode {
+                    WorkMode::Manual => crate::prompts::PLAN_APPROVED_MANUAL_PROMPT,
+                    WorkMode::Yolo => crate::prompts::PLAN_APPROVED_YOLO_PROMPT,
+                    _ => crate::prompts::PLAN_APPROVED_AUTO_PROMPT,
+                }
+                .to_string()
+            };
+            self.run_turn(instruction, InputRole::Developer, format)
+                .await
         }
     }
 
@@ -379,6 +927,13 @@ impl HeadlessAgent {
 }
 
 struct CliSurface {
+    suspend: bool,
+    compaction: Option<(
+        Arc<compaction::Compactor>,
+        Arc<Mutex<Conversation>>,
+        CancellationToken,
+    )>,
+    progress: Arc<Mutex<Progress>>,
     jsonl: bool,
     plan: bool,
     skill_prompt: Option<String>,
@@ -387,7 +942,24 @@ struct CliSurface {
 
 #[async_trait::async_trait]
 impl AgentSurface for CliSurface {
+    fn suspend_enabled(&self) -> bool {
+        self.suspend
+    }
     fn on_event(&self, event: RunnerEvent<'_>) {
+        {
+            let mut progress = self.progress.lock().unwrap();
+            match &event {
+                RunnerEvent::Phase(RunnerPhase::Streaming) => progress.streaming.clear(),
+                RunnerEvent::StreamChunk(chunk) => {
+                    if let async_openai::types::responses::ResponseStreamEvent::ResponseOutputTextDelta(delta) = chunk.as_ref() {
+                        progress.streaming.push_str(&delta.delta);
+                        progress.text = progress.streaming.clone();
+                    }
+                }
+                RunnerEvent::Assistant(text) => progress.text = text.to_string(),
+                _ => {}
+            }
+        }
         if !self.jsonl {
             return;
         }
@@ -421,6 +993,17 @@ impl AgentSurface for CliSurface {
             RunnerEvent::UsageSafePoint { .. } | RunnerEvent::WaitingSubagents(_) => return,
         };
         println!("{event}");
+    }
+
+    async fn usage_safe_point(&self, input_tokens: u32) -> Result<(), crate::runner::RunnerError> {
+        if let Some((compactor, conversation, cancel)) = &self.compaction
+            && compactor
+                .run(input_tokens, conversation, cancel, self.jsonl)
+                .await?
+        {
+            self.progress.lock().unwrap().compactions += 1;
+        }
+        Ok(())
     }
 
     async fn review(
@@ -465,6 +1048,111 @@ fn input_message(text: String, role: InputRole) -> ApiMessageItem {
     })
 }
 
+fn apply_overrides(
+    config: &mut crate::config::programmer_config::ProgrammerConfig,
+    args: &AgentArgs,
+) -> color_eyre::Result<()> {
+    if args.no_compact {
+        config.auto_compact_tokens = 0;
+        config.mandatory_compact_tokens = 0;
+    } else {
+        if let Some(tokens) = args.compact_tokens {
+            config.auto_compact_tokens = tokens;
+        }
+        if let Some(tokens) = args.mandatory_compact_tokens {
+            config.mandatory_compact_tokens = tokens;
+        }
+    }
+    if args.vision || args.no_vision {
+        config.vision_enabled = args.vision;
+    }
+    if args.no_memory {
+        config.memory.enabled = false;
+    }
+    for name in &args.mcp {
+        if !config.mcp_servers.iter().any(|server| &server.name == name) {
+            return Err(crate::headless_security::UsageError(format!(
+                "unknown MCP server '{name}'; available servers: {}",
+                config
+                    .mcp_servers
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .into());
+        }
+    }
+    if args.no_mcp {
+        config.mcp_servers.clear();
+    } else if !args.mcp.is_empty() {
+        config
+            .mcp_servers
+            .retain(|server| args.mcp.contains(&server.name));
+    }
+    if args.no_coauthor {
+        config.git_coauthor = None;
+    } else if let Some(coauthor) = &args.coauthor {
+        config.git_coauthor = Some(coauthor.clone());
+    }
+    if let Some(path) = &args.soul_file {
+        config.soul = Some(std::fs::read_to_string(path)?);
+    }
+    Ok(())
+}
+
+async fn prepare_inputs(
+    inputs: Option<RunInputs>,
+    vision_enabled: bool,
+) -> color_eyre::Result<Option<(Vec<String>, ApiMessageItem)>> {
+    let Some(inputs) = inputs else {
+        return Ok(None);
+    };
+    if inputs.prompt.is_none() && inputs.prompt_file.is_none() {
+        return Ok(None);
+    }
+    if !vision_enabled && !inputs.images.is_empty() {
+        return Err(crate::headless_security::UsageError(
+            "--image requires vision; enable it with --vision".into(),
+        )
+        .into());
+    }
+    let mut instructions = inputs.append_prompt;
+    for path in inputs.append_prompt_file {
+        instructions.push(std::fs::read_to_string(path)?);
+    }
+    let mut images = Vec::new();
+    for path in inputs.images {
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.len() > crate::commands::MAX_IMAGE_BYTES {
+            return Err(color_eyre::eyre::eyre!(
+                "image {} exceeds size limit",
+                path.display()
+            ));
+        }
+        let bytes = std::fs::read(&path)?;
+        images.push(
+            crate::commands::image_content_from_bytes(&bytes)
+                .map_err(color_eyre::eyre::Report::msg)?,
+        );
+    }
+    let dropped = crate::commands::limit_image_attachments(&mut images);
+    if dropped > 0 {
+        eprintln!("warning: dropped {dropped} image attachments exceeding per-message limits");
+    }
+    let text = read_prompt(inputs.prompt, inputs.prompt_file).await?;
+    let mut content = vec![InputContent::InputText(text.into())];
+    content.extend(images.into_iter().map(InputContent::InputImage));
+    Ok(Some((
+        instructions,
+        ApiMessageItem::Input(InputMessage {
+            content,
+            role: InputRole::User,
+            status: Some(OutputStatus::Completed),
+        }),
+    )))
+}
+
 async fn read_prompt(
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
@@ -490,21 +1178,24 @@ async fn run_with_timeout<F>(
     operation: F,
     timeout_seconds: Option<u64>,
     cancel: &CancellationToken,
-) -> color_eyre::Result<bool>
+) -> color_eyre::Result<HeadlessOutcome>
 where
-    F: std::future::Future<Output = color_eyre::Result<bool>>,
+    F: std::future::Future<Output = color_eyre::Result<HeadlessOutcome>>,
 {
-    let Some(seconds) = timeout_seconds else {
-        return operation.await;
-    };
-    match tokio::time::timeout(Duration::from_secs(seconds), operation).await {
-        Ok(result) => result,
-        Err(_) => {
-            cancel.cancel();
-            Err(color_eyre::eyre::eyre!(
-                "headless operation timed out after {seconds} second(s)"
-            ))
+    let deadline = async {
+        match timeout_seconds {
+            Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
+            None => std::future::pending::<()>().await,
         }
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.wait() => Ok(HeadlessOutcome::Interrupted),
+        _ = deadline => {
+            cancel.cancel();
+            Ok(HeadlessOutcome::Timeout)
+        }
+        result = operation => result,
     }
 }
 
@@ -528,24 +1219,34 @@ pub(crate) fn set_working_directory(path: Option<&Path>) -> color_eyre::Result<(
     })
 }
 
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical(a) == canonical(b)
+}
+
 fn current_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn install_security() -> color_eyre::Result<()> {
-    let (config, _) = crate::load_config()?;
-    crate::install_security_for_current_dir(&config).map(|_| ())
-}
-
 #[derive(Debug, Serialize)]
 struct AgentResult<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending: Option<&'a pending::Pending>,
+    session_id: Option<&'a str>,
     schema_version: u32,
+    steps: usize,
+    tool_calls: usize,
+    duration_ms: u128,
+    compactions: usize,
     response: &'a str,
     model: &'a str,
     usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     check: Option<&'a DiagnosticsReport>,
     passed: bool,
+    stop_reason: &'a str,
+    work_mode: String,
+    security: Option<&'a crate::headless_security::SecurityMetadata>,
 }
 
 #[derive(Debug, Serialize)]
@@ -555,14 +1256,34 @@ struct Usage {
     cached_input_tokens: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_agent_result(
     format: AgentOutputFormat,
     model: &str,
     result: TurnResult,
     check: Option<&DiagnosticsReport>,
+    outcome: HeadlessOutcome,
+    mode: WorkMode,
+    security: Option<&crate::headless_security::SecurityMetadata>,
+    duration_ms: u128,
+    compactions: usize,
+    session_id: Option<&str>,
+    pending: Option<&pending::Pending>,
 ) -> color_eyre::Result<()> {
+    // The runner checkpoint is private session state, not part of the output contract.
+    let public_pending = pending.map(|pending| pending::Pending {
+        checkpoint: None,
+        ..pending.clone()
+    });
+    let pending = public_pending.as_ref();
     let output = AgentResult {
+        pending,
         schema_version: OUTPUT_SCHEMA_VERSION,
+        session_id,
+        steps: result.steps,
+        tool_calls: result.tool_calls,
+        duration_ms,
+        compactions,
         response: &result.final_text,
         model,
         usage: Usage {
@@ -571,12 +1292,32 @@ fn emit_agent_result(
             cached_input_tokens: result.usage.2,
         },
         check,
-        passed: check.is_none_or(|report| report.passed),
+        passed: outcome == HeadlessOutcome::Completed,
+        stop_reason: outcome.stop_reason(),
+        work_mode: mode_label(mode),
+        security,
     };
 
+    if format == AgentOutputFormat::Jsonl
+        && let Some(pending) = pending
+    {
+        println!(
+            "{}",
+            json!({"schema_version": OUTPUT_SCHEMA_VERSION, "type": "input_required", "pending": pending})
+        );
+    }
     match format {
         AgentOutputFormat::Text => {
-            println!("{}", result.final_text);
+            println!(
+                "{}",
+                pending.map_or(result.final_text.as_str(), |p| p.prompt.as_str())
+            );
+            if let Some(pending) = pending {
+                eprintln!("Continue: {}", pending.resume_command);
+            }
+            if let Some(id) = session_id {
+                eprintln!("session: {id}");
+            }
             if let Some(report) = check {
                 eprintln!("\n--- Final diagnostics ---\n{}", report.render());
             }
@@ -695,8 +1436,93 @@ fn count_severity(diagnostics: &[Diagnostic], severity: Severity) -> usize {
         .count()
 }
 
+fn validate_answer(
+    pending: Option<&pending::Pending>,
+    answer: Option<&str>,
+    id: Option<&str>,
+    allow_yolo: bool,
+) -> color_eyre::Result<()> {
+    let fail = |message: &str| crate::headless_security::UsageError(message.into());
+    let Some(pending) = pending else {
+        return if answer.is_some() {
+            Err(fail("session has no pending interaction").into())
+        } else {
+            Ok(())
+        };
+    };
+    let answer =
+        answer.ok_or_else(|| fail("pending interaction requires --answer or --answer-file"))?;
+    if id.is_some_and(|id| id != pending.id) {
+        return Err(fail("--answer-id does not match pending interaction").into());
+    }
+    let valid = match pending.kind.as_str() {
+        "tool_approval" => {
+            answer == "approve"
+                || answer == "deny"
+                || answer
+                    .strip_prefix("deny:")
+                    .is_some_and(|s| !s.trim().is_empty())
+        }
+        "permission" => {
+            answer == "allow"
+                || answer == "deny"
+                || answer
+                    .strip_prefix("deny:")
+                    .is_some_and(|s| !s.trim().is_empty())
+        }
+        "question" => true,
+        "plan_review" => interaction::parse_plan_answer(answer, allow_yolo).is_ok(),
+        _ => false,
+    };
+    if !valid {
+        return Err(fail("invalid --answer for pending interaction").into());
+    }
+    Ok(())
+}
+
+fn normalize_answer(pending: &crate::runner::Pending, answer: &str) -> String {
+    match pending.kind {
+        crate::runner::PendingKind::Permission if answer == "allow" => {
+            "Approve for this session".into()
+        }
+        crate::runner::PendingKind::Question => answer
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| pending.options.get(index))
+            .cloned()
+            .unwrap_or_else(|| answer.into()),
+        _ => answer.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_answers_are_validated_without_mutation() {
+        let mut p =
+            super::pending::Pending::plan("Review".into(), uuid::Uuid::new_v4().to_string());
+        assert!(super::validate_answer(Some(&p), None, None, false).is_err());
+        assert!(super::validate_answer(Some(&p), Some("auto"), Some("wrong"), false).is_err());
+        assert!(super::validate_answer(Some(&p), Some("yolo"), None, false).is_err());
+        assert!(super::validate_answer(Some(&p), Some("revise: add tests"), None, false).is_ok());
+        for (kind, valid, invalid) in [
+            ("tool_approval", "approve", "allow"),
+            ("permission", "allow", "approve"),
+        ] {
+            p.kind = kind.into();
+            for answer in [valid, "deny", "deny: not needed"] {
+                assert!(super::validate_answer(Some(&p), Some(answer), Some(&p.id), false).is_ok());
+            }
+            assert!(super::validate_answer(Some(&p), Some(invalid), None, false).is_err());
+        }
+        assert!(super::validate_answer(None, Some("approve"), None, false).is_err());
+        let mut snapshot = crate::session::SessionManager::for_test(std::env::temp_dir()).create();
+        snapshot.headless_pending = Some(serde_json::to_value(&p).unwrap());
+        let restored: crate::session::SessionSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        assert_eq!(snapshot.headless_pending, restored.headless_pending);
+    }
     use super::*;
     use crate::tools::provider::{McpToolProvider, ToolRegistry};
 
@@ -759,6 +1585,185 @@ mod tests {
         }
     }
 
+    fn agent_args(flags: &[&str]) -> AgentArgs {
+        use clap::Parser;
+        let mut argv = vec!["programmer", "init"];
+        argv.extend_from_slice(flags);
+        let parsed = crate::cli::Args::try_parse_from(argv).unwrap();
+        let Some(crate::cli::Command::Init(args)) = parsed.command else {
+            panic!("init")
+        };
+        args.agent
+    }
+
+    #[test]
+    fn invocation_overrides_are_local_and_select_servers() {
+        let original = crate::config::programmer_config::ProgrammerConfig::default();
+        let mut config = original.clone();
+        config.mcp_servers = vec![
+            http_server("one", "unused".into()),
+            http_server("two", "unused".into()),
+        ];
+        apply_overrides(
+            &mut config,
+            &agent_args(&[
+                "--vision",
+                "--no-memory",
+                "--mcp",
+                "two",
+                "--coauthor",
+                "Name <mail@example.com>",
+            ]),
+        )
+        .unwrap();
+        assert!(config.vision_enabled);
+        assert!(!config.memory.enabled);
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(config.mcp_servers[0].name, "two");
+        assert_eq!(
+            config.git_coauthor.as_deref(),
+            Some("Name <mail@example.com>")
+        );
+        assert!(original.memory.enabled);
+        apply_overrides(
+            &mut config,
+            &agent_args(&["--no-vision", "--no-mcp", "--no-coauthor"]),
+        )
+        .unwrap();
+        assert!(!config.vision_enabled);
+        assert!(config.mcp_servers.is_empty());
+        assert!(config.git_coauthor.is_none());
+    }
+
+    #[tokio::test]
+    async fn appended_instructions_and_images_use_shared_encoding() {
+        use image::{ImageBuffer, ImageFormat, Rgb};
+        let temp = std::env::temp_dir().join(format!("programmer-inputs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&temp).unwrap();
+        let instruction = temp.join("instructions.txt");
+        std::fs::write(&instruction, "file instruction").unwrap();
+        let soul = temp.join("soul.txt");
+        std::fs::write(&soul, "temporary soul").unwrap();
+        let mut config = crate::config::programmer_config::ProgrammerConfig::default();
+        apply_overrides(
+            &mut config,
+            &agent_args(&["--soul-file", soul.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(config.soul.as_deref(), Some("temporary soul"));
+        let path = temp.join("image.png");
+        ImageBuffer::from_pixel(2, 1, Rgb([10u8, 20, 30]))
+            .save_with_format(&path, ImageFormat::Png)
+            .unwrap();
+        let inputs = RunInputs {
+            prompt: Some("user text".into()),
+            append_prompt: vec!["first".into(), "second".into()],
+            append_prompt_file: vec![instruction],
+            images: vec![path],
+            ..Default::default()
+        };
+        let (instructions, message) = prepare_inputs(Some(inputs), true).await.unwrap().unwrap();
+        assert_eq!(instructions, ["first", "second", "file instruction"]);
+        let ApiMessageItem::Input(message) = message else {
+            panic!("input")
+        };
+        assert_eq!(message.role, InputRole::User);
+        assert!(
+            matches!(&message.content[0], InputContent::InputText(text) if text.text == "user text")
+        );
+        assert!(
+            matches!(&message.content[1], InputContent::InputImage(image) if image.image_url.as_deref().unwrap().starts_with("data:image/png;base64,"))
+        );
+        for name in ["instructions.txt", "soul.txt", "image.png"] {
+            std::fs::remove_file(temp.join(name)).unwrap();
+        }
+        std::fs::remove_dir(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn images_require_vision_before_reading_files() {
+        let error = prepare_inputs(
+            Some(RunInputs {
+                prompt: Some("text".into()),
+                images: vec![PathBuf::from("missing.png")],
+                ..Default::default()
+            }),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(HeadlessOutcome::from_error(&error), HeadlessOutcome::Usage);
+    }
+
+    #[test]
+    fn exit_codes_are_stable() {
+        for (outcome, code) in [
+            (HeadlessOutcome::Completed, 0),
+            (HeadlessOutcome::Error, 1),
+            (HeadlessOutcome::Usage, 2),
+            (HeadlessOutcome::CheckFailed, 3),
+            (HeadlessOutcome::Timeout, 4),
+            (HeadlessOutcome::MaxSteps, 5),
+            (HeadlessOutcome::NeedsInput, 10),
+            (HeadlessOutcome::Interrupted, 130),
+        ] {
+            assert_eq!(outcome.exit_code(), code);
+        }
+        let limit = color_eyre::Report::new(crate::runner::RunnerError::StepLimit { limit: 1 });
+        assert_eq!(
+            HeadlessOutcome::from_error(&limit),
+            HeadlessOutcome::MaxSteps
+        );
+        let cancelled = color_eyre::Report::new(crate::runner::RunnerError::Cancelled);
+        assert_eq!(
+            HeadlessOutcome::from_error(&cancelled),
+            HeadlessOutcome::Interrupted
+        );
+        assert_eq!(
+            HeadlessOutcome::from_error(&color_eyre::eyre::eyre!("IO")),
+            HeadlessOutcome::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_and_cancellation_have_distinct_outcomes() {
+        let cancel = CancellationToken::new();
+        let result = run_with_timeout(std::future::pending(), Some(0), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(result, HeadlessOutcome::Timeout);
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            run_with_timeout(std::future::pending(), None, &cancel)
+                .await
+                .unwrap(),
+            HeadlessOutcome::Interrupted
+        );
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            run_with_timeout(async { Ok(HeadlessOutcome::Completed) }, None, &cancel)
+                .await
+                .unwrap(),
+            HeadlessOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn surface_keeps_last_assistant_text_without_jsonl() {
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let surface = CliSurface {
+            suspend: false,
+            compaction: None,
+            progress: progress.clone(),
+            jsonl: false,
+            plan: false,
+            skill_prompt: None,
+            approval_label: String::new(),
+        };
+        surface.on_event(RunnerEvent::Assistant("partial answer"));
+        assert_eq!(progress.lock().unwrap().text, "partial answer");
+    }
+
     #[test]
     fn thresholds_include_more_severe_findings() {
         assert!(DiagnosticThreshold::Error.matches(Severity::Error));
@@ -801,6 +1806,9 @@ mod tests {
     #[test]
     fn cli_surface_exposes_the_loaded_skill_prompt() {
         let surface = CliSurface {
+            suspend: false,
+            compaction: None,
+            progress: Arc::default(),
             jsonl: false,
             plan: false,
             skill_prompt: Some("skill instructions".to_string()),
