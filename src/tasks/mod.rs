@@ -256,6 +256,15 @@ struct TaskEntry {
     pty: Option<PtyState>,
 }
 
+/// Atomic result of resolving a foreground command at a timeout or cancellation
+/// boundary. Keeping the kind/status check and transition under one registry
+/// lock prevents Ctrl+Z promotion from racing with command-tool cleanup.
+pub(crate) enum ForegroundCommandResolution {
+    Background,
+    Finished(TaskSnapshot),
+    StopRequested,
+}
+
 /// A read-only view of an interactive task's screen, for the agent and the UI.
 #[derive(Debug, Clone)]
 pub struct ScreenSnapshot {
@@ -739,6 +748,9 @@ impl TaskManager {
                 entry.status.label()
             ));
         }
+        if entry.kill.is_none() {
+            return Err(format!("error: command {id} is already stopping"));
+        }
 
         entry.kind = TaskKind::Background;
         entry.origin = TaskOrigin::PromotedCommand;
@@ -795,9 +807,63 @@ async fn kill_process_tree(child: &mut tokio::process::Child, process_id: Option
 }
 
 impl TaskManager {
+    /// Promote a foreground command at its timeout boundary. A concurrent
+    /// Ctrl+Z promotion and process completion are observed atomically.
+    pub(crate) fn promote_command_at_deadline(
+        &self,
+        id: u64,
+    ) -> Result<ForegroundCommandResolution, String> {
+        let mut reg = self.state.registry.lock().unwrap();
+        let entry = reg
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| format!("error: no task with id {id}"))?;
+        if entry.kind == TaskKind::Background {
+            return Ok(ForegroundCommandResolution::Background);
+        }
+        if entry.status != TaskStatus::Running {
+            return Ok(ForegroundCommandResolution::Finished(snapshot_entry(entry)));
+        }
+        if entry.kill.is_none() {
+            return Ok(ForegroundCommandResolution::StopRequested);
+        }
+
+        entry.kind = TaskKind::Background;
+        entry.origin = TaskOrigin::PromotedCommand;
+        entry.notify_agent.store(true, Ordering::Release);
+        entry.call_id = None;
+        entry.max_output = MAX_TASK_OUTPUT;
+        cap_buffer(&mut entry.output, MAX_TASK_OUTPUT);
+        cap_buffer(&mut entry.stderr_output, MAX_TASK_OUTPUT);
+        Ok(ForegroundCommandResolution::Background)
+    }
+
+    /// Request cleanup only while this call still owns a foreground command.
+    /// Returning `Background` preserves a concurrent Ctrl+Z promotion.
+    pub(crate) fn stop_foreground_command(
+        &self,
+        id: u64,
+    ) -> Result<ForegroundCommandResolution, String> {
+        let mut reg = self.state.registry.lock().unwrap();
+        let entry = reg
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| format!("error: no task with id {id}"))?;
+        if entry.kind == TaskKind::Background {
+            return Ok(ForegroundCommandResolution::Background);
+        }
+        if entry.status != TaskStatus::Running {
+            return Ok(ForegroundCommandResolution::Finished(snapshot_entry(entry)));
+        }
+        let Some(kill) = entry.kill.take() else {
+            return Ok(ForegroundCommandResolution::StopRequested);
+        };
+        let _ = kill.send(());
+        Ok(ForegroundCommandResolution::StopRequested)
+    }
+
     /// Whether a command has already handed ownership to the background task
-    /// system. Cancellation and hard-timeout paths use this to avoid killing a
-    /// process after the user has pressed Ctrl+Z.
+    /// system.
     pub fn is_background(&self, id: u64) -> bool {
         let reg = self.state.registry.lock().unwrap();
         reg.iter()

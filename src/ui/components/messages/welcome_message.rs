@@ -13,37 +13,141 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::ui::markdown_theme::palette;
 use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
-
-const DIM: Color = Color::Gray;
-const TEXT: Color = Color::White;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const PROJECT_URL: &str = "https://github.com/huangdihd/programmer";
+
+fn key(label: &'static str) -> Span<'static> {
+    Span::styled(
+        format!("{label:<11}"),
+        Style::default()
+            .fg(role::HEADING)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn action(label: &'static str) -> Span<'static> {
+    Span::styled(label, Style::default().fg(palette::TEXT))
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct WelcomeMessage;
 
 impl Widget for &WelcomeMessage {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = self.block();
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        let cols = WelcomeMessage::split_columns(inner);
-
-        self.render_left(cols[0], buf);
-        self.render_right(cols[1], buf);
+        let content_area = WelcomeMessage::content_area(area);
+        Paragraph::new(self.content(area.width))
+            .wrap(Wrap { trim: false })
+            .render(content_area, buf);
     }
 }
 
 impl WelcomeMessage {
-    /// Hit-test the actually rendered URL, including centering and clipping.
+    fn content_area(area: Rect) -> Rect {
+        let horizontal = if area.width >= 24 { 2 } else { 0 };
+        Rect {
+            x: area.x.saturating_add(horizontal),
+            y: area.y,
+            width: area.width.saturating_sub(horizontal.saturating_mul(2)),
+            height: area.height,
+        }
+    }
+
+    fn content(&self, width: u16) -> Text<'static> {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    "PROGRAMMER",
+                    Style::default()
+                        .fg(role::HEADING)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  v{VERSION}"), Style::default().fg(palette::FAINT)),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "AI coding in your terminal",
+                    Style::default().fg(palette::TEXT),
+                ),
+                Span::styled("  ·  Rust / Ratatui", Style::default().fg(palette::MUTED)),
+            ]),
+            Line::from(""),
+        ];
+
+        if width >= 72 {
+            lines.extend([
+                Line::from(vec![
+                    key("Enter"),
+                    action("send"),
+                    Span::styled("     ", Style::default()),
+                    key("Alt+Enter"),
+                    action("new line"),
+                    Span::styled("     ", Style::default()),
+                    key("Ctrl+T"),
+                    action("work mode"),
+                ]),
+                Line::from(vec![
+                    key("Ctrl+B"),
+                    action("sidebar"),
+                    Span::styled("  ", Style::default()),
+                    key("Mouse"),
+                    action("select / open / scroll"),
+                ]),
+            ]);
+        } else {
+            lines.extend([
+                Line::from(vec![key("Enter"), action("send")]),
+                Line::from(vec![key("Alt+Enter"), action("new line")]),
+                Line::from(vec![key("Ctrl+T"), action("work mode")]),
+                Line::from(vec![key("Ctrl+B"), action("sidebar")]),
+                Line::from(vec![key("Mouse"), action("select / open / scroll")]),
+            ]);
+        }
+
+        lines.extend([
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("│ ", Style::default().fg(role::WELCOME_DIVIDER)),
+                Span::styled(
+                    "Initially, computer means a person who computes.",
+                    Style::default()
+                        .fg(palette::MUTED)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("│ ", Style::default().fg(role::WELCOME_DIVIDER)),
+                Span::styled(
+                    "When will we pass programmer to coding agents?",
+                    Style::default()
+                        .fg(palette::MUTED)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("/help", Style::default().fg(role::HEADING)),
+                Span::styled("  shortcuts    ", Style::default().fg(palette::FAINT)),
+                Span::styled(
+                    PROJECT_URL,
+                    Style::default()
+                        .fg(role::FOCUS)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+            ]),
+        ]);
+
+        Text::from(lines)
+    }
+
+    /// Hit-test the actually rendered URL, including wrapping and clipping.
     pub(crate) fn link_at(&self, width: u16, x: u16, y: u16) -> Option<&'static str> {
         let height = self.line_count(width);
         if x >= width || y >= height || usize::from(width) * usize::from(height) > 1_000_000 {
@@ -59,152 +163,30 @@ impl WelcomeMessage {
     }
 
     pub fn line_count(&self, total_width: u16) -> u16 {
-        let dummy = Rect::new(0, 0, total_width, u16::MAX);
-        let inner = self.block().inner(dummy);
-        let cols = Self::split_columns(inner);
-
-        let left_lines = self.left_content().len() as u16;
-
-        let right_chunks = Self::split_right(cols[1]);
-        let right_lines = Paragraph::new(self.right_content())
-            .wrap(Wrap { trim: true })
-            .line_count(right_chunks[1].width) as u16;
-
-        left_lines.max(right_lines) + 2 // Top and bottom borders.
-    }
-
-    fn block(&self) -> Block<'static> {
-        Block::default()
-            .title(format!(" programmer v{} ", VERSION))
-            .title_style(
-                Style::default()
-                    .fg(role::HEADING)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(role::BORDER))
-    }
-
-    fn split_columns(inner: Rect) -> std::rc::Rc<[Rect]> {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-            .split(inner)
-    }
-
-    fn split_right(area: Rect) -> std::rc::Rc<[Rect]> {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(2), Constraint::Min(1)])
-            .split(area)
-    }
-
-    fn left_content(&self) -> Vec<Line<'static>> {
-        vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Welcome back!",
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(" ▄▄▄▄▄▄ ", Style::default().fg(role::LOGO))),
-            Line::from(Span::styled(" █ ▀▀ █ ", Style::default().fg(role::LOGO))),
-            Line::from(Span::styled(" ▀▄▄▄▄▀ ", Style::default().fg(role::LOGO))),
-            Line::from(""),
-            Line::from(Span::styled(
-                "A coding agent written in rust",
-                Style::default().fg(DIM),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                PROJECT_URL,
-                Style::default()
-                    .fg(role::FOCUS)
-                    .add_modifier(Modifier::UNDERLINED),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "© 2026 huangdihd  |  GPL-3.0-or-later  |  No warranty",
-                Style::default().fg(DIM),
-            )),
-        ]
-    }
-
-    fn right_content(&self) -> Vec<Line<'static>> {
-        vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Keyboard shortcuts",
-                Style::default()
-                    .fg(role::HEADING)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::styled("  Enter", Style::default().fg(role::HEADING)),
-                Span::styled("          Send message", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Alt+Enter", Style::default().fg(role::HEADING)),
-                Span::styled("      Insert newline", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Ctrl+T", Style::default().fg(role::HEADING)),
-                Span::styled("         Cycle work mode", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Ctrl+B", Style::default().fg(role::HEADING)),
-                Span::styled("         Toggle sidebar", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Ctrl+C", Style::default().fg(role::HEADING)),
-                Span::styled("         Quit", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Scroll", Style::default().fg(role::HEADING)),
-                Span::styled("         Scroll conversation", Style::default().fg(TEXT)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Quote",
-                Style::default()
-                    .fg(role::HEADING)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "Initially, computer means a person who computes.",
-                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-            )),
-            Line::from(Span::styled(
-                "When will we pass programmer to coding agents?",
-                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-            )),
-        ]
-    }
-
-    fn render_left(&self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(self.left_content())
-            .alignment(Alignment::Center)
-            .render(area, buf);
-    }
-
-    fn render_right(&self, area: Rect, buf: &mut Buffer) {
-        let chunks = Self::split_right(area);
-
-        Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(role::WELCOME_DIVIDER))
-            .render(chunks[0], buf);
-
-        Paragraph::new(self.right_content())
-            .wrap(Wrap { trim: true })
-            .render(chunks[1], buf);
+        let area = Self::content_area(Rect::new(0, 0, total_width, u16::MAX));
+        Paragraph::new(self.content(total_width))
+            .wrap(Wrap { trim: false })
+            .line_count(area.width) as u16
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn welcome_keeps_the_project_quote() {
+        let welcome = WelcomeMessage;
+        let text = welcome
+            .content(100)
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("Initially, computer means a person who computes."));
+        assert!(text.contains("When will we pass programmer to coding agents?"));
+    }
 
     #[test]
     fn project_url_hit_test_matches_visible_cells_at_different_widths() {

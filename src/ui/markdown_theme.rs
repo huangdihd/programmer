@@ -16,39 +16,47 @@
 use ratatui::prelude::Color;
 use ratatui_markdown::theme::{CodeColors, Generation, RichTextTheme};
 
-/// Central color palette for the whole UI (Tokyo Night-ish). Every color used
-/// anywhere in the app is defined here so the theme lives in one place.
+/// Central midnight palette for the whole UI. Colors are deliberately muted
+/// enough for long terminal sessions while preserving clear semantic contrast.
 pub mod palette {
     use ratatui::prelude::Color;
 
     /// Primary foreground text.
-    pub const TEXT: Color = Color::Rgb(0xd8, 0xd8, 0xd8);
+    pub const TEXT: Color = Color::Rgb(0xdc, 0xe3, 0xf1);
     /// Dimmed text (reasoning label, tool details, secondary info).
-    pub const MUTED: Color = Color::Rgb(0x80, 0x88, 0x90);
+    pub const MUTED: Color = Color::Rgb(0x7f, 0x8a, 0x9d);
     /// Even fainter text (code-block language label, JSON null).
-    pub const FAINT: Color = Color::Rgb(0x56, 0x5f, 0x89);
+    pub const FAINT: Color = Color::Rgb(0x55, 0x60, 0x70);
 
     /// Blue accent (primary, focused border, links, user prompt marker).
-    pub const BLUE: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
-    /// Green accent (secondary, strings).
-    pub const GREEN: Color = Color::Rgb(0x9e, 0xce, 0x6a);
-    /// Cyan accent (info).
-    pub const CYAN: Color = Color::Rgb(0x7d, 0xcf, 0xff);
-    /// Yellow accent (numbers, tool call marker).
-    pub const YELLOW: Color = Color::Rgb(0xe0, 0xaf, 0x68);
-    /// Purple accent (booleans).
-    pub const PURPLE: Color = Color::Rgb(0xbb, 0x9a, 0xf7);
-    /// Red (errors).
-    pub const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e);
+    pub const BLUE: Color = Color::Rgb(0x82, 0xaa, 0xff);
+    /// Green accent (secondary, strings and success).
+    pub const GREEN: Color = Color::Rgb(0x8b, 0xd5, 0xa6);
+    /// Cyan accent (information and active output).
+    pub const CYAN: Color = Color::Rgb(0x78, 0xdc, 0xe8);
+    /// Yellow accent (warnings and pending work).
+    pub const YELLOW: Color = Color::Rgb(0xf0, 0xc6, 0x74);
+    /// Purple accent (skills and special states).
+    pub const PURPLE: Color = Color::Rgb(0xc0, 0x99, 0xff);
+    /// Red (errors and destructive actions).
+    pub const RED: Color = Color::Rgb(0xff, 0x7a, 0x90);
     /// Muted red (error body text).
-    pub const RED_MUTED: Color = Color::Rgb(0xd8, 0x8b, 0x94);
+    pub const RED_MUTED: Color = Color::Rgb(0xd9, 0x82, 0x91);
 
     /// Border lines.
-    pub const BORDER: Color = Color::Rgb(0x3b, 0x42, 0x52);
-    /// Panel / selected-row background (user bar, expanded detail panel).
-    pub const SURFACE: Color = Color::Rgb(0x2a, 0x2f, 0x3a);
+    pub const BORDER: Color = Color::Rgb(0x2c, 0x34, 0x42);
+    /// Elevated panel / selected-row background.
+    pub const SURFACE: Color = Color::Rgb(0x1a, 0x20, 0x2c);
+    /// Stepped interactive backgrounds used by the shared 120 ms hover fade.
+    pub const SURFACE_HOVER_SOFT: Color = Color::Rgb(0x1d, 0x24, 0x30);
+    pub const SURFACE_HOVER_MEDIUM: Color = Color::Rgb(0x21, 0x28, 0x35);
+    /// Stable interactive hover background, visibly raised above `SURFACE` cards.
+    pub const SURFACE_HOVER: Color = Color::Rgb(0x24, 0x2c, 0x3a);
     /// Code-block background (a touch darker than `SURFACE`).
-    pub const CODE_BG: Color = Color::Rgb(0x1f, 0x23, 0x35);
+    pub const CODE_BG: Color = Color::Rgb(0x14, 0x19, 0x23);
+    /// Added and removed line backgrounds used by inline diffs.
+    pub const DIFF_ADDED_BG: Color = Color::Rgb(0x1d, 0x30, 0x28);
+    pub const DIFF_REMOVED_BG: Color = Color::Rgb(0x34, 0x21, 0x2a);
 }
 
 /// Syntax-highlight colors derived from the application palette.
@@ -57,7 +65,7 @@ pub const CODE_COLORS: CodeColors = CodeColors {
     keyword: palette::PURPLE,
     string: palette::GREEN,
     string_escape: palette::CYAN,
-    number: Color::Cyan,
+    number: palette::CYAN,
     constant: palette::PURPLE,
     function: palette::BLUE,
     r#type: palette::CYAN,
@@ -65,7 +73,7 @@ pub const CODE_COLORS: CodeColors = CodeColors {
     property: palette::BLUE,
     operator: palette::PURPLE,
     punctuation: palette::MUTED,
-    attribute: Color::Cyan,
+    attribute: palette::CYAN,
     tag: palette::BLUE,
     label: palette::RED_MUTED,
     error: palette::RED,
@@ -113,7 +121,7 @@ impl RichTextTheme for AppTheme {
     }
 
     fn get_json_number_color(&self) -> Color {
-        Color::Cyan
+        palette::CYAN
     }
     fn get_json_bool_color(&self) -> Color {
         palette::PURPLE
@@ -122,7 +130,7 @@ impl RichTextTheme for AppTheme {
         palette::FAINT
     }
     fn get_accent_yellow(&self) -> Color {
-        Color::Cyan
+        palette::CYAN
     }
     fn get_code_colors(&self) -> CodeColors {
         CODE_COLORS

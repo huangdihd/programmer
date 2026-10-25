@@ -24,4 +24,8 @@ pub struct CompletionPopup<'a, T> {
     pub selected: usize,
     /// Scroll offset (items scrolled off the top).
     pub scroll_offset: usize,
+    /// Pointer feedback supplied by the owning surface.
+    pub hovered: Option<usize>,
+    pub pressed: Option<usize>,
+    pub hover_background: ratatui::style::Color,
 }

@@ -16,14 +16,15 @@
 use super::footer::Footer;
 use crate::classifier::WorkMode;
 use crate::security::SandboxMode;
+use crate::ui::markdown_theme::palette;
 use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::Widget;
+use ratatui::widgets::{Block, Widget};
 use unicode_width::UnicodeWidthStr;
 
-const DIM: Color = Color::DarkGray;
+const DIM: Color = palette::MUTED;
 
 impl Widget for &Footer {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -34,12 +35,17 @@ impl Widget for &Footer {
             (&self.status).render(area, buf);
             return;
         }
+        Block::default()
+            .style(Style::default().bg(palette::SURFACE))
+            .render(area, buf);
+
         let mode_text = format!("  {} {} ", self.work_mode.icon(), self.work_mode.label());
-        let mode_len = mode_text.len() as u16;
+        let mode_len = mode_text.width() as u16;
         let sandbox_text = self.sandbox_text();
         let sandbox_len = sandbox_text.width() as u16;
-        let model_text = self.model_and_thinking_text();
-        let model_len = model_text.width() as u16;
+        let model_text = self.model_text();
+        let thinking_text = self.thinking_text();
+        let (model_len, thinking_len) = self.model_and_thinking_widths(area.width);
 
         // LSP indicator: shown whenever the project has an LSP checker
         // configured (from startup) or a server is live. Command-backend
@@ -49,19 +55,19 @@ impl Widget for &Footer {
             // Running a check.
             (
                 " \u{25c8} LSP \u{27f3} ".to_string(),
-                Style::default().fg(Color::LightYellow),
+                Style::default().fg(palette::YELLOW),
             )
         } else if lsp.failed {
             // Last attempt failed (server wouldn't start / snapshot errored).
             (
                 " \u{25c8} LSP \u{2717} ".to_string(),
-                Style::default().fg(Color::LightRed),
+                Style::default().fg(palette::RED),
             )
         } else if lsp.servers > 0 {
             // One or more warm servers.
             (
                 format!(" \u{25c8} LSP {} ", lsp.servers),
-                Style::default().fg(Color::LightGreen),
+                Style::default().fg(palette::GREEN),
             )
         } else if self.lsp_configured {
             // Configured but no server started yet — idle.
@@ -69,35 +75,35 @@ impl Widget for &Footer {
         } else {
             (String::new(), Style::default())
         };
-        let lsp_len = lsp_text.chars().count() as u16;
+        let lsp_len = lsp_text.width() as u16;
 
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(mode_len),    // work mode (leftmost)
-                Constraint::Length(sandbox_len), // sandbox mode
-                Constraint::Min(1),              // status
-                Constraint::Length(model_len),   // model and thinking level
-                Constraint::Length(lsp_len),     // LSP status
-                Constraint::Length(28),          // "GPL-3.0-or-later · © 2026"
+                Constraint::Length(mode_len),     // work mode (leftmost)
+                Constraint::Length(sandbox_len),  // sandbox mode
+                Constraint::Min(1),               // status
+                Constraint::Length(lsp_len),      // LSP status
+                Constraint::Length(model_len),    // model
+                Constraint::Length(thinking_len), // thinking level
             ])
             .split(area);
 
         // Far left: work mode pill
         let mode_style = match self.work_mode {
-            WorkMode::Manual => Style::default().fg(Color::LightRed),
-            WorkMode::Auto => Style::default().fg(Color::LightGreen),
-            WorkMode::Yolo => Style::default().fg(Color::LightYellow),
-            WorkMode::Plan => Style::default().fg(Color::LightCyan),
+            WorkMode::Manual => Style::default().fg(palette::RED),
+            WorkMode::Auto => Style::default().fg(palette::GREEN),
+            WorkMode::Yolo => Style::default().fg(palette::YELLOW),
+            WorkMode::Plan => Style::default().fg(palette::CYAN),
         };
         ratatui::widgets::Paragraph::new(mode_text)
             .style(mode_style)
             .render(chunks[0], buf);
 
         let sandbox_style = match self.sandbox_mode {
-            SandboxMode::Restricted => Style::default().fg(Color::LightGreen),
-            SandboxMode::Network => Style::default().fg(Color::LightYellow),
-            SandboxMode::Off => Style::default().fg(Color::LightRed),
+            SandboxMode::Restricted => Style::default().fg(palette::GREEN),
+            SandboxMode::Network => Style::default().fg(palette::YELLOW),
+            SandboxMode::Off => Style::default().fg(palette::RED),
         };
         ratatui::widgets::Paragraph::new(sandbox_text)
             .style(sandbox_style)
@@ -106,24 +112,24 @@ impl Widget for &Footer {
         // Status indicator
         (&self.status).render(chunks[2], buf);
 
-        // Model name and thinking level
-        if !model_text.is_empty() {
-            ratatui::widgets::Paragraph::new(model_text)
-                .style(Style::default().fg(role::SUBTLE))
-                .render(chunks[3], buf);
-        }
-
         // LSP status (empty string renders nothing)
         if !lsp_text.is_empty() {
             ratatui::widgets::Paragraph::new(lsp_text)
                 .style(lsp_style)
-                .render(chunks[4], buf);
+                .render(chunks[3], buf);
         }
 
-        // Right: copyright
-        ratatui::widgets::Paragraph::new("GPL-3.0-or-later \u{b7} \u{a9} 2026")
-            .style(Style::default().fg(DIM))
-            .render(chunks[5], buf);
+        // Keep the active model and independently clickable thinking level
+        // anchored at the right edge.
+        if !model_text.is_empty() {
+            ratatui::widgets::Paragraph::new(model_text)
+                .right_aligned()
+                .style(Style::default().fg(role::SUBTLE))
+                .render(chunks[4], buf);
+            ratatui::widgets::Paragraph::new(thinking_text)
+                .style(Style::default().fg(role::SUBTLE))
+                .render(chunks[5], buf);
+        }
     }
 }
 

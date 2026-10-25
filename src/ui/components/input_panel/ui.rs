@@ -14,16 +14,17 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::ui::components::input_panel::input_panel::InputPanel;
+use crate::ui::markdown_theme::palette;
 use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
-const PASTE_ACCENT: Color = Color::LightMagenta;
+const PASTE_ACCENT: Color = palette::PURPLE;
 /// Accent while the input is a `!command` (shell mode) — the green of the
 /// terminal panel's grabbed state.
-const BANG_ACCENT: Color = Color::LightGreen;
+const BANG_ACCENT: Color = palette::GREEN;
 
 impl Widget for &InputPanel<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -47,7 +48,8 @@ impl Widget for &InputPanel<'_> {
         let block = Block::default()
             .title(title)
             .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
-            .borders(Borders::TOP | Borders::BOTTOM)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(accent));
 
         let inner = block.inner(area);

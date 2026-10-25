@@ -41,6 +41,22 @@ pub(crate) async fn handle_key_events(
         return Ok(());
     }
 
+    // ---- image viewer (modal; owns navigation and Esc) ----
+    if let Some(viewer) = app.ui.image_viewer.as_mut() {
+        match key_event.code {
+            KeyCode::Esc => app.ui.image_viewer = None,
+            KeyCode::Char('+' | '=') => viewer.zoom_in(),
+            KeyCode::Char('-' | '_') => viewer.zoom_out(),
+            KeyCode::Char('0') => viewer.reset(),
+            KeyCode::Left => viewer.pan_by(-2, 0),
+            KeyCode::Right => viewer.pan_by(2, 0),
+            KeyCode::Up => viewer.pan_by(0, -1),
+            KeyCode::Down => viewer.pan_by(0, 1),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // ---- Ctrl+Z while a command tool is running: keep its process alive as
     // a background task. Do this before modal routing so the foreground turn
     // can finish and the promoted task can appear in the sidebar immediately.
@@ -190,6 +206,8 @@ pub(crate) async fn handle_key_events(
 
     // ---- Ctrl+B: toggle sidebar ----
     if key_event.code == KeyCode::Char('b') && key_event.modifiers == KeyModifiers::CONTROL {
+        app.ui.sidebar_resize_preview = None;
+        app.ui.sidebar_resizing = false;
         if app.ui.sidebar.is_some() {
             app.ui.sidebar = None;
         } else {
@@ -499,7 +517,8 @@ pub(crate) async fn handle_key_events(
 /// Independent UI surfaces must get the first chance to close or leave their
 /// local mode before Esc is interpreted as cancelling the active model turn.
 fn independent_overlay_owns_escape(app: &App<'_>) -> bool {
-    app.ui.terminal_pane.is_some()
+    app.ui.image_viewer.is_some()
+        || app.ui.terminal_pane.is_some()
         || app.ui.agent_panel.is_some()
         || app.ui.activity_page.is_some()
         || app.ui.rewind_panel.is_some()
@@ -522,7 +541,7 @@ fn independent_overlay_owns_escape(app: &App<'_>) -> bool {
             .is_some_and(|completion| completion.visible)
 }
 
-fn apply_rewind(
+pub(super) fn apply_rewind(
     app: &mut App<'_>,
     checkpoint_id: u64,
     mode: crate::ui::components::rewind_panel::RestoreMode,
@@ -735,7 +754,7 @@ fn apply_rewind(
     app.ui.conversation_panel.scroll_to_bottom();
 }
 
-async fn apply_rewind_fork(app: &mut App<'_>, checkpoint_id: u64) {
+pub(super) async fn apply_rewind_fork(app: &mut App<'_>, checkpoint_id: u64) {
     if !app.require_running_session() {
         return;
     }
@@ -1077,6 +1096,9 @@ pub(crate) fn is_newline_modifier(modifiers: KeyModifiers) -> bool {
 
 /// Handles text pasted into the terminal (bracketed paste).
 pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
+    if app.ui.image_viewer.is_some() {
+        return;
+    }
     // While the terminal panel has input grabbed, a paste goes to the PTY.
     if let Some(pane) = app.ui.terminal_pane.as_ref() {
         if pane.grabbed {
@@ -1089,7 +1111,10 @@ pub(crate) fn handle_paste(app: &mut App<'_>, data: String) {
         return;
     }
     let data = data.replace("\r\n", "\n").replace('\r', "\n");
-    if app.ui.rewind_panel.is_some() || app.ui.activity_page.is_some() {
+    if app.ui.agent_panel.is_some()
+        || app.ui.rewind_panel.is_some()
+        || app.ui.activity_page.is_some()
+    {
         return;
     }
     if let Some(panel) = app.ui.question_panel.as_mut() {
@@ -1428,6 +1453,24 @@ mod tests {
         );
         assert!(!app.agent_loop.cancel.active.is_cancelled());
     }
+    #[tokio::test]
+    async fn agent_panel_owns_paste_without_mutating_hidden_input() {
+        let mut app = crate::app::commands::tests::command_test_app().await;
+        app.ui.agent_panel = Some(crate::ui::components::agent_panel::AgentPanel::new(
+            crate::tasks::TaskManager::default(),
+            7,
+            "reviewer".into(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::conversation::Conversation::new(),
+            )),
+        ));
+        let original = app.ui.input_panel.get_content();
+
+        super::handle_paste(&mut app, "must not reach input".into());
+
+        assert_eq!(app.ui.input_panel.get_content(), original);
+    }
+
     #[tokio::test]
     async fn activity_page_owns_escape_and_paste_without_cancelling_active_turn() {
         let mut config = crate::config::programmer_config::ProgrammerConfig::default();

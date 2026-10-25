@@ -419,14 +419,9 @@ fn diff_lines(old: &str, new: &str, base: usize) -> Vec<Line<'static>> {
         })
         .collect();
 
-    use ratatui::style::Color;
     let context = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
-    let removed = Style::new()
-        .fg(palette::RED)
-        .bg(Color::Rgb(0x3a, 0x22, 0x28));
-    let added = Style::new()
-        .fg(palette::GREEN)
-        .bg(Color::Rgb(0x25, 0x33, 0x1d));
+    let removed = Style::new().fg(palette::RED).bg(palette::DIFF_REMOVED_BG);
+    let added = Style::new().fg(palette::GREEN).bg(palette::DIFF_ADDED_BG);
 
     // Width of the line-number column, sized to the largest number shown.
     let max_no = base + old_lines.len().max(new_lines.len());

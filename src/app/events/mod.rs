@@ -91,17 +91,59 @@ async fn handle_crossterm(
             // mode the user selected when the terminal regains focus.
             let _ = crate::terminal::set_mouse_capture(!app.ui.native_selection_mode);
         }
+        crossterm::event::Event::FocusLost => {
+            // A terminal may never deliver the matching mouse-up after focus
+            // changes. Discard captured targets so a later click cannot finish
+            // a stale sidebar action or selection gesture.
+            app.ui.sidebar_click_target = None;
+            app.ui.sidebar_resize_preview = None;
+            app.ui.sidebar_resizing = false;
+            app.ui.sidebar_resize_main = None;
+            app.ui.clear_pointer_feedback();
+            app.ui.conversation_click_consumed = false;
+            app.ui.conversation_panel.cancel_pointer_gesture();
+            if let Some(panel) = app.ui.agent_panel.as_mut() {
+                panel.cancel_pointer_gesture();
+            }
+            if let Some(page) = app.ui.activity_page.as_mut() {
+                page.panel.cancel_pointer_gesture();
+            }
+            if let Some(panel) = app.ui.provider_panel.as_mut() {
+                panel.cancel_pointer_gesture();
+            }
+            if let Some(panel) = app.ui.skills_panel.as_mut() {
+                panel.cancel_pointer_gesture();
+            }
+            if let Some(panel) = app.ui.mcp_panel.as_mut() {
+                panel.cancel_pointer_gesture();
+            }
+            if let Some(panel) = app.ui.rewind_panel.as_mut() {
+                panel.cancel_pointer_gesture();
+            }
+            if let Some(panel) = app.ui.diagnostics_panel.as_mut() {
+                panel.cancel_pointer_gesture();
+            }
+            if let Some(panel) = app.ui.security_panel.as_mut() {
+                panel.cancel_pointer_gesture();
+            }
+            if let Some(viewer) = app.ui.image_viewer.as_mut() {
+                viewer.end_drag();
+            }
+        }
         crossterm::event::Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
             handle_key_events(app, key_event).await?
         }
         crossterm::event::Event::Paste(data) => keys::handle_paste(app, data),
-        crossterm::event::Event::Mouse(_)
+        crossterm::event::Event::Mouse(mouse)
             if app.ui.provider_panel.is_some()
                 || app.ui.skills_panel.is_some()
                 || app.ui.mcp_panel.is_some()
                 || app.ui.diagnostics_panel.is_some()
                 || app.ui.security_panel.is_some()
-                || app.ui.rewind_panel.is_some() => {}
+                || app.ui.rewind_panel.is_some() =>
+        {
+            mouse::handle_full_screen_panel_mouse(app, mouse).await?;
+        }
         crossterm::event::Event::Mouse(mouse) if app.ui.activity_page.is_some() => {
             super::activity::handle_mouse(app, mouse);
         }
@@ -123,7 +165,7 @@ async fn handle_crossterm(
                 app.ui.conversation_panel.scroll_to_bottom();
             }
         }
-        crossterm::event::Event::Mouse(mouse) => mouse::handle_mouse(app, mouse),
+        crossterm::event::Event::Mouse(mouse) => mouse::handle_mouse(app, mouse).await?,
         _ => {}
     }
     Ok(())

@@ -227,11 +227,13 @@ src/
 └── ui/                       # Terminal UI (Ratatui)
     ├── mod.rs
     ├── ui.rs                 #   Main UI layout + render dispatch
-    ├── event.rs              #   Event + EventHandler enums
+    ├── event.rs              #   Event + coalesced redraw/status/selection scheduling
+    ├── interaction.rs        #   Shared short-lived pointer-feedback animation
+    ├── image_preview.rs      #   Inline image decoding, placements, and modal viewer
     ├── text.rs               #   Text styling helpers
-    ├── markdown_code_block.rs    # Syntax-highlighted code block widget
-    ├── markdown_theme.rs         # Original dark Markdown colour palette
-    ├── theme.rs                  # auto/light/dark config, detection and final-frame conversion
+    ├── markdown_code_block.rs    # Syntax highlighting, math, and Mermaid rendering
+    ├── markdown_theme.rs         # Central midnight palette and Markdown styling
+    ├── theme.rs                  # auto/light/dark config, semantic roles and final-frame conversion
     ├── tool_details.rs       #   Tool-call detail popup (arguments + output)
     └── components/
         ├── mod.rs
@@ -284,8 +286,8 @@ src/
 - **Cancellation and queues:** Foreground events carry `cancel::OperationId`; zero is explicitly `UNTAGGED` for non-turn surfaces. `app/lifecycle.rs` centralizes begin/cancel/finish transitions: cancellation retains ownership until a terminal event, while non-terminal events require a live token. Esc cancels only the active request, not the queue. Dispatch waits for its matching terminal event; stale events cannot advance the queue. User drafts, approvals, and peer consent still block dispatch. Before any model output, restore the original draft only into an empty input with no queued user request; otherwise retain the cancelled input in conversation history. Task/agent notifications and already-authorized peer work remain eligible after cancellation, without restarting the cancelled request.
 - **Async:** `#[tokio::main]` on `main()`, `tokio::spawn` for concurrent tasks. All tool execution is async.
 - **Configuration:** `ProgrammerConfig` deserializes from TOML via the `config` crate. Environment variables prefixed with `Programmer` override file values. Config lives at `~/.config/programmer/config.toml`. The optional top-level `soul` value replaces only the identity/mindset section of the developer prompt.
-- **Markdown links:** Assistant inline HTTP(S) links are resolved from original cached paragraph styles by `conversation_panel/links.rs`; stationary clicks launch the browser without a shell. Drags cancel activation; ambiguous labels and unsupported link forms are inert.
-- **UI themes:** `/theme [auto|light|dark]` persists the top-level `theme` setting (default `auto`). Startup OSC 11 background detection shares the ratatui-image query; missing results fall back to dark. `ui/theme.rs` resolves paired semantic UI-role tokens (decorative headings, borders, tool summaries, and status colors are distinct) at frame presentation, leaving cached Markdown styles intact and child terminal colors untouched.
+- **Conversation media:** Data-URL images decoded by `ui/image_preview.rs` render inline and expose per-occurrence screen placements for click handling; the modal viewer owns keyboard, mouse, and paste events until closed. Remote image URLs are not synchronously fetched. Assistant inline HTTP(S) links are resolved from original cached paragraph styles by `conversation_panel/links.rs`; stationary clicks launch the browser without a shell. Drags cancel activation; ambiguous labels and unsupported link forms are inert.
+- **UI themes and interaction:** `/theme [auto|light|dark]` persists the top-level `theme` setting (default `auto`). Startup OSC 11 background detection shares the ratatui-image query; missing results fall back to dark. `ui/theme.rs` resolves paired semantic UI-role tokens (decorative headings, borders, pointer press, tool summaries, and status colors are distinct) at frame presentation, leaving cached Markdown styles intact and child terminal colors untouched. `ui/interaction.rs` provides the shared 120 ms stepped hover transition; `UiState` and each conversation panel own target state, and the app loop schedules coalesced redraws only while a transition is active.
 - **Sessions:** Stored as JSON under the platform config directory's `programmer/sessions/<uuid>.json`. Each session contains message items, history, the latest input suggestion, todos, and persisted task state. `SessionManager::load` distinguishes missing files from typed read/parse failures without renaming the original. App persistence builds an owned snapshot and acknowledges dirty state only after a successful save. `PersistenceState` allows one idle attempt per new change; a failed save is not retried by ticks or timers. New changes or explicit saves may attempt again.
 - **Task ownership:** Each application/server owns a clone-shared `TaskManager`; tool providers, child agents, task rendering, and persistence use that same instance. Independent managers isolate task IDs, lifecycle events, generation, and cleanup. Do not reintroduce a global registry.
 - **Module visibility:** `pub(crate)` for internal visibility; `pub` only where needed externally. UI internals are `mod` (private). Tool modules are `pub` within `tools/`.

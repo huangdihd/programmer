@@ -14,8 +14,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::commands::CompletionState;
+use crate::ui::markdown_theme::palette;
 use async_openai::types::responses::InputImageContent;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, Input, TextArea};
 
 const DEFAULT_PLACEHOLDER: &str = "Talk with the programmer…";
@@ -54,13 +55,13 @@ impl InputPanel<'_> {
     pub fn new() -> Self {
         let mut text_area = TextArea::default();
 
-        text_area.set_style(Style::default().fg(Color::White));
+        text_area.set_style(Style::default().fg(palette::TEXT));
         text_area.set_cursor_line_style(Style::default());
         text_area.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
         text_area.set_placeholder_text(DEFAULT_PLACEHOLDER);
         text_area.set_placeholder_style(
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(palette::MUTED)
                 .add_modifier(Modifier::ITALIC),
         );
 
@@ -314,6 +315,21 @@ impl InputPanel<'_> {
         self.text_area.insert_str(text);
     }
 
+    /// Accept a clicked completion without also submitting the resulting command.
+    pub(crate) fn accept_completion(&mut self, index: usize) -> bool {
+        let Some(text) = self
+            .completion
+            .as_ref()
+            .filter(|completion| index < completion.candidates.len())
+            .map(|completion| completion.line(index))
+        else {
+            return false;
+        };
+        self.set_content(&text);
+        self.completion = None;
+        true
+    }
+
     /// Push a message to the history (after sending).
     pub fn push_history(&mut self, text: String) {
         // Don't push duplicates of the last entry.
@@ -478,6 +494,32 @@ mod tests {
         assert!(panel.add_image(image(), 320, 200));
         panel.set_content("placeholder removed");
         assert!(panel.take_images().is_empty());
+    }
+
+    #[test]
+    fn clicked_completion_inserts_the_candidate_without_submitting_it() {
+        let mut panel = InputPanel::new();
+        panel.completion = Some(crate::commands::CompletionState {
+            prefix: "/".into(),
+            candidates: vec![
+                crate::commands::CompletionCandidate {
+                    value: "help".into(),
+                    label: "help".into(),
+                },
+                crate::commands::CompletionCandidate {
+                    value: "theme".into(),
+                    label: "theme".into(),
+                },
+            ],
+            selected: 0,
+            visible: true,
+            scroll_offset: 0,
+        });
+
+        assert!(panel.accept_completion(1));
+        assert_eq!(panel.get_content(), "/theme");
+        assert!(panel.completion.is_none());
+        assert!(!panel.accept_completion(0));
     }
 
     #[test]

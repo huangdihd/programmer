@@ -358,58 +358,103 @@ impl ActivityPanel {
         if self.mode == ActivityMode::Dream {
             return self.handle_dream_mouse(event);
         }
-        let position = Position::new(event.column, event.row);
-        let hits = &self.graph.hits;
-        let focus = if hits.peers.contains(position) {
-            Focus::Peers
-        } else if hits.events.contains(position) {
-            Focus::Events
-        } else if hits.details.contains(position) {
-            Focus::Details
-        } else {
-            return ActivityAction::None;
-        };
-        if matches!(
-            event.kind,
-            MouseEventKind::Down(MouseButton::Left)
-                | MouseEventKind::ScrollUp
-                | MouseEventKind::ScrollDown
-        ) && self.graph.search_editing
-        {
-            self.search
-                .handle_key(KeyEvent::new(KeyCode::Enter, event.modifiers));
-            self.graph.search_editing = false;
-        }
+        let target = self.graph_mouse_target(Position::new(event.column, event.row));
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.graph.focus = focus;
-                if hits.peer_rows.contains(position) {
-                    let index = self.graph.peer_offset
-                        + usize::from((event.row - hits.peer_rows.y) / PEER_ITEM_HEIGHT);
-                    if let Some(peer) = self.graph_peers().get(index) {
-                        self.select_graph_peer(peer.key.clone());
+            MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                self.set_mouse_hover(target)
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.begin_mouse_press(target),
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(target) = self.finish_mouse_press(target) {
+                    if self.graph.search_editing {
+                        self.search
+                            .handle_key(KeyEvent::new(KeyCode::Enter, event.modifiers));
+                        self.graph.search_editing = false;
                     }
-                } else if hits.event_rows.contains(position) {
-                    let index = self.graph.event_offset
-                        + usize::from((event.row - hits.event_rows.y) / EVENT_ITEM_HEIGHT);
-                    if index < self.visible_entries().len() {
-                        self.select_graph_event(index);
-                    }
-                } else if hits.metadata.contains(position) {
-                    self.graph.metadata_expanded = !self.graph.metadata_expanded;
+                    self.activate_graph_mouse_target(target);
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                self.graph.focus = focus;
-                self.navigate_graph(if event.kind == MouseEventKind::ScrollUp {
-                    KeyCode::Up
-                } else {
-                    KeyCode::Down
-                });
+                let focus = match target {
+                    Some(ActivityMouseTarget::GraphPeers | ActivityMouseTarget::GraphPeer(_)) => {
+                        Some(Focus::Peers)
+                    }
+                    Some(ActivityMouseTarget::GraphEvents | ActivityMouseTarget::GraphEvent(_)) => {
+                        Some(Focus::Events)
+                    }
+                    Some(
+                        ActivityMouseTarget::GraphDetails | ActivityMouseTarget::GraphMetadata,
+                    ) => Some(Focus::Details),
+                    _ => None,
+                };
+                if let Some(focus) = focus {
+                    if self.graph.search_editing {
+                        self.search
+                            .handle_key(KeyEvent::new(KeyCode::Enter, event.modifiers));
+                        self.graph.search_editing = false;
+                    }
+                    self.graph.focus = focus;
+                    self.navigate_graph(if event.kind == MouseEventKind::ScrollUp {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    });
+                }
             }
             _ => {}
         }
         ActivityAction::None
+    }
+
+    fn graph_mouse_target(&self, position: Position) -> Option<ActivityMouseTarget> {
+        let hits = &self.graph.hits;
+        if hits.peer_rows.contains(position) {
+            let index = self.graph.peer_offset
+                + usize::from((position.y - hits.peer_rows.y) / PEER_ITEM_HEIGHT);
+            return (index < self.graph_peers().len())
+                .then_some(ActivityMouseTarget::GraphPeer(index));
+        }
+        if hits.event_rows.contains(position) {
+            let index = self.graph.event_offset
+                + usize::from((position.y - hits.event_rows.y) / EVENT_ITEM_HEIGHT);
+            return (index < self.visible_entries().len())
+                .then_some(ActivityMouseTarget::GraphEvent(index));
+        }
+        if hits.metadata.contains(position) {
+            return Some(ActivityMouseTarget::GraphMetadata);
+        }
+        if hits.peers.contains(position) {
+            Some(ActivityMouseTarget::GraphPeers)
+        } else if hits.events.contains(position) {
+            Some(ActivityMouseTarget::GraphEvents)
+        } else if hits.details.contains(position) {
+            Some(ActivityMouseTarget::GraphDetails)
+        } else {
+            None
+        }
+    }
+
+    fn activate_graph_mouse_target(&mut self, target: ActivityMouseTarget) {
+        match target {
+            ActivityMouseTarget::GraphPeer(index) => {
+                self.graph.focus = Focus::Peers;
+                if let Some(peer) = self.graph_peers().get(index) {
+                    self.select_graph_peer(peer.key.clone());
+                }
+            }
+            ActivityMouseTarget::GraphEvent(index) => {
+                self.graph.focus = Focus::Events;
+                self.select_graph_event(index);
+            }
+            ActivityMouseTarget::GraphMetadata => {
+                self.graph.focus = Focus::Details;
+                self.graph.metadata_expanded = !self.graph.metadata_expanded;
+            }
+            ActivityMouseTarget::GraphPeers => self.graph.focus = Focus::Peers,
+            ActivityMouseTarget::GraphEvents => self.graph.focus = Focus::Events,
+            ActivityMouseTarget::GraphDetails => self.graph.focus = Focus::Details,
+            _ => {}
+        }
     }
 
     pub(super) fn render_session_graph(&mut self, area: Rect, buffer: &mut Buffer) {
@@ -486,6 +531,7 @@ impl ActivityPanel {
             format!("1 Peers ({})", peers.len()),
             self.graph.focus == Focus::Peers,
             false,
+            self.mouse_style(ActivityMouseTarget::GraphPeers),
             buffer,
         );
         let capacity = usize::from((body.height / PEER_ITEM_HEIGHT).max(1));
@@ -534,6 +580,13 @@ impl ActivityPanel {
                 PEER_ITEM_HEIGHT,
                 buffer,
             );
+            self.fill_mouse_row(
+                body,
+                self.graph.peer_offset,
+                PEER_ITEM_HEIGHT,
+                ActivityMouseTarget::GraphPeer,
+                buffer,
+            );
         }
     }
 
@@ -549,6 +602,7 @@ impl ActivityPanel {
             format!("2 Events · {label}"),
             self.graph.focus == Focus::Events,
             false,
+            self.mouse_style(ActivityMouseTarget::GraphEvents),
             buffer,
         );
         let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(body);
@@ -625,6 +679,13 @@ impl ActivityPanel {
                 EVENT_ITEM_HEIGHT,
                 buffer,
             );
+            self.fill_mouse_row(
+                rows[1],
+                offset,
+                EVENT_ITEM_HEIGHT,
+                ActivityMouseTarget::GraphEvent,
+                buffer,
+            );
         }
     }
 
@@ -635,6 +696,7 @@ impl ActivityPanel {
             "3 Details".into(),
             self.graph.focus == Focus::Details,
             area.width < 80 && area.x > 0,
+            self.mouse_style(ActivityMouseTarget::GraphDetails),
             buffer,
         );
         let entry = self.selected_entry();
@@ -681,7 +743,10 @@ impl ActivityPanel {
             } else {
                 "▸ Record metadata / provenance [m]"
             })
-            .style(Style::default().fg(palette::MUTED))
+            .style(
+                self.mouse_style(ActivityMouseTarget::GraphMetadata)
+                    .unwrap_or_else(|| Style::default().fg(palette::MUTED)),
+            )
             .render(rows[1], buffer);
         }
         if rows[0].is_empty() {
@@ -698,6 +763,44 @@ impl ActivityPanel {
         paragraph
             .scroll((self.details_scroll, 0))
             .render(rows[0], buffer);
+    }
+
+    fn fill_mouse_row(
+        &self,
+        area: Rect,
+        offset: usize,
+        height: u16,
+        target: fn(usize) -> ActivityMouseTarget,
+        buffer: &mut Buffer,
+    ) {
+        let Some(index) =
+            self.mouse_pressed
+                .or(self.mouse_hover)
+                .and_then(|current| match current {
+                    ActivityMouseTarget::GraphPeer(index)
+                        if target(index) == ActivityMouseTarget::GraphPeer(index) =>
+                    {
+                        Some(index)
+                    }
+                    ActivityMouseTarget::GraphEvent(index)
+                        if target(index) == ActivityMouseTarget::GraphEvent(index) =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                })
+        else {
+            return;
+        };
+        if let Some(background) = self.mouse_background(target(index)) {
+            fill_row_background(
+                area,
+                index.saturating_sub(offset),
+                height,
+                background,
+                buffer,
+            );
+        }
     }
 }
 
@@ -728,6 +831,16 @@ fn viewport(offset: usize, selected: usize, capacity: usize, count: usize) -> us
 /// Line styles cover glyphs only. Paint the selected item's entire visible
 /// rectangle without overwriting status foregrounds or adjacent regions.
 fn fill_selected_row(area: Rect, visible_index: usize, height: u16, buffer: &mut Buffer) {
+    fill_row_background(area, visible_index, height, palette::SURFACE, buffer);
+}
+
+fn fill_row_background(
+    area: Rect,
+    visible_index: usize,
+    height: u16,
+    background: ratatui::style::Color,
+    buffer: &mut Buffer,
+) {
     let offset = visible_index.saturating_mul(usize::from(height));
     if offset >= usize::from(area.height) {
         return;
@@ -735,7 +848,7 @@ fn fill_selected_row(area: Rect, visible_index: usize, height: u16, buffer: &mut
     let top = area.y + offset as u16;
     for y in top..top.saturating_add(height).min(area.bottom()) {
         for x in area.x..area.right() {
-            buffer[(x, y)].set_bg(palette::SURFACE);
+            buffer[(x, y)].set_bg(background);
         }
     }
 }
@@ -755,6 +868,7 @@ fn region(
     title: String,
     focused: bool,
     left_border: bool,
+    interaction: Option<Style>,
     buffer: &mut Buffer,
 ) -> Rect {
     let block = Block::default()
@@ -765,8 +879,11 @@ fn region(
         })
         .border_style(Style::default().fg(palette::BORDER))
         .title(
-            Line::from(format!(" {}{title} ", if focused { "● " } else { "" }))
-                .style(Style::default().fg(if focused { role::FOCUS } else { palette::MUTED })),
+            Line::from(format!(" {}{title} ", if focused { "● " } else { "" })).style(
+                interaction.unwrap_or_else(|| {
+                    Style::default().fg(if focused { role::FOCUS } else { palette::MUTED })
+                }),
+            ),
         );
     let body = block.inner(area);
     block.render(area, buffer);
@@ -1221,14 +1338,73 @@ mod tests {
     }
 
     fn mouse(panel: &mut ActivityPanel, area: Rect, kind: MouseEventKind) {
+        let event = |kind| MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(panel.handle_mouse(event(kind)), ActivityAction::None);
+        if kind == MouseEventKind::Down(MouseButton::Left) {
+            assert_eq!(
+                panel.handle_mouse(event(MouseEventKind::Up(MouseButton::Left))),
+                ActivityAction::None
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_hover_press_and_matching_release_drive_feedback_and_activation() {
+        let mut panel = panel(ActivityMode::SessionGraph);
+        let mut other = entry("other");
+        other.from = Some("other-peer".into());
+        panel.entries.push(other);
+        let area = Rect::new(0, 0, 120, 25);
+        let mut buffer = Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        let rows = panel.graph.hits.peer_rows;
+        let second = Rect::new(rows.x, rows.y + PEER_ITEM_HEIGHT, 1, 1);
+
+        mouse(&mut panel, second, MouseEventKind::Moved);
+        assert_eq!(panel.mouse_hover, Some(ActivityMouseTarget::GraphPeer(1)));
+        buffer.reset();
+        panel.render(area, &mut buffer);
         assert_eq!(
-            panel.handle_mouse(MouseEvent {
-                kind,
-                column: area.x,
-                row: area.y,
-                modifiers: KeyModifiers::NONE,
-            }),
-            ActivityAction::None
+            buffer[(rows.x, second.y)].bg,
+            panel.interaction_animation.hover_background()
+        );
+
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: second.x,
+            row: second.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(panel.handle_mouse(down), ActivityAction::None);
+        assert_eq!(
+            panel.current_graph_peer(),
+            Some(PeerKey::Session("peer".into())),
+            "press alone must not activate"
+        );
+        buffer.reset();
+        panel.render(area, &mut buffer);
+        assert_eq!(buffer[(rows.x, second.y)].bg, role::INTERACTION_PRESSED_BG);
+
+        let mismatch = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: rows.x,
+            row: rows.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(panel.handle_mouse(mismatch), ActivityAction::None);
+        assert_eq!(
+            panel.current_graph_peer(),
+            Some(PeerKey::Session("peer".into()))
+        );
+        mouse(&mut panel, second, MouseEventKind::Down(MouseButton::Left));
+        assert_eq!(
+            panel.current_graph_peer(),
+            Some(PeerKey::Session("other-peer".into()))
         );
     }
 

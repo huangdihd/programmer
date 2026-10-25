@@ -15,10 +15,12 @@
 
 use super::{AddMode, TodoPanel};
 use crate::todos::TodoStatus;
+use crate::ui::markdown_theme::palette;
 use crate::ui::text::truncate_to_width;
+use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
@@ -27,11 +29,11 @@ impl TodoPanel {
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(palette::BLUE))
             .title(Span::styled(
                 " Todos ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette::BLUE)
                     .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
@@ -47,7 +49,7 @@ impl TodoPanel {
     fn render_list(&self, area: Rect, buf: &mut Buffer) {
         if self.list.todos.is_empty() {
             let msg = Paragraph::new("No todos yet. Press 'a' to add one.")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(palette::MUTED))
                 .wrap(Wrap { trim: true });
             msg.render(area, buf);
 
@@ -77,8 +79,8 @@ impl TodoPanel {
             .split(chunks[0]);
 
         let highlight_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(role::SELECTION_TEXT)
+            .bg(role::SELECTION_BG)
             .add_modifier(Modifier::BOLD);
 
         for i in 0..visible_count {
@@ -90,10 +92,10 @@ impl TodoPanel {
             let is_selected = idx == self.selected;
 
             let (icon, status_color) = match todo.status {
-                TodoStatus::Pending => (TodoStatus::Pending.icon(), Color::DarkGray),
-                TodoStatus::InProgress => (TodoStatus::InProgress.icon(), Color::Yellow),
-                TodoStatus::Completed => (TodoStatus::Completed.icon(), Color::Green),
-                TodoStatus::Cancelled => (TodoStatus::Cancelled.icon(), Color::Red),
+                TodoStatus::Pending => (TodoStatus::Pending.icon(), palette::MUTED),
+                TodoStatus::InProgress => (TodoStatus::InProgress.icon(), palette::YELLOW),
+                TodoStatus::Completed => (TodoStatus::Completed.icon(), palette::GREEN),
+                TodoStatus::Cancelled => (TodoStatus::Cancelled.icon(), palette::RED),
             };
 
             let marker = if is_selected { "❯" } else { " " };
@@ -133,7 +135,7 @@ impl TodoPanel {
                     self.list.todos.len(),
                     pct
                 ),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::MUTED),
             )]);
             // Overlay scroll info in the bottom-right corner of the list area.
             let indicator_x = chunks[0]
@@ -166,25 +168,22 @@ impl TodoPanel {
 
         Paragraph::new(Line::from(vec![Span::styled(
             "New todo — title:",
-            Style::default().fg(Color::White).bold(),
+            Style::default().fg(palette::TEXT).bold(),
         )]))
         .render(chunks[0], buf);
 
         let input_line = Line::from(vec![
-            Span::styled("  ❯ ", Style::default().fg(Color::Cyan)),
-            Span::styled(input, Style::default().fg(Color::White)),
-            Span::styled("▏", Style::default().fg(Color::Cyan)),
+            Span::styled("  ❯ ", Style::default().fg(palette::BLUE)),
+            Span::styled(input, Style::default().fg(palette::TEXT)),
+            Span::styled("▏", Style::default().fg(palette::BLUE)),
         ]);
         Paragraph::new(input_line).render(chunks[1], buf);
 
         let hint = Line::from(vec![
-            Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(
-                " next (description)  ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter", Style::default().fg(palette::GREEN).bold()),
+            Span::styled(" next (description)  ", Style::default().fg(palette::MUTED)),
+            Span::styled("Esc", Style::default().fg(palette::BLUE).bold()),
+            Span::styled(" cancel", Style::default().fg(palette::MUTED)),
         ]);
         Paragraph::new(hint).render(chunks[2], buf);
     }
@@ -201,38 +200,38 @@ impl TodoPanel {
 
         Paragraph::new(Line::from(vec![Span::styled(
             "Description (optional, Enter to save):",
-            Style::default().fg(Color::White).bold(),
+            Style::default().fg(palette::TEXT).bold(),
         )]))
         .render(chunks[0], buf);
 
         let input_line = Line::from(vec![
-            Span::styled("  ❯ ", Style::default().fg(Color::Cyan)),
-            Span::styled(input, Style::default().fg(Color::White)),
-            Span::styled("▏", Style::default().fg(Color::Cyan)),
+            Span::styled("  ❯ ", Style::default().fg(palette::BLUE)),
+            Span::styled(input, Style::default().fg(palette::TEXT)),
+            Span::styled("▏", Style::default().fg(palette::BLUE)),
         ]);
         Paragraph::new(input_line).render(chunks[1], buf);
 
         let hint = Line::from(vec![
-            Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(" save  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" skip description", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter", Style::default().fg(palette::GREEN).bold()),
+            Span::styled(" save  ", Style::default().fg(palette::MUTED)),
+            Span::styled("Esc", Style::default().fg(palette::BLUE).bold()),
+            Span::styled(" skip description", Style::default().fg(palette::MUTED)),
         ]);
         Paragraph::new(hint).render(chunks[2], buf);
     }
 
     fn render_hint(&self, area: Rect, buf: &mut Buffer) {
         let hints = vec![
-            Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(" toggle  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("a", Style::default().fg(Color::Green).bold()),
-            Span::styled(" add  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("d", Style::default().fg(Color::Red).bold()),
-            Span::styled(" delete  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" close", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑↓", Style::default().fg(palette::BLUE).bold()),
+            Span::styled(" navigate  ", Style::default().fg(palette::MUTED)),
+            Span::styled("Enter", Style::default().fg(palette::GREEN).bold()),
+            Span::styled(" toggle  ", Style::default().fg(palette::MUTED)),
+            Span::styled("a", Style::default().fg(palette::GREEN).bold()),
+            Span::styled(" add  ", Style::default().fg(palette::MUTED)),
+            Span::styled("d", Style::default().fg(palette::RED).bold()),
+            Span::styled(" delete  ", Style::default().fg(palette::MUTED)),
+            Span::styled("Esc", Style::default().fg(palette::BLUE).bold()),
+            Span::styled(" close", Style::default().fg(palette::MUTED)),
         ];
         Paragraph::new(Line::from(hints)).render(area, buf);
     }

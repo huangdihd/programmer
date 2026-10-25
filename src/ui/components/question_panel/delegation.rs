@@ -1,11 +1,11 @@
 //! Compact, opt-in peer work consent; ordinary tool questions keep their UI.
 use std::cell::Cell;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
-    style::{Color, Style},
+    layout::{Position, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget},
 };
@@ -14,8 +14,17 @@ use unicode_width::UnicodeWidthChar;
 use super::{AnswerAction, QuestionPanel};
 use crate::{
     tools::ask_user::{Question, QuestionKind},
-    ui::event::AnswerTx,
+    ui::{event::AnswerTx, markdown_theme::palette, theme::role},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerTarget {
+    Header,
+    Model,
+    ModelChoice(usize),
+    Deny,
+    Accept,
+}
 
 pub(super) struct Delegation {
     source: String,
@@ -29,6 +38,9 @@ pub(super) struct Delegation {
     scroll: Cell<usize>,
     page: Cell<usize>,
     max_scroll: Cell<usize>,
+    pointer_hover: Option<PointerTarget>,
+    pointer_pressed: Option<PointerTarget>,
+    pointer_animation: crate::ui::interaction::InteractionAnimation,
 }
 
 impl QuestionPanel {
@@ -62,6 +74,9 @@ impl QuestionPanel {
             scroll: Cell::new(0),
             page: Cell::new(1),
             max_scroll: Cell::new(0),
+            pointer_hover: None,
+            pointer_pressed: None,
+            pointer_animation: crate::ui::interaction::InteractionAnimation::default(),
         });
         panel
     }
@@ -118,6 +133,151 @@ impl Delegation {
             .iter()
             .filter(|m| m.label.to_lowercase().contains(&query))
             .collect()
+    }
+
+    fn pointer_target(&self, area: Rect, column: u16, row: u16) -> Option<PointerTarget> {
+        if area.is_empty() {
+            return None;
+        }
+        let inner = Block::default().borders(Borders::TOP).inner(area);
+        if !inner.contains(Position::new(column, row)) {
+            return None;
+        }
+        if self.picker.is_some() {
+            let list = Rect::new(
+                inner.x,
+                inner.y.saturating_add(1),
+                inner.width,
+                inner.height.saturating_sub(2),
+            );
+            if !list.contains(Position::new(column, row)) {
+                return None;
+            }
+            let models = self.filtered_models();
+            let visible = usize::from(list.height).max(1);
+            let scroll = self.selected_model.saturating_sub(visible - 1);
+            let index = scroll + usize::from(row - list.y);
+            return (index < models.len()).then_some(PointerTarget::ModelChoice(index));
+        }
+
+        let choices_y = inner
+            .bottom()
+            .saturating_sub(if inner.height >= 3 { 2 } else { 1 });
+        if row == inner.y && choices_y > inner.y {
+            return Some(PointerTarget::Header);
+        }
+        let model_y = choices_y.saturating_sub(1);
+        if !self.model.is_empty() && row == model_y {
+            return Some(PointerTarget::Model);
+        }
+        if row == choices_y {
+            let deny = Rect::new(inner.x, choices_y, 4.min(inner.width), 1);
+            if deny.contains(Position::new(column, row)) {
+                return Some(PointerTarget::Deny);
+            }
+            let yes_width = if self.busy { 13 } else { 17 };
+            let accept = Rect::new(
+                inner.x.saturating_add(6),
+                choices_y,
+                yes_width.min(inner.width.saturating_sub(6)),
+                1,
+            );
+            if accept.contains(Position::new(column, row)) {
+                return Some(PointerTarget::Accept);
+            }
+        }
+        None
+    }
+
+    fn set_pointer_hover(&mut self, target: Option<PointerTarget>) {
+        if self.pointer_hover == target {
+            return;
+        }
+        self.pointer_hover = target;
+        if target.is_some() {
+            self.pointer_animation.restart();
+        } else {
+            self.pointer_animation.cancel();
+        }
+    }
+
+    pub(super) fn handle_mouse(&mut self, area: Rect, event: MouseEvent) -> AnswerAction {
+        let target = self.pointer_target(area, event.column, event.row);
+        self.set_pointer_hover(target);
+        match event.kind {
+            MouseEventKind::ScrollUp if self.picker.is_some() => {
+                self.selected_model = self.selected_model.saturating_sub(1);
+            }
+            MouseEventKind::ScrollDown if self.picker.is_some() => {
+                self.selected_model =
+                    (self.selected_model + 1).min(self.filtered_models().len().saturating_sub(1));
+            }
+            MouseEventKind::ScrollUp if self.expanded => {
+                self.scroll.set(self.scroll.get().saturating_sub(1));
+            }
+            MouseEventKind::ScrollDown if self.expanded => {
+                self.scroll.set(
+                    self.scroll
+                        .get()
+                        .saturating_add(1)
+                        .min(self.max_scroll.get()),
+                );
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.pointer_pressed = target;
+                if target.is_some() {
+                    self.pointer_animation.cancel();
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let activate = target.is_some() && self.pointer_pressed.take() == target;
+                if !activate {
+                    return AnswerAction::None;
+                }
+                match target.expect("checked above") {
+                    PointerTarget::Header => {
+                        self.expanded = !self.expanded;
+                        self.scroll.set(0);
+                    }
+                    PointerTarget::Model => {
+                        self.picker = Some(String::new());
+                        self.selected_model = self
+                            .models
+                            .iter()
+                            .position(|model| model.value == self.model)
+                            .unwrap_or(0);
+                        self.set_pointer_hover(None);
+                    }
+                    PointerTarget::ModelChoice(index) => {
+                        if let Some(model) = self.filtered_models().get(index) {
+                            let model = model.value.clone();
+                            self.picker = None;
+                            self.set_pointer_hover(None);
+                            return AnswerAction::SelectModel(model);
+                        }
+                    }
+                    PointerTarget::Deny | PointerTarget::Accept => {
+                        self.accept = target == Some(PointerTarget::Accept);
+                        return AnswerAction::Answer(if self.accept { "Yes" } else { "No" }.into());
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.pointer_pressed = None;
+            }
+            _ => {}
+        }
+        AnswerAction::None
+    }
+
+    pub(super) fn interaction_animation_active(&self) -> bool {
+        self.pointer_animation.active()
+    }
+
+    pub(super) fn clear_pointer_feedback(&mut self) {
+        self.pointer_hover = None;
+        self.pointer_pressed = None;
+        self.pointer_animation.cancel();
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> AnswerAction {
@@ -192,7 +352,7 @@ impl Delegation {
         }
         let block = Block::default()
             .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(role::FOCUS));
         let inner = block.inner(area);
         block.render(area, buf);
         if inner.is_empty() {
@@ -223,6 +383,15 @@ impl Delegation {
                     label: |model| model.label.as_str(),
                     selected: self.selected_model,
                     scroll_offset: self.selected_model.saturating_sub(visible - 1),
+                    hovered: match self.pointer_hover {
+                        Some(PointerTarget::ModelChoice(index)) => Some(index),
+                        _ => None,
+                    },
+                    pressed: match self.pointer_pressed {
+                        Some(PointerTarget::ModelChoice(index)) => Some(index),
+                        _ => None,
+                    },
+                    hover_background: self.pointer_animation.hover_background(),
                 };
                 (&popup).render(list, buf);
             }
@@ -233,18 +402,40 @@ impl Delegation {
             .bottom()
             .saturating_sub(if inner.height >= 3 { 2 } else { 1 });
         let row = |y| Rect::new(inner.x, y, inner.width, 1);
+        let interactive_style = |target, base: Style| {
+            if self.pointer_hover != Some(target) {
+                return base;
+            }
+            if self.pointer_pressed == Some(target) {
+                Style::default()
+                    .fg(role::SELECTION_TEXT)
+                    .bg(role::INTERACTION_PRESSED_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                base.bg(self.pointer_animation.hover_background())
+                    .add_modifier(Modifier::BOLD)
+            }
+        };
         if choices_y > inner.y {
             Paragraph::new(format!(
                 "Peer delegation · {}",
                 self.source.replace(['\n', '\r'], " ")
             ))
-            .style(Style::default().fg(Color::Cyan).bold())
+            .style(interactive_style(
+                PointerTarget::Header,
+                Style::default().fg(role::HEADING).bold(),
+            ))
             .render(row(inner.y), buf);
         }
         let body_y = inner.y.saturating_add(1);
         let model_y = choices_y.saturating_sub(1);
         if model_y > inner.y {
-            Paragraph::new(format!("Model: {} (session)", self.model)).render(row(model_y), buf);
+            Paragraph::new(format!("Model: {} (session)", self.model))
+                .style(interactive_style(
+                    PointerTarget::Model,
+                    Style::default().fg(palette::TEXT),
+                ))
+                .render(row(model_y), buf);
         }
         let body_height = model_y.saturating_sub(body_y);
         if body_height > 0 {
@@ -275,17 +466,32 @@ impl Delegation {
             Paragraph::new(visible)
                 .render(Rect::new(inner.x, body_y, inner.width, body_height), buf);
         }
-        let selected = Style::default().fg(Color::Black).bg(Color::Cyan).bold();
-        let normal = Style::default().fg(Color::Gray);
+        let selected = Style::default()
+            .fg(role::SELECTION_TEXT)
+            .bg(role::SELECTION_BG)
+            .bold();
+        let normal = Style::default().fg(palette::MUTED);
         let yes = if self.busy {
             " Yes · queue "
         } else {
             " Yes · run tools "
         };
         Paragraph::new(Line::from(vec![
-            Span::styled(" No ", if self.accept { normal } else { selected }),
+            Span::styled(
+                " No ",
+                interactive_style(
+                    PointerTarget::Deny,
+                    if self.accept { normal } else { selected },
+                ),
+            ),
             Span::raw("  "),
-            Span::styled(yes, if self.accept { selected } else { normal }),
+            Span::styled(
+                yes,
+                interactive_style(
+                    PointerTarget::Accept,
+                    if self.accept { selected } else { normal },
+                ),
+            ),
         ]))
         .render(row(choices_y), buf);
         if inner.height >= 3 {
@@ -301,7 +507,7 @@ impl Delegation {
                 "←→ select  Enter confirm  Esc deny  D expand  M model"
             };
             Paragraph::new(hint)
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(palette::FAINT))
                 .render(row(inner.bottom() - 1), buf);
         }
     }

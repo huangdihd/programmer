@@ -14,16 +14,42 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::status_bar::{StatusBar, StatusState};
+use crate::ui::{markdown_theme::palette, theme::role};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
+use std::time::Duration;
 
-const DIM: Color = Color::DarkGray;
-const ACCENT: Color = Color::LightBlue;
-const OUTPUT: Color = Color::LightGreen;
-const WARN: Color = Color::Yellow;
+const DIM: Color = palette::MUTED;
+const ACCENT: Color = palette::BLUE;
+const OUTPUT: Color = palette::GREEN;
+const WARN: Color = palette::YELLOW;
+const BREATH_STEP: Duration = Duration::from_millis(400);
+const THINKING_DEEP_AFTER: Duration = Duration::from_secs(10);
+const THINKING_DEEPEST_AFTER: Duration = Duration::from_secs(30);
+
+fn breath_modifier(elapsed: Duration) -> Modifier {
+    match (elapsed.as_millis() / BREATH_STEP.as_millis()) % 4 {
+        0 => Modifier::DIM,
+        2 => Modifier::BOLD,
+        _ => Modifier::empty(),
+    }
+}
+
+fn active_color(status: StatusState, elapsed: Duration) -> Option<Color> {
+    match status {
+        StatusState::Connecting => Some(role::STATUS_CONNECTING),
+        StatusState::Thinking if elapsed >= THINKING_DEEPEST_AFTER => {
+            Some(role::STATUS_THINKING_DEEPEST)
+        }
+        StatusState::Thinking if elapsed >= THINKING_DEEP_AFTER => Some(role::STATUS_THINKING_DEEP),
+        StatusState::Thinking => Some(role::STATUS_THINKING),
+        StatusState::ToolRunning => Some(role::STATUS_TOOL_RUNNING),
+        _ => None,
+    }
+}
 
 impl Widget for &StatusBar {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -42,12 +68,13 @@ impl Widget for &StatusBar {
             StatusState::Cancelling => ("✖", "Cancelling", WARN),
             StatusState::WaitingAnswer => ("?", "Waiting for answer", ACCENT),
             StatusState::WaitingApproval => ("🛡", "Waiting for approval", WARN),
-            StatusState::WaitingSubagents => ("⏳", "waiting subagents", ACCENT),
+            StatusState::WaitingSubagents => ("⏳", "Waiting for subagents", ACCENT),
         };
 
         let busy = self.status.is_busy();
+        let elapsed = self.elapsed();
         let mut text = format!(" {} {} ", icon, label);
-        if busy && let Some(dur) = self.elapsed() {
+        if busy && let Some(dur) = elapsed {
             let secs = dur.as_secs_f64();
             if secs < 60.0 {
                 text.push_str(&format!("({:.1}s)", secs));
@@ -58,10 +85,16 @@ impl Widget for &StatusBar {
             }
         }
 
-        let mut spans = vec![Span::styled(
-            text,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )];
+        let style = if let Some(elapsed) = elapsed
+            && let Some(color) = active_color(self.status, elapsed)
+        {
+            Style::default()
+                .fg(color)
+                .add_modifier(breath_modifier(elapsed))
+        } else {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        };
+        let mut spans = vec![Span::styled(text, style)];
         if let Some(detail) = &self.detail {
             spans.push(Span::styled(
                 format!("· {detail} "),
@@ -69,5 +102,69 @@ impl Widget for &StatusBar {
             ));
         }
         ratatui::widgets::Paragraph::new(Line::from(spans)).render(area, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_status_breath_is_deterministic_and_repeats() {
+        let phases = [
+            (0, Modifier::DIM),
+            (399, Modifier::DIM),
+            (400, Modifier::empty()),
+            (800, Modifier::BOLD),
+            (1_200, Modifier::empty()),
+            (1_600, Modifier::DIM),
+        ];
+        for (millis, expected) in phases {
+            assert_eq!(breath_modifier(Duration::from_millis(millis)), expected);
+        }
+    }
+
+    #[test]
+    fn only_requested_active_statuses_use_animation_roles() {
+        let elapsed = Duration::from_secs(1);
+        assert_eq!(
+            active_color(StatusState::Connecting, elapsed),
+            Some(role::STATUS_CONNECTING)
+        );
+        assert_eq!(
+            active_color(StatusState::Thinking, elapsed),
+            Some(role::STATUS_THINKING)
+        );
+        assert_eq!(
+            active_color(StatusState::ToolRunning, elapsed),
+            Some(role::STATUS_TOOL_RUNNING)
+        );
+        assert_eq!(active_color(StatusState::Outputting, elapsed), None);
+    }
+
+    #[test]
+    fn thinking_color_deepens_at_duration_boundaries() {
+        assert_eq!(
+            active_color(
+                StatusState::Thinking,
+                THINKING_DEEP_AFTER - Duration::from_millis(1)
+            ),
+            Some(role::STATUS_THINKING)
+        );
+        assert_eq!(
+            active_color(StatusState::Thinking, THINKING_DEEP_AFTER),
+            Some(role::STATUS_THINKING_DEEP)
+        );
+        assert_eq!(
+            active_color(
+                StatusState::Thinking,
+                THINKING_DEEPEST_AFTER - Duration::from_millis(1)
+            ),
+            Some(role::STATUS_THINKING_DEEP)
+        );
+        assert_eq!(
+            active_color(StatusState::Thinking, THINKING_DEEPEST_AFTER),
+            Some(role::STATUS_THINKING_DEEPEST)
+        );
     }
 }

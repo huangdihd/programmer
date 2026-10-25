@@ -11,11 +11,14 @@ use crate::config::programmer_config::{ProgrammerConfig, validate_security_profi
 use crate::security::policy::{AccessKind, PermissionEffect, PermissionRule};
 use crate::security::{SandboxMode, SecurityConfig};
 use crate::ui::components::panel_search::{PanelSearch, SearchKey};
-use crossterm::event::{KeyCode, KeyEvent};
+use crate::ui::interaction::InteractionAnimation;
+use crate::ui::markdown_theme::palette;
+use crate::ui::theme::role;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use globset::Glob;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget};
 use std::path::PathBuf;
@@ -72,11 +75,29 @@ enum Mode {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseTarget {
+    Row(usize),
+    Activate,
+    Primary,
+    Secondary,
+    Tertiary,
+    Quaternary,
+    Search,
+    Back,
+    Save,
+    Cancel,
+    FormField(usize),
+}
+
 #[derive(Debug)]
 pub struct SecurityPanel {
     mode: Mode,
     selected: usize,
     search: PanelSearch,
+    mouse_hover: Option<MouseTarget>,
+    mouse_pressed: Option<MouseTarget>,
+    interaction_animation: InteractionAnimation,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -321,7 +342,326 @@ impl SecurityPanel {
             mode: Mode::List,
             selected: 0,
             search: PanelSearch::default(),
+            mouse_hover: None,
+            mouse_pressed: None,
+            interaction_animation: InteractionAnimation::default(),
         }
+    }
+
+    pub(crate) fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        area: Rect,
+        config: &mut ProgrammerConfig,
+    ) -> PanelAction {
+        let target = self.mouse_target(mouse.column, mouse.row, area, config);
+        if self.mouse_hover != target {
+            self.mouse_hover = target;
+            if target.is_some() {
+                self.interaction_animation.restart();
+            } else {
+                self.interaction_animation.cancel();
+            }
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp if self.pointer_over_list(mouse.column, mouse.row, area) => {
+                return self.handle_key(KeyEvent::new(KeyCode::Up, mouse.modifiers), config);
+            }
+            MouseEventKind::ScrollDown
+                if self.pointer_over_list(mouse.column, mouse.row, area) =>
+            {
+                return self.handle_key(KeyEvent::new(KeyCode::Down, mouse.modifiers), config);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_pressed = target;
+                self.select_mouse_target(target);
+                self.interaction_animation.cancel();
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {}
+            MouseEventKind::Up(MouseButton::Left) => {
+                let activate = self
+                    .mouse_pressed
+                    .take()
+                    .filter(|pressed| Some(*pressed) == target);
+                if let Some(target) = activate {
+                    self.interaction_animation.restart();
+                    return self.activate_mouse_target(target, config);
+                }
+            }
+            _ => {}
+        }
+        PanelAction::None
+    }
+
+    pub(crate) fn interaction_animation_active(&self) -> bool {
+        self.interaction_animation.active()
+    }
+
+    pub(crate) fn cancel_pointer_gesture(&mut self) {
+        self.mouse_hover = None;
+        self.mouse_pressed = None;
+        self.interaction_animation.cancel();
+    }
+
+    fn select_mouse_target(&mut self, target: Option<MouseTarget>) {
+        let Some(MouseTarget::Row(index)) = target else {
+            if let Some(MouseTarget::FormField(index)) = target
+                && let Mode::RuleForm { focus, .. } = &mut self.mode
+            {
+                *focus = index;
+            }
+            return;
+        };
+        match &mut self.mode {
+            Mode::List => self.selected = index,
+            Mode::Edit { selected, .. } | Mode::Collection { selected, .. } => *selected = index,
+            _ => {}
+        }
+    }
+
+    fn activate_mouse_target(
+        &mut self,
+        target: MouseTarget,
+        config: &mut ProgrammerConfig,
+    ) -> PanelAction {
+        self.select_mouse_target(Some(target));
+        if matches!(self.mode, Mode::List) {
+            match target {
+                MouseTarget::Search => {
+                    self.search.focus();
+                    return PanelAction::None;
+                }
+                MouseTarget::Back => return PanelAction::Close,
+                _ => self.search.blur(),
+            }
+        }
+        let code = match (&self.mode, target) {
+            (_, MouseTarget::Row(_)) | (Mode::List, MouseTarget::Activate) => KeyCode::Enter,
+            (Mode::List, MouseTarget::Primary) => KeyCode::Char('a'),
+            (Mode::List, MouseTarget::Secondary) => KeyCode::Char('e'),
+            (Mode::List, MouseTarget::Tertiary) => KeyCode::Char('d'),
+            (Mode::List, MouseTarget::Quaternary) => KeyCode::Char('r'),
+            (Mode::List, MouseTarget::Search) => KeyCode::Char('/'),
+            (Mode::Edit { .. }, MouseTarget::Primary) => KeyCode::Enter,
+            (Mode::Collection { .. }, MouseTarget::Primary) => KeyCode::Char('a'),
+            (Mode::Collection { .. }, MouseTarget::Secondary) => KeyCode::Char('e'),
+            (Mode::Collection { .. }, MouseTarget::Tertiary) => KeyCode::Char('d'),
+            (Mode::ConfirmDelete(_), MouseTarget::Save) => KeyCode::Char('y'),
+            (_, MouseTarget::Save) => KeyCode::Enter,
+            (_, MouseTarget::Back | MouseTarget::Cancel) => KeyCode::Esc,
+            (_, MouseTarget::FormField(_)) => return PanelAction::None,
+            _ => return PanelAction::None,
+        };
+        self.handle_key(KeyEvent::new(code, KeyModifiers::NONE), config)
+    }
+
+    fn mouse_target(
+        &self,
+        column: u16,
+        row: u16,
+        area: Rect,
+        config: &ProgrammerConfig,
+    ) -> Option<MouseTarget> {
+        if !area.contains((column, row).into()) {
+            return None;
+        }
+
+        match &self.mode {
+            Mode::Name { error, .. } => {
+                let overlay = security_overlay(area, 2 + usize::from(error.is_some()));
+                let action_row = overlay.y + 2;
+                return (row == action_row).then(|| {
+                    hit_horizontal_target(
+                        column,
+                        overlay.x.saturating_add(1),
+                        &[
+                            ("Enter save  ", Some(MouseTarget::Save)),
+                            ("Esc cancel", Some(MouseTarget::Cancel)),
+                        ],
+                    )
+                })?;
+            }
+            Mode::ValueForm { error, .. } => {
+                let overlay = security_overlay(area, 2 + usize::from(error.is_some()));
+                let action_row = overlay.y + 2 + u16::from(error.is_some());
+                return (row == action_row).then(|| {
+                    hit_horizontal_target(
+                        column,
+                        overlay.x.saturating_add(1),
+                        &[
+                            ("Enter save  ", Some(MouseTarget::Save)),
+                            ("Esc cancel", Some(MouseTarget::Cancel)),
+                        ],
+                    )
+                })?;
+            }
+            Mode::RuleForm { error, .. } => {
+                let line_count = 4 + usize::from(error.is_some());
+                let overlay = security_overlay(area, line_count);
+                let inner = Block::default().borders(Borders::ALL).inner(overlay);
+                if inner.contains((column, row).into()) && row < inner.y.saturating_add(3) {
+                    return Some(MouseTarget::FormField(usize::from(row - inner.y)));
+                }
+                let action_row = inner.y + 3 + u16::from(error.is_some());
+                return (row == action_row).then(|| {
+                    hit_horizontal_target(
+                        column,
+                        inner.x,
+                        &[
+                            ("Tab/↑↓ field  ←→/Space change  ", None),
+                            ("Enter save  ", Some(MouseTarget::Save)),
+                            ("Esc cancel", Some(MouseTarget::Cancel)),
+                        ],
+                    )
+                })?;
+            }
+            Mode::ConfirmDelete(name) => {
+                let overlay = security_overlay(area, 2);
+                let action_row = overlay.y + 2;
+                if row != action_row {
+                    return None;
+                }
+                let blocked = config.security_profiles.len() == 1
+                    || config.active_security_profile == *name;
+                return if blocked {
+                    hit_horizontal_target(
+                        column,
+                        overlay.x.saturating_add(1),
+                        &[("Esc back", Some(MouseTarget::Cancel))],
+                    )
+                } else {
+                    hit_horizontal_target(
+                        column,
+                        overlay.x.saturating_add(1),
+                        &[
+                            ("y yes  ", Some(MouseTarget::Save)),
+                            ("n no", Some(MouseTarget::Cancel)),
+                        ],
+                    )
+                };
+            }
+            _ => {}
+        }
+
+        let chunks = panel_chunks(area);
+        let inner = Block::default().borders(Borders::ALL).inner(chunks[1]);
+        if inner.contains((column, row).into()) {
+            let visible = usize::from(inner.height);
+            if visible == 0 {
+                return None;
+            }
+            let row = usize::from(row - inner.y);
+            return match &self.mode {
+                Mode::List => {
+                    let names = self.filtered_names(config);
+                    let offset = self.selected.saturating_add(1).saturating_sub(visible);
+                    let index = offset + row;
+                    (index < names.len()).then_some(MouseTarget::Row(index))
+                }
+                Mode::Edit { selected, .. } => {
+                    let offset = selected.saturating_add(1).saturating_sub(visible);
+                    let index = offset + row;
+                    (index < SecuritySetting::ALL.len()).then_some(MouseTarget::Row(index))
+                }
+                Mode::Collection {
+                    name,
+                    kind,
+                    selected,
+                } => {
+                    let offset = selected.saturating_add(1).saturating_sub(visible);
+                    let index = offset + row;
+                    (index < kind.len(&config.security_profiles[name]))
+                        .then_some(MouseTarget::Row(index))
+                }
+                _ => None,
+            };
+        }
+        if row != chunks[2].y {
+            return None;
+        }
+        match self.mode {
+            Mode::List => hit_horizontal_target(
+                column,
+                chunks[2].x,
+                &[
+                    ("Enter activate  ", Some(MouseTarget::Activate)),
+                    ("a clone  ", Some(MouseTarget::Primary)),
+                    ("e edit  ", Some(MouseTarget::Secondary)),
+                    ("r rename  ", Some(MouseTarget::Quaternary)),
+                    ("d delete  ", Some(MouseTarget::Tertiary)),
+                    ("/ search  ", Some(MouseTarget::Search)),
+                    ("q/Esc close", Some(MouseTarget::Back)),
+                ],
+            ),
+            Mode::Edit { .. } => hit_horizontal_target(
+                column,
+                chunks[2].x,
+                &[
+                    ("↑↓ select  ", None),
+                    ("←→/Space/Enter change/open  ", Some(MouseTarget::Primary)),
+                    ("Esc back", Some(MouseTarget::Back)),
+                ],
+            ),
+            Mode::Collection { .. } => hit_horizontal_target(
+                column,
+                chunks[2].x,
+                &[
+                    ("↑↓ select  ", None),
+                    ("a add  ", Some(MouseTarget::Primary)),
+                    ("e/Enter edit  ", Some(MouseTarget::Secondary)),
+                    ("d delete  ", Some(MouseTarget::Tertiary)),
+                    ("Esc back", Some(MouseTarget::Back)),
+                ],
+            ),
+            _ => None,
+        }
+    }
+
+    fn pointer_over_list(&self, column: u16, row: u16, area: Rect) -> bool {
+        matches!(self.mode, Mode::List | Mode::Edit { .. } | Mode::Collection { .. })
+            && Block::default()
+                .borders(Borders::ALL)
+                .inner(panel_chunks(area)[1])
+                .contains((column, row).into())
+    }
+
+    fn mouse_style(&self, target: MouseTarget) -> Option<Style> {
+        if self.mouse_pressed == Some(target) && self.mouse_hover == Some(target) {
+            Some(
+                Style::default()
+                    .fg(role::SELECTION_TEXT)
+                    .bg(role::INTERACTION_PRESSED_BG)
+                    .bold(),
+            )
+        } else if self.mouse_hover == Some(target) {
+            Some(
+                Style::default()
+                    .fg(palette::TEXT)
+                    .bg(self.interaction_animation.hover_background())
+                    .bold(),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn action_key(&self, label: &'static str, target: MouseTarget) -> Span<'static> {
+        Span::styled(
+            label,
+            Style::default()
+                .fg(palette::BLUE)
+                .bold()
+                .patch(self.mouse_style(target).unwrap_or_default()),
+        )
+    }
+
+    fn action_hint(&self, label: &'static str, target: MouseTarget) -> Span<'static> {
+        Span::styled(
+            label,
+            Style::default()
+                .fg(palette::MUTED)
+                .patch(self.mouse_style(target).unwrap_or_default()),
+        )
     }
 
     fn filtered_names(&self, config: &ProgrammerConfig) -> Vec<String> {
@@ -839,19 +1179,12 @@ impl SecurityPanel {
 
     pub fn render(&self, config: &ProgrammerConfig, area: Rect, buf: &mut Buffer) {
         Clear.render(area, buf);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(5),
-                Constraint::Length(2),
-            ])
-            .split(area);
+        let chunks = panel_chunks(area);
 
         Paragraph::new(Line::from(vec![
             Span::styled(
                 " Security profiles ",
-                Style::default().fg(Color::Cyan).bold(),
+                Style::default().fg(role::HEADING).bold(),
             ),
             Span::styled(
                 format!(
@@ -859,7 +1192,7 @@ impl SecurityPanel {
                     config.security_profiles.len(),
                     config.active_security_profile
                 ),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::FAINT),
             ),
         ]))
         .render(chunks[0], buf);
@@ -898,20 +1231,21 @@ impl SecurityPanel {
         let names = self.filtered_names(config);
         let items = names
             .iter()
-            .map(|name| {
+            .enumerate()
+            .map(|(index, name)| {
                 let profile = &config.security_profiles[name];
                 let active = config.active_security_profile == *name;
                 let marker = if active { "●" } else { " " };
                 let marker_style = if active {
-                    Style::default().fg(Color::LightGreen)
+                    Style::default().fg(palette::GREEN)
                 } else {
                     Style::default()
                 };
-                ListItem::new(Line::from(vec![
+                let item = ListItem::new(Line::from(vec![
                     Span::styled(format!(" {marker} "), marker_style),
                     Span::styled(
                         format!("{name:<24}"),
-                        Style::default().fg(Color::White).bold(),
+                        Style::default().fg(palette::TEXT).bold(),
                     ),
                     Span::styled(
                         format!(
@@ -920,9 +1254,14 @@ impl SecurityPanel {
                             state_label(profile.enabled),
                             profile.rules.len()
                         ),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(palette::MUTED),
                     ),
-                ]))
+                ]));
+                if let Some(style) = self.mouse_style(MouseTarget::Row(index)) {
+                    item.style(style)
+                } else {
+                    item
+                }
             })
             .collect::<Vec<_>>();
         let mut state = ListState::default();
@@ -931,11 +1270,16 @@ impl SecurityPanel {
         }
         ratatui::widgets::StatefulWidget::render(
             List::new(items)
-                .block(Block::default().borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(role::BORDER)),
+                )
                 .highlight_symbol("❯")
                 .highlight_style(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(role::SELECTION_TEXT)
+                        .bg(role::SELECTION_BG)
                         .add_modifier(Modifier::BOLD),
                 ),
             area,
@@ -959,19 +1303,24 @@ impl SecurityPanel {
             .enumerate()
             .map(|(index, setting)| {
                 let style = if index == selected {
-                    Style::default().fg(Color::Cyan).bold()
+                    Style::default().fg(palette::BLUE).bold()
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(palette::TEXT)
                 };
                 let value = setting.value(profile);
                 let value_style = setting
                     .boolean_value(profile)
                     .map(setting_style)
-                    .unwrap_or_else(|| Style::default().fg(Color::Gray));
-                ListItem::new(Line::from(vec![
+                    .unwrap_or_else(|| Style::default().fg(palette::MUTED));
+                let item = ListItem::new(Line::from(vec![
                     Span::styled(format!(" {:<24}", setting.label()), style),
                     Span::styled(value, value_style),
-                ]))
+                ]));
+                if let Some(style) = self.mouse_style(MouseTarget::Row(index)) {
+                    item.style(style)
+                } else {
+                    item
+                }
             })
             .collect::<Vec<_>>();
         let mut state = ListState::default();
@@ -981,9 +1330,16 @@ impl SecurityPanel {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_style(Style::default().fg(role::BORDER))
                         .title(format!(" Edit {name} ")),
                 )
-                .highlight_symbol("❯"),
+                .highlight_symbol("❯")
+                .highlight_style(
+                    Style::default()
+                        .fg(role::SELECTION_TEXT)
+                        .bg(role::SELECTION_BG)
+                        .add_modifier(Modifier::BOLD),
+                ),
             area,
             buf,
             &mut state,
@@ -1004,16 +1360,22 @@ impl SecurityPanel {
         let items = if values.is_empty() {
             vec![ListItem::new(Line::from(Span::styled(
                 format!(" No {} entries. Press 'a' to add one.", kind.singular()),
-                Style::default().fg(Color::DarkGray).italic(),
+                Style::default().fg(palette::FAINT).italic(),
             )))]
         } else {
             values
                 .into_iter()
-                .map(|value| {
-                    ListItem::new(Line::from(Span::styled(
+                .enumerate()
+                .map(|(index, value)| {
+                    let item = ListItem::new(Line::from(Span::styled(
                         format!(" {value}"),
-                        Style::default().fg(Color::White),
-                    )))
+                        Style::default().fg(palette::TEXT),
+                    )));
+                    if let Some(style) = self.mouse_style(MouseTarget::Row(index)) {
+                        item.style(style)
+                    } else {
+                        item
+                    }
                 })
                 .collect()
         };
@@ -1026,12 +1388,14 @@ impl SecurityPanel {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_style(Style::default().fg(role::BORDER))
                         .title(format!(" {} · {name} ", kind.title())),
                 )
                 .highlight_symbol("❯")
                 .highlight_style(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(role::SELECTION_TEXT)
+                        .bg(role::SELECTION_BG)
                         .add_modifier(Modifier::BOLD),
                 ),
             area,
@@ -1049,30 +1413,32 @@ impl SecurityPanel {
     ) {
         match &self.mode {
             Mode::List => {
-                let mut spans = vec![
-                    key("Enter"),
-                    hint(" activate  "),
-                    key("a"),
-                    hint(" clone  "),
-                    key("e"),
-                    hint(" edit  "),
-                    key("r"),
-                    hint(" rename  "),
-                    key("d"),
-                    hint(" delete  "),
-                ];
-                spans.extend(PanelSearch::help_spans());
-                spans.extend([key("q/Esc"), hint(" close")]);
-                Paragraph::new(Line::from(spans)).render(bottom, buf);
+                Paragraph::new(Line::from(vec![
+                    self.action_key("Enter", MouseTarget::Activate),
+                    self.action_hint(" activate  ", MouseTarget::Activate),
+                    self.action_key("a", MouseTarget::Primary),
+                    self.action_hint(" clone  ", MouseTarget::Primary),
+                    self.action_key("e", MouseTarget::Secondary),
+                    self.action_hint(" edit  ", MouseTarget::Secondary),
+                    self.action_key("r", MouseTarget::Quaternary),
+                    self.action_hint(" rename  ", MouseTarget::Quaternary),
+                    self.action_key("d", MouseTarget::Tertiary),
+                    self.action_hint(" delete  ", MouseTarget::Tertiary),
+                    self.action_key("/", MouseTarget::Search),
+                    self.action_hint(" search  ", MouseTarget::Search),
+                    self.action_key("q/Esc", MouseTarget::Back),
+                    self.action_hint(" close", MouseTarget::Back),
+                ]))
+                .render(bottom, buf);
             }
             Mode::Edit { .. } => {
                 Paragraph::new(Line::from(vec![
                     key("↑↓"),
                     hint(" select  "),
-                    key("←→/Space/Enter"),
-                    hint(" change/open  "),
-                    key("Esc"),
-                    hint(" back"),
+                    self.action_key("←→/Space/Enter", MouseTarget::Primary),
+                    self.action_hint(" change/open  ", MouseTarget::Primary),
+                    self.action_key("Esc", MouseTarget::Back),
+                    self.action_hint(" back", MouseTarget::Back),
                 ]))
                 .render(bottom, buf);
             }
@@ -1080,14 +1446,14 @@ impl SecurityPanel {
                 Paragraph::new(Line::from(vec![
                     key("↑↓"),
                     hint(" select  "),
-                    key("a"),
-                    hint(" add  "),
-                    key("e/Enter"),
-                    hint(" edit  "),
-                    key("d"),
-                    hint(" delete  "),
-                    key("Esc"),
-                    hint(" back"),
+                    self.action_key("a", MouseTarget::Primary),
+                    self.action_hint(" add  ", MouseTarget::Primary),
+                    self.action_key("e/Enter", MouseTarget::Secondary),
+                    self.action_hint(" edit  ", MouseTarget::Secondary),
+                    self.action_key("d", MouseTarget::Tertiary),
+                    self.action_hint(" delete  ", MouseTarget::Tertiary),
+                    self.action_key("Esc", MouseTarget::Back),
+                    self.action_hint(" back", MouseTarget::Back),
                 ]))
                 .render(bottom, buf);
             }
@@ -1099,17 +1465,26 @@ impl SecurityPanel {
                 ..
             } => {
                 let action = if original.is_some() { "Edit" } else { "Add" };
-                let lines = form_lines(
-                    vec![Line::from(vec![
-                        Span::styled(
-                            format!(" {}: ", capitalize(kind.singular())),
-                            Style::default().fg(Color::Gray),
-                        ),
-                        Span::styled(value, Style::default().fg(Color::White)),
-                        Span::styled("▏", Style::default().fg(Color::Cyan)),
-                    ])],
-                    error.as_deref(),
-                );
+                let mut lines = vec![Line::from(vec![
+                    Span::styled(
+                        format!(" {}: ", capitalize(kind.singular())),
+                        Style::default().fg(palette::MUTED),
+                    ),
+                    Span::styled(value, Style::default().fg(palette::TEXT)),
+                    Span::styled("▏", Style::default().fg(palette::BLUE)),
+                ])];
+                if let Some(error) = error {
+                    lines.push(Line::from(Span::styled(
+                        format!(" {error}"),
+                        Style::default().fg(palette::RED),
+                    )));
+                }
+                lines.push(Line::from(vec![
+                    self.action_key("Enter", MouseTarget::Save),
+                    self.action_hint(" save  ", MouseTarget::Save),
+                    self.action_key("Esc", MouseTarget::Cancel),
+                    self.action_hint(" cancel", MouseTarget::Cancel),
+                ]));
                 render_overlay(
                     &format!(" {action} {} ", kind.singular()),
                     lines,
@@ -1137,17 +1512,17 @@ impl SecurityPanel {
                     .enumerate()
                     .map(|(index, (label, value))| {
                         let selected = index == *focus;
-                        Line::from(vec![
+                        let line = Line::from(vec![
                             Span::styled(
                                 if selected { "❯ " } else { "  " },
-                                Style::default().fg(Color::Cyan),
+                                Style::default().fg(palette::BLUE),
                             ),
                             Span::styled(
                                 format!("{label:<10}: "),
                                 if selected {
-                                    Style::default().fg(Color::Cyan).bold()
+                                    Style::default().fg(palette::BLUE).bold()
                                 } else {
-                                    Style::default().fg(Color::Gray)
+                                    Style::default().fg(palette::MUTED)
                                 },
                             ),
                             Span::styled(
@@ -1156,19 +1531,24 @@ impl SecurityPanel {
                                 } else {
                                     value
                                 },
-                                Style::default().fg(Color::White),
+                                Style::default().fg(palette::TEXT),
                             ),
                             Span::styled(
                                 if selected && index == 2 { "▏" } else { "" },
-                                Style::default().fg(Color::Cyan),
+                                Style::default().fg(palette::BLUE),
                             ),
-                        ])
+                        ]);
+                        if let Some(style) = self.mouse_style(MouseTarget::FormField(index)) {
+                            line.style(style)
+                        } else {
+                            line
+                        }
                     })
                     .collect::<Vec<_>>();
                 if let Some(error) = error {
                     lines.push(Line::from(Span::styled(
                         format!(" {error}"),
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(palette::RED),
                     )));
                 }
                 lines.push(Line::from(vec![
@@ -1176,10 +1556,10 @@ impl SecurityPanel {
                     hint(" field  "),
                     key("←→/Space"),
                     hint(" change  "),
-                    key("Enter"),
-                    hint(" save  "),
-                    key("Esc"),
-                    hint(" cancel"),
+                    self.action_key("Enter", MouseTarget::Save),
+                    self.action_hint(" save  ", MouseTarget::Save),
+                    self.action_key("Esc", MouseTarget::Cancel),
+                    self.action_hint(" cancel", MouseTarget::Cancel),
                 ]));
                 render_overlay(
                     &format!(" {action} permission rule "),
@@ -1199,21 +1579,21 @@ impl SecurityPanel {
                 };
                 let mut lines = vec![
                     Line::from(vec![
-                        Span::styled(" Name: ", Style::default().fg(Color::Gray)),
-                        Span::styled(value, Style::default().fg(Color::White)),
-                        Span::styled("▏", Style::default().fg(Color::Cyan)),
+                        Span::styled(" Name: ", Style::default().fg(palette::MUTED)),
+                        Span::styled(value, Style::default().fg(palette::TEXT)),
+                        Span::styled("▏", Style::default().fg(palette::BLUE)),
                     ]),
                     Line::from(vec![
-                        key("Enter"),
-                        hint(" save  "),
-                        key("Esc"),
-                        hint(" cancel"),
+                        self.action_key("Enter", MouseTarget::Save),
+                        self.action_hint(" save  ", MouseTarget::Save),
+                        self.action_key("Esc", MouseTarget::Cancel),
+                        self.action_hint(" cancel", MouseTarget::Cancel),
                     ]),
                 ];
                 if let Some(error) = error {
                     lines.push(Line::from(Span::styled(
                         format!(" {error}"),
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(palette::RED),
                     )));
                 }
                 render_overlay(title, lines, full_area, buf);
@@ -1230,21 +1610,63 @@ impl SecurityPanel {
                 };
                 let mut lines = vec![Line::from(Span::styled(
                     message,
-                    Style::default().fg(Color::Yellow).bold(),
+                    Style::default().fg(palette::YELLOW).bold(),
                 ))];
                 if !blocked {
                     lines.push(Line::from(vec![
-                        key("y"),
-                        hint(" yes  "),
-                        key("n"),
-                        hint(" no"),
+                        self.action_key("y", MouseTarget::Save),
+                        self.action_hint(" yes  ", MouseTarget::Save),
+                        self.action_key("n", MouseTarget::Cancel),
+                        self.action_hint(" no", MouseTarget::Cancel),
                     ]));
                 } else {
-                    lines.push(Line::from(vec![key("Esc"), hint(" back")]));
+                    lines.push(Line::from(vec![
+                        self.action_key("Esc", MouseTarget::Cancel),
+                        self.action_hint(" back", MouseTarget::Cancel),
+                    ]));
                 }
                 render_overlay(" Delete security profile ", lines, full_area, buf);
             }
         }
+    }
+}
+
+fn hit_horizontal_target(
+    column: u16,
+    start: u16,
+    spans: &[(&str, Option<MouseTarget>)],
+) -> Option<MouseTarget> {
+    let x = column.checked_sub(start)?;
+    let mut offset = 0_u16;
+    for (text, target) in spans {
+        let width = Line::from(*text).width().min(usize::from(u16::MAX)) as u16;
+        if x >= offset && x < offset.saturating_add(width) {
+            return *target;
+        }
+        offset = offset.saturating_add(width);
+    }
+    None
+}
+
+fn panel_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .split(area)
+}
+
+fn security_overlay(area: Rect, line_count: usize) -> Rect {
+    let width = area.width.saturating_sub(4).min(64);
+    let height = (line_count as u16 + 2).min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     }
 }
 
@@ -1254,9 +1676,9 @@ fn state_label(enabled: bool) -> &'static str {
 
 fn setting_style(enabled: bool) -> Style {
     if enabled {
-        Style::default().fg(Color::LightGreen)
+        Style::default().fg(palette::GREEN)
     } else {
-        Style::default().fg(Color::LightRed)
+        Style::default().fg(palette::RED)
     }
 }
 
@@ -1317,45 +1739,23 @@ fn capitalize(value: &str) -> String {
     }
 }
 
-fn form_lines<'a>(mut lines: Vec<Line<'a>>, error: Option<&'a str>) -> Vec<Line<'a>> {
-    if let Some(error) = error {
-        lines.push(Line::from(Span::styled(
-            format!(" {error}"),
-            Style::default().fg(Color::Red),
-        )));
-    }
-    lines.push(Line::from(vec![
-        key("Enter"),
-        hint(" save  "),
-        key("Esc"),
-        hint(" cancel"),
-    ]));
-    lines
-}
-
 fn key(label: &'static str) -> Span<'static> {
-    Span::styled(label, Style::default().fg(Color::Cyan).bold())
+    Span::styled(label, Style::default().fg(palette::BLUE).bold())
 }
 
 fn hint(label: &'static str) -> Span<'static> {
-    Span::styled(label, Style::default().fg(Color::Gray))
+    Span::styled(label, Style::default().fg(palette::MUTED))
 }
 
 fn render_overlay(title: &str, lines: Vec<Line<'_>>, area: Rect, buf: &mut Buffer) {
-    let width = area.width.saturating_sub(4).min(64);
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let overlay = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
+    let overlay = security_overlay(area, lines.len());
     Clear.render(overlay, buf);
     Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(role::FOCUS))
+                .title_style(Style::default().fg(role::FOCUS).bold())
                 .title(title),
         )
         .render(overlay, buf);
@@ -1365,9 +1765,164 @@ fn render_overlay(title: &str, lines: Vec<Line<'_>>, area: Rect, buf: &mut Buffe
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use unicode_width::UnicodeWidthStr;
 
     fn key_event(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_requires_matching_release_and_scopes_wheel_to_list() {
+        let area = Rect::new(0, 0, 120, 12);
+        let chunks = panel_chunks(area);
+        let list = Block::default().borders(Borders::ALL).inner(chunks[1]);
+        let mut config = ProgrammerConfig::default();
+        config.normalize_security_profiles();
+        config
+            .security_profiles
+            .insert("network".to_string(), SecurityConfig::default());
+        let mut panel = SecurityPanel::new();
+
+        assert_eq!(
+            panel.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0), area, &mut config),
+            PanelAction::None
+        );
+        assert_eq!(panel.selected, 0);
+        assert_eq!(
+            panel.handle_mouse(
+                mouse(MouseEventKind::ScrollDown, list.x, list.y),
+                area,
+                &mut config,
+            ),
+            PanelAction::None
+        );
+        assert_eq!(panel.selected, 1);
+
+        let footer = chunks[2];
+        let clone_x = footer.x + "Enter activate  ".width() as u16;
+        let edit_x = clone_x + "a clone  ".width() as u16;
+        panel.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), clone_x, footer.y),
+            area,
+            &mut config,
+        );
+        assert_eq!(
+            panel.handle_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), edit_x, footer.y),
+                area,
+                &mut config,
+            ),
+            PanelAction::None
+        );
+        assert!(matches!(panel.mode, Mode::List));
+    }
+
+    #[test]
+    fn mouse_delete_only_confirms_on_matching_button_release() {
+        let area = Rect::new(0, 0, 120, 12);
+        let chunks = panel_chunks(area);
+        let footer = chunks[2];
+        let delete_x = footer.x
+            + ("Enter activate  ".width()
+                + "a clone  ".width()
+                + "e edit  ".width()
+                + "r rename  ".width()) as u16;
+        let mut config = ProgrammerConfig::default();
+        config.normalize_security_profiles();
+        config
+            .security_profiles
+            .insert("network".to_string(), SecurityConfig::default());
+        let mut panel = SecurityPanel::new();
+        panel.selected = 1;
+
+        panel.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), delete_x, footer.y),
+            area,
+            &mut config,
+        );
+        assert_eq!(
+            panel.handle_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), delete_x, footer.y),
+                area,
+                &mut config,
+            ),
+            PanelAction::None
+        );
+        assert!(matches!(panel.mode, Mode::ConfirmDelete(_)));
+
+        let overlay = security_overlay(area, 2);
+        let yes_x = overlay.x + 1;
+        let no_x = yes_x + "y yes  ".width() as u16;
+        let action_y = overlay.y + 2;
+        panel.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), yes_x, action_y),
+            area,
+            &mut config,
+        );
+        assert_eq!(
+            panel.handle_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), no_x, action_y),
+                area,
+                &mut config,
+            ),
+            PanelAction::None
+        );
+        assert!(config.security_profiles.contains_key("network"));
+        assert!(matches!(panel.mode, Mode::ConfirmDelete(_)));
+
+        panel.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), yes_x, action_y),
+            area,
+            &mut config,
+        );
+        assert_eq!(
+            panel.handle_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), yes_x, action_y),
+                area,
+                &mut config,
+            ),
+            PanelAction::Saved
+        );
+        assert!(!config.security_profiles.contains_key("network"));
+    }
+
+    #[test]
+    fn value_form_error_keeps_mouse_actions_on_rendered_row() {
+        let area = Rect::new(0, 0, 80, 12);
+        let config = ProgrammerConfig::default();
+        let panel = SecurityPanel {
+            mode: Mode::ValueForm {
+                name: "default".to_string(),
+                kind: CollectionKind::DeniedEnvironment,
+                original: None,
+                value: "[".to_string(),
+                error: Some("invalid pattern".to_string()),
+            },
+            ..SecurityPanel::new()
+        };
+        let overlay = security_overlay(area, 3);
+        assert_eq!(
+            panel.mouse_target(overlay.x + 1, overlay.y + 3, area, &config),
+            Some(MouseTarget::Save)
+        );
+        assert_eq!(
+            panel.mouse_target(
+                overlay.x + 1 + "Enter save  ".width() as u16,
+                overlay.y + 3,
+                area,
+                &config,
+            ),
+            Some(MouseTarget::Cancel)
+        );
     }
 
     #[test]
@@ -1508,8 +2063,7 @@ mod tests {
                 value: "[".to_string(),
                 error: None,
             },
-            selected: 0,
-            search: PanelSearch::default(),
+            ..SecurityPanel::new()
         };
 
         assert_eq!(
@@ -1552,8 +2106,7 @@ mod tests {
                 value: "/new".to_string(),
                 error: None,
             },
-            selected: 0,
-            search: PanelSearch::default(),
+            ..SecurityPanel::new()
         };
 
         assert_eq!(

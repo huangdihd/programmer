@@ -712,7 +712,22 @@ async fn shutdown_kills_descendants_while_pipe_waiter_is_draining() {
     let id = manager
         .spawn("sleep 30 & echo shell-exited", None, None)
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut shell_exited = false;
+    for _ in 0..100 {
+        if manager
+            .snapshot(id)
+            .is_some_and(|snapshot| snapshot.output.contains("shell-exited"))
+        {
+            shell_exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        shell_exited,
+        "shell should exit while its child holds the pipe"
+    );
+
     manager.shutdown(Duration::from_secs(5)).await.unwrap();
     let snapshot = manager.wait_until_finished(id).await.unwrap();
     assert!(snapshot.output.contains("shell-exited"));

@@ -14,14 +14,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::CompletionPopup;
+use crate::ui::markdown_theme::palette;
 use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Clear, List, ListItem, Widget};
 
-const BG: Color = Color::Rgb(30, 30, 40);
-const FG: Color = Color::White;
+const BG: Color = palette::CODE_BG;
+const FG: Color = palette::TEXT;
 
 impl<T> Widget for &CompletionPopup<'_, T> {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -52,7 +53,14 @@ impl<T> Widget for &CompletionPopup<'_, T> {
             .skip(scroll)
             .take(visible_height)
             .map(|(i, candidate)| {
-                let style = if i == self.selected {
+                let hovered = self.hovered == Some(i);
+                let style = if hovered && self.pressed == Some(i) {
+                    Style::default()
+                        .fg(role::SELECTION_TEXT)
+                        .bg(role::INTERACTION_PRESSED_BG)
+                } else if hovered {
+                    Style::default().fg(FG).bg(self.hover_background)
+                } else if i == self.selected {
                     Style::default()
                         .fg(role::SELECTION_TEXT)
                         .bg(role::SELECTION_BG)
@@ -73,6 +81,31 @@ mod tests {
     use crate::ui::theme::{self, Theme};
 
     #[test]
+    fn pointer_feedback_takes_precedence_over_keyboard_selection() {
+        let candidates = ["auto", "light"];
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buffer = Buffer::empty(area);
+        let popup = CompletionPopup {
+            candidates: &candidates,
+            label: |value| *value,
+            selected: 0,
+            scroll_offset: 0,
+            hovered: Some(0),
+            pressed: None,
+            hover_background: palette::SURFACE_HOVER_SOFT,
+        };
+        (&popup).render(area, &mut buffer);
+        assert_eq!(buffer[(0, 0)].bg, palette::SURFACE_HOVER_SOFT);
+
+        let pressed = CompletionPopup {
+            pressed: Some(0),
+            ..popup
+        };
+        (&pressed).render(area, &mut buffer);
+        assert_eq!(buffer[(0, 0)].bg, role::INTERACTION_PRESSED_BG);
+    }
+
+    #[test]
     fn selected_row_is_filled_edge_to_edge_in_both_themes() {
         let candidates = ["auto", "light", "dark"];
         let popup = CompletionPopup {
@@ -80,6 +113,9 @@ mod tests {
             label: |value| *value,
             selected: 0,
             scroll_offset: 0,
+            hovered: None,
+            pressed: None,
+            hover_background: palette::SURFACE_HOVER,
         };
         let area = Rect::new(2, 1, 12, 3);
         for mode in [Theme::Light, Theme::Dark] {
@@ -87,9 +123,9 @@ mod tests {
             (&popup).render(area, &mut buffer);
             theme::apply(mode, buffer.area, &mut buffer);
             let (fg, bg) = if mode == Theme::Light {
-                (Color::Rgb(56, 58, 66), Color::Rgb(225, 235, 253))
+                (Color::Rgb(37, 42, 53), Color::Rgb(225, 231, 245))
             } else {
-                (Color::Black, Color::LightBlue)
+                (palette::TEXT, palette::SURFACE)
             };
             for x in area.x..area.right() {
                 assert_eq!(buffer[(x, area.y)].bg, bg);

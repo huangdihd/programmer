@@ -20,11 +20,12 @@ use crate::mcp::{McpConnectionState, McpServerStatus};
 use crate::providers::{ProviderModelState, ProviderModelStatus};
 use crate::tasks::{SidebarTaskSnapshot, TaskStatus};
 use crate::todos::{TodoList, TodoStatus};
+use crate::ui::markdown_theme::palette;
 use crate::ui::text::{format_duration_secs, truncate_to_width, wrap_to_width};
 use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
@@ -69,7 +70,8 @@ impl Sidebar {
         self.hide();
         let block = Block::default()
             .borders(Borders::LEFT)
-            .border_style(Style::default().fg(role::DIVIDER));
+            .border_style(Style::default().fg(role::DIVIDER))
+            .style(Style::default().bg(palette::SURFACE));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -121,30 +123,51 @@ impl Sidebar {
         {
             let y = inner.y + i as u16;
             if y < inner.y + inner.height {
-                Paragraph::new(line.clone()).render(
-                    Rect {
-                        x: inner.x,
-                        y,
-                        width: inner.width,
-                        height: 1,
-                    },
-                    buf,
-                );
+                let row_area = Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                };
+                Paragraph::new(line.clone()).render(row_area, buf);
+                let row = i as u16;
+                let interactive = self
+                    .click_map
+                    .get(i)
+                    .is_some_and(|target| !matches!(target, ClickTarget::None));
+                if interactive && self.pointer_hover_row == Some(row) {
+                    let pressed = self.pointer_pressed_row == Some(row);
+                    let style = if pressed {
+                        Style::default()
+                            .fg(role::SELECTION_TEXT)
+                            .bg(role::INTERACTION_PRESSED_BG)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(self.pointer_hover_background)
+                    };
+                    for x in row_area.x..row_area.right() {
+                        if let Some(cell) = buf.cell_mut((x, y)) {
+                            cell.set_style(style);
+                        }
+                    }
+                }
             }
         }
 
-        // Scroll indicator at bottom-right if content overflows.
+        // Scroll indicator at bottom-right if content overflows. The row is
+        // intentionally inert because the indicator visually covers its item.
         if total_lines > visible_height {
+            if let Some(target) = self.click_map.last_mut() {
+                *target = ClickTarget::None;
+            }
             let pct = offset as f64 / max_scroll.max(1) as f64 * 100.0;
             let indicator = format!("{}/{total_lines} ({pct:.0}%)", offset + 1);
             let indicator_len = indicator.len() as u16;
             let x = inner
                 .x
                 .saturating_add(inner.width.saturating_sub(indicator_len));
-            let indicator_line = Line::from(Span::styled(
-                indicator,
-                Style::default().fg(Color::DarkGray),
-            ));
+            let indicator_line =
+                Line::from(Span::styled(indicator, Style::default().fg(palette::MUTED)));
             Paragraph::new(indicator_line).render(
                 Rect {
                     x,
@@ -233,7 +256,7 @@ impl Sidebar {
             lines.push(Line::from(Span::styled(
                 "  nothing to show yet",
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(palette::MUTED)
                     .add_modifier(Modifier::ITALIC),
             )));
             targets.push(ClickTarget::None);
@@ -438,15 +461,15 @@ impl Sidebar {
         for provider in providers {
             let (dot_color, label, label_color) = match provider.state {
                 ProviderModelState::Refreshing => {
-                    (Color::Yellow, "refreshing…".to_string(), Color::Yellow)
+                    (palette::YELLOW, "refreshing…".to_string(), palette::YELLOW)
                 }
                 ProviderModelState::Ready { model_count } => (
-                    Color::Green,
+                    palette::GREEN,
                     format!("{model_count} models"),
-                    Color::DarkGray,
+                    palette::MUTED,
                 ),
                 ProviderModelState::Failed => {
-                    (Color::Red, "refresh failed".to_string(), Color::Red)
+                    (palette::RED, "refresh failed".to_string(), palette::RED)
                 }
             };
             let active_marker = if provider.name == active_provider {
@@ -458,8 +481,8 @@ impl Sidebar {
                 Span::raw("  "),
                 Span::styled("●", Style::default().fg(dot_color)),
                 Span::raw(" "),
-                Span::styled(provider.name.clone(), Style::default().fg(Color::White)),
-                Span::styled(active_marker, Style::default().fg(Color::Yellow)),
+                Span::styled(provider.name.clone(), Style::default().fg(palette::TEXT)),
+                Span::styled(active_marker, Style::default().fg(palette::YELLOW)),
                 Span::styled(format!(" ({label})"), Style::default().fg(label_color)),
             ]));
             targets.push(ClickTarget::None);
@@ -477,7 +500,7 @@ impl Sidebar {
                 Span::raw("  "),
                 Span::styled("●", Style::default().fg(role::SECTION_SKILLS)),
                 Span::raw(" "),
-                Span::styled(name.clone(), Style::default().fg(Color::White)),
+                Span::styled(name.clone(), Style::default().fg(palette::TEXT)),
             ]));
             targets.push(ClickTarget::None);
         }
@@ -494,7 +517,7 @@ impl Sidebar {
         if !lsp_configured && diagnostics.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No diagnostics configured",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::MUTED),
             )));
             targets.push(ClickTarget::None);
             return;
@@ -502,7 +525,7 @@ impl Sidebar {
         if diagnostics.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No issues detected",
-                Style::default().fg(Color::Green),
+                Style::default().fg(palette::GREEN),
             )));
             targets.push(ClickTarget::None);
             return;
@@ -514,10 +537,10 @@ impl Sidebar {
 
         for (i, d) in sorted.iter().enumerate() {
             let (severity_icon, severity_color) = match d.severity {
-                Severity::Error => ("E", Color::Red),
-                Severity::Warning => ("W", Color::Yellow),
-                Severity::Lint => ("L", Color::DarkGray),
-                Severity::Info => ("I", Color::Blue),
+                Severity::Error => ("E", palette::RED),
+                Severity::Warning => ("W", palette::YELLOW),
+                Severity::Lint => ("L", palette::MUTED),
+                Severity::Info => ("I", palette::BLUE),
             };
 
             // Show just basename:line so it fits.
@@ -541,7 +564,7 @@ impl Sidebar {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(loc, Style::default().fg(Color::Gray)),
+                Span::styled(loc, Style::default().fg(palette::MUTED)),
             ]);
             lines.push(header);
             targets.push(ClickTarget::Diagnostic(i));
@@ -551,7 +574,7 @@ impl Sidebar {
             for chunk in &msg_chunks {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(chunk.clone(), Style::default().fg(Color::White)),
+                    Span::styled(chunk.clone(), Style::default().fg(palette::TEXT)),
                 ]));
                 targets.push(ClickTarget::None);
             }
@@ -567,23 +590,25 @@ impl Sidebar {
     ) {
         for server in mcp_servers.iter().take(VISIBLE_PER_SECTION) {
             let (dot_color, label, label_color) = match &server.state {
-                McpConnectionState::Connecting => {
-                    (Color::Yellow, " (connecting...)".to_string(), Color::Yellow)
-                }
+                McpConnectionState::Connecting => (
+                    palette::YELLOW,
+                    " (connecting...)".to_string(),
+                    palette::YELLOW,
+                ),
                 McpConnectionState::Connected { tool_count } => (
-                    Color::Green,
+                    palette::GREEN,
                     format!(" ({tool_count} tools)"),
-                    Color::DarkGray,
+                    palette::MUTED,
                 ),
                 McpConnectionState::Failed { .. } => {
-                    (Color::Red, " (failed)".to_string(), Color::Red)
+                    (palette::RED, " (failed)".to_string(), palette::RED)
                 }
             };
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("●", Style::default().fg(dot_color)),
                 Span::raw(" "),
-                Span::styled(server.name.clone(), Style::default().fg(Color::White)),
+                Span::styled(server.name.clone(), Style::default().fg(palette::TEXT)),
                 Span::styled(label, Style::default().fg(label_color)),
             ]));
             targets.push(ClickTarget::None);
@@ -595,7 +620,7 @@ impl Sidebar {
             for chunk in wrap_to_width(error, msg_max) {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(chunk, Style::default().fg(Color::Yellow)),
+                    Span::styled(chunk, Style::default().fg(palette::YELLOW)),
                 ]));
                 targets.push(ClickTarget::None);
             }
@@ -605,7 +630,7 @@ impl Sidebar {
             let remaining = mcp_servers.len() - VISIBLE_PER_SECTION;
             lines.push(Line::from(Span::styled(
                 format!("    … {remaining} more"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::MUTED),
             )));
             targets.push(ClickTarget::None);
         }
@@ -621,7 +646,7 @@ impl Sidebar {
         if todo_list.todos.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No todos",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::MUTED),
             )));
             targets.push(ClickTarget::None);
             return;
@@ -632,14 +657,14 @@ impl Sidebar {
 
         for (i, todo) in sorted.iter().enumerate() {
             let (icon, color) = match todo.status {
-                TodoStatus::Pending => (TodoStatus::Pending.icon(), Color::DarkGray),
-                TodoStatus::InProgress => (TodoStatus::InProgress.icon(), Color::Yellow),
-                TodoStatus::Completed => (TodoStatus::Completed.icon(), Color::Green),
-                TodoStatus::Cancelled => (TodoStatus::Cancelled.icon(), Color::Red),
+                TodoStatus::Pending => (TodoStatus::Pending.icon(), palette::MUTED),
+                TodoStatus::InProgress => (TodoStatus::InProgress.icon(), palette::YELLOW),
+                TodoStatus::Completed => (TodoStatus::Completed.icon(), palette::GREEN),
+                TodoStatus::Cancelled => (TodoStatus::Cancelled.icon(), palette::RED),
             };
 
-            let title_style = Style::default().fg(Color::White);
-            let cont_style = Style::default().fg(Color::DarkGray);
+            let title_style = Style::default().fg(palette::TEXT);
+            let cont_style = Style::default().fg(palette::MUTED);
 
             let prefix_spans: Vec<Span<'static>> = vec![
                 Span::raw("  "),
@@ -662,9 +687,8 @@ impl Sidebar {
                 title_style,
                 cont_style,
             );
-            targets.push(ClickTarget::TodoItem(i));
-            for _ in 1..(lines.len() - line_count_before) {
-                targets.push(ClickTarget::None);
+            for _ in 0..(lines.len() - line_count_before) {
+                targets.push(ClickTarget::TodoItem(i));
             }
         }
     }
@@ -679,7 +703,7 @@ impl Sidebar {
         if tasks.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No background tasks",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::MUTED),
             )));
             targets.push(ClickTarget::None);
             return;
@@ -687,17 +711,17 @@ impl Sidebar {
 
         for task in tasks {
             let (icon, color) = match task.status {
-                TaskStatus::Running => ("▶", Color::Yellow),
-                TaskStatus::Completed => ("✓", Color::Green),
-                TaskStatus::Failed => ("✗", Color::Red),
-                TaskStatus::Killed => ("⊘", Color::DarkGray),
+                TaskStatus::Running => ("▶", palette::YELLOW),
+                TaskStatus::Completed => ("✓", palette::GREEN),
+                TaskStatus::Failed => ("✗", palette::RED),
+                TaskStatus::Killed => ("⊘", palette::MUTED),
             };
 
             let expanded = self.task_expanded(task.id);
             let arrow = if expanded { "▾" } else { "▸" };
             let elapsed = format_duration_secs(task.elapsed);
-            let title_style = Style::default().fg(Color::White);
-            let cont_style = Style::default().fg(Color::DarkGray);
+            let title_style = Style::default().fg(palette::TEXT);
+            let cont_style = Style::default().fg(palette::MUTED);
 
             let prefix_spans: Vec<Span<'static>> = vec![
                 Span::raw("  "),
@@ -707,7 +731,7 @@ impl Sidebar {
                 ),
                 Span::styled(
                     format!(" {arrow} #{} ", task.id),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette::MUTED),
                 ),
             ];
             let prefix_width = spans_width(&prefix_spans);
@@ -743,10 +767,10 @@ impl Sidebar {
     ) {
         for agent in agents {
             let (icon, color) = match agent.status {
-                AgentStatus::Running => ("▶", Color::Yellow),
-                AgentStatus::Completed => ("✓", Color::Green),
-                AgentStatus::Failed => ("✗", Color::Red),
-                AgentStatus::Cancelled => ("⊘", Color::DarkGray),
+                AgentStatus::Running => ("▶", palette::YELLOW),
+                AgentStatus::Completed => ("✓", palette::GREEN),
+                AgentStatus::Failed => ("✗", palette::RED),
+                AgentStatus::Cancelled => ("⊘", palette::MUTED),
             };
             let prefix_spans = vec![
                 Span::raw("  "),
@@ -756,7 +780,7 @@ impl Sidebar {
                 ),
                 Span::styled(
                     format!(" #{} ", agent.id),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette::MUTED),
                 ),
             ];
             let prefix_width = spans_width(&prefix_spans);
@@ -778,8 +802,8 @@ impl Sidebar {
                 width,
                 prefix_width,
                 CONT_INDENT,
-                Style::default().fg(Color::White),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::TEXT),
+                Style::default().fg(palette::MUTED),
             );
             for _ in 0..(lines.len() - before) {
                 targets.push(ClickTarget::Agent(agent.id));
@@ -796,8 +820,8 @@ impl Sidebar {
         width: u16,
         task: &SidebarTaskSnapshot,
     ) {
-        let dim = Style::default().fg(Color::DarkGray);
-        let text_style = Style::default().fg(Color::Gray);
+        let dim = Style::default().fg(palette::MUTED);
+        let text_style = Style::default().fg(palette::MUTED);
         let budget = (width.saturating_sub(6) as usize).max(8);
 
         if let Some(code) = task.exit_code {
@@ -979,6 +1003,39 @@ mod tests {
             &[],
         );
         buffer_text(&buf)
+    }
+
+    #[test]
+    fn wrapped_todo_rows_share_the_same_click_target() {
+        let mut sidebar = Sidebar::new();
+        let area = Rect::new(0, 0, 20, 20);
+        let mut buf = Buffer::empty(area);
+        let mut todos = crate::todos::TodoList::default();
+        todos.add(
+            "a todo title long enough to wrap onto another row".to_string(),
+            None,
+        );
+
+        sidebar.render(
+            area,
+            &mut buf,
+            &[],
+            false,
+            &[],
+            &[],
+            "",
+            &[],
+            &todos,
+            &[],
+            &[],
+        );
+
+        let clickable_rows = sidebar
+            .click_map
+            .iter()
+            .filter(|target| matches!(target, ClickTarget::TodoItem(0)))
+            .count();
+        assert!(clickable_rows >= 2, "click map: {:?}", sidebar.click_map);
     }
 
     #[test]

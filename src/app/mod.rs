@@ -65,12 +65,6 @@ fn event_requests_immediate_redraw(event: &Event) -> bool {
     !matches!(
         event,
         Event::App(crate::ui::event::AppEvent::ChunkReceived(_, _))
-            | Event::Crossterm(crossterm::event::Event::Mouse(
-                crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Moved,
-                    ..
-                }
-            ))
     )
 }
 
@@ -95,6 +89,55 @@ fn scroll_direction(event: &Event) -> Option<crossterm::event::MouseEventKind> {
         },
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImagePointerSurface {
+    MainViewer,
+    MainInline(usize),
+    AgentViewer,
+    AgentInline(usize),
+}
+
+fn image_pointer_surface(app: &App<'_>) -> Option<ImagePointerSurface> {
+    if app.ui.image_viewer.is_some() {
+        return Some(ImagePointerSurface::MainViewer);
+    }
+    if let Some(key) = app
+        .ui
+        .agent_panel
+        .as_ref()
+        .and_then(|panel| panel.image_pointer_key())
+    {
+        return Some(match key {
+            None => ImagePointerSurface::AgentViewer,
+            Some(image_id) => ImagePointerSurface::AgentInline(image_id),
+        });
+    }
+    app.ui
+        .conversation_panel
+        .hovered_image_id()
+        .map(ImagePointerSurface::MainInline)
+}
+
+fn is_pointer_move(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Crossterm(crossterm::event::Event::Mouse(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Moved,
+                ..
+            }
+        ))
+    )
+}
+
+fn throttle_image_drag(event: &Event, surface: Option<ImagePointerSurface>) -> bool {
+    is_left_drag(event)
+        && matches!(
+            surface,
+            Some(ImagePointerSurface::MainViewer | ImagePointerSurface::AgentViewer)
+        )
 }
 
 /// A pending tool-call review request from the runner. Manual mode now gets
@@ -309,6 +352,19 @@ impl TaskNotificationState {
     }
 }
 
+/// Interactive surface currently under or held by the pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PointerTarget {
+    Sidebar { row: u16 },
+    SidebarResize,
+    Footer(crate::ui::components::footer::footer::FooterTarget),
+    Completion { index: usize },
+    Todo { index: usize },
+    Question { index: usize },
+    Approval { index: usize },
+    Plan { index: usize },
+}
+
 /// Presentation state grouped without changing component or conversation ownership.
 pub struct UiState<'a> {
     /// Time of the first Ctrl+C press while waiting for exit confirmation.
@@ -318,6 +374,8 @@ pub struct UiState<'a> {
     pub(crate) native_selection_mode: bool,
     pub input_panel: InputPanel<'a>,
     pub conversation_panel: ConversationPanel,
+    /// Modal viewer for a clicked inline conversation image.
+    pub(crate) image_viewer: Option<crate::ui::image_preview::ImageViewer>,
     pub footer: Footer,
     /// Full-screen provider management panel, when open.
     pub provider_panel: Option<ProviderPanel>,
@@ -345,8 +403,29 @@ pub struct UiState<'a> {
     pub sidebar: Option<Sidebar>,
     /// The sidebar's screen area from the last render, used to route mouse
     /// scroll events to the correct panel.
-    /// Tracks whether the current mouse-drag started in the sidebar area.
-    pub(crate) sidebar_click_active: bool,
+    /// Sidebar target and row captured on mouse-down, preventing asynchronous
+    /// redraws from changing what the eventual mouse-up activates.
+    pub(crate) sidebar_click_target: Option<(crate::ui::components::sidebar::ClickTarget, u16)>,
+    /// Preferred sidebar width and whether its left divider is being dragged.
+    pub(crate) sidebar_width: u16,
+    pub(crate) sidebar_resize_preview: Option<u16>,
+    pub(crate) sidebar_resizing: bool,
+    /// Frozen main-pane frame used while the sidebar divider moves. Reusing it
+    /// avoids reparsing and rewrapping the whole transcript for every width.
+    pub(crate) sidebar_resize_main: Option<(u16, ratatui::buffer::Buffer)>,
+    /// Pointer hover and press state used for desktop-like feedback and stable activation.
+    pub(crate) pointer_hover: Option<PointerTarget>,
+    pub(crate) pointer_pressed: Option<PointerTarget>,
+    pub(crate) pointer_animation: crate::ui::interaction::InteractionAnimation,
+    /// Whether mouse-down activated a conversation control whose matching
+    /// mouse-up must not be interpreted as a text-selection gesture.
+    pub(crate) conversation_click_consumed: bool,
+    /// Interactive regions captured from the latest frame for mouse routing.
+    pub(crate) frame_area: ratatui::layout::Rect,
+    pub(crate) bottom_interaction_area: Option<ratatui::layout::Rect>,
+    pub(crate) footer_area: Option<ratatui::layout::Rect>,
+    pub(crate) completion_area: Option<ratatui::layout::Rect>,
+    pub(crate) todo_area: Option<ratatui::layout::Rect>,
     /// UI snapshot of the current session's todo list.
     pub todo_list: crate::todos::TodoList,
     /// Operation whose completed turn is currently generating an input hint.
@@ -358,6 +437,91 @@ pub struct UiState<'a> {
 }
 
 /// Runtime state of the foreground agent loop.
+impl UiState<'_> {
+    pub(crate) fn set_pointer_hover(&mut self, target: Option<PointerTarget>) {
+        if self.pointer_hover == target {
+            return;
+        }
+        self.pointer_hover = target;
+        if self.pointer_hover.is_some() {
+            self.pointer_animation.restart();
+        } else {
+            self.pointer_animation.cancel();
+        }
+    }
+
+    pub(crate) fn set_pointer_pressed(&mut self, target: Option<PointerTarget>) {
+        self.pointer_pressed = target;
+        if self.pointer_pressed.is_some() {
+            // Pressed styling fully covers hover, so settle the hidden fade
+            // instead of scheduling frames that cannot change the screen.
+            self.pointer_animation.cancel();
+        }
+    }
+
+    pub(crate) fn take_pointer_pressed(&mut self) -> Option<PointerTarget> {
+        self.pointer_pressed.take()
+    }
+
+    pub(crate) fn clear_pointer_feedback(&mut self) {
+        self.pointer_hover = None;
+        self.pointer_pressed = None;
+        self.pointer_animation.cancel();
+        if let Some(panel) = self.question_panel.as_mut() {
+            panel.clear_pointer_feedback();
+        }
+    }
+
+    pub(crate) fn pointer_hover_background(&self) -> ratatui::style::Color {
+        self.pointer_animation.hover_background()
+    }
+
+    pub(crate) fn interaction_animation_active(&self) -> bool {
+        self.pointer_animation.active()
+            || self.conversation_panel.interaction_animation_active()
+            || self
+                .question_panel
+                .as_ref()
+                .is_some_and(|panel| panel.interaction_animation_active())
+            || self
+                .image_viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.render_pending())
+            || self
+                .agent_panel
+                .as_ref()
+                .is_some_and(|panel| panel.interaction_animation_active())
+            || self
+                .provider_panel
+                .as_ref()
+                .is_some_and(|panel| panel.interaction_animation_active())
+            || self
+                .skills_panel
+                .as_ref()
+                .is_some_and(|panel| panel.interaction_animation_active())
+            || self
+                .mcp_panel
+                .as_ref()
+                .is_some_and(|panel| panel.interaction_animation_active())
+            || self
+                .rewind_panel
+                .as_ref()
+                .is_some_and(|panel| panel.interaction_animation_active())
+            || self
+                .diagnostics_panel
+                .as_ref()
+                .is_some_and(|panel| panel.interaction_animation_active())
+            || self
+                .security_panel
+                .as_ref()
+                .is_some_and(|panel| panel.interaction_animation_active())
+            || self
+                .activity_page
+                .as_ref()
+                .is_some_and(|page| page.panel.interaction_animation_active())
+    }
+}
+
 pub(crate) struct LoopState {
     pub(crate) background_handles: Vec<tokio::task::JoinHandle<()>>,
     pub(crate) runner: Option<Arc<crate::runner::TurnRunner>>,
@@ -562,6 +726,7 @@ impl App<'_> {
                 native_selection_mode: false,
                 input_panel,
                 conversation_panel,
+                image_viewer: None,
                 footer: Footer::new(),
                 provider_panel: open_provider_panel.then(ProviderPanel::new),
                 skills_panel: None,
@@ -576,7 +741,20 @@ impl App<'_> {
                 agent_panel: None,
                 activity_page: None,
                 sidebar: Some(Sidebar::new()),
-                sidebar_click_active: false,
+                sidebar_click_target: None,
+                sidebar_width: Sidebar::needed_width(),
+                sidebar_resize_preview: None,
+                sidebar_resizing: false,
+                sidebar_resize_main: None,
+                pointer_hover: None,
+                pointer_pressed: None,
+                pointer_animation: crate::ui::interaction::InteractionAnimation::default(),
+                conversation_click_consumed: false,
+                frame_area: ratatui::layout::Rect::ZERO,
+                bottom_interaction_area: None,
+                footer_area: None,
+                completion_area: None,
+                todo_area: None,
                 todo_list,
                 active_suggestion_operation_id: None,
                 input_suggestion_cancel: None,
@@ -892,6 +1070,9 @@ impl App<'_> {
             // at the configured frame rate. User input and lifecycle events still
             // request an immediate frame.
             terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+            if self.ui.interaction_animation_active() {
+                self.events.schedule_redraw();
+            }
             while self.running {
                 let mut event = Some(self.events.next().await?);
                 let mut redraw = false;
@@ -907,9 +1088,35 @@ impl App<'_> {
                     );
                     let current_scroll_direction = scroll_direction(&current);
                     let current_is_left_drag = is_left_drag(&current);
-                    redraw |= matches!(&current, Event::Tick | Event::Redraw)
-                        || event_requests_immediate_redraw(&current);
+                    let current_image_surface = image_pointer_surface(&self);
+                    let image_pointer_before =
+                        is_pointer_move(&current).then_some(current_image_surface);
+                    let forced_redraw = matches!(&current, Event::Tick | Event::Redraw);
+                    let throttle_sidebar_drag = current_is_left_drag && self.ui.sidebar_resizing;
+                    let throttle_image_drag = throttle_image_drag(&current, current_image_surface);
+                    let immediate_redraw = event_requests_immediate_redraw(&current)
+                        && !throttle_sidebar_drag
+                        && !throttle_image_drag;
+                    // Interactive terminal programs can request every pointer
+                    // motion report (for drawing, sliders, or their own text
+                    // selection), so only coalesce drags owned by TUI views.
+                    let coalesce_left_drag =
+                        current_is_left_drag && self.ui.terminal_pane.is_none();
                     self.handle_event(current).await?;
+                    if throttle_sidebar_drag || throttle_image_drag {
+                        // Mouse reports can exceed the terminal frame rate.
+                        // Apply the newest pointer position now, but coalesce
+                        // layout and native-image requests to at most 60 FPS.
+                        self.events.schedule_redraw();
+                    }
+                    let stable_image_pointer = image_pointer_before
+                        .flatten()
+                        .is_some_and(|before| image_pointer_surface(&self) == Some(before));
+                    // Native image protocols are emitted outside the normal
+                    // cell grid. Re-emitting the same image for every motion
+                    // report causes visible flicker in some terminals, and no
+                    // hover styling is painted over image pixels anyway.
+                    redraw |= forced_redraw || (immediate_redraw && !stable_image_pointer);
                     if chunk_received {
                         chunks += 1;
                     } else {
@@ -929,7 +1136,7 @@ impl App<'_> {
                     // Drag reports can arrive much faster than a full terminal
                     // frame can be drawn. Apply only the latest contiguous point
                     // so stale coordinates cannot build up behind rendering.
-                    if current_is_left_drag {
+                    if coalesce_left_drag {
                         let mut latest_drag = None;
                         while let Some(next) = self.events.try_next() {
                             if !is_left_drag(&next) {
@@ -970,6 +1177,9 @@ impl App<'_> {
                 }
                 if self.running && redraw {
                     terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+                    if self.ui.interaction_animation_active() {
+                        self.events.schedule_redraw();
+                    }
                 }
             }
             Ok(())
@@ -1241,7 +1451,8 @@ pub(crate) fn dream_transcript(items: &[crate::response::message_item::MessageIt
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskNotificationState, dream_transcript, event_requests_immediate_redraw, is_left_drag,
+        ImagePointerSurface, TaskNotificationState, dream_transcript,
+        event_requests_immediate_redraw, is_left_drag, throttle_image_drag,
     };
     use crate::ui::event::{AppEvent, Event};
     use crossterm::event::{
@@ -1326,7 +1537,7 @@ mod tests {
     fn redraw_policy_keeps_ticks_and_interaction_immediate_but_throttles_chunks() {
         assert!(event_requests_immediate_redraw(&Event::Tick));
         assert!(event_requests_immediate_redraw(&Event::App(AppEvent::Quit)));
-        assert!(!event_requests_immediate_redraw(&mouse_event(
+        assert!(event_requests_immediate_redraw(&mouse_event(
             MouseEventKind::Moved
         )));
     }
@@ -1342,6 +1553,27 @@ mod tests {
         assert!(!is_left_drag(&mouse_event(MouseEventKind::Up(
             MouseButton::Left
         ))));
+    }
+
+    #[test]
+    fn modal_image_drags_are_limited_to_the_frame_rate() {
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left));
+        assert!(throttle_image_drag(
+            &drag,
+            Some(ImagePointerSurface::MainViewer)
+        ));
+        assert!(throttle_image_drag(
+            &drag,
+            Some(ImagePointerSurface::AgentViewer)
+        ));
+        assert!(!throttle_image_drag(
+            &drag,
+            Some(ImagePointerSurface::MainInline(1))
+        ));
+        assert!(!throttle_image_drag(
+            &mouse_event(MouseEventKind::Up(MouseButton::Left)),
+            Some(ImagePointerSurface::MainViewer)
+        ));
     }
 
     fn mouse_event(kind: MouseEventKind) -> Event {

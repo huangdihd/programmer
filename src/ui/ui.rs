@@ -13,16 +13,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::app::App;
+use crate::app::{App, PointerTarget};
 use crate::ui::components::completion_popup::CompletionPopup;
 use crate::ui::components::conversation_panel::conversation_panel::ActivePhase;
 use crate::ui::components::logo::Logo;
-use crate::ui::components::sidebar::Sidebar;
 use crate::ui::components::status_bar::status_bar::StatusState;
+use crate::ui::markdown_theme::palette;
+use crate::ui::theme::role;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
 fn terminal_title_subject<'a>(session_title: &'a str, project_name: &'a str) -> &'a str {
@@ -36,6 +37,63 @@ fn terminal_title_subject<'a>(session_title: &'a str, project_name: &'a str) -> 
 
 fn status_for_waiting_subagents(waiting: bool) -> Option<StatusState> {
     waiting.then_some(StatusState::WaitingSubagents)
+}
+
+fn sidebar_width(preferred: u16, total: u16) -> u16 {
+    let max = total.saturating_sub(20).max(1);
+    preferred.clamp(20.min(max), max)
+}
+
+fn snapshot_buffer(area: Rect, buf: &Buffer) -> Buffer {
+    let mut snapshot = Buffer::empty(area);
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let (Some(source), Some(target)) = (buf.cell((x, y)), snapshot.cell_mut((x, y))) {
+                *target = source.clone();
+            }
+        }
+    }
+    snapshot
+}
+
+fn paint_snapshot(snapshot: &Buffer, area: Rect, buf: &mut Buffer) {
+    Clear.render(area, buf);
+    let right = area.right().min(snapshot.area.right());
+    let bottom = area.bottom().min(snapshot.area.bottom());
+    for y in area.y.max(snapshot.area.y)..bottom {
+        for x in area.x.max(snapshot.area.x)..right {
+            if let (Some(source), Some(target)) = (snapshot.cell((x, y)), buf.cell_mut((x, y))) {
+                *target = source.clone();
+            }
+        }
+    }
+}
+
+fn paint_pointer_row(
+    buf: &mut Buffer,
+    area: Rect,
+    row: u16,
+    pressed: bool,
+    hover_background: ratatui::style::Color,
+) {
+    let y = area.y.saturating_add(row);
+    if y >= area.bottom() {
+        return;
+    }
+    for x in area.x..area.right() {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            if pressed {
+                cell.set_style(
+                    Style::default()
+                        .fg(role::SELECTION_TEXT)
+                        .bg(role::INTERACTION_PRESSED_BG)
+                        .add_modifier(Modifier::BOLD),
+                );
+            } else {
+                cell.set_bg(hover_background);
+            }
+        }
+    }
 }
 
 fn status_for_pending_turn(active_turn: bool, retrying: bool) -> StatusState {
@@ -139,10 +197,81 @@ impl App<'_> {
                 Constraint::Length(1),             // POS_FOOTER
             ])
             .split(area);
+
+        // Only the topmost pointer surface may retain feedback. This prevents
+        // a conversation/sidebar hover from showing through a newly opened
+        // question, approval bar, completion popup, or todo overlay.
+        let todo_owns_pointer = self.ui.todo_panel.is_some();
+        let question_owns_pointer = !todo_owns_pointer && self.ui.question_panel.is_some();
+        let approval_owns_pointer = !todo_owns_pointer
+            && !question_owns_pointer
+            && self.agent_loop.pending_review.is_some();
+        let plan_owns_pointer = !todo_owns_pointer
+            && !question_owns_pointer
+            && !approval_owns_pointer
+            && self.agent_loop.session.work_mode == crate::classifier::WorkMode::Plan
+            && self.agent_loop.plan_phase == crate::classifier::PlanPhase::Reviewing;
+        let completion_owns_pointer = !todo_owns_pointer
+            && !question_owns_pointer
+            && !approval_owns_pointer
+            && !plan_owns_pointer
+            && self
+                .ui
+                .input_panel
+                .completion
+                .as_ref()
+                .is_some_and(|completion| completion.visible);
+        let overlay_owns_pointer = todo_owns_pointer
+            || question_owns_pointer
+            || approval_owns_pointer
+            || plan_owns_pointer
+            || completion_owns_pointer;
+        let target_is_visible = |target: &PointerTarget| match target {
+            PointerTarget::Todo { .. } => todo_owns_pointer,
+            PointerTarget::Question { .. } => question_owns_pointer,
+            PointerTarget::Approval { .. } => approval_owns_pointer,
+            PointerTarget::Plan { .. } => plan_owns_pointer,
+            PointerTarget::Completion { .. } => completion_owns_pointer,
+            PointerTarget::Sidebar { .. }
+            | PointerTarget::SidebarResize
+            | PointerTarget::Footer(_) => !overlay_owns_pointer,
+        };
+        let stale_hover = self
+            .ui
+            .pointer_hover
+            .as_ref()
+            .is_some_and(|target| !target_is_visible(target));
+        let stale_press = self
+            .ui
+            .pointer_pressed
+            .as_ref()
+            .is_some_and(|target| !target_is_visible(target));
+        if stale_hover || stale_press {
+            self.ui.clear_pointer_feedback();
+        }
+        if overlay_owns_pointer {
+            self.ui.conversation_panel.clear_pointer_feedback();
+        }
+
         self.ui.conversation_panel.render(chunks[POS_CONV], buf);
+        self.ui.bottom_interaction_area = Some(chunks[POS_BOTTOM]);
+        let hover_background = self.ui.pointer_hover_background();
 
         if let Some(panel) = &self.ui.question_panel {
             panel.render(chunks[POS_BOTTOM], buf);
+            let hovered = match self.ui.pointer_hover {
+                Some(PointerTarget::Question { index }) => Some(index),
+                _ => None,
+            };
+            let pressed = match self.ui.pointer_pressed {
+                Some(PointerTarget::Question { index }) => Some(index),
+                _ => None,
+            };
+            if let Some(index) = hovered
+                && let Some(row) = panel.choice_row_area(chunks[POS_BOTTOM], index)
+            {
+                paint_pointer_row(buf, row, 0, pressed == Some(index), hover_background);
+            }
         } else if let Some(ref review) = self.agent_loop.pending_review {
             let (current, total) = review.position;
             let detail_lines = crate::ui::tool_details::format_tool_details(
@@ -157,13 +286,28 @@ impl App<'_> {
                 .enumerate()
                 .map(|(i, label)| {
                     let marker = if i == sel { "❯" } else { " " };
-                    let style = if i == sel {
+                    let hovered = matches!(
+                        self.ui.pointer_hover,
+                        Some(PointerTarget::Approval { index }) if index == i
+                    );
+                    let pressed = matches!(
+                        self.ui.pointer_pressed,
+                        Some(PointerTarget::Approval { index }) if index == i
+                    );
+                    let style = if hovered && pressed {
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
+                            .fg(role::SELECTION_TEXT)
+                            .bg(role::INTERACTION_PRESSED_BG)
+                            .add_modifier(Modifier::BOLD)
+                    } else if hovered {
+                        Style::default().fg(palette::TEXT).bg(hover_background)
+                    } else if i == sel {
+                        Style::default()
+                            .fg(role::SELECTION_TEXT)
+                            .bg(role::SELECTION_BG)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(palette::MUTED)
                     };
                     Line::from(vec![
                         Span::styled("  ", Style::default()),
@@ -174,23 +318,23 @@ impl App<'_> {
 
             let mut lines: Vec<Line> = vec![
                 Line::from(vec![
-                    Span::styled("🛡  ", Style::default().fg(Color::Yellow)),
+                    Span::styled("🛡  ", Style::default().fg(palette::YELLOW)),
                     Span::styled(
                         format!("Approve tool call?  ({current}/{total})"),
                         Style::default()
-                            .fg(Color::White)
+                            .fg(palette::TEXT)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  reason: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(review.reason.as_str(), Style::default().fg(Color::Yellow)),
+                    Span::styled("  reason: ", Style::default().fg(palette::MUTED)),
+                    Span::styled(review.reason.as_str(), Style::default().fg(palette::YELLOW)),
                 ]),
             ];
             for line in &detail_lines {
                 lines.push(Line::from(Span::styled(
                     format!("  {line}"),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(palette::MUTED),
                 )));
             }
             lines.extend(option_lines);
@@ -198,9 +342,22 @@ impl App<'_> {
                 .block(
                     Block::default()
                         .borders(Borders::TOP)
-                        .border_style(Style::default().fg(Color::Yellow)),
+                        .border_style(Style::default().fg(palette::YELLOW)),
                 )
                 .render(chunks[POS_BOTTOM], buf);
+            if let Some(PointerTarget::Approval { index }) = self.ui.pointer_hover {
+                paint_pointer_row(
+                    buf,
+                    chunks[POS_BOTTOM],
+                    3u16.saturating_add(detail_lines.len() as u16)
+                        .saturating_add(index as u16),
+                    matches!(
+                        self.ui.pointer_pressed,
+                        Some(PointerTarget::Approval { index: pressed }) if pressed == index
+                    ),
+                    hover_background,
+                );
+            }
         } else if self.agent_loop.session.work_mode == crate::classifier::WorkMode::Plan
             && self.agent_loop.plan_phase == crate::classifier::PlanPhase::Reviewing
         {
@@ -225,13 +382,28 @@ impl App<'_> {
                 .enumerate()
                 .map(|(i, label)| {
                     let marker = if i == sel { "\u{2771}" } else { " " };
-                    let style = if i == sel {
+                    let hovered = matches!(
+                        self.ui.pointer_hover,
+                        Some(PointerTarget::Plan { index }) if index == i
+                    );
+                    let pressed = matches!(
+                        self.ui.pointer_pressed,
+                        Some(PointerTarget::Plan { index }) if index == i
+                    );
+                    let style = if hovered && pressed {
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
+                            .fg(role::SELECTION_TEXT)
+                            .bg(role::INTERACTION_PRESSED_BG)
+                            .add_modifier(Modifier::BOLD)
+                    } else if hovered {
+                        Style::default().fg(palette::TEXT).bg(hover_background)
+                    } else if i == sel {
+                        Style::default()
+                            .fg(role::SELECTION_TEXT)
+                            .bg(role::SELECTION_BG)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(palette::MUTED)
                     };
                     Line::from(vec![
                         Span::styled("  ", Style::default()),
@@ -244,42 +416,71 @@ impl App<'_> {
                 Line::from(vec![Span::styled(
                     "\u{1f4cb}  Plan received. Choose how to execute:",
                     Style::default()
-                        .fg(Color::White)
+                        .fg(palette::TEXT)
                         .add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(vec![Span::styled(
                     "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette::BORDER),
                 )]),
             ];
             lines.extend(option_lines);
             // Hint line
             lines.push(Line::from(vec![
-                Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan).bold()),
-                Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-                Span::styled(" confirm  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-                Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "\u{2191}\u{2193}",
+                    Style::default().fg(palette::BLUE).bold(),
+                ),
+                Span::styled(" select  ", Style::default().fg(palette::MUTED)),
+                Span::styled("Enter", Style::default().fg(palette::GREEN).bold()),
+                Span::styled(" confirm  ", Style::default().fg(palette::MUTED)),
+                Span::styled("Esc", Style::default().fg(palette::BLUE).bold()),
+                Span::styled(" cancel", Style::default().fg(palette::MUTED)),
             ]));
 
             Paragraph::new(lines)
                 .block(
                     Block::default()
                         .borders(Borders::TOP)
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(palette::BLUE)),
                 )
                 .render(chunks[POS_BOTTOM], buf);
+            if let Some(PointerTarget::Plan { index }) = self.ui.pointer_hover {
+                paint_pointer_row(
+                    buf,
+                    chunks[POS_BOTTOM],
+                    3u16.saturating_add(index as u16),
+                    matches!(
+                        self.ui.pointer_pressed,
+                        Some(PointerTarget::Plan { index: pressed }) if pressed == index
+                    ),
+                    hover_background,
+                );
+            }
         } else {
             self.ui.input_panel.render(chunks[POS_BOTTOM], buf);
         }
+        self.ui.footer_area = Some(chunks[POS_FOOTER]);
         (&self.ui.footer).render(chunks[POS_FOOTER], buf);
+        if let Some(PointerTarget::Footer(target)) = self.ui.pointer_hover
+            && let Some((_, target_area)) = self
+                .ui
+                .footer
+                .regions(chunks[POS_FOOTER])
+                .into_iter()
+                .find(|(candidate, _)| *candidate == target)
+        {
+            paint_pointer_row(
+                buf,
+                target_area,
+                0,
+                matches!(self.ui.pointer_pressed, Some(PointerTarget::Footer(pressed)) if pressed == target),
+                hover_background,
+            );
+        }
 
         // ---- completion popup (floats above the input panel) ----
-        if let Some(ref completion) = self.ui.input_panel.completion
-            && completion.visible
-            && self.ui.question_panel.is_none()
-        {
+        if completion_owns_pointer && let Some(ref completion) = self.ui.input_panel.completion {
             let max_visible = 10u16;
             let count = (completion.candidates.len() as u16).min(max_visible);
             let popup_height = count;
@@ -300,11 +501,21 @@ impl App<'_> {
                 height: popup_height.min(chunks[POS_BOTTOM].y),
             };
 
+            self.ui.completion_area = Some(popup_area);
             let popup = CompletionPopup {
                 candidates: &completion.candidates,
                 label: |candidate| candidate.label.as_str(),
                 selected: completion.selected,
                 scroll_offset: completion.scroll_offset,
+                hovered: match self.ui.pointer_hover {
+                    Some(PointerTarget::Completion { index }) => Some(index),
+                    _ => None,
+                },
+                pressed: match self.ui.pointer_pressed {
+                    Some(PointerTarget::Completion { index }) => Some(index),
+                    _ => None,
+                },
+                hover_background,
             };
             popup.render(popup_area, buf);
         }
@@ -332,19 +543,38 @@ impl App<'_> {
                     {
                         cell.set_style(
                             Style::default()
-                                .fg(Color::DarkGray)
+                                .fg(palette::MUTED)
                                 .add_modifier(Modifier::DIM),
                         );
                     }
                 }
             }
+            self.ui.todo_area = Some(panel_area);
             panel.render(panel_area, buf);
+            if let Some(PointerTarget::Todo { index }) = self.ui.pointer_hover {
+                let inner = Block::default().borders(Borders::ALL).inner(panel_area);
+                let row = index.saturating_sub(panel.scroll_offset()) as u16;
+                paint_pointer_row(
+                    buf,
+                    inner,
+                    row,
+                    matches!(
+                        self.ui.pointer_pressed,
+                        Some(PointerTarget::Todo { index: pressed }) if pressed == index
+                    ),
+                    hover_background,
+                );
+            }
         }
     }
 }
 
 impl Widget for &mut App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        self.ui.bottom_interaction_area = None;
+        self.ui.footer_area = None;
+        self.ui.completion_area = None;
+        self.ui.todo_area = None;
         self.ui.conversation_panel.phase = self.agent_loop.phase;
         self.ui.conversation_panel.pending_message = self
             .agent_loop
@@ -363,8 +593,26 @@ impl Widget for &mut App<'_> {
 
 impl App<'_> {
     fn render_content(&mut self, area: Rect, buf: &mut Buffer) {
+        self.ui.frame_area = area;
         if let Some(sidebar) = &mut self.ui.sidebar {
             sidebar.hide();
+        }
+        if self.ui.image_viewer.is_some() {
+            self.ui.clear_pointer_feedback();
+            self.ui.conversation_panel.clear_pointer_feedback();
+        }
+        let full_screen_surface = self.ui.provider_panel.is_some()
+            || self.ui.rewind_panel.is_some()
+            || self.ui.skills_panel.is_some()
+            || self.ui.mcp_panel.is_some()
+            || self.ui.diagnostics_panel.is_some()
+            || self.ui.security_panel.is_some()
+            || self.ui.terminal_pane.is_some()
+            || self.ui.activity_page.is_some()
+            || self.ui.agent_panel.is_some();
+        if full_screen_surface {
+            self.ui.clear_pointer_feedback();
+            self.ui.conversation_panel.clear_pointer_feedback();
         }
         if let Some(panel) = &self.ui.provider_panel {
             panel.render(&self.config, &self.provider_manager, area, buf);
@@ -463,7 +711,7 @@ impl App<'_> {
             .as_ref()
             .map(|q| {
                 let sidebar_width = if self.ui.sidebar.is_some() {
-                    Sidebar::needed_width().min(area.width / 3)
+                    sidebar_width(self.ui.sidebar_width, area.width)
                 } else {
                     0
                 };
@@ -514,23 +762,71 @@ impl App<'_> {
         } else {
             &self.agent_loop.session.title
         };
-        Logo::new(title)
-            .with_dream(self.dream_active.load(std::sync::atomic::Ordering::Relaxed))
-            .render(vert[0], buf);
         let content_area = vert[1];
+        let sidebar_divider_x = self.ui.sidebar.as_ref().map(|_| {
+            content_area
+                .right()
+                .saturating_sub(sidebar_width(self.ui.sidebar_width, content_area.width))
+        });
+        let sidebar_resize_preview_x = self.ui.sidebar_resize_preview.map(|width| {
+            content_area
+                .right()
+                .saturating_sub(sidebar_width(width, content_area.width))
+        });
+        let mut logo = Logo::new(title)
+            .with_dream(self.dream_active.load(std::sync::atomic::Ordering::Relaxed));
+        if let Some(x) = sidebar_divider_x {
+            logo = logo.with_divider_at(x);
+        }
+        logo.render(vert[0], buf);
+        if let Some(x) = sidebar_resize_preview_x.filter(|x| Some(*x) != sidebar_divider_x)
+            && let Some(cell) = buf.cell_mut((x, vert[0].y + 1))
+        {
+            cell.set_symbol("┬").set_style(
+                Style::default()
+                    .fg(role::FOCUS)
+                    .bg(palette::CODE_BG)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
 
         // ---- sidebar: conditionally split the content area horizontally ----
         if self.ui.sidebar.is_some() {
-            let sidebar_width = Sidebar::needed_width().min(content_area.width / 3);
+            let rendered_sidebar_width = sidebar_width(self.ui.sidebar_width, content_area.width);
             let horiz = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Min(10),               // main area
-                    Constraint::Length(sidebar_width), // sidebar
+                    Constraint::Min(10),                        // main area
+                    Constraint::Length(rendered_sidebar_width), // sidebar
                 ])
                 .split(content_area);
 
-            self.render_main(horiz[0], buf, bottom_height);
+            let main_area = horiz[0];
+            if self.ui.sidebar_resizing {
+                let cache_valid =
+                    self.ui
+                        .sidebar_resize_main
+                        .as_ref()
+                        .is_some_and(|(screen_width, snapshot)| {
+                            *screen_width == area.width
+                                && snapshot.area.x == main_area.x
+                                && snapshot.area.y == main_area.y
+                                && snapshot.area.height == main_area.height
+                        });
+                if !cache_valid {
+                    self.ui.sidebar_resize_main = None;
+                }
+                if let Some((_, snapshot)) = &self.ui.sidebar_resize_main {
+                    paint_snapshot(snapshot, main_area, buf);
+                } else {
+                    self.render_main(main_area, buf, bottom_height);
+                    self.ui.sidebar_resize_main =
+                        Some((area.width, snapshot_buffer(main_area, buf)));
+                }
+            } else {
+                self.ui.sidebar_resize_main = None;
+                self.render_main(main_area, buf, bottom_height);
+            }
 
             let expanded_task_ids = self
                 .ui
@@ -544,6 +840,20 @@ impl App<'_> {
                 .tasks
                 .snapshot_for_sidebar(&expanded_task_ids);
             let sidebar_agents = self.agent_loop.session.agents.snapshot_all();
+            let hover_row = match self.ui.pointer_hover {
+                Some(PointerTarget::Sidebar { row }) => Some(row),
+                _ => None,
+            };
+            let pressed_row = match self.ui.pointer_pressed {
+                Some(PointerTarget::Sidebar { row }) => Some(row),
+                _ => None,
+            };
+            let hover_background = self.ui.pointer_hover_background();
+            self.ui.sidebar.as_mut().unwrap().set_pointer_rows(
+                hover_row,
+                pressed_row,
+                hover_background,
+            );
             let active_provider = self
                 .agent_loop
                 .session
@@ -566,15 +876,38 @@ impl App<'_> {
                 &sidebar_tasks,
                 &sidebar_agents,
             );
+            if matches!(self.ui.pointer_hover, Some(PointerTarget::SidebarResize)) {
+                let x = sidebar_resize_preview_x.unwrap_or(horiz[1].x);
+                let style = if self.ui.sidebar_resizing {
+                    Style::default()
+                        .fg(role::FOCUS)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(role::FOCUS)
+                };
+                for y in horiz[1].y..horiz[1].bottom() {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_symbol("│").set_style(style);
+                    }
+                }
+            }
         } else {
+            self.ui.sidebar_resize_main = None;
             self.render_main(content_area, buf, bottom_height);
+        }
+
+        if let Some(viewer) = self.ui.image_viewer.as_mut() {
+            viewer.render(area, buf);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{status_for_pending_turn, status_for_waiting_subagents, terminal_title_subject};
+    use super::{
+        sidebar_width, status_for_pending_turn, status_for_waiting_subagents,
+        terminal_title_subject,
+    };
     use crate::ui::components::status_bar::status_bar::StatusState;
 
     #[test]
@@ -594,6 +927,14 @@ mod tests {
             Some(StatusState::WaitingSubagents)
         );
         assert_eq!(status_for_waiting_subagents(false), None);
+    }
+
+    #[test]
+    fn sidebar_width_is_resizable_without_starving_the_main_pane() {
+        assert_eq!(sidebar_width(32, 120), 32);
+        assert_eq!(sidebar_width(48, 120), 48);
+        assert_eq!(sidebar_width(80, 60), 40);
+        assert_eq!(sidebar_width(10, 120), 20);
     }
 
     #[test]

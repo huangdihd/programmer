@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use super::panel_search::{PanelSearch, SearchKey};
-use crate::ui::theme::role;
+use crate::ui::{interaction::InteractionAnimation, theme::role};
 
 mod dream;
 mod graph;
@@ -29,6 +29,23 @@ pub use graph::{GraphEventStatus, GraphStatusTone};
 pub enum ActivityMode {
     Dream,
     SessionGraph,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActivityMouseTarget {
+    GraphPeers,
+    GraphPeer(usize),
+    GraphEvents,
+    GraphEvent(usize),
+    GraphDetails,
+    GraphMetadata,
+    DreamTimeline,
+    DreamRun(usize),
+    DreamDetails,
+    DreamSources,
+    DreamMetadata,
+    DreamConfirm,
+    DreamCancel,
 }
 
 /// Authoritative event classification supplied by the caller, never inferred from display text.
@@ -79,6 +96,9 @@ pub struct ActivityPanel {
     details_limit: u16,
     pending_rollback: Option<String>,
     confirmation: Option<(String, String)>,
+    mouse_hover: Option<ActivityMouseTarget>,
+    mouse_pressed: Option<ActivityMouseTarget>,
+    interaction_animation: InteractionAnimation,
 }
 
 impl ActivityPanel {
@@ -106,7 +126,76 @@ impl ActivityPanel {
             details_limit: 0,
             pending_rollback: None,
             confirmation: None,
+            mouse_hover: None,
+            mouse_pressed: None,
+            interaction_animation: InteractionAnimation::default(),
         }
+    }
+
+    fn set_mouse_hover(&mut self, target: Option<ActivityMouseTarget>) {
+        if self.mouse_hover == target {
+            return;
+        }
+        self.mouse_hover = target;
+        if target.is_some() {
+            self.interaction_animation.restart();
+        } else {
+            self.interaction_animation.cancel();
+        }
+    }
+
+    fn begin_mouse_press(&mut self, target: Option<ActivityMouseTarget>) {
+        self.set_mouse_hover(target);
+        self.mouse_pressed = target;
+        self.interaction_animation.cancel();
+    }
+
+    fn finish_mouse_press(
+        &mut self,
+        target: Option<ActivityMouseTarget>,
+    ) -> Option<ActivityMouseTarget> {
+        self.set_mouse_hover(target);
+        let activated = self
+            .mouse_pressed
+            .take()
+            .filter(|pressed| Some(*pressed) == target);
+        if activated.is_some() {
+            self.interaction_animation.restart();
+        }
+        activated
+    }
+
+    fn mouse_style(&self, target: ActivityMouseTarget) -> Option<Style> {
+        if self.mouse_pressed == Some(target) {
+            Some(
+                Style::default()
+                    .fg(role::SELECTION_TEXT)
+                    .bg(role::INTERACTION_PRESSED_BG)
+                    .bold(),
+            )
+        } else if self.mouse_hover == Some(target) {
+            Some(
+                Style::default()
+                    .fg(role::SELECTION_TEXT)
+                    .bg(self.interaction_animation.hover_background()),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn mouse_background(&self, target: ActivityMouseTarget) -> Option<ratatui::style::Color> {
+        self.mouse_style(target).and_then(|style| style.bg)
+    }
+
+    pub(crate) fn interaction_animation_active(&self) -> bool {
+        self.interaction_animation.active()
+    }
+
+    pub(crate) fn cancel_pointer_gesture(&mut self) {
+        self.mouse_hover = None;
+        self.mouse_pressed = None;
+        self.interaction_animation.cancel();
     }
 
     fn visible_entries(&self) -> Vec<&ActivityEntry> {
