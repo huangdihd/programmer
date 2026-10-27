@@ -30,9 +30,13 @@
   again before storage and child-policy propagation. Sandboxed child writes
   require overlapping recursive read and write approvals rather than silently
   widening write-only access.
+- Tolerate brief cross-process memory-lock handoffs without failing ordinary
+  recall and management operations, while keeping long-running Dream lock
+  contention bounded and explicit.
 - Expand regression coverage across pointer routing, selection, image protocols,
-  process ownership, security grants, theme resolution, tool animation, and
-  responsive welcome rendering; refresh the user and architecture documentation.
+  process ownership, security grants, theme resolution, tool animation, memory
+  locking, and responsive welcome rendering; refresh the user and architecture
+  documentation.
 
 Upgrade note: `request_permission` filesystem elevation now accepts only `read`
 and `write`; executable access remains configurable through security policy but
