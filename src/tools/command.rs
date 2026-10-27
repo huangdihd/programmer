@@ -39,8 +39,9 @@ pub fn tool() -> Tool {
          combined stdout/stderr and exit code. The command runs through the host \
          platform's shell (see the environment info in the system prompt). If a \
          security policy blocks required work, use request_permission to ask for \
-         the exact filesystem access or least-permissive sandbox mode, then retry \
-         after approval.",
+         operation-scoped filesystem access or the least-permissive sandbox mode, then retry \
+         after approval. Sandboxed child-process writes outside existing policy require \
+         overlapping recursive read and write grants.",
         parameters_schema::<Args>(),
     )
 }

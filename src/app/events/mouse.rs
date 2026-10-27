@@ -251,31 +251,27 @@ pub(crate) async fn handle_full_screen_panel_mouse(
         use crate::ui::components::diagnostics_panel::PanelAction;
         match action {
             PanelAction::Close => app.ui.diagnostics_panel = None,
-            PanelAction::Saved(profile) => {
-                match crate::app::diagnostics::save_profile(&profile) {
-                    Ok(()) => {
-                        crate::app::diagnostics::reset_diagnostics_state(app);
-                        app.agent_loop
-                            .session
-                            .diagnostics_state
-                            .lock()
-                            .unwrap()
-                            .lsp_configured = crate::app::helpers::lsp_checker_configured();
-                        crate::app::diagnostics::start_update(app, false);
-                    }
-                    Err(error) => {
-                        app.agent_loop
-                            .session
-                            .conversation
-                            .lock()
-                            .unwrap()
-                            .add_error_string(format!(
-                                "could not save diagnostics profile: {error}"
-                            ));
-                        app.ui.conversation_panel.scroll_to_bottom();
-                    }
+            PanelAction::Saved(profile) => match crate::app::diagnostics::save_profile(&profile) {
+                Ok(()) => {
+                    crate::app::diagnostics::reset_diagnostics_state(app);
+                    app.agent_loop
+                        .session
+                        .diagnostics_state
+                        .lock()
+                        .unwrap()
+                        .lsp_configured = crate::app::helpers::lsp_checker_configured();
+                    crate::app::diagnostics::start_update(app, false);
                 }
-            }
+                Err(error) => {
+                    app.agent_loop
+                        .session
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .add_error_string(format!("could not save diagnostics profile: {error}"));
+                    app.ui.conversation_panel.scroll_to_bottom();
+                }
+            },
             PanelAction::None => {}
         }
         return Ok(());

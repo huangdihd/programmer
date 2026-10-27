@@ -15,7 +15,7 @@
 
 use async_openai::types::responses::{FunctionCallOutputItemParam, OutputItem, ReasoningItem};
 use ratatui::prelude::Color;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Text;
 use ratatui_widgets::block::{Block, Padding};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
@@ -53,6 +53,7 @@ pub struct AssistantMessage<'a> {
     /// For a still-running `command` call: its output so far, rendered live
     /// until the committed result arrives.
     live_output: Option<&'a str>,
+    tool_title_modifier: Modifier,
     image_previews: Option<&'a crate::ui::image_preview::ImagePreviewStore>,
 }
 
@@ -66,6 +67,7 @@ impl<'a> AssistantMessage<'a> {
             frame_count: None,
             tool_output: None,
             live_output: None,
+            tool_title_modifier: Modifier::empty(),
             image_previews: None,
         }
     }
@@ -101,6 +103,11 @@ impl<'a> AssistantMessage<'a> {
         self
     }
 
+    pub(crate) fn tool_title_modifier(mut self, modifier: Modifier) -> Self {
+        self.tool_title_modifier = modifier;
+        self
+    }
+
     pub fn frame_count(mut self, frame_count: u64) -> Self {
         self.frame_count = Some(frame_count);
         self
@@ -125,6 +132,7 @@ impl<'a> AssistantMessage<'a> {
                     )
                     .approval_label(self.tool_output.and_then(|(_, _, label)| label))
                     .live_output(self.live_output)
+                    .title_modifier(self.tool_title_modifier)
                     .expanded(self.expanded)
                     .with_optional_image_previews(self.image_previews)
                     .into_text(),

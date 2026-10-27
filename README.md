@@ -329,7 +329,8 @@ denied_read_paths = []
 denied_environment = []
 
 # Rules use absolute globs or the portable `workspace/**` prefix. Explicit
-# denies take precedence over allows.
+# denies take precedence over configured allows; an explicit session approval
+# through request_permission overrides a matching deny for its approved scope.
 [[security.rules]]
 operation = "read"
 pattern = "/path/to/private/**"
@@ -383,7 +384,7 @@ api_key = "sk-your-key-here"
 | `security.sandbox.denied_read_paths` | `[]` | Paths sandboxed child processes must not read. |
 | `security.sandbox.denied_environment` | `[]` | Environment variable name globs removed from sandboxed child processes. An empty list inherits the complete parent environment. |
 
-`request_permission` refuses filesystem access requests when the sandbox is off. Sandbox-mode requests may only relax isolation (for example, `restricted` → `network`); requests that would make the current mode stricter are rejected without prompting.
+`request_permission` supports read or write filesystem requests even when the process sandbox is off. Sandbox-mode requests may only relax isolation (for example, `restricted` → `network`); requests that would make the current mode stricter are rejected without prompting, including when another approval widens the mode while an older prompt is waiting. Filesystem grants are scoped to one operation and explicitly override matching configured deny rules: granting an existing directory covers that directory and its descendants for the session, while granting a file covers only that exact file. The OS process sandbox can express only subtree read or read-write access, so it fails closed instead of widening a grant: exact-file grants remain limited to built-in tools while sandboxing is enabled, and a directory is writable by child processes only after separate recursive read and write grants cover it. When process sandboxing is off, filesystem grants authorize built-in path tools but do not constrain commands or tasks. Approved paths are re-canonicalized before storage, and propagated directory paths are re-canonicalized again, rejecting redirections already visible at those checks. Enforcement remains pathname-based and is not an atomic defense against a hostile process replacing path components between a check and later grant propagation or file I/O.
 
 Each provider is a `[providers.<name>]` section. You can add as many as you want.
 

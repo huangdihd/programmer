@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use super::status_bar::{StatusBar, StatusState};
+use super::status_bar::{StatusBar, StatusState, breath_modifier};
 use crate::ui::{markdown_theme::palette, theme::role};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -26,17 +26,8 @@ const DIM: Color = palette::MUTED;
 const ACCENT: Color = palette::BLUE;
 const OUTPUT: Color = palette::GREEN;
 const WARN: Color = palette::YELLOW;
-const BREATH_STEP: Duration = Duration::from_millis(400);
 const THINKING_DEEP_AFTER: Duration = Duration::from_secs(10);
 const THINKING_DEEPEST_AFTER: Duration = Duration::from_secs(30);
-
-fn breath_modifier(elapsed: Duration) -> Modifier {
-    match (elapsed.as_millis() / BREATH_STEP.as_millis()) % 4 {
-        0 => Modifier::DIM,
-        2 => Modifier::BOLD,
-        _ => Modifier::empty(),
-    }
-}
 
 fn active_color(status: StatusState, elapsed: Duration) -> Option<Color> {
     match status {
@@ -49,6 +40,26 @@ fn active_color(status: StatusState, elapsed: Duration) -> Option<Color> {
         StatusState::ToolRunning => Some(role::STATUS_TOOL_RUNNING),
         _ => None,
     }
+}
+
+fn status_styles(
+    status: StatusState,
+    fallback_color: Color,
+    elapsed: Option<Duration>,
+) -> (Style, Style) {
+    if let Some(elapsed) = elapsed
+        && let Some(color) = active_color(status, elapsed)
+    {
+        let text_style = Style::default().fg(color);
+        return (
+            text_style,
+            text_style.add_modifier(breath_modifier(elapsed)),
+        );
+    }
+    let style = Style::default()
+        .fg(fallback_color)
+        .add_modifier(Modifier::BOLD);
+    (style, style)
 }
 
 impl Widget for &StatusBar {
@@ -73,28 +84,25 @@ impl Widget for &StatusBar {
 
         let busy = self.status.is_busy();
         let elapsed = self.elapsed();
-        let mut text = format!(" {} {} ", icon, label);
-        if busy && let Some(dur) = elapsed {
-            let secs = dur.as_secs_f64();
-            if secs < 60.0 {
-                text.push_str(&format!("({:.1}s)", secs));
+        let mut suffix = format!(" {label} ");
+        if busy && let Some(duration) = elapsed {
+            let seconds = duration.as_secs_f64();
+            if seconds < 60.0 {
+                suffix.push_str(&format!("({seconds:.1}s)"));
             } else {
-                let m = (secs / 60.0) as u64;
-                let s = secs % 60.0;
-                text.push_str(&format!("({}m {:.0}s)", m, s));
+                let minutes = (seconds / 60.0) as u64;
+                let remaining_seconds = seconds % 60.0;
+                suffix.push_str(&format!("({minutes}m {remaining_seconds:.0}s)"));
             }
         }
+        suffix.push(' ');
 
-        let style = if let Some(elapsed) = elapsed
-            && let Some(color) = active_color(self.status, elapsed)
-        {
-            Style::default()
-                .fg(color)
-                .add_modifier(breath_modifier(elapsed))
-        } else {
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
-        };
-        let mut spans = vec![Span::styled(text, style)];
+        let (text_style, icon_style) = status_styles(self.status, color, elapsed);
+        let mut spans = vec![
+            Span::styled(" ", text_style),
+            Span::styled(icon, icon_style),
+            Span::styled(suffix, text_style),
+        ];
         if let Some(detail) = &self.detail {
             spans.push(Span::styled(
                 format!("· {detail} "),
@@ -122,6 +130,16 @@ mod tests {
         for (millis, expected) in phases {
             assert_eq!(breath_modifier(Duration::from_millis(millis)), expected);
         }
+    }
+
+    #[test]
+    fn active_status_animation_dims_only_the_icon() {
+        let (text_style, icon_style) =
+            status_styles(StatusState::ToolRunning, WARN, Some(Duration::ZERO));
+
+        assert!(!text_style.add_modifier.contains(Modifier::DIM));
+        assert!(icon_style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(text_style.fg, icon_style.fg);
     }
 
     #[test]

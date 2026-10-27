@@ -143,7 +143,7 @@ impl WelcomeMessage {
             Line::from(""),
             Line::from(vec![
                 Span::styled("/help", Style::default().fg(role::HEADING)),
-                Span::styled("  shortcuts", Style::default().fg(palette::FAINT)),
+                Span::styled("  shortcuts", Style::default().fg(role::SUBTLE)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -215,7 +215,7 @@ impl WelcomeMessage {
             Line::from(""),
             Line::from(vec![
                 Span::styled("/help", Style::default().fg(role::HEADING)),
-                Span::styled("  shortcuts    ", Style::default().fg(palette::FAINT)),
+                Span::styled("  shortcuts    ", Style::default().fg(role::SUBTLE)),
                 Span::styled(
                     PROJECT_URL,
                     Style::default()
@@ -284,6 +284,8 @@ impl WelcomeMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::theme::{self, Theme};
+    use ratatui::style::Color;
 
     fn render(width: u16) -> (u16, Buffer) {
         let welcome = WelcomeMessage;
@@ -302,6 +304,38 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn find_text(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        let symbols = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect::<Vec<_>>();
+        let needle_width = u16::try_from(symbols.len()).ok()?;
+        let right = buffer.area.x.saturating_add(buffer.area.width);
+        let bottom = buffer.area.y.saturating_add(buffer.area.height);
+
+        for y in buffer.area.y..bottom {
+            for x in buffer.area.x..right {
+                if x.saturating_add(needle_width) > right {
+                    break;
+                }
+                if symbols.iter().enumerate().all(|(offset, symbol)| {
+                    buffer[(x + u16::try_from(offset).unwrap(), y)].symbol() == symbol
+                }) {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    fn resolved_subtle(theme_value: Theme) -> Color {
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer[(0, 0)].fg = role::SUBTLE;
+        theme::apply(theme_value, area, &mut buffer);
+        buffer[(0, 0)].fg
     }
 
     #[test]
@@ -332,6 +366,25 @@ mod tests {
         assert!(text.contains("AI coding in your terminal"));
         assert!(text.contains("select / open / scroll"));
         assert!(!text.contains("Keyboard shortcuts"));
+    }
+
+    #[test]
+    fn shortcuts_label_uses_visible_theme_subtle_color_in_both_layouts() {
+        for width in [COLUMN_LAYOUT_MIN_WIDTH - 1, 120] {
+            for theme_value in [Theme::Dark, Theme::Light] {
+                let (_, mut buffer) = render(width);
+                let (label_x, y) = find_text(&buffer, "  shortcuts").unwrap();
+                let x = label_x + 2;
+                assert_eq!(buffer[(x, y)].fg, role::SUBTLE);
+
+                let area = buffer.area;
+                theme::apply(theme_value, area, &mut buffer);
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.fg, resolved_subtle(theme_value));
+                assert_ne!(cell.fg, palette::FAINT);
+                assert_ne!(cell.fg, cell.bg);
+            }
+        }
     }
 
     #[test]

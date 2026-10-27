@@ -128,9 +128,7 @@ impl RewindPanel {
             MouseEventKind::ScrollUp if self.pointer_over_list(mouse.column, mouse.row, area) => {
                 return self.handle_key(KeyEvent::new(KeyCode::Up, mouse.modifiers));
             }
-            MouseEventKind::ScrollDown
-                if self.pointer_over_list(mouse.column, mouse.row, area) =>
-            {
+            MouseEventKind::ScrollDown if self.pointer_over_list(mouse.column, mouse.row, area) => {
                 return self.handle_key(KeyEvent::new(KeyCode::Down, mouse.modifiers));
             }
             _ => {}
@@ -517,10 +515,7 @@ mod tests {
         );
         assert_eq!(panel.selected, 0);
         assert_eq!(
-            panel.handle_mouse(
-                mouse(MouseEventKind::ScrollDown, list.x, list.y),
-                area
-            ),
+            panel.handle_mouse(mouse(MouseEventKind::ScrollDown, list.x, list.y), area),
             PanelAction::None
         );
         assert_eq!(panel.selected, 1);
@@ -562,20 +557,12 @@ mod tests {
         assert_eq!(panel.handle_key(key(KeyCode::Enter)), PanelAction::None);
 
         panel.handle_mouse(
-            mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                list.x,
-                list.y + 2,
-            ),
+            mouse(MouseEventKind::Down(MouseButton::Left), list.x, list.y + 2),
             area,
         );
         assert_eq!(
             panel.handle_mouse(
-                mouse(
-                    MouseEventKind::Up(MouseButton::Left),
-                    list.x,
-                    list.y + 1
-                ),
+                mouse(MouseEventKind::Up(MouseButton::Left), list.x, list.y + 1),
                 area
             ),
             PanelAction::None
@@ -583,20 +570,12 @@ mod tests {
         assert!(matches!(panel.mode, Mode::Actions));
 
         panel.handle_mouse(
-            mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                list.x,
-                list.y + 2,
-            ),
+            mouse(MouseEventKind::Down(MouseButton::Left), list.x, list.y + 2),
             area,
         );
         assert_eq!(
             panel.handle_mouse(
-                mouse(
-                    MouseEventKind::Up(MouseButton::Left),
-                    list.x,
-                    list.y + 2
-                ),
+                mouse(MouseEventKind::Up(MouseButton::Left), list.x, list.y + 2),
                 area
             ),
             PanelAction::Restore {

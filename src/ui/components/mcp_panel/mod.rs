@@ -507,8 +507,9 @@ impl McpPanel {
             .split(area);
         let bottom = chunks[chunks.len() - 1];
         if matches!(self.mode, Mode::List) {
-            self.list_area
-                .set(Some(Block::default().borders(Borders::ALL).inner(chunks[1])));
+            self.list_area.set(Some(
+                Block::default().borders(Borders::ALL).inner(chunks[1]),
+            ));
         }
 
         // -- Title --
@@ -1040,8 +1041,10 @@ mod tests {
     #[test]
     fn mouse_list_rows_buttons_wheel_and_matching_release() {
         let mut panel = McpPanel::new();
-        let mut config = ProgrammerConfig::default();
-        config.mcp_servers = vec![server("one"), server("two")];
+        let mut config = ProgrammerConfig {
+            mcp_servers: vec![server("one"), server("two")],
+            ..ProgrammerConfig::default()
+        };
         render(&panel, &config);
 
         let (add_x, add_y) = target_point(&panel, MouseTarget::Add);

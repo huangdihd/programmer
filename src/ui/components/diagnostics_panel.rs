@@ -153,9 +153,7 @@ impl DiagnosticsPanel {
             MouseEventKind::ScrollUp if self.pointer_over_list(mouse.column, mouse.row, area) => {
                 return self.handle_key(KeyEvent::new(KeyCode::Up, mouse.modifiers));
             }
-            MouseEventKind::ScrollDown
-                if self.pointer_over_list(mouse.column, mouse.row, area) =>
-            {
+            MouseEventKind::ScrollDown if self.pointer_over_list(mouse.column, mouse.row, area) => {
                 return self.handle_key(KeyEvent::new(KeyCode::Down, mouse.modifiers));
             }
             _ => {}
@@ -695,10 +693,7 @@ mod tests {
         );
         assert_eq!(panel.selected, 0);
         assert_eq!(
-            panel.handle_mouse(
-                mouse(MouseEventKind::ScrollDown, list.x, list.y),
-                area
-            ),
+            panel.handle_mouse(mouse(MouseEventKind::ScrollDown, list.x, list.y), area),
             PanelAction::None
         );
         assert_eq!(panel.selected, 1);
@@ -729,9 +724,7 @@ mod tests {
         let chunks = panel_chunks(area);
         let footer = chunks[2];
         let delete_x = footer.x
-            + ("↑↓ navigate  ".width()
-                + "a add  ".width()
-                + "Enter/e edit  ".width()) as u16;
+            + ("↑↓ navigate  ".width() + "a add  ".width() + "Enter/e edit  ".width()) as u16;
         let mut panel = panel_with_checkers(1);
 
         panel.handle_mouse(

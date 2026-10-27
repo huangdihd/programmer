@@ -251,9 +251,11 @@ impl ProviderPanel {
                 } else {
                     KeyCode::Down
                 };
-                let over_list = self.scroll_area.get().is_some_and(|area| {
-                    area.contains((mouse.column, mouse.row).into())
-                }) || matches!(target, Some(MouseTarget::Completion(_)));
+                let over_list = self
+                    .scroll_area
+                    .get()
+                    .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
+                    || matches!(target, Some(MouseTarget::Completion(_)));
                 if over_list {
                     return self.handle_key(KeyEvent::new(code, mouse.modifiers), config, pm);
                 }
@@ -1573,9 +1575,7 @@ impl ProviderPanel {
                     add_footer_hits(
                         &mut hits,
                         chunks[2],
-                        &format!(
-                            " filter: \"{filter}\"  ↑↓ navigate  Enter choose role  "
-                        ),
+                        &format!(" filter: \"{filter}\"  ↑↓ navigate  Enter choose role  "),
                         &[("Esc", " back", MouseTarget::Close)],
                     );
                 }

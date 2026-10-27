@@ -245,7 +245,7 @@ struct TaskEntry {
     /// Interleaved tail used while a foreground command is still running.
     live_output: String,
     /// Per-task output cap in chars. Defaults to [`MAX_TASK_OUTPUT`]; can be
-    /// overridden with [`set_max_output`].
+    /// overridden with [`TaskManager::set_max_output`].
     max_output: usize,
     /// Signals the reader task to kill the child. `None` once finished.
     kill: Option<tokio::sync::oneshot::Sender<()>>,
@@ -908,8 +908,8 @@ pub fn harden_dll_search() {
 
 impl TaskManager {
     /// Spawn `command` in a real PTY as an interactive background task. Its output
-    /// is parsed into a vt100 screen grid (readable via [`screen_snapshot`]) and it
-    /// is driven with byte input via [`write_bytes`] rather than line-based stdin.
+    /// is parsed into a vt100 screen grid (readable via [`Self::screen_snapshot`]) and it
+    /// is driven with byte input via [`Self::write_bytes`] rather than line-based stdin.
     pub fn spawn_interactive(
         &self,
         command: &str,

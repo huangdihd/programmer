@@ -18,7 +18,7 @@ use crate::ui::components::conversation_panel::conversation_panel::{
     ActivePhase, CachedLiveSlot, CachedParagraph, CachedToolGroup, ConversationPanel,
     ConversationPointerTarget, LiveGroupHeader, LiveParagraph, LiveParagraphContent,
     LiveRenderCache, MaterializedLiveCache, ToolGroupLayout, ViewportParagraphCache, is_foldable,
-    is_full_card_clickable, live_response_message_key,
+    live_response_message_key,
 };
 use crate::ui::components::conversation_panel::tool_group::{
     GroupReasoningRender, MemberHeader, ToolGroup, ToolGroupMember,
@@ -293,10 +293,12 @@ fn restore_bottom_follow(panel: &mut ConversationPanel) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn live_cache_matches(
     cache: &LiveRenderCache,
     response_revision: u64,
     content_width: u16,
+    tool_title_modifier: Modifier,
     conversation_len: usize,
     conversation_mutation_version: u64,
     expanded_items: &HashSet<usize>,
@@ -304,6 +306,7 @@ fn live_cache_matches(
 ) -> bool {
     cache.response_revision == response_revision
         && cache.content_width == content_width
+        && (!cache.animates_tool_titles || cache.tool_title_modifier == tool_title_modifier)
         && cache.conversation_len == conversation_len
         && cache.conversation_mutation_version == conversation_mutation_version
         && cache.expanded_items == *expanded_items
@@ -384,6 +387,7 @@ fn build_live_group_slot<'a>(
     live_reasoning_text: &HashMap<usize, GroupReasoningRender>,
     live_reasoning_indices: &HashSet<usize>,
     image_previews: &crate::ui::image_preview::ImagePreviewStore,
+    tool_title_modifier: Modifier,
 ) -> CachedLiveSlot {
     let live_outputs: Vec<Option<String>> = group
         .member_indices
@@ -466,6 +470,7 @@ fn build_live_group_slot<'a>(
                 Some(live_reasoning_text),
                 live_reasoning_indices,
                 Some(image_previews),
+                tool_title_modifier,
             );
         let collapsed_height = collapsed.line_count(content_width) as u16;
         let (expanded, expanded_headers, expanded_buttons) =
@@ -479,6 +484,7 @@ fn build_live_group_slot<'a>(
                 Some(live_reasoning_text),
                 live_reasoning_indices,
                 Some(image_previews),
+                tool_title_modifier,
             );
         let expanded_height = expanded.line_count(content_width) as u16;
         CachedLiveSlot::Explore {
@@ -508,6 +514,7 @@ fn build_live_group_slot<'a>(
                 Some(live_reasoning_text),
                 live_reasoning_indices,
                 Some(image_previews),
+                tool_title_modifier,
             );
         let height = paragraph.line_count(content_width) as u16;
         CachedLiveSlot::Fixed {
@@ -565,6 +572,7 @@ fn recalled_memory_snapshots(items: &[MessageItem]) -> Vec<String> {
 
 /// Builds the paragraph for a finished history item. Called at most once per
 /// item (the result is cached in [`ConversationPanel::render_cache`]).
+#[allow(clippy::too_many_arguments)]
 fn build_item_paragraph(
     item: &MessageItem,
     content_width: u16,
@@ -573,6 +581,7 @@ fn build_item_paragraph(
     live_output: Option<&str>,
     memory_snapshots: Vec<String>,
     image_previews: &crate::ui::image_preview::ImagePreviewStore,
+    tool_title_modifier: Modifier,
 ) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
     match item {
         MessageItem::ToolOutput { output, failed, .. } => {
@@ -598,6 +607,7 @@ fn build_item_paragraph(
             .expanded(expanded)
             .tool_output(tool_output)
             .live_output(live_output)
+            .tool_title_modifier(tool_title_modifier)
             .into_paragraph(),
         MessageItem::OpenAIError(error) => (
             ErrorMessage::new(error.to_string()).into_paragraph(),
@@ -695,6 +705,8 @@ impl Widget for &mut ConversationPanel {
         let content_area = transcript_content_area(area);
         let content_width = content_area.width;
         let image_previews = self.image_previews.clone();
+        let tool_title_modifier =
+            crate::ui::components::status_bar::status_bar::tool_title_modifier();
         // Pull a completed background Markdown result into the front buffer
         // before calculating live layout. No Markdown parser is run on this
         // render thread.
@@ -775,6 +787,7 @@ impl Widget for &mut ConversationPanel {
                 cache,
                 live_response_revision,
                 content_width,
+                tool_title_modifier,
                 conv.items.len(),
                 conv.mutation_version,
                 &self.expanded_items,
@@ -978,8 +991,21 @@ impl Widget for &mut ConversationPanel {
                 _ => None,
             };
             let foldable = is_foldable(&conv.items[index]);
-            let full_card_clickable = is_full_card_clickable(&conv.items[index]);
             let in_viewport = index >= build_from || in_window[index];
+            let animates_tool_title = !hidden
+                && if is_group_start {
+                    !effective_has_output
+                } else {
+                    matches!(
+                        conv.items[index],
+                        MessageItem::Output(OutputItem::FunctionCall(_))
+                    ) && !has_output
+                };
+            let cached_tool_title_modifier = if animates_tool_title {
+                tool_title_modifier
+            } else {
+                Modifier::empty()
+            };
             let group_render_key = group.filter(|_| is_group_start).map(|group| {
                 // Open runs stay collapsed by default, same as closed ones;
                 // only the user's explicit expansion opens a group.
@@ -1037,6 +1063,7 @@ impl Widget for &mut ConversationPanel {
                         || entry.has_output != effective_has_output
                         || cached_group_key != group_render_key.as_deref()
                         || entry.hidden != hidden
+                        || entry.tool_title_modifier != cached_tool_title_modifier
                         || (entry.lazy && in_viewport)
                 });
             if needs_build {
@@ -1047,9 +1074,9 @@ impl Widget for &mut ConversationPanel {
                         hidden: true,
                         expanded,
                         has_output: effective_has_output,
+                        tool_title_modifier: cached_tool_title_modifier,
                         copy_buttons: Arc::new(Vec::new()),
                         foldable,
-                        full_card_clickable,
                         lazy: false,
                         tool_group: None,
                     }
@@ -1060,9 +1087,9 @@ impl Widget for &mut ConversationPanel {
                         hidden: false,
                         expanded,
                         has_output: effective_has_output,
+                        tool_title_modifier: cached_tool_title_modifier,
                         copy_buttons: Arc::new(Vec::new()),
                         foldable,
-                        full_card_clickable,
                         lazy: true,
                         tool_group: group
                             .filter(|_| is_group_start)
@@ -1124,6 +1151,7 @@ impl Widget for &mut ConversationPanel {
                             Some(&committed_reasoning_text),
                             &committed_pending_reasoning,
                             Some(&image_previews),
+                            tool_title_modifier,
                         );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
@@ -1132,9 +1160,9 @@ impl Widget for &mut ConversationPanel {
                         hidden: false,
                         expanded,
                         has_output: effective_has_output,
+                        tool_title_modifier: cached_tool_title_modifier,
                         copy_buttons: Arc::new(copy_buttons),
                         foldable,
-                        full_card_clickable,
                         lazy: false,
                         tool_group: Some(CachedToolGroup {
                             key: group.key.clone(),
@@ -1159,9 +1187,9 @@ impl Widget for &mut ConversationPanel {
                             hidden: false,
                             expanded,
                             has_output: effective_has_output,
+                            tool_title_modifier: cached_tool_title_modifier,
                             copy_buttons: snapshot.copy_buttons.clone(),
                             foldable,
-                            full_card_clickable,
                             lazy: false,
                             tool_group: None,
                         }
@@ -1177,9 +1205,9 @@ impl Widget for &mut ConversationPanel {
                             hidden: false,
                             expanded,
                             has_output: effective_has_output,
+                            tool_title_modifier: cached_tool_title_modifier,
                             copy_buttons: Arc::new(Vec::new()),
                             foldable,
-                            full_card_clickable,
                             lazy: false,
                             tool_group: None,
                         }
@@ -1196,6 +1224,7 @@ impl Widget for &mut ConversationPanel {
                                 Vec::new()
                             },
                             &image_previews,
+                            tool_title_modifier,
                         );
                         let height = paragraph.line_count(content_width) as u16;
                         CachedParagraph {
@@ -1204,9 +1233,9 @@ impl Widget for &mut ConversationPanel {
                             hidden: false,
                             expanded,
                             has_output: effective_has_output,
+                            tool_title_modifier: cached_tool_title_modifier,
                             copy_buttons: Arc::new(copy_buttons),
                             foldable,
-                            full_card_clickable,
                             lazy: false,
                             tool_group: None,
                         }
@@ -1376,6 +1405,7 @@ impl Widget for &mut ConversationPanel {
                         &reasoning_text,
                         &reasoning_pending,
                         &image_previews,
+                        tool_title_modifier,
                     );
                     let (paragraph, group_header) = materialize_live_slot(
                         &slot,
@@ -1443,6 +1473,7 @@ impl Widget for &mut ConversationPanel {
                             AssistantMessage::new(output_item, content_width)
                                 .in_progress(*in_progress)
                                 .expanded(expanded)
+                                .tool_title_modifier(tool_title_modifier)
                                 .frame_count(self.frame_count)
                                 .into_paragraph();
                         let height = paragraph.line_count(content_width) as u16;
@@ -1465,6 +1496,10 @@ impl Widget for &mut ConversationPanel {
             self.live_render_cache = cacheable.then(|| LiveRenderCache {
                 response_revision: live_response_revision,
                 content_width,
+                tool_title_modifier,
+                animates_tool_titles: receiving_items
+                    .iter()
+                    .any(|(item, _)| matches!(item, OutputItem::FunctionCall(_))),
                 conversation_len: conv.items.len(),
                 conversation_mutation_version: conv.mutation_version,
                 expanded_items: self.expanded_items.clone(),
@@ -1925,6 +1960,18 @@ mod tests {
             .collect();
         assert!(rows.windows(2).all(|pair| pair[0] < pair[1]), "{rows:?}");
         assert!(panel.expanded_items.contains(&1));
+
+        // Every row of a disclosure is interactive, not only its title. Use
+        // empty horizontal space on the compaction summary row to prove both
+        // pointer feedback and click handling cover the complete expanded item.
+        let summary_hit = panel.pointer_hit_screen(80, rows[2]).unwrap();
+        assert_eq!(
+            summary_hit.target,
+            ConversationPointerTarget::HistoryItem { index: 1 }
+        );
+        assert!(summary_hit.rect.height > 1);
+        panel.handle_click(80, rows[2]).unwrap();
+        assert!(!panel.expanded_items.contains(&1));
     }
 
     #[test]
@@ -2200,6 +2247,8 @@ mod tests {
         let cache = LiveRenderCache {
             response_revision: 7,
             content_width: 80,
+            tool_title_modifier: Modifier::DIM,
+            animates_tool_titles: true,
             conversation_len: 12,
             conversation_mutation_version: 3,
             expanded_items: HashSet::from([2]),
@@ -2214,6 +2263,7 @@ mod tests {
             &cache,
             7,
             80,
+            Modifier::DIM,
             12,
             3,
             &expanded_items,
@@ -2223,6 +2273,7 @@ mod tests {
             &cache,
             8,
             80,
+            Modifier::DIM,
             12,
             3,
             &expanded_items,
@@ -2232,10 +2283,22 @@ mod tests {
             &cache,
             7,
             81,
+            Modifier::DIM,
             12,
             3,
             &expanded_items,
             &live_expanded_items
+        ));
+
+        assert!(!live_cache_matches(
+            &cache,
+            7,
+            80,
+            Modifier::BOLD,
+            12,
+            3,
+            &expanded_items,
+            &live_expanded_items,
         ));
 
         let mut changed_folds = expanded_items.clone();
@@ -2244,6 +2307,7 @@ mod tests {
             &cache,
             7,
             80,
+            Modifier::DIM,
             12,
             3,
             &changed_folds,

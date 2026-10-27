@@ -635,9 +635,11 @@ fn picker_session_double_click(
     uuid: &str,
     now: std::time::Instant,
 ) -> bool {
-    let double_click = previous.as_ref().is_some_and(|(previous_uuid, clicked_at)| {
-        previous_uuid == uuid && now.duration_since(*clicked_at) <= PICKER_DOUBLE_CLICK_TIMEOUT
-    });
+    let double_click = previous
+        .as_ref()
+        .is_some_and(|(previous_uuid, clicked_at)| {
+            previous_uuid == uuid && now.duration_since(*clicked_at) <= PICKER_DOUBLE_CLICK_TIMEOUT
+        });
     if double_click {
         *previous = None;
     } else {

@@ -560,6 +560,7 @@ pub(crate) fn build_tool_group_paragraph<'a>(
         None,
         &HashSet::new(),
         None,
+        Modifier::empty(),
     )
 }
 
@@ -579,6 +580,7 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
     reasoning_cache: Option<&HashMap<usize, GroupReasoningRender>>,
     live_reasoning_indices: &HashSet<usize>,
     image_previews: Option<&crate::ui::image_preview::ImagePreviewStore>,
+    tool_title_modifier: Modifier,
 ) -> (Paragraph<'static>, Vec<MemberHeader>, Vec<CodeCopyButton>) {
     let completed = members
         .iter()
@@ -597,14 +599,22 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
     };
     let arrow = if expanded { "\u{25BE}" } else { "\u{25B8}" };
     let muted = Style::new().fg(palette::MUTED);
+    let header_modifier = if completed < members.len() {
+        tool_title_modifier
+    } else {
+        Modifier::empty()
+    };
+    let header_muted = muted.add_modifier(header_modifier);
     let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{arrow} "), muted),
+        Span::styled(format!("{arrow} "), header_muted),
         Span::styled(
             format!(
                 "\u{1F6E0} {}",
                 group.title_with_members(members, completed, failed)
             ),
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(color)
+                .add_modifier(Modifier::BOLD | header_modifier),
         ),
     ])];
     // Collapsed groups get a muted summary line: which tools, the MCP server
@@ -640,6 +650,11 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
                     .failed(member.output.map(|(_, failed, _)| failed).unwrap_or(false))
                     .approval_label(member.output.and_then(|(_, _, label)| label))
                     .live_output(member.live_output)
+                    .title_modifier(if member.output.is_none() {
+                        tool_title_modifier
+                    } else {
+                        Modifier::empty()
+                    })
                     .expanded(member.expanded)
                     .with_optional_image_previews(image_previews)
                     .into_text();
@@ -860,6 +875,78 @@ mod tests {
             id: None,
             status: None,
         }))
+    }
+
+    #[test]
+    fn pending_group_animation_applies_to_the_complete_header() {
+        let first = FunctionToolCall {
+            arguments: "{}".into(),
+            call_id: "call-0".into(),
+            namespace: None,
+            name: "grep".into(),
+            id: None,
+            status: None,
+        };
+        let second = FunctionToolCall {
+            arguments: "{}".into(),
+            call_id: "call-1".into(),
+            namespace: None,
+            name: "read_file".into(),
+            id: None,
+            status: None,
+        };
+        let items = vec![
+            MessageItem::Output(OutputItem::FunctionCall(first.clone())),
+            MessageItem::Output(OutputItem::FunctionCall(second.clone())),
+        ];
+        let group = discover_tool_groups(&items).pop().unwrap();
+        let members = [
+            ToolGroupMember {
+                index: 0,
+                call: &first,
+                output: None,
+                live_output: None,
+                expanded: false,
+            },
+            ToolGroupMember {
+                index: 1,
+                call: &second,
+                output: None,
+                live_output: None,
+                expanded: false,
+            },
+        ];
+        let (paragraph, _, _) = build_tool_group_paragraph_with_reasoning_cache(
+            &group,
+            &members,
+            &[],
+            80,
+            false,
+            false,
+            None,
+            &HashSet::new(),
+            None,
+            Modifier::DIM,
+        );
+        let area = Rect::new(0, 0, 80, 3);
+        let mut buffer = Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+
+        let title_cells = (0..area.width)
+            .filter_map(|column| {
+                let cell = &buffer[(column, 0)];
+                (cell.symbol() != " ").then_some(cell)
+            })
+            .collect::<Vec<_>>();
+        assert!(!title_cells.is_empty());
+        assert!(
+            title_cells
+                .iter()
+                .all(|cell| cell.modifier.contains(Modifier::DIM))
+        );
+        assert!(
+            (0..area.width).all(|column| { !buffer[(column, 1)].modifier.contains(Modifier::DIM) })
+        );
     }
 
     #[test]

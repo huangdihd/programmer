@@ -18,6 +18,7 @@ use crate::response::partial_response::PartialResponse;
 use async_openai::types::responses::{InputParam, OutputItem, ResponseStreamEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
+use ratatui::style::Modifier;
 use ratatui::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
 use std::collections::{HashMap, HashSet};
@@ -126,18 +127,6 @@ pub(crate) fn is_foldable(item: &MessageItem) -> bool {
     )
 }
 
-/// Card-like disclosures toggle from any row in their body. Compact text-only
-/// disclosures retain their existing header-only behavior.
-pub(crate) fn is_full_card_clickable(item: &MessageItem) -> bool {
-    matches!(
-        item,
-        MessageItem::Output(OutputItem::Reasoning(_))
-            | MessageItem::Output(OutputItem::FunctionCall(_))
-            | MessageItem::ToolOutput { .. }
-            | MessageItem::Usage(..)
-    )
-}
-
 /// Cached render output for a single finished message.
 ///
 /// Historical `items` are append-only and never mutate once added, so their
@@ -157,14 +146,15 @@ pub(crate) struct CachedParagraph {
     /// For tool-call items: whether the matching result was already available
     /// when this entry was built, so it can be rebuilt when the result arrives.
     pub has_output: bool,
+    /// Animation modifier applied to a pending tool or tool-group title. This
+    /// keeps cached paragraphs stable between animation phase changes.
+    pub tool_title_modifier: Modifier,
     /// Clickable copy hotspots for the item's code blocks, relative to the
     /// paragraph's top-left corner.
     pub copy_buttons: Arc<Vec<CodeCopyButton>>,
-    /// Whether this history item has collapsible details.
+    /// Whether this history item has collapsible details. Every row in a
+    /// foldable item toggles it unless a more specific embedded control wins.
     pub foldable: bool,
-    /// Whether every row of the card toggles those details. Cached so pointer
-    /// hit-testing during render never re-locks the conversation.
-    pub full_card_clickable: bool,
     /// True when this entry's paragraph was skipped (only height estimated)
     /// to avoid expensive markdown rendering of far-offscreen items.
     pub lazy: bool,
@@ -363,6 +353,8 @@ pub(crate) enum CachedLiveSlot {
 pub(crate) struct LiveRenderCache {
     pub response_revision: u64,
     pub content_width: u16,
+    pub tool_title_modifier: Modifier,
+    pub animates_tool_titles: bool,
     pub conversation_len: usize,
     pub conversation_mutation_version: u64,
     pub expanded_items: HashSet<usize>,
@@ -1049,18 +1041,15 @@ impl ConversationPanel {
         }
 
         if let Some((index, top, bottom)) = history_item
-            && let Some(entry) = self.render_cache.entries.get(index)
-            && entry.foldable
-            && (entry.full_card_clickable || y == top)
+            && self
+                .render_cache
+                .entries
+                .get(index)
+                .is_some_and(|entry| entry.foldable)
         {
-            let height = if entry.full_card_clickable {
-                bottom - top
-            } else {
-                1
-            };
             return Some(ConversationPointerHit {
                 target: ConversationPointerTarget::HistoryItem { index },
-                rect: Rect::new(0, top, self.view_area.width, height),
+                rect: Rect::new(0, top, self.view_area.width, bottom - top),
             });
         }
         None
@@ -1274,10 +1263,12 @@ impl ConversationPanel {
             return Ok(());
         }
 
-        if let Some((index, top, _)) = history_item
-            && self.render_cache.entries.get(index).is_some_and(|entry| {
-                entry.foldable && (entry.full_card_clickable || buffer_y == top)
-            })
+        if let Some((index, _, _)) = history_item
+            && self
+                .render_cache
+                .entries
+                .get(index)
+                .is_some_and(|entry| entry.foldable)
             && !self.expanded_items.remove(&index)
         {
             self.expanded_items.insert(index);
@@ -2819,6 +2810,7 @@ mod tests {
             hidden: false,
             expanded: false,
             has_output: false,
+            tool_title_modifier: Modifier::empty(),
             copy_buttons: Arc::new(vec![CodeCopyButton {
                 row: 0,
                 x_start: 8,
@@ -2826,7 +2818,6 @@ mod tests {
                 content: "history code".into(),
             }]),
             foldable: false,
-            full_card_clickable: false,
             lazy: false,
             tool_group: None,
         });

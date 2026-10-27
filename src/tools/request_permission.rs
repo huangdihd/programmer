@@ -19,11 +19,14 @@ pub fn tool() -> Tool {
     function_tool(
         NAME,
         "Ask the user for a session-only security permission when necessary work is \
-         blocked. Request either a sandbox mode change or exact filesystem access. \
-         Filesystem permission applies only to the requested operation and normalized \
-         path; retry the blocked tool call after approval. No change is applied without \
-         explicit user approval, and approvals are not persisted across application \
-         restarts.",
+         blocked. Request either a sandbox mode change or filesystem access. Filesystem \
+         permission applies only to the requested operation and normalized path. An \
+         existing directory grant covers that directory and its descendants, including \
+         paths denied by configuration; a file grant covers only that exact file. \
+         Sandboxed child-process writes need overlapping recursive read and write grants. \
+         Filesystem grants do not constrain commands when the process sandbox is off. \
+         Retry the blocked tool call after approval. No change is applied without explicit \
+         user approval, and approvals are not persisted across application restarts.",
         json!({
             "kind": {
                 "type": "string",
@@ -37,13 +40,13 @@ pub fn tool() -> Tool {
             },
             "operation": {
                 "type": ["string", "null"],
-                "enum": ["read", "write", "execute", null],
+                "enum": ["read", "write", null],
                 "description": "Filesystem requests: the exact operation to allow. Use null for sandbox requests."
             },
             "path": {
                 "type": ["string", "null"],
                 "minLength": 1,
-                "description": "Filesystem requests: the exact path to allow. Relative paths are resolved against the project directory. Use null for sandbox requests."
+                "description": "Filesystem requests: the path to allow. An existing directory covers itself and descendants; a file covers only itself. Relative paths are resolved against the project directory. Use null for sandbox requests."
             },
             "reason": {
                 "type": "string",
@@ -140,10 +143,16 @@ async fn request_sandbox(
         ));
     }
 
-    context.security.set_sandbox_mode(mode)?;
+    let active = context.security.relax_sandbox_mode(mode)?;
+    if active != mode {
+        return Ok(format!(
+            "permission approval was no longer needed; sandbox remains {}",
+            active.label()
+        ));
+    }
     Ok(format!(
         "permission granted for this session; sandbox mode is now {}",
-        mode.label()
+        active.label()
     ))
 }
 
@@ -153,8 +162,8 @@ async fn request_filesystem(
     reason: &str,
     context: &RequestContext<'_>,
 ) -> Result<String, String> {
-    if operation == AccessKind::Network {
-        return Err("error: filesystem permission does not support network access".to_string());
+    if !matches!(operation, AccessKind::Read | AccessKind::Write) {
+        return Err("error: filesystem permission supports only read or write access".to_string());
     }
     let path = path.trim();
     if path.is_empty() {
@@ -171,10 +180,16 @@ async fn request_filesystem(
         ));
     }
 
+    let recursive = resolved.is_dir();
+    let permission_scope = if recursive {
+        "This permission covers this directory and all of its descendants, overriding matching configured denies"
+    } else {
+        "This permission covers this file only, overriding a matching configured deny"
+    };
     let approved = prompt_approval(
         format!(
             "The agent requests {} access to:\n{}\nReason: {reason}\n\
-             This exact-path permission lasts for this application session only.",
+             {permission_scope} and lasts for this application session only.",
             operation.label(),
             resolved.display()
         ),
@@ -189,7 +204,9 @@ async fn request_filesystem(
         ));
     }
 
-    let granted = context.security.grant_path(operation, &resolved)?;
+    let granted = context
+        .security
+        .grant_path_if_unchanged(operation, path, &resolved, recursive)?;
     Ok(format!(
         "permission granted for this session; {} access is now allowed for {}",
         operation.label(),
@@ -286,6 +303,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_older_sandbox_approval_cannot_tighten_a_newer_mode() {
+        let manager = SecurityManager::standalone().expect("standalone security");
+        let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
+        security.set_sandbox_mode(SandboxMode::Restricted).unwrap();
+        let (questions, mut receiver) = super::super::ask_user::question_channel();
+        let cancel = CancellationToken::new();
+        let arguments = r#"{"kind":"sandbox","mode":"network","operation":null,"path":null,"reason":"download dependencies"}"#;
+        let request = tokio::spawn({
+            let questions = questions.clone();
+            let cancel = cancel.clone();
+            let security = security.clone();
+            async move { run(arguments, &questions, &cancel, OperationId(18), &security).await }
+        });
+
+        let prompt = tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+            .await
+            .expect("permission prompt")
+            .expect("event channel");
+        security.set_sandbox_mode(SandboxMode::Off).unwrap();
+        prompt
+            .answer
+            .send("Approve for this session".to_string())
+            .unwrap();
+
+        let output = request
+            .await
+            .expect("permission task")
+            .expect("permission result");
+        assert!(output.contains("sandbox remains off"));
+        assert_eq!(security.sandbox_mode(), SandboxMode::Off);
+    }
+
+    #[tokio::test]
     async fn permission_change_requires_an_explicit_approval() {
         let manager = SecurityManager::standalone().expect("standalone security");
         let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
@@ -316,6 +366,22 @@ mod tests {
             .expect("permission result");
         assert!(output.contains("permission granted"));
         assert_eq!(security.sandbox_mode(), SandboxMode::Network);
+    }
+
+    #[tokio::test]
+    async fn filesystem_permission_rejects_unrepresentable_execute_access() {
+        let manager = SecurityManager::standalone().expect("standalone security");
+        let security = SecurityHandle::new(Arc::new(manager));
+        let (questions, mut receiver) = super::super::ask_user::question_channel();
+        let cancel = CancellationToken::new();
+        let arguments = r#"{"kind":"filesystem","mode":null,"operation":"execute","path":"bin/tool","reason":"run it"}"#;
+
+        let error = run(arguments, &questions, &cancel, OperationId(8), &security)
+            .await
+            .expect_err("execute permission must fail closed");
+
+        assert!(error.contains("supports only read or write"));
+        assert!(receiver.try_recv().is_err(), "must not prompt for approval");
     }
 
     #[tokio::test]
@@ -360,6 +426,7 @@ mod tests {
             .await
             .expect("permission prompt")
             .expect("event channel");
+        assert!(event.question.text.contains("covers this file only"));
         let answer_tx = event.answer;
         answer_tx
             .send("Approve for this session".to_string())
@@ -391,6 +458,137 @@ mod tests {
                 .authorize_path(AccessKind::Write, &path)
                 .is_ok()
         );
+
+        drop(security);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[tokio::test]
+    async fn filesystem_directory_permission_discloses_and_grants_descendant_access() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
+        let external =
+            std::env::temp_dir().join(format!("programmer-external-{}", uuid::Uuid::new_v4()));
+        let granted_directory = external.join("granted");
+        let nested_file = granted_directory.join("nested/file.txt");
+        let sibling_file = external.join("sibling/file.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(nested_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(sibling_file.parent().unwrap()).unwrap();
+        let manager =
+            SecurityManager::new(crate::security::SecurityConfig::default(), root.clone())
+                .expect("security manager");
+        let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
+
+        let (questions, mut receiver) = super::super::ask_user::question_channel();
+        let cancel = CancellationToken::new();
+        let arguments = serde_json::json!({
+            "kind": "filesystem",
+            "mode": null,
+            "operation": "write",
+            "path": granted_directory,
+            "reason": "update generated files"
+        })
+        .to_string();
+        let task = tokio::spawn({
+            let questions = questions.clone();
+            let cancel = cancel.clone();
+            let security = security.clone();
+            async move { run(&arguments, &questions, &cancel, OperationId(11), &security).await }
+        });
+
+        let event = tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+            .await
+            .expect("permission prompt")
+            .expect("event channel");
+        assert!(
+            event
+                .question
+                .text
+                .contains("covers this directory and all of its descendants")
+        );
+        event
+            .answer
+            .send("Approve for this session".to_string())
+            .unwrap();
+        assert!(
+            task.await
+                .expect("permission task")
+                .expect("permission result")
+                .contains("permission granted")
+        );
+
+        let policy = security.snapshot();
+        assert!(
+            policy
+                .authorize_path(AccessKind::Write, nested_file)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .authorize_path(AccessKind::Write, sibling_file)
+                .is_err()
+        );
+
+        drop(policy);
+        drop(security);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_permission_rejects_a_target_redirected_during_approval() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
+        let external =
+            std::env::temp_dir().join(format!("programmer-external-{}", uuid::Uuid::new_v4()));
+        let parent = external.join("parent");
+        let original_parent = external.join("original-parent");
+        let requested = parent.join("granted");
+        let redirected = external.join("redirected");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&requested).unwrap();
+        std::fs::create_dir_all(redirected.join("granted")).unwrap();
+        let manager =
+            SecurityManager::new(crate::security::SecurityConfig::default(), root.clone())
+                .expect("security manager");
+        let security = Arc::new(SecurityHandle::new(Arc::new(manager)));
+        let (questions, mut receiver) = super::super::ask_user::question_channel();
+        let cancel = CancellationToken::new();
+        let arguments = serde_json::json!({
+            "kind": "filesystem",
+            "mode": null,
+            "operation": "write",
+            "path": requested,
+            "reason": "update generated files"
+        })
+        .to_string();
+        let task = tokio::spawn({
+            let questions = questions.clone();
+            let cancel = cancel.clone();
+            let security = security.clone();
+            async move { run(&arguments, &questions, &cancel, OperationId(12), &security).await }
+        });
+
+        let event = tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+            .await
+            .expect("permission prompt")
+            .expect("event channel");
+        std::fs::rename(&parent, &original_parent).unwrap();
+        std::os::unix::fs::symlink(&redirected, &parent).unwrap();
+        event
+            .answer
+            .send("Approve for this session".to_string())
+            .unwrap();
+
+        let error = task
+            .await
+            .expect("permission task")
+            .expect_err("redirected target must be rejected");
+        assert!(error.contains("target changed while awaiting approval"));
+        assert_eq!(security.snapshot().session_grant_count(), 0);
 
         drop(security);
         std::fs::remove_dir_all(root).unwrap();

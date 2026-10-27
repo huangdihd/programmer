@@ -216,6 +216,9 @@ mod tests {
         assert!(search.is_filtering());
         assert!(search.matches(&["example"]));
         assert!(!search.matches(&["other"]));
-        assert_eq!(search.handle_key(key(KeyCode::Char('a'))), SearchKey::Ignored);
+        assert_eq!(
+            search.handle_key(key(KeyCode::Char('a'))),
+            SearchKey::Ignored
+        );
     }
 }

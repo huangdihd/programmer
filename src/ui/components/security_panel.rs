@@ -367,9 +367,7 @@ impl SecurityPanel {
             MouseEventKind::ScrollUp if self.pointer_over_list(mouse.column, mouse.row, area) => {
                 return self.handle_key(KeyEvent::new(KeyCode::Up, mouse.modifiers), config);
             }
-            MouseEventKind::ScrollDown
-                if self.pointer_over_list(mouse.column, mouse.row, area) =>
-            {
+            MouseEventKind::ScrollDown if self.pointer_over_list(mouse.column, mouse.row, area) => {
                 return self.handle_key(KeyEvent::new(KeyCode::Down, mouse.modifiers), config);
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -521,8 +519,8 @@ impl SecurityPanel {
                 if row != action_row {
                     return None;
                 }
-                let blocked = config.security_profiles.len() == 1
-                    || config.active_security_profile == *name;
+                let blocked =
+                    config.security_profiles.len() == 1 || config.active_security_profile == *name;
                 return if blocked {
                     hit_horizontal_target(
                         column,
@@ -618,11 +616,13 @@ impl SecurityPanel {
     }
 
     fn pointer_over_list(&self, column: u16, row: u16, area: Rect) -> bool {
-        matches!(self.mode, Mode::List | Mode::Edit { .. } | Mode::Collection { .. })
-            && Block::default()
-                .borders(Borders::ALL)
-                .inner(panel_chunks(area)[1])
-                .contains((column, row).into())
+        matches!(
+            self.mode,
+            Mode::List | Mode::Edit { .. } | Mode::Collection { .. }
+        ) && Block::default()
+            .borders(Borders::ALL)
+            .inner(panel_chunks(area)[1])
+            .contains((column, row).into())
     }
 
     fn mouse_style(&self, target: MouseTarget) -> Option<Style> {

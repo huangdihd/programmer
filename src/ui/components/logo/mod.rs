@@ -19,7 +19,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::prelude::Widget;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
@@ -70,18 +70,10 @@ impl Widget for Logo<'_> {
         let title_style = Style::default()
             .fg(role::TITLE)
             .add_modifier(Modifier::BOLD);
-        let title = if self.title.width() + 3 <= usize::from(area.width) {
-            Line::from(vec![
-                Span::styled(
-                    "  ",
-                    Style::default().fg(role::LOGO).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(self.title, title_style),
-            ])
-        } else {
-            Line::styled(self.title, title_style)
-        };
-        Paragraph::new(title).render(Rect::new(area.x, area.y, area.width, 1), buf);
+        let title = Line::styled(self.title, title_style);
+        Paragraph::new(title)
+            .centered()
+            .render(Rect::new(area.x, area.y, area.width, 1), buf);
         if area.height > 1 {
             let separator_style = Style::default().fg(role::DIVIDER).bg(palette::CODE_BG);
             for x in area.x..area.right() {
@@ -132,7 +124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renders_the_supplied_session_title() {
+    fn renders_the_supplied_session_title_centered() {
         let area = Rect::new(0, 0, 30, 2);
         let mut buffer = Buffer::empty(area);
 
@@ -143,6 +135,9 @@ mod tests {
             .collect::<String>();
         assert!(first_line.contains("Fix session header"));
         assert!(!first_line.contains("Programmer"));
+        let title_width = "Fix session header".width() as u16;
+        let expected_x = (area.width - title_width) / 2;
+        assert_eq!(buffer[(expected_x, area.y)].symbol(), "F");
     }
 
     fn row(area: Rect, buffer: &Buffer) -> String {

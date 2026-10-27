@@ -28,9 +28,7 @@ use crate::ui::components::panel_search::{PanelSearch, SearchKey};
 use crate::ui::interaction::InteractionAnimation;
 use crate::ui::markdown_theme::palette;
 use crate::ui::theme::role;
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -177,9 +175,10 @@ impl SkillsPanel {
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                if self.scroll_area.get().is_some_and(|area| {
-                    area.contains((mouse.column, mouse.row).into())
-                }) =>
+                if self
+                    .scroll_area
+                    .get()
+                    .is_some_and(|area| area.contains((mouse.column, mouse.row).into())) =>
             {
                 let code = if mouse.kind == MouseEventKind::ScrollUp {
                     KeyCode::Up
@@ -388,9 +387,9 @@ impl SkillsPanel {
                 });
             }
         }
-        let mut x = chunks[2].x.saturating_add(
-            UnicodeWidthStr::width(" ↑↓ navigate  Space/Enter toggle  ") as u16,
-        );
+        let mut x = chunks[2]
+            .x
+            .saturating_add(UnicodeWidthStr::width(" ↑↓ navigate  Space/Enter toggle  ") as u16);
         for (label, suffix, target) in [
             ("/", " search  ", MouseTarget::Search),
             ("c", " clear all  ", MouseTarget::Clear),
@@ -398,13 +397,19 @@ impl SkillsPanel {
         ] {
             let width = UnicodeWidthStr::width(label) + UnicodeWidthStr::width(suffix);
             hits.push(HitRegion {
-                area: Rect::new(x, chunks[2].y, (width as u16).min(chunks[2].right().saturating_sub(x)), 1),
+                area: Rect::new(
+                    x,
+                    chunks[2].y,
+                    (width as u16).min(chunks[2].right().saturating_sub(x)),
+                    1,
+                ),
                 target,
             });
             x = x.saturating_add(width as u16);
         }
-        self.scroll_area
-            .set(Some(Block::default().borders(Borders::ALL).inner(chunks[1])));
+        self.scroll_area.set(Some(
+            Block::default().borders(Borders::ALL).inner(chunks[1]),
+        ));
         paint_mouse_feedback(
             buf,
             &hits,
