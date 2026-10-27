@@ -94,16 +94,17 @@ pub(crate) fn set_terminal_background(background: Option<(u8, u8, u8)>) {
     let _ = TERMINAL_BACKGROUND.set(background);
 }
 
-// Approved A preview: design-demos/light-themes.html (including yellow/purple refinement).
-const BACKGROUND: Color = Color::Rgb(250, 250, 250);
-const TEXT: Color = Color::Rgb(56, 58, 66);
-const MUTED: Color = Color::Rgb(129, 134, 144);
-const BLUE: Color = Color::Rgb(87, 140, 245);
-const GREEN: Color = Color::Rgb(104, 182, 103);
-const CYAN: Color = Color::Rgb(40, 163, 203);
-const YELLOW: Color = Color::Rgb(223, 182, 78);
-const PURPLE: Color = Color::Rgb(204, 120, 202);
-const RED: Color = Color::Rgb(237, 113, 102);
+// Light counterpart to the midnight palette. Neutral surfaces stay cool while
+// semantic accents are dark enough to remain legible on pale backgrounds.
+const BACKGROUND: Color = Color::Rgb(246, 247, 251);
+const TEXT: Color = Color::Rgb(37, 42, 53);
+const MUTED: Color = Color::Rgb(111, 119, 133);
+const BLUE: Color = Color::Rgb(79, 111, 216);
+const GREEN: Color = Color::Rgb(62, 148, 100);
+const CYAN: Color = Color::Rgb(40, 136, 155);
+const YELLOW: Color = Color::Rgb(168, 117, 24);
+const PURPLE: Color = Color::Rgb(138, 92, 194);
+const RED: Color = Color::Rgb(212, 78, 98);
 
 // Reserved presentation tokens distinguish decorative UI roles from syntax and
 // status colors. Resolve only after rendering so cached paragraphs stay valid.
@@ -128,32 +129,63 @@ pub(crate) mod role {
     pub const WELCOME_DIVIDER: Color = Color::Rgb(1, 0, 17);
     pub const SELECTION_BG: Color = Color::Rgb(1, 0, 18);
     pub const SELECTION_TEXT: Color = Color::Rgb(1, 0, 19);
+    pub const INTERACTION_PRESSED_BG: Color = Color::Rgb(1, 0, 20);
+    pub const STATUS_CONNECTING: Color = Color::Rgb(1, 0, 21);
+    pub const STATUS_THINKING: Color = Color::Rgb(1, 0, 22);
+    pub const STATUS_THINKING_DEEP: Color = Color::Rgb(1, 0, 23);
+    pub const STATUS_THINKING_DEEPEST: Color = Color::Rgb(1, 0, 24);
+    pub const STATUS_TOOL_RUNNING: Color = Color::Rgb(1, 0, 25);
 }
 
 fn role_color(color: Color, light: bool) -> Option<Color> {
     let (dark, bright) = match color {
-        role::BORDER => (Color::LightBlue, BLUE),
-        role::SELECTION_BG => (Color::LightBlue, Color::Rgb(225, 235, 253)),
-        role::SELECTION_TEXT => (Color::Black, TEXT),
-        role::FOCUS => (Color::LightBlue, BLUE),
-        role::HEADING => (Color::LightBlue, BLUE),
-        role::SECTION_PROVIDERS => (Color::Green, GREEN),
-        role::SECTION_SKILLS => (Color::LightMagenta, PURPLE),
-        role::SECTION_MCP => (Color::Magenta, PURPLE),
-        role::SECTION_TODOS => (Color::Yellow, YELLOW),
-        role::SECTION_TASKS => (Color::Cyan, CYAN),
-        role::SECTION_AGENTS => (Color::Blue, BLUE),
-        role::SECTION_DIAGNOSTICS => (Color::Red, RED),
+        role::BORDER => (palette::BORDER, Color::Rgb(205, 211, 224)),
+        role::SELECTION_BG => (palette::SURFACE, Color::Rgb(225, 231, 245)),
+        role::SELECTION_TEXT => (palette::TEXT, TEXT),
+        role::INTERACTION_PRESSED_BG => {
+            (Color::Rgb(0x31, 0x3d, 0x52), Color::Rgb(0xd4, 0xdc, 0xea))
+        }
+        role::STATUS_CONNECTING => (palette::BLUE, BLUE),
+        role::STATUS_THINKING => (palette::BLUE, BLUE),
+        role::STATUS_THINKING_DEEP => (Color::Rgb(111, 145, 224), Color::Rgb(65, 91, 185)),
+        role::STATUS_THINKING_DEEPEST => (Color::Rgb(93, 121, 194), Color::Rgb(52, 72, 154)),
+        role::STATUS_TOOL_RUNNING => (palette::YELLOW, YELLOW),
+        role::FOCUS => (palette::BLUE, BLUE),
+        role::HEADING => (palette::BLUE, BLUE),
+        role::SECTION_PROVIDERS => (palette::GREEN, GREEN),
+        role::SECTION_SKILLS => (palette::PURPLE, PURPLE),
+        role::SECTION_MCP => (palette::PURPLE, PURPLE),
+        role::SECTION_TODOS => (palette::YELLOW, YELLOW),
+        role::SECTION_TASKS => (palette::CYAN, CYAN),
+        role::SECTION_AGENTS => (palette::BLUE, BLUE),
+        role::SECTION_DIAGNOSTICS => (palette::RED, RED),
         role::TOOL_SUCCESS => (palette::GREEN, GREEN),
         role::TOOL_PENDING => (palette::YELLOW, YELLOW),
-        role::TITLE => (Color::Cyan, CYAN),
-        role::LOGO => (Color::LightBlue, BLUE),
-        role::SUBTLE => (Color::LightBlue, BLUE),
-        role::DIVIDER => (Color::DarkGray, Color::Rgb(217, 220, 226)),
-        role::WELCOME_DIVIDER => (Color::Gray, Color::Rgb(217, 220, 226)),
+        role::TITLE => (palette::TEXT, TEXT),
+        role::LOGO => (palette::BLUE, BLUE),
+        role::SUBTLE => (palette::MUTED, MUTED),
+        role::DIVIDER => (palette::BORDER, Color::Rgb(215, 220, 230)),
+        role::WELCOME_DIVIDER => (palette::BORDER, Color::Rgb(215, 220, 230)),
         _ => return None,
     };
     Some(if light { bright } else { dark })
+}
+
+fn dark_color(color: Color, background: bool) -> Color {
+    match color {
+        Color::Reset => Color::Reset,
+        Color::Black if !background => palette::CODE_BG,
+        Color::White | Color::Gray => palette::TEXT,
+        Color::DarkGray => palette::MUTED,
+        Color::Blue | Color::LightBlue => palette::BLUE,
+        Color::Green | Color::LightGreen => palette::GREEN,
+        Color::Cyan | Color::LightCyan => palette::CYAN,
+        Color::Yellow | Color::LightYellow => palette::YELLOW,
+        Color::Magenta | Color::LightMagenta => palette::PURPLE,
+        Color::Red | Color::LightRed => palette::RED,
+        Color::Rgb(30, 30, 40) => palette::SURFACE,
+        other => other,
+    }
 }
 
 fn light_color(color: Color, background: bool) -> Color {
@@ -168,12 +200,15 @@ fn light_color(color: Color, background: bool) -> Color {
         Color::Yellow | Color::LightYellow | palette::YELLOW => YELLOW,
         Color::Magenta | Color::LightMagenta | palette::PURPLE => PURPLE,
         Color::Red | Color::LightRed | palette::RED => RED,
-        palette::RED_MUTED => Color::Rgb(215, 99, 112),
-        palette::BORDER => Color::Rgb(217, 220, 226),
-        palette::SURFACE | Color::Rgb(30, 30, 40) => Color::Rgb(240, 241, 243),
-        palette::CODE_BG => Color::Rgb(240, 241, 243),
-        Color::Rgb(58, 34, 40) => Color::Rgb(247, 228, 227),
-        Color::Rgb(37, 51, 29) => Color::Rgb(229, 240, 228),
+        palette::RED_MUTED => Color::Rgb(190, 91, 108),
+        palette::BORDER => Color::Rgb(205, 211, 224),
+        palette::SURFACE | Color::Rgb(30, 30, 40) => Color::Rgb(236, 239, 245),
+        palette::SURFACE_HOVER_SOFT => Color::Rgb(233, 236, 243),
+        palette::SURFACE_HOVER_MEDIUM => Color::Rgb(229, 233, 241),
+        palette::SURFACE_HOVER => Color::Rgb(225, 230, 240),
+        palette::CODE_BG => Color::Rgb(231, 235, 243),
+        palette::DIFF_REMOVED_BG => Color::Rgb(248, 229, 233),
+        palette::DIFF_ADDED_BG => Color::Rgb(228, 241, 233),
         other => other,
     }
 }
@@ -195,15 +230,15 @@ pub(crate) fn apply(theme: Theme, area: Rect, buf: &mut Buffer) {
             let foreground_role = role_color(cell.fg, light);
             let background_role = role_color(cell.bg, light);
             if !light {
-                cell.fg = foreground_role.unwrap_or(cell.fg);
-                cell.bg = background_role.unwrap_or(cell.bg);
+                cell.fg = foreground_role.unwrap_or_else(|| dark_color(cell.fg, false));
+                cell.bg = background_role.unwrap_or_else(|| dark_color(cell.bg, true));
                 if theme != Theme::Dark {
                     continue;
                 }
-                // Explicit dark overrides a light terminal, while auto/dark
-                // retains the user's original terminal background.
+                // An explicit dark override paints a deterministic canvas;
+                // auto-dark keeps the terminal's own background transparent.
                 if cell.bg == Color::Reset {
-                    cell.bg = Color::Rgb(26, 27, 38);
+                    cell.bg = Color::Rgb(16, 19, 26);
                 }
                 if cell.fg == Color::Reset {
                     cell.fg = palette::TEXT;
@@ -236,28 +271,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn light_palette_matches_the_approved_preview() {
-        assert_eq!(BACKGROUND, Color::Rgb(250, 250, 250));
-        assert_eq!(TEXT, Color::Rgb(56, 58, 66));
-        assert_eq!(MUTED, Color::Rgb(129, 134, 144));
-        assert_eq!(BLUE, Color::Rgb(87, 140, 245));
-        assert_eq!(GREEN, Color::Rgb(104, 182, 103));
-        assert_eq!(CYAN, Color::Rgb(40, 163, 203));
-        assert_eq!(YELLOW, Color::Rgb(223, 182, 78));
-        assert_eq!(PURPLE, Color::Rgb(204, 120, 202));
-        assert_eq!(RED, Color::Rgb(237, 113, 102));
+    fn light_palette_matches_the_midnight_counterpart() {
+        assert_eq!(BACKGROUND, Color::Rgb(246, 247, 251));
+        assert_eq!(TEXT, Color::Rgb(37, 42, 53));
+        assert_eq!(MUTED, Color::Rgb(111, 119, 133));
+        assert_eq!(BLUE, Color::Rgb(79, 111, 216));
+        assert_eq!(GREEN, Color::Rgb(62, 148, 100));
+        assert_eq!(CYAN, Color::Rgb(40, 136, 155));
+        assert_eq!(YELLOW, Color::Rgb(168, 117, 24));
+        assert_eq!(PURPLE, Color::Rgb(138, 92, 194));
+        assert_eq!(RED, Color::Rgb(212, 78, 98));
         assert_eq!(
             light_color(palette::SURFACE, true),
-            Color::Rgb(240, 241, 243)
+            Color::Rgb(236, 239, 245)
+        );
+        assert_eq!(
+            light_color(palette::SURFACE_HOVER_SOFT, true),
+            Color::Rgb(233, 236, 243)
+        );
+        assert_eq!(
+            light_color(palette::SURFACE_HOVER_MEDIUM, true),
+            Color::Rgb(229, 233, 241)
+        );
+        assert_eq!(
+            light_color(palette::SURFACE_HOVER, true),
+            Color::Rgb(225, 230, 240)
         );
         assert_eq!(
             light_color(palette::CODE_BG, true),
-            Color::Rgb(240, 241, 243)
+            Color::Rgb(231, 235, 243)
         );
         for (source, token) in [
             (palette::BLUE, role::SECTION_AGENTS),
             (palette::GREEN, role::SECTION_PROVIDERS),
-            (palette::CYAN, role::TITLE),
+            (palette::TEXT, role::TITLE),
             (palette::PURPLE, role::SECTION_SKILLS),
             (palette::YELLOW, role::SECTION_TODOS),
             (palette::RED, role::SECTION_DIAGNOSTICS),
@@ -267,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn light_accents_are_brighter_than_the_previous_muted_palette() {
+    fn light_accents_have_sufficient_contrast() {
         fn luminance(color: Color) -> f64 {
             let Color::Rgb(r, g, b) = color else {
                 panic!("RGB accent")
@@ -282,22 +329,18 @@ mod tests {
             };
             0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
         }
-        for (current, previous) in [
-            (BLUE, Color::Rgb(46, 96, 172)),
-            (GREEN, Color::Rgb(42, 112, 77)),
-            (CYAN, Color::Rgb(39, 104, 125)),
-            (YELLOW, Color::Rgb(145, 99, 28)),
-            (PURPLE, Color::Rgb(113, 83, 145)),
-            (RED, Color::Rgb(181, 63, 68)),
-        ] {
-            assert!(luminance(current) > luminance(previous) * 1.5);
+        let background_luminance = luminance(BACKGROUND);
+        for accent in [BLUE, GREEN, CYAN, YELLOW, PURPLE, RED] {
+            let accent_luminance = luminance(accent);
+            let contrast = (background_luminance + 0.05) / (accent_luminance + 0.05);
+            assert!(contrast >= 3.0, "accent contrast was {contrast:.2}");
         }
         for (token, expected) in [
             (role::HEADING, BLUE),
             (role::SECTION_PROVIDERS, GREEN),
             (role::SECTION_SKILLS, PURPLE),
             (role::SECTION_TODOS, YELLOW),
-            (role::TITLE, CYAN),
+            (role::TITLE, TEXT),
             (role::TOOL_SUCCESS, GREEN),
         ] {
             assert_eq!(role_color(token, true), Some(expected));
@@ -328,16 +371,39 @@ mod tests {
         assert_eq!(role_color(role::SECTION_SKILLS, true), Some(PURPLE));
         assert_eq!(
             role_color(role::SECTION_SKILLS, false),
-            Some(Color::LightMagenta)
+            Some(palette::PURPLE)
         );
-        assert_eq!(role_color(role::BORDER, false), Some(Color::LightBlue));
-        assert_eq!(role_color(role::BORDER, true), Some(BLUE));
+        assert_eq!(role_color(role::BORDER, false), Some(palette::BORDER));
         assert_eq!(
+            role_color(role::BORDER, true),
+            Some(Color::Rgb(205, 211, 224))
+        );
+        assert_ne!(
             role_color(role::BORDER, true),
             role_color(role::HEADING, true)
         );
         assert_eq!(role_color(role::TOOL_SUCCESS, true), Some(GREEN));
         assert_eq!(light_color(palette::GREEN, false), GREEN);
+        assert_eq!(
+            role_color(role::STATUS_CONNECTING, false),
+            Some(palette::BLUE)
+        );
+        assert_eq!(role_color(role::STATUS_CONNECTING, true), Some(BLUE));
+        assert_eq!(
+            role_color(role::STATUS_TOOL_RUNNING, false),
+            Some(palette::YELLOW)
+        );
+        assert_eq!(role_color(role::STATUS_TOOL_RUNNING, true), Some(YELLOW));
+        for light in [false, true] {
+            assert_ne!(
+                role_color(role::STATUS_THINKING, light),
+                role_color(role::STATUS_THINKING_DEEP, light)
+            );
+            assert_ne!(
+                role_color(role::STATUS_THINKING_DEEP, light),
+                role_color(role::STATUS_THINKING_DEEPEST, light)
+            );
+        }
         assert_ne!(light_color(Color::Gray, false), TEXT);
         let area = Rect::new(0, 0, 1, 1);
         let mut buf = Buffer::empty(area);
@@ -365,17 +431,18 @@ mod tests {
         original[(1, 0)].set_fg(Color::Black).set_bg(Color::Cyan);
         original[(2, 0)]
             .set_fg(palette::RED)
-            .set_bg(Color::Rgb(58, 34, 40));
+            .set_bg(palette::DIFF_REMOVED_BG);
         let mut dark = original.clone();
         apply(Theme::Dark, area, &mut dark);
-        assert_eq!(dark[(0, 0)].bg, Color::Rgb(26, 27, 38));
-        assert_eq!(dark[(1, 0)], original[(1, 0)]);
+        assert_eq!(dark[(0, 0)].bg, Color::Rgb(16, 19, 26));
+        assert_eq!(dark[(1, 0)].fg, palette::CODE_BG);
+        assert_eq!(dark[(1, 0)].bg, palette::CYAN);
         assert_eq!(dark[(2, 0)], original[(2, 0)]);
         apply(Theme::Light, area, &mut original);
         assert_eq!(original[(0, 0)].bg, BACKGROUND);
         assert_eq!(original[(0, 0)].fg, TEXT);
         assert_eq!(original[(1, 0)].fg, Color::White);
         assert_eq!(original[(1, 0)].bg, CYAN);
-        assert_eq!(original[(2, 0)].bg, Color::Rgb(247, 228, 227));
+        assert_eq!(original[(2, 0)].bg, Color::Rgb(248, 229, 233));
     }
 }

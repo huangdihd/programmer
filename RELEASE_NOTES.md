@@ -1,3 +1,55 @@
+### programmer v0.2.28
+
+- Redesign the terminal UI around a compact dark/light semantic palette, with
+  denser conversation cards, sidebar sections, footer controls, status surfaces,
+  management panels, a centered session title, and a responsive rounded welcome
+  card whose shortcut hint remains legible in both themes and narrow terminals.
+- Add comprehensive mouse interaction: scroll the surface under the pointer,
+  resize the sidebar, drag the conversation scrollbar, select and copy wrapped
+  transcript text, activate code-copy controls and links, operate list panels,
+  and expand any foldable conversation card from its full rendered area.
+- Add a modal inline-image viewer with zoom, pan, reset, and protocol-aware
+  caching. Kitty terminals upload one bounded PNG stream and update one cropped
+  native placement while zooming or panning; pointer events and image work are
+  coalesced so they do not starve keyboard input or model events.
+- Render supported Mermaid flowcharts and mind maps directly in the terminal,
+  with readable fallbacks for layouts that do not route reliably in character
+  cells. Convert common inline, display, and fenced LaTeX-like math notation to
+  terminal-friendly Unicode symbols and linear fractions.
+- Improve command and background-task lifecycle handling around timeout,
+  cancellation, process-tree cleanup, interactive terminals, and foreground
+  commands moved into the task manager, avoiding stale registrations and races
+  that could terminate an already-promoted task.
+- Make active feedback calmer and cheaper: coalesce TUI pointer motion, preserve
+  the 120 ms hover transition, animate complete pending tool and tool-group
+  titles in one shared phase, and limit status-bar breathing to the activity icon
+  so labels and elapsed time remain stable.
+- Make session filesystem approvals operation-scoped and explicit. Existing
+  directory approvals cover descendants, file approvals remain exact, stale
+  sandbox approvals cannot tighten a newer mode, and approved paths are checked
+  again before storage and child-policy propagation. Sandboxed child writes
+  require overlapping recursive read and write approvals rather than silently
+  widening write-only access.
+- Tolerate brief cross-process memory-lock handoffs without failing ordinary
+  recall and management operations, while keeping long-running Dream lock
+  contention bounded and explicit.
+- Expand regression coverage across pointer routing, selection, image protocols,
+  process ownership, security grants, theme resolution, tool animation, memory
+  locking, and responsive welcome rendering; refresh the user and architecture
+  documentation.
+
+Upgrade note: `request_permission` filesystem elevation now accepts only `read`
+and `write`; executable access remains configurable through security policy but
+cannot be granted interactively. An explicit session approval overrides a
+matching configured deny for its approved operation and scope. Exact-file grants
+apply to built-in path tools but cannot be represented safely in the native
+subprocess sandbox, and filesystem grants do not constrain commands when process
+sandboxing is off.
+
+**Full changelog:** https://github.com/huangdihd/programmer/compare/v0.2.27...v0.2.28
+
+---
+
 ### programmer v0.2.27
 
 - Give headless `programmer run` and `programmer init` stable exit codes:

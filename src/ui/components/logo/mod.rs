@@ -13,13 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::ui::markdown_theme::palette;
 use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::prelude::Widget;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 /// U+1F4AD SPEECH BALLOON — the Dream indicator, shown while the background
@@ -30,6 +31,8 @@ pub struct Logo<'a> {
     title: &'a str,
     /// Whether a background consolidation pass is running.
     dream: bool,
+    /// Absolute column where the header rule meets a vertical pane divider.
+    divider_x: Option<u16>,
 }
 
 impl<'a> Logo<'a> {
@@ -37,6 +40,7 @@ impl<'a> Logo<'a> {
         Logo {
             title,
             dream: false,
+            divider_x: None,
         }
     }
 
@@ -45,23 +49,44 @@ impl<'a> Logo<'a> {
         self.dream = dream;
         self
     }
+
+    /// Join the header separator to a vertical pane divider below it.
+    pub fn with_divider_at(mut self, x: u16) -> Self {
+        self.divider_x = Some(x);
+        self
+    }
 }
 
 impl Widget for Logo<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let title = Line::styled(
-            self.title,
-            Style::default()
-                .fg(role::TITLE)
-                .add_modifier(Modifier::BOLD),
-        );
-        let separator = Line::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(Color::DarkGray),
-        );
-        Paragraph::new(vec![title, separator])
+        if area.is_empty() {
+            return;
+        }
+
+        Block::default()
+            .style(Style::default().bg(palette::CODE_BG))
+            .render(Rect::new(area.x, area.y, area.width, 1), buf);
+
+        let title_style = Style::default()
+            .fg(role::TITLE)
+            .add_modifier(Modifier::BOLD);
+        let title = Line::styled(self.title, title_style);
+        Paragraph::new(title)
             .centered()
-            .render(area, buf);
+            .render(Rect::new(area.x, area.y, area.width, 1), buf);
+        if area.height > 1 {
+            let separator_style = Style::default().fg(role::DIVIDER).bg(palette::CODE_BG);
+            for x in area.x..area.right() {
+                if let Some(cell) = buf.cell_mut((x, area.y + 1)) {
+                    let symbol = if self.divider_x == Some(x) {
+                        "┬"
+                    } else {
+                        "─"
+                    };
+                    cell.set_symbol(symbol).set_style(separator_style);
+                }
+            }
+        }
         if self.dream {
             render_dream_indicator(area, buf);
         }
@@ -86,7 +111,12 @@ fn render_dream_indicator(area: Rect, buf: &mut Buffer) {
     if occupied {
         return;
     }
-    buf.set_string(x, area.y, DREAM_ICON, Style::default().fg(Color::LightCyan));
+    buf.set_string(
+        x,
+        area.y,
+        DREAM_ICON,
+        Style::default().fg(role::LOGO).bg(palette::CODE_BG),
+    );
 }
 
 #[cfg(test)]
@@ -94,7 +124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renders_the_supplied_session_title() {
+    fn renders_the_supplied_session_title_centered() {
         let area = Rect::new(0, 0, 30, 2);
         let mut buffer = Buffer::empty(area);
 
@@ -105,12 +135,77 @@ mod tests {
             .collect::<String>();
         assert!(first_line.contains("Fix session header"));
         assert!(!first_line.contains("Programmer"));
+        let title_width = "Fix session header".width() as u16;
+        let expected_x = (area.width - title_width) / 2;
+        assert_eq!(buffer[(expected_x, area.y)].symbol(), "F");
     }
 
     fn row(area: Rect, buffer: &Buffer) -> String {
         (0..area.width)
             .map(|x| buffer[(x, area.y)].symbol())
             .collect::<String>()
+    }
+
+    #[test]
+    fn separator_fills_the_complete_row_at_a_nonzero_origin() {
+        let area = Rect::new(7, 3, 30, 2);
+        let mut buffer = Buffer::empty(area);
+
+        Logo::new("Fix session header").render(area, &mut buffer);
+
+        for x in area.x..area.right() {
+            let cell = &buffer[(x, area.y + 1)];
+            assert_eq!(cell.symbol(), "─", "missing cell at x={x}");
+            assert_eq!(
+                cell.bg,
+                palette::CODE_BG,
+                "missing separator background at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn separator_joins_a_vertical_pane_divider() {
+        let area = Rect::new(7, 3, 30, 2);
+        let mut buffer = Buffer::empty(area);
+        let divider_x = 27;
+
+        Logo::new("Fix session header")
+            .with_divider_at(divider_x)
+            .render(area, &mut buffer);
+
+        assert_eq!(buffer[(divider_x - 1, area.y + 1)].symbol(), "─");
+        assert_eq!(buffer[(divider_x, area.y + 1)].symbol(), "┬");
+        assert_eq!(buffer[(divider_x + 1, area.y + 1)].symbol(), "─");
+    }
+
+    #[test]
+    fn separator_and_sidebar_border_form_one_continuous_junction() {
+        use ratatui::widgets::Borders;
+
+        let area = Rect::new(7, 3, 40, 8);
+        let mut buffer = Buffer::empty(area);
+        let divider_x = 34;
+        let header = Rect::new(area.x, area.y, area.width, 2);
+        let sidebar = Rect::new(
+            divider_x,
+            header.bottom(),
+            area.right() - divider_x,
+            area.bottom() - header.bottom(),
+        );
+
+        Logo::new("Fix session header")
+            .with_divider_at(divider_x)
+            .render(header, &mut buffer);
+        Block::default()
+            .borders(Borders::LEFT)
+            .render(sidebar, &mut buffer);
+
+        assert_eq!(buffer[(divider_x - 1, header.bottom() - 1)].symbol(), "─");
+        assert_eq!(buffer[(divider_x, header.bottom() - 1)].symbol(), "┬");
+        assert_eq!(buffer[(divider_x + 1, header.bottom() - 1)].symbol(), "─");
+        assert_eq!(buffer[(divider_x, header.bottom())].symbol(), "│");
+        assert_eq!(buffer[(divider_x, header.bottom() + 1)].symbol(), "│");
     }
 
     #[test]

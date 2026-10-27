@@ -36,11 +36,24 @@ static PASTED_IMAGE_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
 pub struct UserMessage<'a> {
     input_item: &'a InputItem,
     width: u16,
+    image_previews: Option<&'a crate::ui::image_preview::ImagePreviewStore>,
 }
 
 impl<'a> UserMessage<'a> {
     pub(crate) fn new(input_item: &'a InputItem, width: u16) -> Self {
-        Self { input_item, width }
+        Self {
+            input_item,
+            width,
+            image_previews: None,
+        }
+    }
+
+    pub(crate) fn image_previews(
+        mut self,
+        image_previews: &'a crate::ui::image_preview::ImagePreviewStore,
+    ) -> Self {
+        self.image_previews = Some(image_previews);
+        self
     }
 
     pub fn into_paragraph(self) -> Paragraph<'static> {
@@ -53,7 +66,7 @@ impl<'a> UserMessage<'a> {
         // before calculating the terminal image size.
         let inner_width = self.width.saturating_sub(PAD_RIGHT);
 
-        let lines = display_lines(self.input_item, inner_width, accent);
+        let lines = display_lines(self.input_item, inner_width, accent, self.image_previews);
 
         Paragraph::new(Text::from(lines))
             .style(Style::new().fg(text_fg).bg(bar_bg))
@@ -66,6 +79,7 @@ fn display_lines(
     input_item: &InputItem,
     width: u16,
     accent: ratatui::style::Color,
+    image_previews: Option<&crate::ui::image_preview::ImagePreviewStore>,
 ) -> Vec<Line<'static>> {
     let InputItem::Item(Message(Input(message))) = input_item else {
         return text_lines(&display_text(input_item), accent, true);
@@ -83,10 +97,11 @@ fn display_lines(
                 lines.extend(text_lines);
             }
             InputContent::InputImage(_) => {
-                lines.extend(crate::ui::image_preview::content_preview_lines(
-                    std::slice::from_ref(content),
-                    width,
-                ));
+                if let Some(image_previews) = image_previews {
+                    lines.extend(
+                        image_previews.content_preview_lines(std::slice::from_ref(content), width),
+                    );
+                }
             }
             InputContent::InputFile(_) => {
                 lines.extend(text_lines("📎 File attachment", accent, !prompt_rendered));
@@ -201,14 +216,16 @@ mod tests {
     #[test]
     fn sent_image_renders_through_the_selected_protocol() {
         let input = pasted_image_message(png_data_url());
+        let image_previews = crate::ui::image_preview::ImagePreviewStore::default();
         let area = Rect::new(0, 0, 40, 8);
         let mut buffer = Buffer::empty(area);
 
         UserMessage::new(&input, area.width)
+            .image_previews(&image_previews)
             .into_paragraph()
             .render(area, &mut buffer);
 
-        crate::ui::image_preview::render_protocol_images(area, &mut buffer);
+        image_previews.render_protocol_images(area, &mut buffer);
 
         let rendered = (0..area.height)
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
@@ -227,10 +244,12 @@ mod tests {
     #[test]
     fn sent_image_renders_before_following_text() {
         let input = pasted_image_message(png_data_url());
+        let image_previews = crate::ui::image_preview::ImagePreviewStore::default();
         let area = Rect::new(0, 0, 40, 8);
         let mut buffer = Buffer::empty(area);
 
         UserMessage::new(&input, area.width)
+            .image_previews(&image_previews)
             .into_paragraph()
             .render(area, &mut buffer);
 

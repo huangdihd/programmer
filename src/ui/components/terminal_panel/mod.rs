@@ -621,7 +621,13 @@ mod tests {
                 Some("pipe"),
             )
             .expect("spawn");
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tasks.wait_until_finished(id),
+        )
+        .await
+        .expect("pipe task should finish promptly")
+        .expect("pipe task should remain registered");
 
         let mut pane = TerminalPane::new(tasks.clone(), id, "pipe".to_string());
         assert!(!pane.accepts_input());

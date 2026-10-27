@@ -26,12 +26,13 @@ pub mod ui;
 #[cfg(test)]
 mod tests;
 
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::style::{Color, Modifier, Style};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::style::{Modifier, Style};
 use ratatui_textarea::TextArea;
 
 use crate::tools::ask_user::{Question, QuestionKind};
 use crate::ui::event::AnswerTx;
+use crate::ui::markdown_theme::palette;
 
 /// The answer action after handling a key.
 #[derive(Debug, PartialEq)]
@@ -61,13 +62,13 @@ pub struct QuestionPanel {
 
 fn make_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_style(Style::default().fg(Color::White));
+    ta.set_style(Style::default().fg(palette::TEXT));
     ta.set_cursor_line_style(Style::default());
     ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     ta.set_placeholder_text("Type your answer\u{2026}");
     ta.set_placeholder_style(
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(palette::MUTED)
             .add_modifier(Modifier::ITALIC),
     );
     ta
@@ -86,6 +87,44 @@ impl QuestionPanel {
             mode,
             answer_tx: Some(answer_tx),
             delegation: None,
+        }
+    }
+
+    pub(crate) fn handle_mouse(
+        &mut self,
+        area: ratatui::layout::Rect,
+        mouse: MouseEvent,
+    ) -> AnswerAction {
+        if let Some(delegation) = &mut self.delegation {
+            return delegation.handle_mouse(area, mouse);
+        }
+        let pointer_over_choice = self.mouse_option(area, mouse).is_some();
+        if pointer_over_choice
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+            && let Mode::Choice { selected } = &mut self.mode
+            && let QuestionKind::Choice { options, .. } = &self.question.kind
+        {
+            if mouse.kind == MouseEventKind::ScrollUp {
+                *selected = selected.saturating_sub(1);
+            } else {
+                *selected = (*selected + 1).min(options.len().saturating_sub(1));
+            }
+        }
+        AnswerAction::None
+    }
+
+    pub(crate) fn interaction_animation_active(&self) -> bool {
+        self.delegation
+            .as_ref()
+            .is_some_and(delegation::Delegation::interaction_animation_active)
+    }
+
+    pub(crate) fn clear_pointer_feedback(&mut self) {
+        if let Some(delegation) = &mut self.delegation {
+            delegation.clear_pointer_feedback();
         }
     }
 
@@ -142,6 +181,61 @@ impl QuestionPanel {
                 }
             },
         }
+    }
+
+    pub(crate) fn mouse_option(
+        &self,
+        area: ratatui::layout::Rect,
+        mouse: MouseEvent,
+    ) -> Option<usize> {
+        if self.delegation.is_some() {
+            return None;
+        }
+        let Mode::Choice { .. } = &self.mode else {
+            return None;
+        };
+        let QuestionKind::Choice { options, .. } = &self.question.kind else {
+            return None;
+        };
+        let inner = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::TOP)
+            .inner(area);
+        let chunks = ratatui::layout::Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([
+                ratatui::layout::Constraint::Min(1),
+                ratatui::layout::Constraint::Length(options.len() as u16),
+                ratatui::layout::Constraint::Length(1),
+            ])
+            .split(inner);
+        if mouse.column < chunks[1].x
+            || mouse.column >= chunks[1].right()
+            || mouse.row < chunks[1].y
+            || mouse.row >= chunks[1].bottom()
+        {
+            return None;
+        }
+        Some(usize::from(mouse.row - chunks[1].y).min(options.len().saturating_sub(1)))
+    }
+
+    /// Handle a click in the panel's last rendered area. Choice rows activate
+    /// immediately; text questions retain keyboard editing while owning the click.
+    pub(crate) fn select_mouse_option(
+        &mut self,
+        area: ratatui::layout::Rect,
+        mouse: MouseEvent,
+    ) -> bool {
+        if mouse.kind != MouseEventKind::Up(MouseButton::Left) {
+            return false;
+        }
+        let Some(index) = self.mouse_option(area, mouse) else {
+            return false;
+        };
+        let Mode::Choice { selected } = &mut self.mode else {
+            return false;
+        };
+        *selected = index;
+        true
     }
 
     /// Consume the stored answer_tx and send the answer.

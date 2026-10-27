@@ -65,6 +65,18 @@ impl ThinkingLevel {
         }
     }
 
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::None,
+            Self::None => Self::Minimal,
+            Self::Minimal => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Xhigh,
+            Self::Xhigh => Self::Auto,
+        }
+    }
+
     /// Build the API reasoning object, or `None` for provider/model defaults.
     pub(crate) fn reasoning(self) -> Option<Reasoning> {
         let effort = match self {
@@ -106,5 +118,22 @@ mod tests {
         assert_eq!(ThinkingLevel::parse("NONE"), Some(ThinkingLevel::None));
         assert_eq!(ThinkingLevel::parse("default"), Some(ThinkingLevel::Auto));
         assert_eq!(ThinkingLevel::parse("off"), None);
+    }
+
+    #[test]
+    fn next_cycles_through_every_level() {
+        let mut level = ThinkingLevel::Auto;
+        for expected in [
+            ThinkingLevel::None,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Xhigh,
+            ThinkingLevel::Auto,
+        ] {
+            level = level.next();
+            assert_eq!(level, expected);
+        }
     }
 }

@@ -127,6 +127,37 @@ fn ordinary_choice_prompt_keeps_vertical_navigation_and_cancel() {
 }
 
 #[test]
+fn ordinary_choice_rows_can_be_selected_with_the_mouse() {
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let mut p = QuestionPanel::new(
+        Question {
+            text: "Choose".into(),
+            kind: QuestionKind::Choice {
+                options: vec!["first".into(), "second".into()],
+                other_index: usize::MAX,
+            },
+        },
+        AnswerTx(tx),
+    );
+    let area = Rect::new(0, 0, 40, p.needed_height());
+    let selected = p.select_mouse_option(
+        area,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 4,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(selected);
+    assert_eq!(
+        key(&mut p, KeyCode::Enter),
+        AnswerAction::Answer("second".into())
+    );
+}
+
+#[test]
 fn consent_answer_uses_existing_channel() {
     for (selection, expected) in [(KeyCode::Left, "No"), (KeyCode::Right, "Yes")] {
         let (tx, mut rx) = tokio::sync::oneshot::channel();

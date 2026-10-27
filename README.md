@@ -38,10 +38,10 @@ TUI built with [Ratatui](https://ratatui.rs).
   to background tasks, drive interactive PTYs from the TUI, and delegate bounded
   work to independent in-process agents whose live phase (including the memory
   model's association pass) shows on their own sidebar row.
-- **Multimodal terminal UI** — paste or reference images, render supported images
-  with terminal graphics protocols, group related tool calls and reasoning, and
-  keep providers, MCP servers, skills, todos, tasks, diagnostics, and agents in a
-  scrollable sidebar.
+- **High-density multimodal terminal UI** — use a redesigned, compact interface
+  with a consistent dark/light palette, dense status and input surfaces, grouped
+  tool calls and reasoning, terminal image protocols, and a scrollable sidebar
+  for providers, MCP servers, skills, todos, tasks, diagnostics, and agents.
 - **Persistent sessions and context control** — resume UUID-keyed conversations,
   track per-turn token usage, queue pending messages, and compact older history
   without losing its summary.
@@ -329,7 +329,8 @@ denied_read_paths = []
 denied_environment = []
 
 # Rules use absolute globs or the portable `workspace/**` prefix. Explicit
-# denies take precedence over allows.
+# denies take precedence over configured allows; an explicit session approval
+# through request_permission overrides a matching deny for its approved scope.
 [[security.rules]]
 operation = "read"
 pattern = "/path/to/private/**"
@@ -383,7 +384,7 @@ api_key = "sk-your-key-here"
 | `security.sandbox.denied_read_paths` | `[]` | Paths sandboxed child processes must not read. |
 | `security.sandbox.denied_environment` | `[]` | Environment variable name globs removed from sandboxed child processes. An empty list inherits the complete parent environment. |
 
-`request_permission` refuses filesystem access requests when the sandbox is off. Sandbox-mode requests may only relax isolation (for example, `restricted` → `network`); requests that would make the current mode stricter are rejected without prompting.
+`request_permission` supports read or write filesystem requests even when the process sandbox is off. Sandbox-mode requests may only relax isolation (for example, `restricted` → `network`); requests that would make the current mode stricter are rejected without prompting, including when another approval widens the mode while an older prompt is waiting. Filesystem grants are scoped to one operation and explicitly override matching configured deny rules: granting an existing directory covers that directory and its descendants for the session, while granting a file covers only that exact file. The OS process sandbox can express only subtree read or read-write access, so it fails closed instead of widening a grant: exact-file grants remain limited to built-in tools while sandboxing is enabled, and a directory is writable by child processes only after separate recursive read and write grants cover it. When process sandboxing is off, filesystem grants authorize built-in path tools but do not constrain commands or tasks. Approved paths are re-canonicalized before storage, and propagated directory paths are re-canonicalized again, rejecting redirections already visible at those checks. Enforcement remains pathname-based and is not an atomic defense against a hostile process replacing path components between a check and later grant propagation or file I/O.
 
 Each provider is a `[providers.<name>]` section. You can add as many as you want.
 
@@ -563,18 +564,80 @@ Zero input-token reports do not erase the last known positive context-size count
 | `Ctrl+T` | Cycle work mode (Manual → Auto → Plan → optional YOLO) |
 | `Ctrl+C` / `Ctrl+Q` twice | Quit |
 | `Ctrl+V` | Paste an image from the clipboard |
-| Mouse scroll | Scroll conversation history |
+| Mouse scroll | Scroll the conversation, sidebar, or active interactive panel under the pointer |
 | `!<command>` + `Enter` | Run a command interactively in a terminal panel (Ctrl+O releases input) |
 
-### Markdown links
+### Mouse interaction
 
-Click a rendered inline HTTP(S) Markdown link in an assistant message to open
-it in your default browser. The underlined project GitHub URL in the welcome
-card is also clickable. Dragging still selects text and never opens a link.
-This works with wrapped/scrolled text and either theme. With `/select on`, mouse
-handling belongs to the terminal instead. Reference links, bare URLs, reasoning
-and tool detail panes are not currently clickable; ambiguous duplicate labels
-are deliberately ignored rather than opening the wrong destination.
+The redesigned high-density interface routes the mouse to the surface under the
+pointer:
+
+- Use the wheel over the conversation or sidebar to scroll that surface. The
+  wheel also scrolls the sub-agent conversation and active list-style overlays.
+  When the conversation is longer than its viewport, drag the right-margin
+  scrollbar thumb; clicking its track jumps to that position and starts a drag.
+- Drag over conversation text to select it; releasing copies the selected text
+  to the system clipboard and leaves it highlighted. Dragging at the top or
+  bottom edge extends the selection while scrolling. Click `⧉ copy` on a code
+  block to copy that block directly. Successful copies briefly show `Copied`.
+- Click a decoded inline image to open the modal viewer. Use `+`/`-` or the
+  wheel to zoom from 50% to 800% of the fitted size; the title reports the
+  actual on-screen scale relative to the source pixels. Use arrow keys or
+  left-button drag to pan, `0` to reset to fit, and `Esc` to close. Kitty
+  uploads the source once and replaces one native cropped placement while zooming or panning;
+  other native protocols use a lower-detail drag preview and restore the
+  full-quality crop on release. Remote image URLs are not fetched synchronously
+  for preview.
+- Click a rendered inline HTTP(S) Markdown link in an assistant message to open
+  it in the default browser. The underlined project GitHub URL in the welcome
+  card is also clickable. A drag is treated as selection, not as a link click.
+- In the sidebar, click section headings to collapse or expand them, todo rows
+  to toggle status, task rows to show or hide output, and agent rows to open the
+  agent's live conversation. Drag the sidebar's left divider to resize the
+  layout live; the main conversation keeps a minimum usable width.
+- Click visible footer controls to cycle the work mode, open security or
+  diagnostics management, start model selection, or cycle the reasoning effort
+  independently; the selected effort is saved with the session.
+- Choice questions, tool approvals, plan review, completion suggestions, and the
+  todo overlay accept wheel navigation and/or direct row clicks where a choice
+  is shown. Clicking a completion inserts it into the input without immediately
+  submitting the resulting command.
+- Tool groups and usage summaries are clickable across their full cards.
+  Expanded tool and reasoning members are indented child cards with their own
+  full-card hover, pressed, and fold behavior; embedded code-block copy controls
+  keep priority.
+
+Interactive rows and cards use the same lightweight terminal feedback: hover
+fades through three semantic palette steps over 120 ms, while mouse-down uses a
+stronger pressed state. TUI pointer moves are collapsed to the latest position
+and presented by the existing periodic frame instead of forcing a full redraw
+for every terminal motion report; only an active transition requests short-lived
+coalesced redraws. Embedded terminal mouse input remains unthrottled.
+
+Selection and link hit-testing account for wrapped and scrolled conversation
+text. With `/select on`, the terminal owns mouse selection instead, so these
+application-level mouse actions are unavailable. Reference links and bare URLs
+inside reasoning or tool details are not currently link targets; ambiguous
+duplicate labels are deliberately ignored rather than opening the wrong destination.
+
+### Markdown diagrams and math
+
+Fenced `mermaid` blocks render supported Mermaid diagrams directly in the
+terminal rather than requiring a browser. Mermaid support is intentionally a
+subset of the full language. Because wide or cyclic `LR`/`RL` flowcharts do not
+route reliably in a character-cell canvas, they use a compact edge-list fallback
+that preserves labels and branches and marks feedback edges with `↩`. `mindmap`
+blocks use a lightweight fallback that turns indentation into a readable terminal
+tree; it preserves the hierarchy and labels but does not implement Mermaid's
+complete mindmap layout or styling.
+
+Math-like Markdown is also made more readable in the terminal. Inline `$...$`,
+display `$$...$$`, and fenced `math`, `tex`, or `latex` blocks convert common
+LaTeX-like commands into Unicode symbols, including Greek letters, operators,
+arrows, and simple numeric superscripts/subscripts. Fractions are displayed in
+linear `(numerator)/(denominator)` form. This is terminal symbol conversion, not
+full TeX typesetting: it does not provide TeX layout, macro expansion, or the
+complete LaTeX command set, and unsupported notation may remain literal.
 
 ### Batch file edits
 

@@ -18,6 +18,7 @@ use crate::response::partial_response::PartialResponse;
 use async_openai::types::responses::{InputParam, OutputItem, ResponseStreamEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
+use ratatui::style::Modifier;
 use ratatui::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
 use std::collections::{HashMap, HashSet};
@@ -27,7 +28,7 @@ use unicode_width::UnicodeWidthStr;
 use super::live_markdown::{
     IncrementalMarkdownParagraph, LiveMarkdownJob, LiveMarkdownSnapshot, LiveMarkdownWorker,
 };
-use super::tool_group::MemberHeader;
+use super::tool_group::{MEMBER_INDENT, MemberHeader};
 use crate::ui::components::messages::pending_message::PendingMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
@@ -105,8 +106,15 @@ fn find_copy_button(buttons: &[CodeCopyButton], row: u16, x: u16) -> Option<Stri
         .map(|b| b.content.clone())
 }
 
+fn find_copy_button_bounds(buttons: &[CodeCopyButton], row: u16, x: u16) -> Option<(u16, u16)> {
+    buttons
+        .iter()
+        .find(|button| button.row == row && x >= button.x_start && x < button.x_end)
+        .map(|button| (button.x_start, button.x_end))
+}
+
 /// Whether an item has collapsible detail the user can click to expand.
-fn is_foldable(item: &MessageItem) -> bool {
+pub(crate) fn is_foldable(item: &MessageItem) -> bool {
     matches!(
         item,
         MessageItem::Output(OutputItem::Reasoning(_))
@@ -138,9 +146,15 @@ pub(crate) struct CachedParagraph {
     /// For tool-call items: whether the matching result was already available
     /// when this entry was built, so it can be rebuilt when the result arrives.
     pub has_output: bool,
+    /// Animation modifier applied to a pending tool or tool-group title. This
+    /// keeps cached paragraphs stable between animation phase changes.
+    pub tool_title_modifier: Modifier,
     /// Clickable copy hotspots for the item's code blocks, relative to the
     /// paragraph's top-left corner.
     pub copy_buttons: Arc<Vec<CodeCopyButton>>,
+    /// Whether this history item has collapsible details. Every row in a
+    /// foldable item toggles it unless a more specific embedded control wins.
+    pub foldable: bool,
     /// True when this entry's paragraph was skipped (only height estimated)
     /// to avoid expensive markdown rendering of far-offscreen items.
     pub lazy: bool,
@@ -208,6 +222,46 @@ pub(crate) struct ToolGroupLayout {
     pub live_index_base: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationPointerTarget {
+    JumpButton,
+    Scrollbar,
+    GroupHeader {
+        live: bool,
+        layout: usize,
+    },
+    GroupMember {
+        live: bool,
+        layout: usize,
+        member: usize,
+    },
+    HistoryItem {
+        index: usize,
+    },
+    LiveItem {
+        index: usize,
+    },
+    HistoryCopyButton {
+        index: usize,
+    },
+    LiveCopyButton {
+        index: usize,
+    },
+    Image {
+        image_id: usize,
+    },
+    Link {
+        fingerprint: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConversationPointerHit {
+    pub target: ConversationPointerTarget,
+    /// Rectangle in scroll-buffer coordinates; x is relative to `view_area`.
+    pub rect: Rect,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum LiveParagraphContent {
     Paragraph(Arc<Paragraph<'static>>),
@@ -224,6 +278,18 @@ impl LiveParagraphContent {
         match self {
             Self::Paragraph(_) => find_copy_button(fallback, row, x),
             Self::Incremental(paragraph) => paragraph.copy_button(row, x),
+        }
+    }
+
+    pub(crate) fn copy_button_bounds(
+        &self,
+        fallback: &[CodeCopyButton],
+        row: u16,
+        x: u16,
+    ) -> Option<(u16, u16)> {
+        match self {
+            Self::Paragraph(_) => find_copy_button_bounds(fallback, row, x),
+            Self::Incremental(paragraph) => paragraph.copy_button_bounds(row, x),
         }
     }
 }
@@ -287,6 +353,8 @@ pub(crate) enum CachedLiveSlot {
 pub(crate) struct LiveRenderCache {
     pub response_revision: u64,
     pub content_width: u16,
+    pub tool_title_modifier: Modifier,
+    pub animates_tool_titles: bool,
     pub conversation_len: usize,
     pub conversation_mutation_version: u64,
     pub expanded_items: HashSet<usize>,
@@ -344,6 +412,8 @@ pub enum SelectionEnd {
     Copied(String),
     /// A safe Markdown destination captured at button-down.
     Link(String),
+    /// A rendered data-URL image captured at button-down.
+    Image(usize),
 }
 
 #[derive(Debug, Default)]
@@ -414,6 +484,10 @@ impl ConversationScrollState {
         self.offset = self.max_offset();
     }
 
+    pub(crate) fn set_offset(&mut self, offset: u16) {
+        self.offset = offset.min(self.max_offset());
+    }
+
     pub(crate) fn is_at_bottom(&self) -> bool {
         self.offset >= self.max_offset()
     }
@@ -421,6 +495,11 @@ impl ConversationScrollState {
     fn max_offset(&self) -> u16 {
         self.content_height.saturating_sub(self.page_height)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarDrag {
+    grab_offset: u16,
 }
 
 #[derive(Debug)]
@@ -479,6 +558,7 @@ pub struct ConversationPanel {
     /// alongside `item_layout` so clicks on streaming items can be mapped.
     live_item_layout: Vec<(usize, u16, u16)>,
     pub(crate) render_cache: RenderCache,
+    pub(crate) image_previews: Arc<crate::ui::image_preview::ImagePreviewStore>,
     pub(crate) viewport_paragraph_cache: ViewportParagraphCache,
     /// Monotonic frame counter, incremented every render. Drives the animated
     /// "Thinking..." dots on the live reasoning indicator during streaming.
@@ -497,6 +577,12 @@ pub struct ConversationPanel {
     /// even though terminals only emit another drag event when the mouse moves.
     selection_drag_position: Option<(u16, u16)>,
     pressed_link: Option<String>,
+    pressed_image: Option<usize>,
+    image_placements: Vec<crate::ui::image_preview::ImagePlacement>,
+    copied_at: Option<std::time::Instant>,
+    pointer_position: Option<(u16, u16)>,
+    pointer_pressed: Option<ConversationPointerTarget>,
+    pointer_animation: crate::ui::interaction::InteractionAnimation,
     /// The streaming items' paragraphs from the last render (paragraph, height,
     /// copy buttons). Exploring-group entries are moved forward unchanged on a
     /// cache hit; all entries are also kept for selection and copy-button clicks.
@@ -554,6 +640,12 @@ pub struct ConversationPanel {
     /// content arriving while the user is scrolled up (which counts as scroll
     /// activity for the auto-hiding scrollbar).
     pub(crate) last_content_height: u16,
+    /// Screen-space scrollbar geometry from the most recent frame. Geometry is
+    /// retained while the thumb is auto-hidden so moving onto its track can
+    /// reveal and drag it without first using the wheel.
+    scrollbar_track: Option<Rect>,
+    scrollbar_thumb: Option<Rect>,
+    scrollbar_drag: Option<ScrollbarDrag>,
 }
 
 impl ConversationPanel {
@@ -586,6 +678,7 @@ impl ConversationPanel {
             live_item_layout: Vec::new(),
             live_tool_group_layout: Vec::new(),
             render_cache: RenderCache::default(),
+            image_previews: Arc::new(crate::ui::image_preview::ImagePreviewStore::default()),
             viewport_paragraph_cache: ViewportParagraphCache::default(),
             frame_count: 0,
             live_expanded_items: HashSet::new(),
@@ -593,6 +686,12 @@ impl ConversationPanel {
             selection: None,
             selection_drag_position: None,
             pressed_link: None,
+            pressed_image: None,
+            image_placements: Vec::new(),
+            copied_at: None,
+            pointer_position: None,
+            pointer_pressed: None,
+            pointer_animation: crate::ui::interaction::InteractionAnimation::default(),
             live_paragraphs: Vec::new(),
             live_group_headers: Vec::new(),
             live_render_cache: None,
@@ -612,6 +711,9 @@ impl ConversationPanel {
             live_explore_cache_hits: 0,
             pending_layout: None,
             last_content_height: 0,
+            scrollbar_track: None,
+            scrollbar_thumb: None,
+            scrollbar_drag: None,
         }
     }
 
@@ -633,6 +735,413 @@ impl ConversationPanel {
         self.live_tool_group_layout = live_tool_group_layout;
     }
 
+    pub(crate) fn set_image_placements(
+        &mut self,
+        placements: Vec<crate::ui::image_preview::ImagePlacement>,
+    ) {
+        self.image_placements = placements;
+    }
+
+    /// Drop the marker registry and every pointer artifact that refers to its
+    /// numeric image ids. These must move together because a fresh registry
+    /// starts allocating ids from zero again.
+    pub(crate) fn invalidate_image_previews(&mut self) {
+        self.image_previews.clear();
+        self.viewport_paragraph_cache = ViewportParagraphCache::default();
+        self.image_placements.clear();
+        // Paragraph markers, hit regions, and the semantic target captured on
+        // mouse-down are one generation. If any side is rebuilt, cancel the
+        // whole gesture rather than letting mouse-up activate reused ids.
+        self.selection = None;
+        self.selection_drag_position = None;
+        self.pressed_link = None;
+        self.pressed_image = None;
+        self.pointer_pressed = None;
+        self.pointer_animation.cancel();
+    }
+
+    pub(crate) fn image_viewer(
+        &self,
+        image_id: usize,
+    ) -> Option<crate::ui::image_preview::ImageViewer> {
+        self.image_previews.viewer(image_id)
+    }
+
+    pub(crate) fn update_scrollbar_geometry(&mut self, track: Rect) {
+        if track.width == 0
+            || track.height == 0
+            || self.scroll_view_state.content_height <= self.scroll_view_state.page_height
+        {
+            self.scrollbar_track = None;
+            self.scrollbar_thumb = None;
+            self.scrollbar_drag = None;
+            return;
+        }
+        let page = u32::from(self.scroll_view_state.page_height);
+        let content = u32::from(self.scroll_view_state.content_height);
+        let thumb_height = ((u32::from(track.height) * page) / content)
+            .max(1)
+            .min(u32::from(track.height)) as u16;
+        let travel = track.height.saturating_sub(thumb_height);
+        let max_offset = self.scroll_view_state.max_offset();
+        let thumb_top = if max_offset == 0 {
+            0
+        } else {
+            (u32::from(travel) * u32::from(self.scroll_view_state.offset) / u32::from(max_offset))
+                as u16
+        };
+        self.scrollbar_track = Some(track);
+        self.scrollbar_thumb = Some(Rect::new(
+            track.x,
+            track.y.saturating_add(thumb_top),
+            track.width,
+            thumb_height,
+        ));
+    }
+
+    pub(crate) fn scrollbar_thumb(&self) -> Option<Rect> {
+        self.scrollbar_thumb
+    }
+
+    pub(crate) fn scrollbar_hovered(&self) -> bool {
+        self.pointer_position
+            .is_some_and(|(column, row)| self.scrollbar_hit(column, row))
+    }
+
+    pub(crate) fn scrollbar_pressed(&self) -> bool {
+        self.scrollbar_hovered()
+            && self.pointer_pressed == Some(ConversationPointerTarget::Scrollbar)
+    }
+
+    fn scrollbar_hit(&self, column: u16, row: u16) -> bool {
+        self.scrollbar_track
+            .is_some_and(|track| track.contains((column, row).into()))
+    }
+
+    pub(crate) fn begin_scrollbar_drag(&mut self, column: u16, row: u16) -> bool {
+        let (Some(track), Some(thumb)) = (self.scrollbar_track, self.scrollbar_thumb) else {
+            return false;
+        };
+        if !track.contains((column, row).into()) {
+            return false;
+        }
+        let grab_offset = if thumb.contains((column, row).into()) {
+            row.saturating_sub(thumb.y)
+        } else {
+            thumb.height / 2
+        };
+        self.scrollbar_drag = Some(ScrollbarDrag { grab_offset });
+        self.drag_scrollbar(row);
+        true
+    }
+
+    pub(crate) fn drag_scrollbar(&mut self, row: u16) -> bool {
+        let (Some(drag), Some(track), Some(thumb)) = (
+            self.scrollbar_drag,
+            self.scrollbar_track,
+            self.scrollbar_thumb,
+        ) else {
+            return false;
+        };
+        let travel = track.height.saturating_sub(thumb.height);
+        let desired_top = row
+            .saturating_sub(track.y)
+            .saturating_sub(drag.grab_offset)
+            .min(travel);
+        let max_offset = self.scroll_view_state.max_offset();
+        let offset = if travel == 0 {
+            0
+        } else {
+            ((u32::from(desired_top) * u32::from(max_offset) + u32::from(travel / 2))
+                / u32::from(travel)) as u16
+        };
+        self.scroll_view_state.set_offset(offset);
+        self.stick_to_bottom = self.scroll_view_state.is_at_bottom();
+        self.note_scroll_activity();
+        self.update_scrollbar_geometry(track);
+        true
+    }
+
+    pub(crate) fn end_scrollbar_drag(&mut self) -> bool {
+        self.scrollbar_drag.take().is_some()
+    }
+
+    pub(crate) fn scrollbar_dragging(&self) -> bool {
+        self.scrollbar_drag.is_some()
+    }
+
+    fn image_at_screen(&self, column: u16, row: u16) -> Option<usize> {
+        self.image_placements
+            .iter()
+            .find(|placement| placement.area.contains((column, row).into()))
+            .map(|placement| placement.image_id)
+    }
+
+    pub(super) fn screen_cell_is_image(&self, column: u16, row: u16) -> bool {
+        self.image_at_screen(column, row).is_some()
+    }
+
+    fn pointer_hit_buffer(&self, x: u16, y: u16) -> Option<ConversationPointerHit> {
+        if let Some(placement) = self.image_placements.iter().find(|placement| {
+            let relative_x = placement.area.x.saturating_sub(self.view_area.x);
+            let buffer_y = placement
+                .area
+                .y
+                .saturating_sub(self.view_area.y)
+                .saturating_add(self.view_offset);
+            x >= relative_x
+                && x < relative_x.saturating_add(placement.area.width)
+                && y >= buffer_y
+                && y < buffer_y.saturating_add(placement.area.height)
+        }) {
+            let relative_x = placement.area.x.saturating_sub(self.view_area.x);
+            let buffer_y = placement
+                .area
+                .y
+                .saturating_sub(self.view_area.y)
+                .saturating_add(self.view_offset);
+            return Some(ConversationPointerHit {
+                target: ConversationPointerTarget::Image {
+                    image_id: placement.image_id,
+                },
+                rect: Rect::new(
+                    relative_x,
+                    buffer_y,
+                    placement.area.width,
+                    placement.area.height,
+                ),
+            });
+        }
+        if let Some(url) = self.link_at(x, y) {
+            let hash = blake3::hash(url.as_bytes());
+            let bytes = hash.as_bytes();
+            let fingerprint = u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            return Some(ConversationPointerHit {
+                target: ConversationPointerTarget::Link { fingerprint },
+                rect: Rect::new(x, y, 1, 1),
+            });
+        }
+        let live_item = self
+            .live_item_layout
+            .iter()
+            .find(|&&(_, top, bottom)| y >= top && y < bottom)
+            .copied();
+        // Controls embedded in a card take priority over both its nested member
+        // and its outer group. The target rectangle stays limited to the label.
+        if let Some((index, top, _)) = live_item
+            && let Some((start, end)) =
+                self.live_paragraphs
+                    .get(index)
+                    .and_then(|(paragraph, _, buttons)| {
+                        paragraph.copy_button_bounds(buttons, y - top, x)
+                    })
+        {
+            return Some(ConversationPointerHit {
+                target: ConversationPointerTarget::LiveCopyButton { index },
+                rect: Rect::new(start, y, end.saturating_sub(start), 1),
+            });
+        }
+
+        for (layout, group) in self.live_tool_group_layout.iter().enumerate() {
+            if let Some((member, header)) = group
+                .member_headers
+                .iter()
+                .enumerate()
+                .find(|(_, header)| x >= MEMBER_INDENT && y >= header.top && y < header.bottom)
+            {
+                return Some(ConversationPointerHit {
+                    target: ConversationPointerTarget::GroupMember {
+                        live: true,
+                        layout,
+                        member,
+                    },
+                    rect: Rect::new(
+                        MEMBER_INDENT,
+                        header.top,
+                        self.view_area.width.saturating_sub(MEMBER_INDENT),
+                        header.bottom - header.top,
+                    ),
+                });
+            }
+            if y >= group.top && y < group.bottom {
+                return Some(ConversationPointerHit {
+                    target: ConversationPointerTarget::GroupHeader { live: true, layout },
+                    rect: Rect::new(0, group.top, self.view_area.width, group.bottom - group.top),
+                });
+            }
+        }
+
+        if let Some((index, top, bottom)) = live_item {
+            let foldable = self.receiving_response.as_ref().is_some_and(|response| {
+                response
+                    .message_item_refs()
+                    .get(index)
+                    .is_some_and(|(item, _)| {
+                        matches!(item, OutputItem::Reasoning(_) | OutputItem::FunctionCall(_))
+                    })
+            });
+            if foldable {
+                return Some(ConversationPointerHit {
+                    target: ConversationPointerTarget::LiveItem { index },
+                    rect: Rect::new(0, top, self.view_area.width, bottom - top),
+                });
+            }
+        }
+
+        let history_item = self
+            .item_layout
+            .iter()
+            .find(|&&(_, top, bottom)| y >= top && y < bottom)
+            .copied();
+        if let Some((index, top, _)) = history_item
+            && let Some(entry) = self.render_cache.entries.get(index)
+            && let Some((start, end)) =
+                entry
+                    .paragraph
+                    .copy_button_bounds(&entry.copy_buttons, y - top, x)
+        {
+            return Some(ConversationPointerHit {
+                target: ConversationPointerTarget::HistoryCopyButton { index },
+                rect: Rect::new(start, y, end.saturating_sub(start), 1),
+            });
+        }
+
+        for (layout, group) in self.tool_group_layout.iter().enumerate() {
+            if let Some((member, header)) = group
+                .member_headers
+                .iter()
+                .enumerate()
+                .find(|(_, header)| x >= MEMBER_INDENT && y >= header.top && y < header.bottom)
+            {
+                return Some(ConversationPointerHit {
+                    target: ConversationPointerTarget::GroupMember {
+                        live: false,
+                        layout,
+                        member,
+                    },
+                    rect: Rect::new(
+                        MEMBER_INDENT,
+                        header.top,
+                        self.view_area.width.saturating_sub(MEMBER_INDENT),
+                        header.bottom - header.top,
+                    ),
+                });
+            }
+            if y >= group.top && y < group.bottom {
+                return Some(ConversationPointerHit {
+                    target: ConversationPointerTarget::GroupHeader {
+                        live: false,
+                        layout,
+                    },
+                    rect: Rect::new(0, group.top, self.view_area.width, group.bottom - group.top),
+                });
+            }
+        }
+
+        if let Some((index, top, bottom)) = history_item
+            && self
+                .render_cache
+                .entries
+                .get(index)
+                .is_some_and(|entry| entry.foldable)
+        {
+            return Some(ConversationPointerHit {
+                target: ConversationPointerTarget::HistoryItem { index },
+                rect: Rect::new(0, top, self.view_area.width, bottom - top),
+            });
+        }
+        None
+    }
+
+    pub(crate) fn pointer_hit_screen(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<ConversationPointerHit> {
+        let (x, y) = self.to_buffer_pos(column, row, false)?;
+        self.pointer_hit_buffer(x, y)
+    }
+
+    pub(crate) fn pointer_hit(&self) -> Option<ConversationPointerHit> {
+        let (column, row) = self.pointer_position?;
+        self.pointer_hit_screen(column, row)
+    }
+
+    fn pointer_target_screen(&self, column: u16, row: u16) -> Option<ConversationPointerTarget> {
+        if self.jump_button_hit(column, row) {
+            Some(ConversationPointerTarget::JumpButton)
+        } else if self.scrollbar_hit(column, row) {
+            Some(ConversationPointerTarget::Scrollbar)
+        } else {
+            self.pointer_hit_screen(column, row).map(|hit| hit.target)
+        }
+    }
+
+    fn pointer_target(&self) -> Option<ConversationPointerTarget> {
+        let (column, row) = self.pointer_position?;
+        self.pointer_target_screen(column, row)
+    }
+
+    pub(crate) fn hovered_image_id(&self) -> Option<usize> {
+        let (column, row) = self.pointer_position?;
+        self.image_at_screen(column, row)
+    }
+
+    pub(crate) fn pointer_is_pressed(&self, target: ConversationPointerTarget) -> bool {
+        self.pointer_pressed == Some(target)
+    }
+
+    pub(crate) fn pointer_moved(&mut self, column: u16, row: u16) {
+        let previous = self.pointer_target();
+        let next = self.pointer_target_screen(column, row);
+        self.pointer_position = Some((column, row));
+        if previous != next {
+            if next.is_some_and(|target| !matches!(target, ConversationPointerTarget::Image { .. }))
+            {
+                self.pointer_animation.restart();
+            } else {
+                // Protocol-rendered image cells encode their pixels in the
+                // foreground/background colors. A card-style hover fill would
+                // visibly corrupt the image, so images keep their native cells.
+                self.pointer_animation.cancel();
+            }
+        }
+    }
+
+    pub(crate) fn pointer_down(&mut self, column: u16, row: u16) {
+        self.pointer_moved(column, row);
+        self.pointer_pressed = self.pointer_target_screen(column, row);
+        if self.pointer_pressed.is_some() {
+            self.pointer_animation.cancel();
+        }
+    }
+
+    pub(crate) fn pointer_dragged(&mut self, column: u16, row: u16) {
+        self.pointer_moved(column, row);
+        self.pointer_pressed = None;
+    }
+
+    pub(crate) fn pointer_up(&mut self, column: u16, row: u16) {
+        self.pointer_moved(column, row);
+        self.pointer_pressed = None;
+    }
+
+    pub(crate) fn clear_pointer_feedback(&mut self) {
+        self.pointer_position = None;
+        self.pointer_pressed = None;
+        self.pointer_animation.cancel();
+    }
+
+    pub(crate) fn pointer_hover_background(&self) -> ratatui::style::Color {
+        self.pointer_animation.hover_background()
+    }
+
+    pub(crate) fn interaction_animation_active(&self) -> bool {
+        self.pointer_animation.active()
+    }
+
     /// Handles a left click at the given screen coordinates: if it lands on a
     /// foldable item (finished or live), toggle that item's expanded state.
     pub fn handle_click(&mut self, column: u16, row: u16) -> Result<(), &'static str> {
@@ -646,27 +1155,36 @@ impl ConversationPanel {
     /// releases use the position captured on button-down so a render between
     /// down and up cannot redirect the click to a different item.
     pub fn handle_buffer_click(&mut self, x_rel: u16, buffer_y: u16) -> Result<(), &'static str> {
-        // Live groups sit after finished content in the scroll buffer; check
-        // their member hit regions before the flat live-item layout so a click
-        // on the header row toggles the group and a click on a member row
-        // toggles that member.
+        // Controls embedded in a live card win over both nested and outer-card
+        // disclosure. This includes copy buttons inside grouped reasoning.
+        let live_item = self
+            .live_item_layout
+            .iter()
+            .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
+            .copied();
+        if let Some((live_idx, top, _)) = live_item
+            && let Some(content) =
+                self.live_paragraphs
+                    .get(live_idx)
+                    .and_then(|(paragraph, _, buttons)| {
+                        paragraph.copy_button(buttons, buffer_y - top, x_rel)
+                    })
+        {
+            return self.copy_code_block(&content);
+        }
+
+        // Live groups own their complete card. Nested members take priority
+        // inside the indented child column; every other point toggles the
+        // outer group. A drag never reaches this click path, so details remain
+        // selectable even though stationary clicks fold the card.
         if let Some(group) = self
             .live_tool_group_layout
             .iter()
             .find(|group| buffer_y >= group.top && buffer_y < group.bottom)
         {
-            if buffer_y == group.top {
-                let key = group.key.clone();
-                if !self.live_expanded_groups.remove(&key)
-                    && !self.expanded_tool_groups.remove(&key)
-                {
-                    self.live_expanded_groups.insert(key);
-                }
-            } else if let Some(header) = group
-                .member_headers
-                .iter()
-                .find(|header| buffer_y >= header.top && buffer_y < header.bottom)
-            {
+            if let Some(header) = group.member_headers.iter().find(|header| {
+                x_rel >= MEMBER_INDENT && buffer_y >= header.top && buffer_y < header.bottom
+            }) {
                 let index = header.index;
                 if let Some(base) = group.live_index_base
                     && index >= base
@@ -678,6 +1196,13 @@ impl ConversationPanel {
                 } else if !self.expanded_items.remove(&index) {
                     self.expanded_items.insert(index);
                 }
+            } else {
+                let key = group.key.clone();
+                if !self.live_expanded_groups.remove(&key)
+                    && !self.expanded_tool_groups.remove(&key)
+                {
+                    self.live_expanded_groups.insert(key);
+                }
             }
             return Ok(());
         }
@@ -685,89 +1210,88 @@ impl ConversationPanel {
         // Live items sit after finished items in the scroll buffer; check them
         // first so they take priority when layout ranges overlap (they shouldn't,
         // but this is the safer ordering).
-        if let Some(&(live_idx, top, _)) = self
-            .live_item_layout
-            .iter()
-            .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
-        {
-            let hit = self
-                .live_paragraphs
-                .get(live_idx)
-                .and_then(|(paragraph, _, buttons)| {
-                    paragraph.copy_button(buttons, buffer_y - top, x_rel)
-                });
-            if let Some(content) = hit {
-                return Self::copy_code_block(&content);
-            }
-            if !self.live_expanded_items.remove(&live_idx) {
+        if let Some((live_idx, _, _)) = live_item {
+            let foldable = self.receiving_response.as_ref().is_some_and(|response| {
+                response
+                    .message_item_refs()
+                    .get(live_idx)
+                    .is_some_and(|(item, _)| {
+                        matches!(item, OutputItem::Reasoning(_) | OutputItem::FunctionCall(_))
+                    })
+            });
+            if foldable && !self.live_expanded_items.remove(&live_idx) {
                 self.live_expanded_items.insert(live_idx);
             }
             return Ok(());
         }
 
-        // A grouped entry owns its full extent. The first row toggles the
-        // outer group; when open, each nested call header toggles that call's
-        // existing detail state. Clicking result text is left to selection.
+        let history_item = self
+            .item_layout
+            .iter()
+            .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
+            .copied();
+        if let Some((index, top, _)) = history_item
+            && let Some(content) = self.render_cache.entries.get(index).and_then(|entry| {
+                entry
+                    .paragraph
+                    .copy_button(&entry.copy_buttons, buffer_y - top, x_rel)
+            })
+        {
+            return self.copy_code_block(&content);
+        }
+
+        // A grouped entry owns its full extent. Indented child cards take
+        // priority; the remaining area toggles the outer card.
         if let Some(group) = self
             .tool_group_layout
             .iter()
             .find(|group| buffer_y >= group.top && buffer_y < group.bottom)
         {
-            if buffer_y == group.top {
-                let key = group.key.clone();
-                if !self.expanded_tool_groups.remove(&key) {
-                    self.expanded_tool_groups.insert(key);
-                }
-            } else if let Some(header) = group
-                .member_headers
-                .iter()
-                .find(|header| buffer_y >= header.top && buffer_y < header.bottom)
-            {
+            if let Some(header) = group.member_headers.iter().find(|header| {
+                x_rel >= MEMBER_INDENT && buffer_y >= header.top && buffer_y < header.bottom
+            }) {
                 let index = header.index;
                 if !self.expanded_items.remove(&index) {
                     self.expanded_items.insert(index);
+                }
+            } else {
+                let key = group.key.clone();
+                if !self.expanded_tool_groups.remove(&key) {
+                    self.expanded_tool_groups.insert(key);
                 }
             }
             return Ok(());
         }
 
-        if let Some(&(index, top, _)) = self
-            .item_layout
-            .iter()
-            .find(|&&(_, top, bottom)| buffer_y >= top && buffer_y < bottom)
-        {
-            let hit = self.render_cache.entries.get(index).and_then(|entry| {
-                entry
-                    .paragraph
-                    .copy_button(&entry.copy_buttons, buffer_y - top, x_rel)
-            });
-            if let Some(content) = hit {
-                return Self::copy_code_block(&content);
-            }
-            if self
-                .conversation
-                .lock()
-                .unwrap()
-                .items
+        if let Some((index, _, _)) = history_item
+            && self
+                .render_cache
+                .entries
                 .get(index)
-                .is_some_and(|item| {
-                    is_foldable(item)
-                        && (!matches!(item, MessageItem::Usage(..)) || buffer_y == top)
-                })
-                && !self.expanded_items.remove(&index)
-            {
-                self.expanded_items.insert(index);
-            }
+                .is_some_and(|entry| entry.foldable)
+            && !self.expanded_items.remove(&index)
+        {
+            self.expanded_items.insert(index);
         }
         Ok(())
     }
 
     /// Copies a code block's content to the clipboard, reporting failure.
-    fn copy_code_block(content: &str) -> Result<(), &'static str> {
+    fn copy_code_block(&mut self, content: &str) -> Result<(), &'static str> {
         if !crate::clipboard::copy(content) {
             return Err("failed to copy code block to clipboard");
         }
+        self.show_copied();
         Ok(())
+    }
+
+    pub(crate) fn show_copied(&mut self) {
+        self.copied_at = Some(std::time::Instant::now());
+    }
+
+    pub(crate) fn copied_visible(&self) -> bool {
+        self.copied_at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500))
     }
 
     /// Maps screen coordinates into scroll-buffer coordinates, clamping into
@@ -813,7 +1337,10 @@ impl ConversationPanel {
             if entry.lazy || entry.hidden || entry.tool_group.is_some() {
                 return None;
             }
-            let conversation = self.conversation.lock().ok()?;
+            // Pointer hover must never stall a frame behind the runner (or
+            // deadlock if a future render path accidentally retains its frame
+            // snapshot). A skipped hover can be recomputed on the next frame.
+            let conversation = self.conversation.try_lock().ok()?;
             let MessageItem::Output(OutputItem::Message(message)) =
                 conversation.items.get(index)?
             else {
@@ -867,8 +1394,12 @@ impl ConversationPanel {
     /// Left button pressed: start a potential selection at this point.
     pub fn selection_begin(&mut self, column: u16, row: u16) {
         self.selection_drag_position = None;
+        self.pressed_image = self.image_at_screen(column, row);
         self.pressed_link = self
-            .to_buffer_pos(column, row, false)
+            .pressed_image
+            .is_none()
+            .then(|| self.to_buffer_pos(column, row, false))
+            .flatten()
             .and_then(|(x, y)| self.link_at(x, y));
         self.selection = self.to_buffer_pos(column, row, false).map(|pos| Selection {
             anchor: pos,
@@ -878,9 +1409,20 @@ impl ConversationPanel {
         });
     }
 
+    /// Cancel an in-progress pointer gesture without preserving a partial selection.
+    pub(crate) fn cancel_pointer_gesture(&mut self) {
+        self.selection = None;
+        self.selection_drag_position = None;
+        self.pressed_link = None;
+        self.pressed_image = None;
+        self.scrollbar_drag = None;
+        self.clear_pointer_feedback();
+    }
+
     /// Mouse dragged with the left button held: extend the selection.
     pub fn selection_drag(&mut self, column: u16, row: u16) {
         self.pressed_link = None;
+        self.pressed_image = None;
         if let Some(selection) = self.selection.as_mut() {
             selection.dragging = true;
         }
@@ -941,8 +1483,24 @@ impl ConversationPanel {
             .selection
             .filter(|sel| !sel.dragging && sel.screen_anchor == (column, row))
         {
+            // Validate against the original buffer coordinate, not whatever a
+            // redraw placed under the physical cursor. This preserves harmless
+            // viewport movement while preventing a replaced target from being
+            // activated with stale mouse-down state.
+            let pressed_target = self.pointer_pressed;
+            let current_target = self
+                .pointer_hit_buffer(sel.anchor.0, sel.anchor.1)
+                .map(|hit| hit.target);
             self.selection = None;
             self.selection_drag_position = None;
+            if pressed_target != current_target {
+                self.pressed_image = None;
+                self.pressed_link = None;
+                return SelectionEnd::Ignored;
+            }
+            if let Some(image_id) = self.pressed_image.take() {
+                return SelectionEnd::Image(image_id);
+            }
             if let Some(url) = self.pressed_link.take() {
                 return SelectionEnd::Link(url);
             }
@@ -1056,8 +1614,10 @@ impl ConversationPanel {
         self.conversation.clone()
     }
 
-    /// History indices changed; discard index-keyed display state only.
+    /// History indices changed; discard every index-keyed display artifact.
     pub fn history_indices_changed(&mut self) {
+        self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         self.expanded_items.clear();
         self.invalidate_live_markdown();
     }
@@ -1120,6 +1680,8 @@ impl ConversationPanel {
 
     /// A summary was installed in history, shifting subsequent display indices.
     pub fn history_compacted(&mut self) {
+        self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
         self.invalidate_live_markdown();
@@ -1129,6 +1691,7 @@ impl ConversationPanel {
     /// Clear pending display state after the domain history was cleared.
     pub fn clear_view(&mut self) {
         self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         self.pending_message = None;
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
@@ -1143,6 +1706,7 @@ impl ConversationPanel {
     /// Reset display caches after replacing the domain history.
     pub fn history_restored(&mut self) {
         self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
         self.invalidate_live_markdown();
@@ -1151,6 +1715,11 @@ impl ConversationPanel {
 
     pub fn history_truncated(&mut self) {
         self.abort_receiving();
+        // The remaining item indices and their image-marker paragraphs may
+        // have changed. Drop both sides together so cached markers never point
+        // into a freshly cleared registry.
+        self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         // `abort_receiving` intentionally preserves committed hand-offs when
         // there is no active response. Truncation changes absolute item
         // indices, so discard those hand-offs explicitly.
@@ -1654,6 +2223,21 @@ impl ConversationPanel {
         })
     }
 
+    pub(crate) fn jump_button_hovered(&self) -> bool {
+        self.pointer_position
+            .is_some_and(|(column, row)| self.jump_button_hit(column, row))
+    }
+
+    pub(crate) fn jump_button_pressed(&self) -> bool {
+        self.jump_button_hovered()
+            && self.pointer_pressed == Some(ConversationPointerTarget::JumpButton)
+    }
+
+    pub(crate) fn jump_button_activates_at(&self, column: u16, row: u16) -> bool {
+        self.pointer_pressed == Some(ConversationPointerTarget::JumpButton)
+            && self.jump_button_hit(column, row)
+    }
+
     pub fn scroll_up(&mut self) {
         // Stop following the bottom so incoming content doesn't yank the view back.
         self.stick_to_bottom = false;
@@ -1906,6 +2490,36 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_track_click_and_drag_map_to_virtual_offset() {
+        let mut panel = ConversationPanel::new();
+        panel.scroll_view_state.update(1_000, 100);
+        panel.update_scrollbar_geometry(Rect::new(79, 5, 1, 20));
+
+        assert_eq!(panel.scrollbar_thumb(), Some(Rect::new(79, 5, 1, 2)));
+        assert!(panel.begin_scrollbar_drag(79, 15));
+        let middle = panel.scroll_view_state.offset().y;
+        assert!((400..=500).contains(&middle), "middle offset: {middle}");
+        assert!(panel.drag_scrollbar(24));
+        assert_eq!(panel.scroll_view_state.offset().y, 900);
+        assert!(panel.is_at_bottom());
+        assert!(panel.end_scrollbar_drag());
+        assert!(!panel.scrollbar_dragging());
+    }
+
+    #[test]
+    fn grabbing_scrollbar_thumb_preserves_its_relative_position() {
+        let mut panel = ConversationPanel::new();
+        panel.scroll_view_state.update(1_000, 100);
+        panel.update_scrollbar_geometry(Rect::new(79, 5, 1, 20));
+
+        assert!(panel.begin_scrollbar_drag(79, 6));
+        assert_eq!(panel.scroll_view_state.offset().y, 0);
+        assert!(panel.drag_scrollbar(24));
+        assert_eq!(panel.scroll_view_state.offset().y, 900);
+        assert!(panel.end_scrollbar_drag());
+    }
+
+    #[test]
     fn virtual_scroll_state_clamps_without_a_content_buffer() {
         let mut state = ConversationScrollState::default();
         state.update(10_000, 20);
@@ -1946,6 +2560,7 @@ mod tests {
             live_index_base: None,
         });
 
+        panel.pointer_down(3, 4);
         panel.selection_begin(3, 4);
         panel.view_offset = 24;
 
@@ -1956,6 +2571,266 @@ mod tests {
         panel.handle_buffer_click(column, row).unwrap();
         assert!(panel.expanded_items.contains(&7));
         assert!(!panel.expanded_items.contains(&9));
+    }
+
+    #[test]
+    fn tool_group_pointer_hits_full_parent_and_indented_child_cards_with_scrolling() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(6, 3, 40, 10);
+        panel.view_offset = 20;
+        panel.tool_group_layout.push(ToolGroupLayout {
+            key: "group".into(),
+            top: 23,
+            bottom: 30,
+            member_headers: vec![MemberHeader {
+                index: 7,
+                top: 25,
+                bottom: 28,
+            }],
+            live_index_base: None,
+        });
+
+        let group = panel.pointer_hit_screen(8, 6).unwrap();
+        assert_eq!(
+            group.target,
+            ConversationPointerTarget::GroupHeader {
+                live: false,
+                layout: 0
+            }
+        );
+        assert_eq!(group.rect, Rect::new(0, 23, 40, 7));
+
+        let member = panel.pointer_hit_screen(8, 9).unwrap();
+        assert_eq!(
+            member.target,
+            ConversationPointerTarget::GroupMember {
+                live: false,
+                layout: 0,
+                member: 0
+            }
+        );
+        assert_eq!(member.rect, Rect::new(MEMBER_INDENT, 25, 38, 3));
+
+        // The child's left gutter and the remaining group body still belong to
+        // the outer card, while a point outside the viewport hits nothing.
+        assert_eq!(panel.pointer_hit_screen(7, 9).unwrap().target, group.target);
+        assert!(panel.pointer_hit_screen(8, 13).is_none());
+
+        panel.handle_click(7, 9).unwrap();
+        assert!(panel.expanded_tool_groups.contains("group"));
+        assert!(!panel.expanded_items.contains(&7));
+        panel.handle_click(8, 9).unwrap();
+        assert!(panel.expanded_items.contains(&7));
+        assert!(panel.expanded_tool_groups.contains("group"));
+
+        panel.pointer_down(8, 9);
+        assert!(panel.pointer_is_pressed(member.target));
+        panel.pointer_dragged(9, 9);
+        assert!(!panel.pointer_is_pressed(member.target));
+    }
+
+    #[test]
+    fn image_preview_click_is_distinct_from_drag_selection() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(6, 3, 40, 10);
+        panel.view_offset = 20;
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 7,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+
+        let hit = panel.pointer_hit_screen(12, 7).expect("image hit");
+        assert_eq!(hit.target, ConversationPointerTarget::Image { image_id: 7 });
+        panel.pointer_moved(12, 7);
+        assert_eq!(panel.hovered_image_id(), Some(7));
+        assert!(
+            !panel.interaction_animation_active(),
+            "image pixels must not receive animated hover background colors"
+        );
+        panel.pointer_down(12, 7);
+        panel.selection_begin(12, 7);
+        assert!(matches!(panel.selection_end(12, 7), SelectionEnd::Image(7)));
+        panel.pointer_up(12, 7);
+
+        panel.pointer_down(12, 7);
+        panel.selection_begin(12, 7);
+        panel.selection_drag(13, 7);
+        assert!(matches!(
+            panel.selection_end(13, 7),
+            SelectionEnd::Copied(_)
+        ));
+    }
+
+    #[test]
+    fn invalidating_image_previews_cancels_a_pressed_image_id() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(6, 3, 40, 10);
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 0,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+        panel.pointer_down(12, 7);
+        panel.selection_begin(12, 7);
+
+        panel.invalidate_image_previews();
+        // A new registry may immediately reuse image id 0. The mouse-up from
+        // the old generation must not open whichever image inherited that id.
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 0,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+
+        assert!(!matches!(
+            panel.selection_end(12, 7),
+            SelectionEnd::Image(_)
+        ));
+    }
+
+    #[test]
+    fn a_target_created_after_mouse_down_is_not_activated() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(6, 3, 40, 10);
+        panel.pointer_down(12, 7);
+        panel.selection_begin(12, 7);
+
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 7,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+
+        assert!(matches!(panel.selection_end(12, 7), SelectionEnd::Ignored));
+    }
+
+    #[test]
+    fn replacing_a_pressed_target_cancels_activation() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(6, 3, 40, 10);
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 7,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+        panel.pointer_down(12, 7);
+        panel.selection_begin(12, 7);
+
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 8,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+
+        assert!(matches!(panel.selection_end(12, 7), SelectionEnd::Ignored));
+    }
+
+    #[test]
+    fn copied_feedback_has_a_bounded_visible_lifetime() {
+        let mut panel = ConversationPanel::new();
+        assert!(!panel.copied_visible());
+        panel.show_copied();
+        assert!(panel.copied_visible());
+        panel.copied_at = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(2))
+                .expect("test instant supports two-second subtraction"),
+        );
+        assert!(!panel.copied_visible());
+    }
+
+    #[test]
+    fn live_tool_and_copy_buttons_have_precise_pointer_targets() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(6, 3, 40, 10);
+        panel.view_offset = 20;
+        panel.live_tool_group_layout.push(ToolGroupLayout {
+            key: "live-group".into(),
+            top: 23,
+            bottom: 27,
+            member_headers: vec![MemberHeader {
+                index: 0,
+                top: 25,
+                bottom: 27,
+            }],
+            live_index_base: Some(0),
+        });
+        panel.live_item_layout.push((0, 23, 27));
+        panel.live_paragraphs.push((
+            LiveParagraphContent::Paragraph(Arc::new(Paragraph::new(""))),
+            4,
+            Arc::new(vec![CodeCopyButton {
+                row: 2,
+                x_start: 5,
+                x_end: 11,
+                content: "grouped live code".into(),
+            }]),
+        ));
+
+        let group = panel.pointer_hit_screen(8, 6).unwrap();
+        assert_eq!(
+            group.target,
+            ConversationPointerTarget::GroupHeader {
+                live: true,
+                layout: 0
+            }
+        );
+        let member = panel.pointer_hit_screen(8, 8).unwrap();
+        assert_eq!(
+            member.target,
+            ConversationPointerTarget::GroupMember {
+                live: true,
+                layout: 0,
+                member: 0
+            }
+        );
+
+        // An embedded control wins even where its row overlaps a nested card.
+        let live_copy = panel.pointer_hit_screen(12, 8).unwrap();
+        assert_eq!(
+            live_copy.target,
+            ConversationPointerTarget::LiveCopyButton { index: 0 }
+        );
+        assert_eq!(live_copy.rect, Rect::new(5, 25, 6, 1));
+
+        panel.live_tool_group_layout.clear();
+        assert!(panel.pointer_hit_screen(17, 8).is_none());
+
+        panel.live_item_layout.clear();
+        panel.tool_group_layout.push(ToolGroupLayout {
+            key: "history-group".into(),
+            top: 27,
+            bottom: 29,
+            member_headers: vec![MemberHeader {
+                index: 0,
+                top: 27,
+                bottom: 29,
+            }],
+            live_index_base: None,
+        });
+        panel.item_layout.push((0, 27, 29));
+        panel.render_cache.entries.push(CachedParagraph {
+            paragraph: LiveParagraphContent::Paragraph(Arc::new(Paragraph::new(""))),
+            height: 2,
+            hidden: false,
+            expanded: false,
+            has_output: false,
+            tool_title_modifier: Modifier::empty(),
+            copy_buttons: Arc::new(vec![CodeCopyButton {
+                row: 0,
+                x_start: 8,
+                x_end: 14,
+                content: "history code".into(),
+            }]),
+            foldable: false,
+            lazy: false,
+            tool_group: None,
+        });
+        let history_copy = panel.pointer_hit_screen(15, 10).unwrap();
+        assert_eq!(
+            history_copy.target,
+            ConversationPointerTarget::HistoryCopyButton { index: 0 }
+        );
+        assert_eq!(history_copy.rect, Rect::new(8, 27, 6, 1));
+        panel.pointer_down(15, 10);
+        assert!(panel.pointer_is_pressed(history_copy.target));
+        panel.pointer_dragged(16, 10);
+        assert!(!panel.pointer_is_pressed(history_copy.target));
     }
 
     #[test]

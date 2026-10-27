@@ -83,10 +83,7 @@ pub(super) fn program_invocation(
     for path in security.session_granted_paths(super::policy::AccessKind::Read) {
         builder = builder.read(path);
     }
-    for path in security.session_granted_paths(super::policy::AccessKind::Execute) {
-        builder = builder.exec(path);
-    }
-    for path in security.session_granted_paths(super::policy::AccessKind::Write) {
+    for path in security.session_read_write_paths() {
         builder = builder.read_write(path);
     }
 
@@ -263,25 +260,51 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let mut config = super::super::SecurityConfig::default();
         config.sandbox.enabled = true;
+        config.sandbox.allow_temp_write = false;
         let denied = root.join("secret");
         let readable = root.join("toolchain");
         config.sandbox.denied_read_paths = vec![denied.clone()];
         config.sandbox.readable_paths = vec![readable.clone()];
         let security = super::super::SecurityManager::new(config, root.clone()).unwrap();
-        let session_read =
-            std::env::temp_dir().join(format!("programmer-session-read-{}", uuid::Uuid::new_v4()));
-        let session_write =
-            std::env::temp_dir().join(format!("programmer-session-write-{}", uuid::Uuid::new_v4()));
+        let session_root = std::env::temp_dir().join(format!(
+            "programmer-session-sandbox-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session_read = session_root.join("read");
+        let session_write_only = session_root.join("write-only");
+        let session_read_write = session_root.join("read-write");
+        let session_exact_file = session_root.join("exact.txt");
+        for directory in [&session_read, &session_write_only, &session_read_write] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(&session_exact_file, b"exact").unwrap();
         security
-            .grant_path(super::super::policy::AccessKind::Read, &session_read)
+            .grant_path(super::super::policy::AccessKind::Read, &session_read, true)
             .unwrap();
         security
-            .grant_path(super::super::policy::AccessKind::Write, &session_write)
+            .grant_path(
+                super::super::policy::AccessKind::Write,
+                &session_write_only,
+                true,
+            )
             .unwrap();
+        for operation in [
+            super::super::policy::AccessKind::Read,
+            super::super::policy::AccessKind::Write,
+        ] {
+            security
+                .grant_path(operation, &session_read_write, true)
+                .unwrap();
+            security
+                .grant_path(operation, &session_exact_file, false)
+                .unwrap();
+        }
         let denied = security.resolve_path(denied).unwrap();
         let readable = security.resolve_path(readable).unwrap();
         let session_read = security.resolve_path(session_read).unwrap();
-        let session_write = security.resolve_path(session_write).unwrap();
+        let session_write_only = security.resolve_path(session_write_only).unwrap();
+        let session_read_write = security.resolve_path(session_read_write).unwrap();
+        let session_exact_file = security.resolve_path(session_exact_file).unwrap();
 
         let wrapped = invocation(&security, "echo test", None)
             .unwrap()
@@ -294,8 +317,12 @@ mod tests {
         assert!(policy.fs_deny_read.contains(&denied));
         assert!(policy.fs_read.contains(&readable));
         assert!(policy.fs_read.contains(&session_read));
-        assert!(policy.fs_read_write.contains(&session_write));
+        assert!(!policy.fs_read_write.contains(&session_write_only));
+        assert!(policy.fs_read_write.contains(&session_read_write));
+        assert!(!policy.fs_read.contains(&session_exact_file));
+        assert!(!policy.fs_read_write.contains(&session_exact_file));
         std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(session_root).unwrap();
     }
 
     #[test]

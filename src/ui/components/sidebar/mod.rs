@@ -75,6 +75,10 @@ pub struct Sidebar {
     /// Click map built by the last render: for each rendered line (after
     /// scrolling), what is clickable there.
     pub click_map: Vec<ClickTarget>,
+    /// View-relative pointer row for hover/pressed feedback.
+    pointer_hover_row: Option<u16>,
+    pointer_pressed_row: Option<u16>,
+    pointer_hover_background: ratatui::style::Color,
     /// Ids of background tasks whose output is expanded.
     expanded_tasks: std::collections::HashSet<u64>,
 }
@@ -117,12 +121,26 @@ impl Sidebar {
             scroll_offset: 0,
             has_focus: false,
             click_map: Vec::new(),
+            pointer_hover_row: None,
+            pointer_pressed_row: None,
+            pointer_hover_background: crate::ui::markdown_theme::palette::SURFACE_HOVER,
             expanded_tasks: std::collections::HashSet::new(),
         }
     }
 
     pub(crate) fn area(&self) -> Option<Rect> {
         self.area
+    }
+
+    pub(crate) fn set_pointer_rows(
+        &mut self,
+        hover: Option<u16>,
+        pressed: Option<u16>,
+        hover_background: ratatui::style::Color,
+    ) {
+        self.pointer_hover_row = hover;
+        self.pointer_pressed_row = pressed;
+        self.pointer_hover_background = hover_background;
     }
 
     /// Hidden panels must not retain hit targets from the previous frame.

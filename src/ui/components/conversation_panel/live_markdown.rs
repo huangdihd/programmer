@@ -220,6 +220,17 @@ impl IncrementalMarkdownParagraph {
         find_chunk_button(&self.tail_buttons, row, x, row_offset)
     }
 
+    pub(crate) fn copy_button_bounds(&self, row: u16, x: u16) -> Option<(u16, u16)> {
+        let mut row_offset = 0u16;
+        for chunk in self.stable_chunks() {
+            if let Some(bounds) = find_chunk_button_bounds(&chunk.buttons, row, x, row_offset) {
+                return Some(bounds);
+            }
+            row_offset = row_offset.saturating_add(chunk.lines.len() as u16);
+        }
+        find_chunk_button_bounds(&self.tail_buttons, row, x, row_offset)
+    }
+
     fn stable_chunks(&self) -> Vec<&StableMarkdownChunk> {
         let mut chunks = Vec::new();
         let mut current = self.stable.as_deref();
@@ -258,6 +269,20 @@ impl IncrementalMarkdownParagraph {
             visit(absolute_row, line);
         }
     }
+}
+
+fn find_chunk_button_bounds(
+    buttons: &[CodeCopyButton],
+    row: u16,
+    x: u16,
+    row_offset: u16,
+) -> Option<(u16, u16)> {
+    buttons
+        .iter()
+        .find(|button| {
+            row == row_offset.saturating_add(button.row) && x >= button.x_start && x < button.x_end
+        })
+        .map(|button| (button.x_start, button.x_end))
 }
 
 fn find_chunk_button(

@@ -13,7 +13,26 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::time::Instant;
+use ratatui::style::Modifier;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+pub(crate) const BREATH_STEP: Duration = Duration::from_millis(400);
+
+pub(crate) fn breath_modifier(elapsed: Duration) -> Modifier {
+    match (elapsed.as_millis() / BREATH_STEP.as_millis()) % 4 {
+        0 => Modifier::DIM,
+        2 => Modifier::BOLD,
+        _ => Modifier::empty(),
+    }
+}
+
+/// Shared phase for animated tool titles. Unlike a status timer, this survives
+/// status transitions so every pending title changes in lockstep.
+pub(crate) fn tool_title_modifier() -> Modifier {
+    static START: OnceLock<Instant> = OnceLock::new();
+    breath_modifier(START.get_or_init(Instant::now).elapsed())
+}
 
 /// What the agent is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

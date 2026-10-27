@@ -21,6 +21,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 pub const NAME: &str = "command";
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const STOP_GRACE: Duration = Duration::from_secs(1);
 
 /// Snapshot the live (still-running) output for a command tool call, cleaned of
 /// terminal control sequences, or `None` if that call isn't currently running.
@@ -37,8 +39,9 @@ pub fn tool() -> Tool {
          combined stdout/stderr and exit code. The command runs through the host \
          platform's shell (see the environment info in the system prompt). If a \
          security policy blocks required work, use request_permission to ask for \
-         the exact filesystem access or least-permissive sandbox mode, then retry \
-         after approval.",
+         operation-scoped filesystem access or the least-permissive sandbox mode, then retry \
+         after approval. Sandboxed child-process writes outside existing policy require \
+         overlapping recursive read and write grants.",
         parameters_schema::<Args>(),
     )
 }
@@ -46,6 +49,7 @@ pub fn tool() -> Tool {
 #[derive(Deserialize, JsonSchema)]
 struct Args {
     command: String,
+    /// Maximum runtime in seconds. Defaults to 120 (two minutes).
     #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
@@ -116,7 +120,7 @@ async fn run_inner(
         None => manager.spawn_command(&args.command, args.dir.as_deref(), live_id),
     }
     .map_err(|error| command_spawn_error(&error))?;
-    let timeout_secs = args.timeout.unwrap_or(120);
+    let timeout_secs = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
     let wait = wait_for_finish_or_promotion(manager, id);
     let wait_or_cancel = async {
         tokio::select! {
@@ -134,25 +138,32 @@ async fn run_inner(
             manager.forget_command(id);
             Err(error)
         }
-        Ok(None) if manager.is_background(id) => Ok(background_result(id)),
-        Ok(None) => {
-            stop_command(manager, id).await;
-            manager.forget_command(id);
-            Err("error: failed to run command: cancelled".to_string())
-        }
+        Ok(None) => interrupted_result(manager, id, "cancelled").await,
         Err(_) if args.timeout_action == TimeoutAction::Background => {
-            match manager.promote_command(id) {
-                Ok(()) => Ok(background_result(id)),
-                Err(_) => completed_result(manager, id, manager.wait_until_finished(id).await?),
+            use crate::tasks::ForegroundCommandResolution;
+            match manager.promote_command_at_deadline(id) {
+                Ok(ForegroundCommandResolution::Background) => Ok(background_result(id)),
+                Ok(ForegroundCommandResolution::Finished(snapshot)) => {
+                    completed_result(manager, id, snapshot)
+                }
+                Ok(ForegroundCommandResolution::StopRequested) => {
+                    stopped_result(
+                        manager,
+                        id,
+                        &format!("command timed out after {timeout_secs}s"),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
             }
         }
-        Err(_) if manager.is_background(id) => Ok(background_result(id)),
         Err(_) => {
-            stop_command(manager, id).await;
-            manager.forget_command(id);
-            Err(format!(
-                "error: failed to run command: command timed out after {timeout_secs}s"
-            ))
+            interrupted_result(
+                manager,
+                id,
+                &format!("command timed out after {timeout_secs}s"),
+            )
+            .await
         }
     }
 }
@@ -212,9 +223,42 @@ fn command_spawn_error(error: &str) -> String {
     format!("error: failed to run command: {detail}")
 }
 
-async fn stop_command(manager: &crate::tasks::TaskManager, id: u64) {
-    let _ = manager.kill(id);
-    let _ = manager.wait_until_finished(id).await;
+async fn interrupted_result(
+    manager: &crate::tasks::TaskManager,
+    id: u64,
+    reason: &str,
+) -> Result<String, String> {
+    use crate::tasks::ForegroundCommandResolution;
+    match manager.stop_foreground_command(id) {
+        Ok(ForegroundCommandResolution::Background) => Ok(background_result(id)),
+        Ok(ForegroundCommandResolution::Finished(snapshot)) => {
+            completed_result(manager, id, snapshot)
+        }
+        Ok(ForegroundCommandResolution::StopRequested) => stopped_result(manager, id, reason).await,
+        Err(error) => Err(error),
+    }
+}
+
+async fn stopped_result(
+    manager: &crate::tasks::TaskManager,
+    id: u64,
+    reason: &str,
+) -> Result<String, String> {
+    let stopped = matches!(
+        tokio::time::timeout(STOP_GRACE, manager.wait_until_finished(id)).await,
+        Ok(Ok(_))
+    );
+    manager.forget_command(id);
+    Err(command_stopped_error(reason, stopped))
+}
+
+fn command_stopped_error(reason: &str, stopped: bool) -> String {
+    let cleanup = if stopped {
+        ""
+    } else {
+        "; process cleanup did not finish within 1s"
+    };
+    format!("error: failed to run command: {reason}{cleanup}")
 }
 
 fn format_output(code: Option<i32>, stdout: &str, stderr: &str) -> String {
@@ -464,15 +508,25 @@ mod live_tests {
     }
 
     #[tokio::test]
-    async fn timeout_kills_the_command_task() {
+    async fn timeout_kills_the_command_tree_promptly() {
         let manager = crate::tasks::TaskManager::default();
-        let args = format!(r#"{{"command":{},"timeout":0}}"#, json!(long_command()));
-        let error = run(&manager, &args)
+        let command = if cfg!(windows) {
+            "start /B ping -n 6 127.0.0.1 > NUL & ping -n 6 127.0.0.1 > NUL"
+        } else {
+            "sleep 5 & wait"
+        };
+        let args = format!(r#"{{"command":{},"timeout":1}}"#, json!(command));
+        let error = tokio::time::timeout(Duration::from_secs(3), run(&manager, &args))
             .await
+            .expect("timeout cleanup must not hang")
             .expect_err("command should time out");
         assert!(
-            error.contains("command timed out after 0s"),
+            error.contains("command timed out after 1s"),
             "unexpected error: {error}"
+        );
+        assert!(
+            manager.snapshot(1).is_none(),
+            "timed-out foreground command must leave the registry after its process tree stops"
         );
     }
 

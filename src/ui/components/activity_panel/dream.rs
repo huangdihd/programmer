@@ -54,6 +54,8 @@ pub(super) struct DreamState {
     details: Rect,
     metadata: Rect,
     sources: Rect,
+    confirm: Rect,
+    cancel: Rect,
     cached_details: Option<DreamDetailsCache>,
     #[cfg(test)]
     detail_builds: usize,
@@ -138,54 +140,120 @@ impl ActivityPanel {
     }
 
     pub(super) fn handle_dream_mouse(&mut self, event: MouseEvent) -> ActivityAction {
-        if self.confirmation.is_some() {
-            match event.kind {
-                MouseEventKind::ScrollUp => self.scroll_details(KeyCode::Up),
-                MouseEventKind::ScrollDown => self.scroll_details(KeyCode::Down),
-                _ => {}
+        let target = self.dream_mouse_target(Position::new(event.column, event.row));
+        match event.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                self.set_mouse_hover(target)
             }
-            return ActivityAction::None;
+            MouseEventKind::Down(MouseButton::Left) => self.begin_mouse_press(target),
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(target) = self.finish_mouse_press(target) {
+                    return self.activate_dream_mouse_target(target, event.modifiers);
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if self.confirmation.is_some() {
+                    self.scroll_details(if event.kind == MouseEventKind::ScrollUp {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    });
+                } else if matches!(
+                    target,
+                    Some(
+                        ActivityMouseTarget::DreamTimeline
+                            | ActivityMouseTarget::DreamRun(_)
+                            | ActivityMouseTarget::DreamDetails
+                            | ActivityMouseTarget::DreamSources
+                            | ActivityMouseTarget::DreamMetadata
+                    )
+                ) {
+                    self.search
+                        .handle_key(KeyEvent::new(KeyCode::Enter, event.modifiers));
+                    self.details_focused = matches!(
+                        target,
+                        Some(
+                            ActivityMouseTarget::DreamDetails
+                                | ActivityMouseTarget::DreamSources
+                                | ActivityMouseTarget::DreamMetadata
+                        )
+                    );
+                    let code = if event.kind == MouseEventKind::ScrollUp {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    };
+                    return self.handle_key(KeyEvent::new(code, event.modifiers));
+                }
+            }
+            _ => {}
         }
-        let position = Position::new(event.column, event.row);
-        let timeline = self.dream.timeline.contains(position);
-        if !timeline && !self.dream.details.contains(position) {
-            return ActivityAction::None;
+        ActivityAction::None
+    }
+
+    fn dream_mouse_target(&self, position: Position) -> Option<ActivityMouseTarget> {
+        if self.confirmation.is_some() {
+            if self.dream.confirm.contains(position) {
+                return Some(ActivityMouseTarget::DreamConfirm);
+            }
+            if self.dream.cancel.contains(position) {
+                return Some(ActivityMouseTarget::DreamCancel);
+            }
+            return None;
         }
-        if !matches!(
-            event.kind,
-            MouseEventKind::Down(MouseButton::Left)
-                | MouseEventKind::ScrollUp
-                | MouseEventKind::ScrollDown
-        ) {
-            return ActivityAction::None;
+        if self.dream.rows.contains(position) {
+            let index =
+                self.dream.offset + usize::from((position.y - self.dream.rows.y) / ITEM_HEIGHT);
+            return (index < self.visible_entries().len())
+                .then_some(ActivityMouseTarget::DreamRun(index));
+        }
+        if self.dream.sources.contains(position) {
+            return Some(ActivityMouseTarget::DreamSources);
+        }
+        if self.dream.metadata.contains(position) {
+            return Some(ActivityMouseTarget::DreamMetadata);
+        }
+        if self.dream.timeline.contains(position) {
+            Some(ActivityMouseTarget::DreamTimeline)
+        } else if self.dream.details.contains(position) {
+            Some(ActivityMouseTarget::DreamDetails)
+        } else {
+            None
+        }
+    }
+
+    fn activate_dream_mouse_target(
+        &mut self,
+        target: ActivityMouseTarget,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> ActivityAction {
+        if matches!(target, ActivityMouseTarget::DreamConfirm) {
+            return self.handle_key(KeyEvent::new(KeyCode::Char('y'), modifiers));
+        }
+        if matches!(target, ActivityMouseTarget::DreamCancel) {
+            return self.handle_key(KeyEvent::new(KeyCode::Char('n'), modifiers));
         }
         self.search
-            .handle_key(KeyEvent::new(KeyCode::Enter, event.modifiers));
-        self.details_focused = !timeline;
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) if self.dream.rows.contains(position) => {
-                let index =
-                    self.dream.offset + usize::from((event.row - self.dream.rows.y) / ITEM_HEIGHT);
-                if index < self.visible_entries().len() && index != self.selected {
+            .handle_key(KeyEvent::new(KeyCode::Enter, modifiers));
+        match target {
+            ActivityMouseTarget::DreamRun(index) => {
+                self.details_focused = false;
+                if index != self.selected {
                     self.selected = index;
                     self.pending_rollback = None;
                     self.reset_details();
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) if self.dream.metadata.contains(position) => {
-                self.dream.metadata_expanded = !self.dream.metadata_expanded
+            ActivityMouseTarget::DreamSources => {
+                self.details_focused = true;
+                self.dream.sources_expanded = !self.dream.sources_expanded;
             }
-            MouseEventKind::Down(MouseButton::Left) if self.dream.sources.contains(position) => {
-                self.dream.sources_expanded = !self.dream.sources_expanded
+            ActivityMouseTarget::DreamMetadata => {
+                self.details_focused = true;
+                self.dream.metadata_expanded = !self.dream.metadata_expanded;
             }
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let code = if event.kind == MouseEventKind::ScrollUp {
-                    KeyCode::Up
-                } else {
-                    KeyCode::Down
-                };
-                return self.handle_key(KeyEvent::new(code, event.modifiers));
-            }
+            ActivityMouseTarget::DreamTimeline => self.details_focused = false,
+            ActivityMouseTarget::DreamDetails => self.details_focused = true,
             _ => {}
         }
         ActivityAction::None
@@ -197,6 +265,8 @@ impl ActivityPanel {
         self.dream.details = Rect::default();
         self.dream.sources = Rect::default();
         self.dream.metadata = Rect::default();
+        self.dream.confirm = Rect::default();
+        self.dream.cancel = Rect::default();
         Clear.render(area, buffer);
         if area.is_empty() {
             return;
@@ -217,11 +287,36 @@ impl ActivityPanel {
                 .render(sections[1], buffer);
         }
         if let Some((id, details)) = &self.confirmation {
-            let inner = region(sections[2], format!("Confirm rollback: {id}"), true, buffer);
-            self.render_dream_text(inner, buffer, Text::from(details.clone()));
-            Paragraph::new("y confirm whole-run rollback · n/Esc cancel · ↑↓ scroll")
-                .style(Style::default().fg(palette::YELLOW))
-                .render(sections[3], buffer);
+            let id = id.clone();
+            let details = details.clone();
+            let inner = region(
+                sections[2],
+                format!("Confirm rollback: {id}"),
+                true,
+                None,
+                buffer,
+            );
+            self.render_dream_text(inner, buffer, Text::from(details));
+            let buttons = Layout::horizontal([
+                Constraint::Length(32),
+                Constraint::Length(18),
+                Constraint::Min(0),
+            ])
+            .split(sections[3]);
+            self.dream.confirm = buttons[0];
+            self.dream.cancel = buttons[1];
+            Paragraph::new("[y] Confirm whole-run rollback")
+                .style(
+                    self.mouse_style(ActivityMouseTarget::DreamConfirm)
+                        .unwrap_or_else(|| Style::default().fg(palette::YELLOW)),
+                )
+                .render(buttons[0], buffer);
+            Paragraph::new("[n] Cancel · ↑↓ scroll")
+                .style(
+                    self.mouse_style(ActivityMouseTarget::DreamCancel)
+                        .unwrap_or_else(|| Style::default().fg(palette::MUTED)),
+                )
+                .render(buttons[1], buffer);
             return;
         }
         let content = sections[2];
@@ -254,6 +349,7 @@ impl ActivityPanel {
             area,
             format!("1 Timeline ({}/{})", visible.len(), self.entries.len()),
             !self.details_focused,
+            self.mouse_style(ActivityMouseTarget::DreamTimeline),
             buffer,
         );
         let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
@@ -341,11 +437,28 @@ impl ActivityPanel {
             height: rows.height.min(capacity as u16 * ITEM_HEIGHT),
             ..rows
         };
+        if let Some(index) = self
+            .mouse_pressed
+            .or(self.mouse_hover)
+            .and_then(|target| match target {
+                ActivityMouseTarget::DreamRun(index) => Some(index),
+                _ => None,
+            })
+            && let Some(background) = self.mouse_background(ActivityMouseTarget::DreamRun(index))
+        {
+            fill_dream_row(rows, index.saturating_sub(offset), background, buffer);
+        }
     }
 
     fn render_dream_details(&mut self, area: Rect, buffer: &mut Buffer) {
         self.dream.details = area;
-        let inner = region(area, "2 Details".into(), self.details_focused, buffer);
+        let inner = region(
+            area,
+            "2 Details".into(),
+            self.details_focused,
+            self.mouse_style(ActivityMouseTarget::DreamDetails),
+            buffer,
+        );
         let sections = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(1),
@@ -439,8 +552,16 @@ impl ActivityPanel {
                 "Metadata / recorded plan [m]",
             ),
         ] {
+            let target = if label.starts_with("Source") {
+                ActivityMouseTarget::DreamSources
+            } else {
+                ActivityMouseTarget::DreamMetadata
+            };
             Paragraph::new(format!("{} {label}", if expanded { "▾" } else { "▸" }))
-                .style(Style::default().fg(palette::MUTED))
+                .style(
+                    self.mouse_style(target)
+                        .unwrap_or_else(|| Style::default().fg(palette::MUTED)),
+                )
                 .render(area, buffer);
         }
     }
@@ -468,13 +589,38 @@ fn dream_markdown(source: &str, width: u16) -> Vec<Line<'static>> {
     render_read_only_markdown(source, width.max(1)).lines
 }
 
-fn region(area: Rect, title: String, focused: bool, buffer: &mut Buffer) -> Rect {
+fn fill_dream_row(
+    area: Rect,
+    visible_index: usize,
+    background: ratatui::style::Color,
+    buffer: &mut Buffer,
+) {
+    let top = area
+        .y
+        .saturating_add((visible_index as u16).saturating_mul(ITEM_HEIGHT));
+    for y in top..top.saturating_add(ITEM_HEIGHT).min(area.bottom()) {
+        for x in area.x..area.right() {
+            buffer[(x, y)].set_bg(background);
+        }
+    }
+}
+
+fn region(
+    area: Rect,
+    title: String,
+    focused: bool,
+    interaction: Option<Style>,
+    buffer: &mut Buffer,
+) -> Rect {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(palette::BORDER))
         .title(
-            Line::from(format!(" {}{title} ", if focused { "● " } else { "" }))
-                .style(Style::default().fg(if focused { role::FOCUS } else { palette::MUTED })),
+            Line::from(format!(" {}{title} ", if focused { "● " } else { "" })).style(
+                interaction.unwrap_or_else(|| {
+                    Style::default().fg(if focused { role::FOCUS } else { palette::MUTED })
+                }),
+            ),
         );
     let inner = block.inner(area);
     block.render(area, buffer);
@@ -488,13 +634,128 @@ mod tests {
     use crate::ui::theme::{self, Theme};
     use crossterm::event::KeyModifiers;
 
-    fn click(panel: &mut ActivityPanel, area: Rect, row: u16) {
+    fn mouse(
+        panel: &mut ActivityPanel,
+        area: Rect,
+        row: u16,
+        kind: MouseEventKind,
+    ) -> ActivityAction {
         panel.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
+            kind,
             column: area.x,
             row: area.y + row,
             modifiers: KeyModifiers::NONE,
-        });
+        })
+    }
+
+    fn click(panel: &mut ActivityPanel, area: Rect, row: u16) -> ActivityAction {
+        assert_eq!(
+            mouse(panel, area, row, MouseEventKind::Down(MouseButton::Left)),
+            ActivityAction::None
+        );
+        mouse(panel, area, row, MouseEventKind::Up(MouseButton::Left))
+    }
+
+    #[test]
+    fn mouse_feedback_requires_matching_release_and_confirmation_buttons_activate() {
+        let mut panel = panel(ActivityMode::Dream);
+        let area = Rect::new(0, 0, 120, 25);
+        let mut buffer = Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        let rows = panel.dream.rows;
+        let second = Rect::new(rows.x, rows.y + ITEM_HEIGHT, 1, 1);
+
+        assert_eq!(
+            mouse(&mut panel, second, 0, MouseEventKind::Moved),
+            ActivityAction::None
+        );
+        buffer.reset();
+        panel.render(area, &mut buffer);
+        assert_eq!(
+            buffer[(second.x, second.y)].bg,
+            panel.interaction_animation.hover_background()
+        );
+        assert_eq!(
+            mouse(
+                &mut panel,
+                second,
+                0,
+                MouseEventKind::Down(MouseButton::Left)
+            ),
+            ActivityAction::None
+        );
+        assert_eq!(panel.selected, 0, "press alone must not select");
+        buffer.reset();
+        panel.render(area, &mut buffer);
+        assert_eq!(
+            buffer[(second.x, second.y)].bg,
+            role::INTERACTION_PRESSED_BG
+        );
+        assert_eq!(
+            mouse(&mut panel, rows, 0, MouseEventKind::Up(MouseButton::Left)),
+            ActivityAction::None
+        );
+        assert_eq!(panel.selected, 0, "mismatched release must not select");
+        assert_eq!(click(&mut panel, second, 0), ActivityAction::None);
+        assert_eq!(panel.selected, 1);
+
+        buffer.reset();
+        panel.render(area, &mut buffer);
+        let sources = panel.dream.sources;
+        assert!(!panel.dream.sources_expanded);
+        assert_eq!(
+            mouse(
+                &mut panel,
+                sources,
+                0,
+                MouseEventKind::Down(MouseButton::Left)
+            ),
+            ActivityAction::None
+        );
+        assert!(!panel.dream.sources_expanded, "press alone must not toggle");
+        assert_eq!(
+            mouse(
+                &mut panel,
+                sources,
+                0,
+                MouseEventKind::Up(MouseButton::Left)
+            ),
+            ActivityAction::None
+        );
+        assert!(panel.dream.sources_expanded);
+
+        panel.pending_rollback = Some("beta".into());
+        assert!(panel.show_rollback_confirmation("beta".into(), "preview".into()));
+        buffer.reset();
+        panel.render(area, &mut buffer);
+        let confirm = panel.dream.confirm;
+        assert_eq!(
+            mouse(
+                &mut panel,
+                confirm,
+                0,
+                MouseEventKind::Down(MouseButton::Left)
+            ),
+            ActivityAction::None
+        );
+        assert!(panel.confirmation.is_some());
+        assert_eq!(
+            mouse(
+                &mut panel,
+                confirm,
+                0,
+                MouseEventKind::Up(MouseButton::Left)
+            ),
+            ActivityAction::ConfirmRollback("beta".into())
+        );
+
+        panel.pending_rollback = Some("beta".into());
+        assert!(panel.show_rollback_confirmation("beta".into(), "preview".into()));
+        buffer.reset();
+        panel.render(area, &mut buffer);
+        let cancel = panel.dream.cancel;
+        assert_eq!(click(&mut panel, cancel, 0), ActivityAction::None);
+        assert!(panel.confirmation.is_none());
     }
 
     #[test]

@@ -39,6 +39,8 @@ pub struct ToolCallMessage<'a> {
     /// control sequences). Rendered in place of the "waiting" spinner until the
     /// call's committed `output` arrives.
     live_output: Option<&'a str>,
+    title_modifier: Option<Modifier>,
+    image_previews: Option<&'a crate::ui::image_preview::ImagePreviewStore>,
 }
 
 impl<'a> ToolCallMessage<'a> {
@@ -51,6 +53,8 @@ impl<'a> ToolCallMessage<'a> {
             expanded: false,
             approval_label: None,
             live_output: None,
+            title_modifier: None,
+            image_previews: None,
         }
     }
 
@@ -69,6 +73,11 @@ impl<'a> ToolCallMessage<'a> {
         self
     }
 
+    pub(crate) fn title_modifier(mut self, modifier: Modifier) -> Self {
+        self.title_modifier = Some(modifier);
+        self
+    }
+
     pub fn expanded(mut self, expanded: bool) -> Self {
         self.expanded = expanded;
         self
@@ -76,6 +85,14 @@ impl<'a> ToolCallMessage<'a> {
 
     pub fn approval_label(mut self, label: Option<&'a str>) -> Self {
         self.approval_label = label;
+        self
+    }
+
+    pub(crate) fn with_optional_image_previews(
+        mut self,
+        image_previews: Option<&'a crate::ui::image_preview::ImagePreviewStore>,
+    ) -> Self {
+        self.image_previews = image_previews;
         self
     }
 
@@ -93,17 +110,26 @@ impl<'a> ToolCallMessage<'a> {
         let status_char = if failed { "\u{2717}" } else { "\u{2713}" };
         let accent = Style::new().fg(status_color).add_modifier(Modifier::BOLD);
         let muted = Style::new().fg(palette::MUTED);
+        let title_modifier = if !failed && output.is_none() {
+            self.title_modifier.unwrap_or_else(|| {
+                crate::ui::components::status_bar::status_bar::tool_title_modifier()
+            })
+        } else {
+            Modifier::empty()
+        };
+        let title_accent = accent.add_modifier(title_modifier);
+        let title_muted = muted.add_modifier(title_modifier);
         let value = serde_json::from_str::<serde_json::Value>(&self.call.arguments).ok();
 
         if !self.expanded {
             let mut spans = vec![
-                Span::styled("\u{25B8} ", muted),
-                Span::styled(format!("\u{1F527} {}", self.call.name), accent),
+                Span::styled("\u{25B8} ", title_muted),
+                Span::styled(format!("\u{1F527} {}", self.call.name), title_accent),
             ];
             let (summary, multiline) = one_line_summary(value.as_ref(), &self.call.arguments);
             if !summary.is_empty() {
                 let suffix = if multiline { "..." } else { "" };
-                spans.push(Span::styled(format!("  {summary}{suffix}"), muted));
+                spans.push(Span::styled(format!("  {summary}{suffix}"), title_muted));
             }
             let mut lines = vec![Line::from(spans)];
             // Approval label (collapsed): subtle line below the tool name.
@@ -140,8 +166,8 @@ impl<'a> ToolCallMessage<'a> {
         }
 
         let mut lines = vec![Line::from(vec![
-            Span::styled("\u{25BE} ", muted),
-            Span::styled(format!("\u{1F527} {}", self.call.name), accent),
+            Span::styled("\u{25BE} ", title_muted),
+            Span::styled(format!("\u{1F527} {}", self.call.name), title_accent),
         ])];
 
         match &value {
@@ -250,11 +276,8 @@ impl<'a> ToolCallMessage<'a> {
                     detail_style(),
                 )));
             }
-            if let Some(output) = output {
-                lines.extend(crate::ui::image_preview::preview_lines(
-                    &output.output,
-                    self.width,
-                ));
+            if let (Some(output), Some(image_previews)) = (output, self.image_previews) {
+                lines.extend(image_previews.preview_lines(&output.output, self.width));
             }
         } else if let Some(live) = self.live_output {
             push_live_output(&mut lines, live, muted, None);
@@ -419,14 +442,9 @@ fn diff_lines(old: &str, new: &str, base: usize) -> Vec<Line<'static>> {
         })
         .collect();
 
-    use ratatui::style::Color;
     let context = Style::new().fg(palette::MUTED).add_modifier(Modifier::DIM);
-    let removed = Style::new()
-        .fg(palette::RED)
-        .bg(Color::Rgb(0x3a, 0x22, 0x28));
-    let added = Style::new()
-        .fg(palette::GREEN)
-        .bg(Color::Rgb(0x25, 0x33, 0x1d));
+    let removed = Style::new().fg(palette::RED).bg(palette::DIFF_REMOVED_BG);
+    let added = Style::new().fg(palette::GREEN).bg(palette::DIFF_ADDED_BG);
 
     // Width of the line-number column, sized to the largest number shown.
     let max_no = base + old_lines.len().max(new_lines.len());
@@ -544,6 +562,35 @@ mod tests {
         let style = lines[0].spans[0].style;
         assert_eq!(style.fg, detail_style().fg);
         assert!(!style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn pending_tool_call_animation_applies_to_the_complete_title_only() {
+        let call = FunctionToolCall {
+            arguments: r#"{"path":"src/main.rs"}"#.to_string(),
+            call_id: "call".to_string(),
+            namespace: None,
+            name: "read_file".to_string(),
+            id: None,
+            status: None,
+        };
+
+        let rendered = ToolCallMessage::new(&call, 80)
+            .title_modifier(Modifier::DIM)
+            .into_text();
+
+        assert!(
+            rendered.lines[0]
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::DIM))
+        );
+        assert!(
+            rendered.lines[1]
+                .spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::DIM))
+        );
     }
 
     #[test]
@@ -705,8 +752,10 @@ mod tests {
             status: None,
         };
 
+        let image_previews = crate::ui::image_preview::ImagePreviewStore::default();
         let collapsed = ToolCallMessage::new(&call, 80)
             .output(Some(&output))
+            .with_optional_image_previews(Some(&image_previews))
             .into_text();
         assert!(
             !plain(&collapsed.lines)
@@ -716,6 +765,7 @@ mod tests {
 
         let expanded = ToolCallMessage::new(&call, 80)
             .output(Some(&output))
+            .with_optional_image_previews(Some(&image_previews))
             .expanded(true)
             .into_text();
         assert!(

@@ -13,37 +13,238 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::ui::markdown_theme::palette;
 use crate::ui::theme::role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 
-const DIM: Color = Color::Gray;
-const TEXT: Color = Color::White;
-
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const COLUMN_LAYOUT_MIN_WIDTH: u16 = 72;
 pub(crate) const PROJECT_URL: &str = "https://github.com/huangdihd/programmer";
+
+fn key(label: &'static str) -> Span<'static> {
+    Span::styled(
+        format!("{label:<11}"),
+        Style::default()
+            .fg(role::HEADING)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn action(label: &'static str) -> Span<'static> {
+    Span::styled(label, Style::default().fg(palette::TEXT))
+}
+
+fn heading(label: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        label,
+        Style::default()
+            .fg(role::HEADING)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn paragraph_height(text: Text<'static>, width: u16, trim: bool) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    Paragraph::new(text).wrap(Wrap { trim }).line_count(width)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct WelcomeMessage;
 
 impl Widget for &WelcomeMessage {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
+
         let block = self.block();
         let inner = block.inner(area);
-        block.render(area, buf);
+        block.render(area, buffer);
 
-        let cols = WelcomeMessage::split_columns(inner);
-
-        self.render_left(cols[0], buf);
-        self.render_right(cols[1], buf);
+        if WelcomeMessage::uses_columns(area.width) {
+            let (left, right) = WelcomeMessage::split_columns(inner);
+            self.render_left(left, buffer);
+            self.render_right(right, buffer);
+        } else {
+            Paragraph::new(self.compact_content())
+                .wrap(Wrap { trim: false })
+                .render(WelcomeMessage::compact_area(inner), buffer);
+        }
     }
 }
 
 impl WelcomeMessage {
-    /// Hit-test the actually rendered URL, including centering and clipping.
+    fn block(&self) -> Block<'static> {
+        Block::default()
+            .title(format!(" PROGRAMMER · v{VERSION} "))
+            .title_style(
+                Style::default()
+                    .fg(role::HEADING)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(role::BORDER))
+    }
+
+    fn uses_columns(width: u16) -> bool {
+        width >= COLUMN_LAYOUT_MIN_WIDTH
+    }
+
+    fn split_columns(area: Rect) -> (Rect, Rect) {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(area);
+        (columns[0], columns[1])
+    }
+
+    fn split_right(area: Rect) -> (Rect, Rect) {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .split(area);
+        (columns[0], columns[1])
+    }
+
+    fn compact_area(area: Rect) -> Rect {
+        let horizontal = u16::from(area.width >= 24);
+        Rect {
+            x: area.x.saturating_add(horizontal),
+            y: area.y,
+            width: area.width.saturating_sub(horizontal.saturating_mul(2)),
+            height: area.height,
+        }
+    }
+
+    fn left_content(&self) -> Text<'static> {
+        Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(" ▄▄▄▄▄▄ ", Style::default().fg(role::LOGO))),
+            Line::from(Span::styled(" █ ▀▀ █ ", Style::default().fg(role::LOGO))),
+            Line::from(Span::styled(" ▀▄▄▄▄▀ ", Style::default().fg(role::LOGO))),
+            Line::from(""),
+            Line::from(Span::styled(
+                "AI coding in your terminal",
+                Style::default()
+                    .fg(palette::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Rust / Ratatui",
+                Style::default().fg(palette::MUTED),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("/help", Style::default().fg(role::HEADING)),
+                Span::styled("  shortcuts", Style::default().fg(role::SUBTLE)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                PROJECT_URL,
+                Style::default()
+                    .fg(role::FOCUS)
+                    .add_modifier(Modifier::UNDERLINED),
+            )),
+        ])
+    }
+
+    fn right_content(&self) -> Text<'static> {
+        Text::from(vec![
+            Line::from(""),
+            heading("Keyboard shortcuts"),
+            Line::from(vec![key("Enter"), action("send")]),
+            Line::from(vec![key("Alt+Enter"), action("new line")]),
+            Line::from(vec![key("Ctrl+T"), action("work mode")]),
+            Line::from(vec![key("Ctrl+B"), action("sidebar")]),
+            Line::from(vec![key("Mouse"), action("select / open / scroll")]),
+            Line::from(""),
+            heading("Quote"),
+            Line::from(Span::styled(
+                "Initially, computer means a person who computes.",
+                Style::default()
+                    .fg(palette::MUTED)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+            Line::from(Span::styled(
+                "When will we pass programmer to coding agents?",
+                Style::default()
+                    .fg(palette::MUTED)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+        ])
+    }
+
+    fn compact_content(&self) -> Text<'static> {
+        Text::from(vec![
+            Line::from(Span::styled(
+                "AI coding in your terminal  ·  Rust / Ratatui",
+                Style::default().fg(palette::TEXT),
+            )),
+            Line::from(""),
+            Line::from(vec![key("Enter"), action("send")]),
+            Line::from(vec![key("Alt+Enter"), action("new line")]),
+            Line::from(vec![key("Ctrl+T"), action("work mode")]),
+            Line::from(vec![key("Ctrl+B"), action("sidebar")]),
+            Line::from(vec![key("Mouse"), action("select / open / scroll")]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("│ ", Style::default().fg(role::WELCOME_DIVIDER)),
+                Span::styled(
+                    "Initially, computer means a person who computes.",
+                    Style::default()
+                        .fg(palette::MUTED)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("│ ", Style::default().fg(role::WELCOME_DIVIDER)),
+                Span::styled(
+                    "When will we pass programmer to coding agents?",
+                    Style::default()
+                        .fg(palette::MUTED)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("/help", Style::default().fg(role::HEADING)),
+                Span::styled("  shortcuts    ", Style::default().fg(role::SUBTLE)),
+                Span::styled(
+                    PROJECT_URL,
+                    Style::default()
+                        .fg(role::FOCUS)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+            ]),
+        ])
+    }
+
+    fn render_left(&self, area: Rect, buffer: &mut Buffer) {
+        Paragraph::new(self.left_content())
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .render(area, buffer);
+    }
+
+    fn render_right(&self, area: Rect, buffer: &mut Buffer) {
+        let (divider, content) = Self::split_right(area);
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(role::WELCOME_DIVIDER))
+            .render(divider, buffer);
+        Paragraph::new(self.right_content())
+            .wrap(Wrap { trim: true })
+            .render(content, buffer);
+    }
+
+    /// Hit-test the actually rendered URL, including wrapping and clipping.
     pub(crate) fn link_at(&self, width: u16, x: u16, y: u16) -> Option<&'static str> {
         let height = self.line_count(width);
         if x >= width || y >= height || usize::from(width) * usize::from(height) > 1_000_000 {
@@ -59,156 +260,143 @@ impl WelcomeMessage {
     }
 
     pub fn line_count(&self, total_width: u16) -> u16 {
-        let dummy = Rect::new(0, 0, total_width, u16::MAX);
-        let inner = self.block().inner(dummy);
-        let cols = Self::split_columns(inner);
-
-        let left_lines = self.left_content().len() as u16;
-
-        let right_chunks = Self::split_right(cols[1]);
-        let right_lines = Paragraph::new(self.right_content())
-            .wrap(Wrap { trim: true })
-            .line_count(right_chunks[1].width) as u16;
-
-        left_lines.max(right_lines) + 2 // Top and bottom borders.
-    }
-
-    fn block(&self) -> Block<'static> {
-        Block::default()
-            .title(format!(" programmer v{} ", VERSION))
-            .title_style(
-                Style::default()
-                    .fg(role::HEADING)
-                    .add_modifier(Modifier::BOLD),
+        let area = Rect::new(0, 0, total_width, u16::MAX);
+        let inner = self.block().inner(area);
+        let content_height = if Self::uses_columns(total_width) {
+            let (left, right) = Self::split_columns(inner);
+            let (_, right_content) = Self::split_right(right);
+            paragraph_height(self.left_content(), left.width, true).max(paragraph_height(
+                self.right_content(),
+                right_content.width,
+                true,
+            ))
+        } else {
+            paragraph_height(
+                self.compact_content(),
+                Self::compact_area(inner).width,
+                false,
             )
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(role::BORDER))
-    }
-
-    fn split_columns(inner: Rect) -> std::rc::Rc<[Rect]> {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-            .split(inner)
-    }
-
-    fn split_right(area: Rect) -> std::rc::Rc<[Rect]> {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(2), Constraint::Min(1)])
-            .split(area)
-    }
-
-    fn left_content(&self) -> Vec<Line<'static>> {
-        vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Welcome back!",
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(" ▄▄▄▄▄▄ ", Style::default().fg(role::LOGO))),
-            Line::from(Span::styled(" █ ▀▀ █ ", Style::default().fg(role::LOGO))),
-            Line::from(Span::styled(" ▀▄▄▄▄▀ ", Style::default().fg(role::LOGO))),
-            Line::from(""),
-            Line::from(Span::styled(
-                "A coding agent written in rust",
-                Style::default().fg(DIM),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                PROJECT_URL,
-                Style::default()
-                    .fg(role::FOCUS)
-                    .add_modifier(Modifier::UNDERLINED),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "© 2026 huangdihd  |  GPL-3.0-or-later  |  No warranty",
-                Style::default().fg(DIM),
-            )),
-        ]
-    }
-
-    fn right_content(&self) -> Vec<Line<'static>> {
-        vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Keyboard shortcuts",
-                Style::default()
-                    .fg(role::HEADING)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::styled("  Enter", Style::default().fg(role::HEADING)),
-                Span::styled("          Send message", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Alt+Enter", Style::default().fg(role::HEADING)),
-                Span::styled("      Insert newline", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Ctrl+T", Style::default().fg(role::HEADING)),
-                Span::styled("         Cycle work mode", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Ctrl+B", Style::default().fg(role::HEADING)),
-                Span::styled("         Toggle sidebar", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Ctrl+C", Style::default().fg(role::HEADING)),
-                Span::styled("         Quit", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Scroll", Style::default().fg(role::HEADING)),
-                Span::styled("         Scroll conversation", Style::default().fg(TEXT)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Quote",
-                Style::default()
-                    .fg(role::HEADING)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "Initially, computer means a person who computes.",
-                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-            )),
-            Line::from(Span::styled(
-                "When will we pass programmer to coding agents?",
-                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-            )),
-        ]
-    }
-
-    fn render_left(&self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(self.left_content())
-            .alignment(Alignment::Center)
-            .render(area, buf);
-    }
-
-    fn render_right(&self, area: Rect, buf: &mut Buffer) {
-        let chunks = Self::split_right(area);
-
-        Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(role::WELCOME_DIVIDER))
-            .render(chunks[0], buf);
-
-        Paragraph::new(self.right_content())
-            .wrap(Wrap { trim: true })
-            .render(chunks[1], buf);
+        };
+        content_height.saturating_add(2).min(usize::from(u16::MAX)) as u16
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::theme::{self, Theme};
+    use ratatui::style::Color;
+
+    fn render(width: u16) -> (u16, Buffer) {
+        let welcome = WelcomeMessage;
+        let height = welcome.line_count(width);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        (&welcome).render(buffer.area, &mut buffer);
+        (height, buffer)
+    }
+
+    fn rendered_text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn find_text(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        let symbols = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect::<Vec<_>>();
+        let needle_width = u16::try_from(symbols.len()).ok()?;
+        let right = buffer.area.x.saturating_add(buffer.area.width);
+        let bottom = buffer.area.y.saturating_add(buffer.area.height);
+
+        for y in buffer.area.y..bottom {
+            for x in buffer.area.x..right {
+                if x.saturating_add(needle_width) > right {
+                    break;
+                }
+                if symbols.iter().enumerate().all(|(offset, symbol)| {
+                    buffer[(x + u16::try_from(offset).unwrap(), y)].symbol() == symbol
+                }) {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    fn resolved_subtle(theme_value: Theme) -> Color {
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer[(0, 0)].fg = role::SUBTLE;
+        theme::apply(theme_value, area, &mut buffer);
+        buffer[(0, 0)].fg
+    }
 
     #[test]
-    fn project_url_hit_test_matches_visible_cells_at_different_widths() {
-        for width in [40, 100, 200] {
+    fn wide_layout_restores_the_rounded_two_column_card() {
+        let (height, buffer) = render(120);
+        assert_eq!(buffer[(0, 0)].symbol(), "╭");
+        assert_eq!(buffer[(119, 0)].symbol(), "╮");
+        assert_eq!(buffer[(0, height - 1)].symbol(), "╰");
+        assert_eq!(buffer[(119, height - 1)].symbol(), "╯");
+
+        let inner = WelcomeMessage.block().inner(buffer.area);
+        let (_, right) = WelcomeMessage::split_columns(inner);
+        assert_eq!(buffer[(right.x, right.y)].symbol(), "│");
+
+        let text = rendered_text(&buffer);
+        assert!(text.contains("AI coding in your terminal"));
+        assert!(text.contains("Keyboard shortcuts"));
+        assert!(text.contains("Initially, computer means a person who computes."));
+        assert!(text.contains("When will we pass programmer to coding agents?"));
+    }
+
+    #[test]
+    fn narrow_layout_keeps_the_card_and_stacks_the_content() {
+        let (height, buffer) = render(COLUMN_LAYOUT_MIN_WIDTH - 1);
+        assert_eq!(buffer[(0, 0)].symbol(), "╭");
+        assert_eq!(buffer[(0, height - 1)].symbol(), "╰");
+        let text = rendered_text(&buffer);
+        assert!(text.contains("AI coding in your terminal"));
+        assert!(text.contains("select / open / scroll"));
+        assert!(!text.contains("Keyboard shortcuts"));
+    }
+
+    #[test]
+    fn shortcuts_label_uses_visible_theme_subtle_color_in_both_layouts() {
+        for width in [COLUMN_LAYOUT_MIN_WIDTH - 1, 120] {
+            for theme_value in [Theme::Dark, Theme::Light] {
+                let (_, mut buffer) = render(width);
+                let (label_x, y) = find_text(&buffer, "  shortcuts").unwrap();
+                let x = label_x + 2;
+                assert_eq!(buffer[(x, y)].fg, role::SUBTLE);
+
+                let area = buffer.area;
+                theme::apply(theme_value, area, &mut buffer);
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.fg, resolved_subtle(theme_value));
+                assert_ne!(cell.fg, palette::FAINT);
+                assert_ne!(cell.fg, cell.bg);
+            }
+        }
+    }
+
+    #[test]
+    fn project_url_hit_test_matches_visible_cells_across_layouts() {
+        for width in [
+            24,
+            40,
+            COLUMN_LAYOUT_MIN_WIDTH - 1,
+            COLUMN_LAYOUT_MIN_WIDTH,
+            100,
+            200,
+        ] {
             let welcome = WelcomeMessage;
             let height = welcome.line_count(width);
             let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
@@ -217,7 +405,8 @@ mod tests {
             for y in 0..height {
                 for x in 0..width {
                     let cell = &buffer[(x, y)];
-                    let expected = cell.modifier.contains(Modifier::UNDERLINED)
+                    let expected = cell.fg == role::FOCUS
+                        && cell.modifier.contains(Modifier::UNDERLINED)
                         && !cell.symbol().trim().is_empty();
                     assert_eq!(welcome.link_at(width, x, y).is_some(), expected);
                     if expected {
@@ -226,7 +415,7 @@ mod tests {
                     }
                 }
             }
-            assert!(hits > 0);
+            assert!(hits > 0, "project URL was not visible at width {width}");
             assert_eq!(welcome.link_at(width, width, 0), None);
             assert_eq!(welcome.link_at(width, 0, height), None);
         }

@@ -3,6 +3,9 @@
 //! blocks reads/writes until explicit recovery completes its recorded target.
 use super::*;
 
+const MEMORY_LOCK_RETRY_DELAYS_MS: [u64; 6] = [1, 2, 4, 8, 16, 32];
+const MEMORY_STORE_BUSY: &str = "memory store is busy; retry after the current writer finishes";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DreamRunStatus {
@@ -201,8 +204,7 @@ impl MemoryManager {
     }
 
     pub(in crate::memory) fn acquire_memory_lock(&self) -> Result<File, String> {
-        self.acquire_dream_lock()?
-            .ok_or_else(|| "memory store is busy; retry after the current writer finishes".into())
+        acquire_memory_lock_with_retry(|| self.acquire_dream_lock(), std::thread::sleep)
     }
 
     fn history_path(&self, run_id: &str) -> Result<PathBuf, String> {
@@ -601,6 +603,22 @@ impl MemoryManager {
         })?;
         Ok(preview)
     }
+}
+
+fn acquire_memory_lock_with_retry<T>(
+    mut acquire: impl FnMut() -> Result<Option<T>, String>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<T, String> {
+    for delay_ms in MEMORY_LOCK_RETRY_DELAYS_MS {
+        if let Some(lock) = acquire()? {
+            return Ok(lock);
+        }
+        // Ordinary operations can immediately follow a writer whose file lock
+        // is still being released. Dream calls acquire_dream_lock directly so
+        // its long-running transaction acquisition remains nonblocking.
+        sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    acquire()?.ok_or_else(|| MEMORY_STORE_BUSY.into())
 }
 
 fn validate_plan(plan: &DreamPlan) -> Result<(), String> {
@@ -1117,6 +1135,50 @@ mod tests {
         std::os::unix::fs::symlink(&moved, &directory).unwrap();
         assert!(manager.dream_recover().unwrap_err().contains("symlink"));
         assert!(manager.journal_path().exists());
+    }
+
+    #[test]
+    fn memory_lock_retries_brief_contention() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        acquire_memory_lock_with_retry(
+            || {
+                attempts += 1;
+                Ok((attempts == 3).then_some(()))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            delays,
+            [
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_lock_reports_sustained_contention_after_bounded_retries() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let error = acquire_memory_lock_with_retry(
+            || {
+                attempts += 1;
+                Ok::<_, String>(None::<()>)
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, MEMORY_STORE_BUSY);
+        assert_eq!(attempts, MEMORY_LOCK_RETRY_DELAYS_MS.len() + 1);
+        assert_eq!(
+            delays,
+            MEMORY_LOCK_RETRY_DELAYS_MS.map(std::time::Duration::from_millis)
+        );
     }
 
     #[test]

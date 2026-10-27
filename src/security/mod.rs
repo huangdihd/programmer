@@ -41,31 +41,60 @@ impl SecurityHandle {
     }
 
     pub(crate) fn replace(&self, security: Arc<SecurityManager>) -> Result<(), String> {
-        let current = self.snapshot();
-        security.inherit_session_grants(&current)?;
-        *self.current.write().expect("security handle lock poisoned") = security.clone();
+        let mut current = self.current.write().expect("security handle lock poisoned");
+        security.inherit_session_grants(current.as_ref())?;
+        *current = security.clone();
         install_active(security);
+        drop(current);
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn set_sandbox_mode(&self, mode: SandboxMode) -> Result<(), String> {
-        let current = self.snapshot();
+        self.update_sandbox_mode(mode, false).map(|_| ())
+    }
+
+    /// Apply an agent-requested mode only when it still relaxes the current
+    /// policy. Another approval may have widened access while this request was
+    /// waiting for the user, and an older request must never tighten it again.
+    pub(crate) fn relax_sandbox_mode(&self, mode: SandboxMode) -> Result<SandboxMode, String> {
+        self.update_sandbox_mode(mode, true)
+    }
+
+    fn update_sandbox_mode(
+        &self,
+        mode: SandboxMode,
+        relaxation_only: bool,
+    ) -> Result<SandboxMode, String> {
+        let mut current = self.current.write().expect("security handle lock poisoned");
+        let current_mode = current.sandbox_mode();
+        if current_mode == mode || relaxation_only && !current_mode.can_request(mode) {
+            return Ok(current_mode);
+        }
+
         let mut config = current.security_config();
         mode.apply(&mut config.sandbox);
         let security = Arc::new(SecurityManager::new(config, current.workspace_path())?);
-        self.replace(security)
+        security.inherit_session_grants(current.as_ref())?;
+        *current = security.clone();
+        install_active(security);
+        drop(current);
+        Ok(mode)
     }
 
     pub(crate) fn sandbox_mode(&self) -> SandboxMode {
         self.snapshot().sandbox_mode()
     }
 
-    pub(crate) fn grant_path(
+    pub(crate) fn grant_path_if_unchanged(
         &self,
         operation: AccessKind,
-        path: impl AsRef<std::path::Path>,
+        requested_path: impl AsRef<std::path::Path>,
+        approved_path: impl AsRef<std::path::Path>,
+        recursive: bool,
     ) -> Result<std::path::PathBuf, String> {
-        self.snapshot().grant_path(operation, path)
+        let current = self.current.read().expect("security handle lock poisoned");
+        current.grant_path_if_unchanged(operation, requested_path, approved_path, recursive)
     }
 
     pub(crate) fn status_text(&self) -> String {

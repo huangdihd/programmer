@@ -16,13 +16,15 @@
 use crate::response::message_item::{MessageItem, extract_input_text};
 use crate::ui::components::conversation_panel::conversation_panel::{
     ActivePhase, CachedLiveSlot, CachedParagraph, CachedToolGroup, ConversationPanel,
-    LiveGroupHeader, LiveParagraph, LiveParagraphContent, LiveRenderCache, MaterializedLiveCache,
-    ToolGroupLayout, ViewportParagraphCache, live_response_message_key,
+    ConversationPointerTarget, LiveGroupHeader, LiveParagraph, LiveParagraphContent,
+    LiveRenderCache, MaterializedLiveCache, ToolGroupLayout, ViewportParagraphCache, is_foldable,
+    live_response_message_key,
 };
 use crate::ui::components::conversation_panel::tool_group::{
-    MemberHeader, ToolGroup, ToolGroupMember, build_tool_group_paragraph_with_reasoning_cache,
-    discover_live_tool_groups, discover_tool_group_bridge_outputs, discover_tool_groups,
-    function_call, is_hidden_runtime_tool,
+    GroupReasoningRender, MemberHeader, ToolGroup, ToolGroupMember,
+    build_tool_group_paragraph_with_reasoning_cache, discover_live_tool_groups,
+    discover_tool_group_bridge_outputs, discover_tool_groups, function_call,
+    is_hidden_runtime_tool,
 };
 use crate::ui::components::messages::assistant_message::AssistantMessage;
 use crate::ui::components::messages::compacting_message::CompactingMessage;
@@ -37,6 +39,7 @@ use crate::ui::components::messages::warning_message::WarningMessage;
 use crate::ui::components::messages::welcome_message::WelcomeMessage;
 use crate::ui::markdown_code_block::CodeCopyButton;
 use crate::ui::markdown_theme::palette;
+use crate::ui::theme::role;
 use async_openai::types::responses::{
     FunctionCallOutputItemParam, InputItem, InputRole, Item, MessageItem as ApiMessageItem,
     OutputItem, ReasoningItem,
@@ -44,7 +47,6 @@ use async_openai::types::responses::{
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Text;
 use ratatui::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
 use std::collections::{HashMap, HashSet};
@@ -291,10 +293,12 @@ fn restore_bottom_follow(panel: &mut ConversationPanel) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn live_cache_matches(
     cache: &LiveRenderCache,
     response_revision: u64,
     content_width: u16,
+    tool_title_modifier: Modifier,
     conversation_len: usize,
     conversation_mutation_version: u64,
     expanded_items: &HashSet<usize>,
@@ -302,6 +306,7 @@ fn live_cache_matches(
 ) -> bool {
     cache.response_revision == response_revision
         && cache.content_width == content_width
+        && (!cache.animates_tool_titles || cache.tool_title_modifier == tool_title_modifier)
         && cache.conversation_len == conversation_len
         && cache.conversation_mutation_version == conversation_mutation_version
         && cache.expanded_items == *expanded_items
@@ -379,8 +384,10 @@ fn build_live_group_slot<'a>(
     live_index_base: usize,
     content_width: u16,
     group_expanded: bool,
-    live_reasoning_text: &HashMap<usize, Arc<Text<'static>>>,
+    live_reasoning_text: &HashMap<usize, GroupReasoningRender>,
     live_reasoning_indices: &HashSet<usize>,
+    image_previews: &crate::ui::image_preview::ImagePreviewStore,
+    tool_title_modifier: Modifier,
 ) -> CachedLiveSlot {
     let live_outputs: Vec<Option<String>> = group
         .member_indices
@@ -452,60 +459,69 @@ fn build_live_group_slot<'a>(
         .any(|&index| receiving_items[index - live_index_base].1);
 
     if group.is_explore() {
-        let (collapsed, collapsed_headers) = build_tool_group_paragraph_with_reasoning_cache(
-            group,
-            &members,
-            &absorbed,
-            content_width,
-            false,
-            thought_in_progress,
-            Some(live_reasoning_text),
-            live_reasoning_indices,
-        );
+        let (collapsed, collapsed_headers, collapsed_buttons) =
+            build_tool_group_paragraph_with_reasoning_cache(
+                group,
+                &members,
+                &absorbed,
+                content_width,
+                false,
+                thought_in_progress,
+                Some(live_reasoning_text),
+                live_reasoning_indices,
+                Some(image_previews),
+                tool_title_modifier,
+            );
         let collapsed_height = collapsed.line_count(content_width) as u16;
-        let (expanded, expanded_headers) = build_tool_group_paragraph_with_reasoning_cache(
-            group,
-            &members,
-            &absorbed,
-            content_width,
-            true,
-            thought_in_progress,
-            Some(live_reasoning_text),
-            live_reasoning_indices,
-        );
+        let (expanded, expanded_headers, expanded_buttons) =
+            build_tool_group_paragraph_with_reasoning_cache(
+                group,
+                &members,
+                &absorbed,
+                content_width,
+                true,
+                thought_in_progress,
+                Some(live_reasoning_text),
+                live_reasoning_indices,
+                Some(image_previews),
+                tool_title_modifier,
+            );
         let expanded_height = expanded.line_count(content_width) as u16;
         CachedLiveSlot::Explore {
             group_key: group.key.clone(),
             collapsed: (
                 LiveParagraphContent::Paragraph(Arc::new(collapsed)),
                 collapsed_height,
-                Arc::new(Vec::new()),
+                Arc::new(collapsed_buttons),
             ),
             collapsed_headers,
             expanded: (
                 LiveParagraphContent::Paragraph(Arc::new(expanded)),
                 expanded_height,
-                Arc::new(Vec::new()),
+                Arc::new(expanded_buttons),
             ),
             expanded_headers,
         }
     } else {
-        let (paragraph, member_headers) = build_tool_group_paragraph_with_reasoning_cache(
-            group,
-            &members,
-            &absorbed,
-            content_width,
-            group_expanded,
-            thought_in_progress,
-            Some(live_reasoning_text),
-            live_reasoning_indices,
-        );
+        let (paragraph, member_headers, copy_buttons) =
+            build_tool_group_paragraph_with_reasoning_cache(
+                group,
+                &members,
+                &absorbed,
+                content_width,
+                group_expanded,
+                thought_in_progress,
+                Some(live_reasoning_text),
+                live_reasoning_indices,
+                Some(image_previews),
+                tool_title_modifier,
+            );
         let height = paragraph.line_count(content_width) as u16;
         CachedLiveSlot::Fixed {
             paragraph: (
                 LiveParagraphContent::Paragraph(Arc::new(paragraph)),
                 height,
-                Arc::new(Vec::new()),
+                Arc::new(copy_buttons),
             ),
             group_header: Some((group.key.clone(), member_headers)),
         }
@@ -556,6 +572,7 @@ fn recalled_memory_snapshots(items: &[MessageItem]) -> Vec<String> {
 
 /// Builds the paragraph for a finished history item. Called at most once per
 /// item (the result is cached in [`ConversationPanel::render_cache`]).
+#[allow(clippy::too_many_arguments)]
 fn build_item_paragraph(
     item: &MessageItem,
     content_width: u16,
@@ -563,6 +580,8 @@ fn build_item_paragraph(
     tool_output: Option<(&FunctionCallOutputItemParam, bool, Option<&str>)>,
     live_output: Option<&str>,
     memory_snapshots: Vec<String>,
+    image_previews: &crate::ui::image_preview::ImagePreviewStore,
+    tool_title_modifier: Modifier,
 ) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
     match item {
         MessageItem::ToolOutput { output, failed, .. } => {
@@ -570,6 +589,7 @@ fn build_item_paragraph(
             // with a call render inside that call's item.
             (
                 ToolResultMessage::new(output, content_width)
+                    .image_previews(image_previews)
                     .failed(*failed)
                     .expanded(expanded)
                     .into_paragraph(),
@@ -577,13 +597,17 @@ fn build_item_paragraph(
             )
         }
         MessageItem::Input(input_item) => (
-            UserMessage::new(input_item, content_width).into_paragraph(),
+            UserMessage::new(input_item, content_width)
+                .image_previews(image_previews)
+                .into_paragraph(),
             Vec::new(),
         ),
         MessageItem::Output(output_item) => AssistantMessage::new(output_item, content_width)
+            .image_previews(image_previews)
             .expanded(expanded)
             .tool_output(tool_output)
             .live_output(live_output)
+            .tool_title_modifier(tool_title_modifier)
             .into_paragraph(),
         MessageItem::OpenAIError(error) => (
             ErrorMessage::new(error.to_string()).into_paragraph(),
@@ -680,6 +704,9 @@ impl Widget for &mut ConversationPanel {
         // margins plus one extra left column here, not in individual messages.
         let content_area = transcript_content_area(area);
         let content_width = content_area.width;
+        let image_previews = self.image_previews.clone();
+        let tool_title_modifier =
+            crate::ui::components::status_bar::status_bar::tool_title_modifier();
         // Pull a completed background Markdown result into the front buffer
         // before calculating live layout. No Markdown parser is run on this
         // render thread.
@@ -703,11 +730,24 @@ impl Widget for &mut ConversationPanel {
         let conv = conv_arc.lock().unwrap();
         self.queue_committed_markdown_jobs(&conv.items, content_width);
 
+        let width_changed = self.render_cache.width != content_width;
+        let mutation_changed = self.render_cache.seen_mutation_version != conv.mutation_version;
+        if width_changed || mutation_changed {
+            self.render_cache.width = content_width;
+            self.render_cache.seen_mutation_version = conv.mutation_version;
+            self.render_cache.entries.clear();
+            // Cached paragraphs and their private-use image markers are one
+            // cache generation. Drop pointer ids too because the fresh image
+            // registry starts allocating ids from zero again.
+            self.invalidate_image_previews();
+            self.selection = None;
+        }
+
         // A response is appended to `conv` before the commit event reaches the
         // UI. Keep its worker keys addressable by absolute history index so a
         // still-running background job can finish the hand-off without making
         // the first committed frame parse the full document synchronously.
-        let mut committed_reasoning_text: HashMap<usize, Arc<Text<'static>>> = HashMap::new();
+        let mut committed_reasoning_text: HashMap<usize, GroupReasoningRender> = HashMap::new();
         let mut committed_pending_reasoning = HashSet::new();
         for (index, item) in conv.items.iter().enumerate() {
             let MessageItem::Output(output) = item else {
@@ -724,7 +764,13 @@ impl Widget for &mut ConversationPanel {
             });
             if let Some(snapshot) = snapshot {
                 if let Some(text) = &snapshot.reasoning_text {
-                    committed_reasoning_text.insert(index, text.clone());
+                    committed_reasoning_text.insert(
+                        index,
+                        GroupReasoningRender {
+                            text: text.clone(),
+                            copy_buttons: snapshot.copy_buttons.clone(),
+                        },
+                    );
                 }
             } else if matches!(output, OutputItem::Reasoning(_)) {
                 committed_pending_reasoning.insert(index);
@@ -741,6 +787,7 @@ impl Widget for &mut ConversationPanel {
                 cache,
                 live_response_revision,
                 content_width,
+                tool_title_modifier,
                 conv.items.len(),
                 conv.mutation_version,
                 &self.expanded_items,
@@ -822,17 +869,6 @@ impl Widget for &mut ConversationPanel {
         // the user toggles that specific item's expand/collapse state, or when a
         // tool call's result arrives.
         let cache = &mut self.render_cache;
-        if cache.width != content_width {
-            cache.width = content_width;
-            cache.entries.clear();
-            self.selection = None;
-        }
-        // An in-place mutation (the runner folding diagnostics into a tool
-        // output) invalidates by version; appends never bump it.
-        if cache.seen_mutation_version != conv.mutation_version {
-            cache.seen_mutation_version = conv.mutation_version;
-            cache.entries.clear();
-        }
         if cache.entries.len() > conv.items.len() {
             cache.entries.truncate(conv.items.len());
         }
@@ -954,7 +990,22 @@ impl Widget for &mut ConversationPanel {
                 }
                 _ => None,
             };
+            let foldable = is_foldable(&conv.items[index]);
             let in_viewport = index >= build_from || in_window[index];
+            let animates_tool_title = !hidden
+                && if is_group_start {
+                    !effective_has_output
+                } else {
+                    matches!(
+                        conv.items[index],
+                        MessageItem::Output(OutputItem::FunctionCall(_))
+                    ) && !has_output
+                };
+            let cached_tool_title_modifier = if animates_tool_title {
+                tool_title_modifier
+            } else {
+                Modifier::empty()
+            };
             let group_render_key = group.filter(|_| is_group_start).map(|group| {
                 // Open runs stay collapsed by default, same as closed ones;
                 // only the user's explicit expansion opens a group.
@@ -1012,6 +1063,7 @@ impl Widget for &mut ConversationPanel {
                         || entry.has_output != effective_has_output
                         || cached_group_key != group_render_key.as_deref()
                         || entry.hidden != hidden
+                        || entry.tool_title_modifier != cached_tool_title_modifier
                         || (entry.lazy && in_viewport)
                 });
             if needs_build {
@@ -1022,7 +1074,9 @@ impl Widget for &mut ConversationPanel {
                         hidden: true,
                         expanded,
                         has_output: effective_has_output,
+                        tool_title_modifier: cached_tool_title_modifier,
                         copy_buttons: Arc::new(Vec::new()),
+                        foldable,
                         lazy: false,
                         tool_group: None,
                     }
@@ -1033,7 +1087,9 @@ impl Widget for &mut ConversationPanel {
                         hidden: false,
                         expanded,
                         has_output: effective_has_output,
+                        tool_title_modifier: cached_tool_title_modifier,
                         copy_buttons: Arc::new(Vec::new()),
+                        foldable,
                         lazy: true,
                         tool_group: group
                             .filter(|_| is_group_start)
@@ -1084,7 +1140,7 @@ impl Widget for &mut ConversationPanel {
                             (index, item, self.expanded_items.contains(&index))
                         })
                         .collect();
-                    let (paragraph, member_headers) =
+                    let (paragraph, member_headers, copy_buttons) =
                         build_tool_group_paragraph_with_reasoning_cache(
                             group,
                             &members,
@@ -1094,6 +1150,8 @@ impl Widget for &mut ConversationPanel {
                             false,
                             Some(&committed_reasoning_text),
                             &committed_pending_reasoning,
+                            Some(&image_previews),
+                            tool_title_modifier,
                         );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
@@ -1102,7 +1160,9 @@ impl Widget for &mut ConversationPanel {
                         hidden: false,
                         expanded,
                         has_output: effective_has_output,
-                        copy_buttons: Arc::new(Vec::new()),
+                        tool_title_modifier: cached_tool_title_modifier,
+                        copy_buttons: Arc::new(copy_buttons),
+                        foldable,
                         lazy: false,
                         tool_group: Some(CachedToolGroup {
                             key: group.key.clone(),
@@ -1127,7 +1187,9 @@ impl Widget for &mut ConversationPanel {
                             hidden: false,
                             expanded,
                             has_output: effective_has_output,
+                            tool_title_modifier: cached_tool_title_modifier,
                             copy_buttons: snapshot.copy_buttons.clone(),
+                            foldable,
                             lazy: false,
                             tool_group: None,
                         }
@@ -1143,7 +1205,9 @@ impl Widget for &mut ConversationPanel {
                             hidden: false,
                             expanded,
                             has_output: effective_has_output,
+                            tool_title_modifier: cached_tool_title_modifier,
                             copy_buttons: Arc::new(Vec::new()),
+                            foldable,
                             lazy: false,
                             tool_group: None,
                         }
@@ -1159,6 +1223,8 @@ impl Widget for &mut ConversationPanel {
                             } else {
                                 Vec::new()
                             },
+                            &image_previews,
+                            tool_title_modifier,
                         );
                         let height = paragraph.line_count(content_width) as u16;
                         CachedParagraph {
@@ -1167,7 +1233,9 @@ impl Widget for &mut ConversationPanel {
                             hidden: false,
                             expanded,
                             has_output: effective_has_output,
+                            tool_title_modifier: cached_tool_title_modifier,
                             copy_buttons: Arc::new(copy_buttons),
+                            foldable,
                             lazy: false,
                             tool_group: None,
                         }
@@ -1273,7 +1341,13 @@ impl Widget for &mut ConversationPanel {
                     && snapshot.width == content_width
                     && let Some(text) = &snapshot.reasoning_text
                 {
-                    reasoning_text.insert(transcript_index, text.clone());
+                    reasoning_text.insert(
+                        transcript_index,
+                        GroupReasoningRender {
+                            text: text.clone(),
+                            copy_buttons: snapshot.copy_buttons.clone(),
+                        },
+                    );
                 }
             }
 
@@ -1330,6 +1404,8 @@ impl Widget for &mut ConversationPanel {
                         group_expanded,
                         &reasoning_text,
                         &reasoning_pending,
+                        &image_previews,
+                        tool_title_modifier,
                     );
                     let (paragraph, group_header) = materialize_live_slot(
                         &slot,
@@ -1397,6 +1473,7 @@ impl Widget for &mut ConversationPanel {
                             AssistantMessage::new(output_item, content_width)
                                 .in_progress(*in_progress)
                                 .expanded(expanded)
+                                .tool_title_modifier(tool_title_modifier)
                                 .frame_count(self.frame_count)
                                 .into_paragraph();
                         let height = paragraph.line_count(content_width) as u16;
@@ -1419,6 +1496,10 @@ impl Widget for &mut ConversationPanel {
             self.live_render_cache = cacheable.then(|| LiveRenderCache {
                 response_revision: live_response_revision,
                 content_width,
+                tool_title_modifier,
+                animates_tool_titles: receiving_items
+                    .iter()
+                    .any(|(item, _)| matches!(item, OutputItem::FunctionCall(_))),
                 conversation_len: conv.items.len(),
                 conversation_mutation_version: conv.mutation_version,
                 expanded_items: self.expanded_items.clone(),
@@ -1533,6 +1614,12 @@ impl Widget for &mut ConversationPanel {
             }
             y = y.saturating_add(entry.height);
         }
+        // History rendering above is the final consumer of this frame's
+        // conversation snapshot. Release it before pointer hit-testing: link
+        // resolution may briefly lock the same model, and keeping this guard
+        // alive would self-deadlock whenever a history row is hovered.
+        drop(conv);
+
         let mut live_layout: Vec<(usize, u16, u16)> =
             Vec::with_capacity(self.live_paragraphs.len());
         let mut live_tool_group_layout = Vec::new();
@@ -1595,31 +1682,115 @@ impl Widget for &mut ConversationPanel {
             );
         }
         clipped_paragraphs.finish_frame();
-        crate::ui::image_preview::render_protocol_images(content_area, buf);
+        let image_placements = image_previews.render_protocol_images(content_area, buf);
+        self.set_image_placements(image_placements);
 
-        // Store the virtual offset and layout for click hit-testing.
+        // Store the virtual offset and layout before painting pointer feedback,
+        // so hit-testing and activation use the exact same frame geometry.
         let offset = self.scroll_view_state.offset().y;
+        self.set_layout(
+            content_area,
+            offset,
+            layout,
+            live_layout,
+            tool_group_layout,
+            live_tool_group_layout,
+        );
 
-        // Draw a minimal custom scrollbar: no background, thin gray thumb. It
-        // lives in the right margin column (never overlapping content) and only
-        // appears for a short window after the user scrolls.
-        if area.height > 0 && content_height > area.height && self.scrollbar_recently_active() {
-            let scrollbar_x = content_area.right();
-            let viewport_h = area.height as f64;
-            let content_h = content_height as f64;
-            let thumb_h = ((viewport_h / content_h) * viewport_h).max(1.0) as u16;
-            let max_scroll = (content_height.saturating_sub(area.height)) as f64;
-            let ratio = if max_scroll > 0.0 {
-                offset as f64 / max_scroll
+        // Keep scrollbar geometry even while auto-hidden so the right-margin
+        // track remains a stable mouse target. Dragging pins the thumb visible.
+        self.update_scrollbar_geometry(Rect::new(
+            content_area.right(),
+            area.y,
+            u16::from(area.width > 0),
+            area.height,
+        ));
+        if (self.scrollbar_recently_active()
+            || self.scrollbar_dragging()
+            || self.scrollbar_hovered())
+            && let Some(thumb) = self.scrollbar_thumb()
+        {
+            let style = if self.scrollbar_pressed() || self.scrollbar_dragging() {
+                Style::new()
+                    .fg(role::SELECTION_TEXT)
+                    .bg(role::INTERACTION_PRESSED_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else if self.scrollbar_hovered() {
+                Style::new()
+                    .fg(palette::TEXT)
+                    .bg(self.pointer_hover_background())
+                    .add_modifier(Modifier::BOLD)
             } else {
-                0.0
+                Style::new().fg(palette::MUTED)
             };
-            let thumb_top = ((area.height.saturating_sub(thumb_h)) as f64 * ratio) as u16;
-            let thumb_bottom = thumb_top.saturating_add(thumb_h).min(area.height);
-            for row in thumb_top..thumb_bottom {
-                if let Some(cell) = buf.cell_mut((scrollbar_x, area.y + row)) {
-                    cell.set_symbol("█")
-                        .set_style(Style::new().fg(palette::MUTED));
+            for row in thumb.y..thumb.bottom() {
+                if let Some(cell) = buf.cell_mut((thumb.x, row)) {
+                    cell.set_symbol("█").set_style(style);
+                }
+            }
+        }
+
+        if let Some(hit) = self
+            .pointer_hit()
+            .filter(|hit| !matches!(hit.target, ConversationPointerTarget::Image { .. }))
+        {
+            let pressed = self.pointer_is_pressed(hit.target);
+            let top = hit.rect.y.max(offset);
+            let bottom = hit
+                .rect
+                .bottom()
+                .min(offset.saturating_add(content_area.height));
+            let mut left = hit.rect.x.min(content_area.width);
+            let mut right = hit.rect.right().min(content_area.width);
+            let link = matches!(hit.target, ConversationPointerTarget::Link { .. });
+            if link && top < bottom {
+                let screen_y = content_area.y.saturating_add(top.saturating_sub(offset));
+                let linked = |cell: &ratatui::buffer::Cell| {
+                    cell.modifier.contains(Modifier::UNDERLINED) && !cell.symbol().trim().is_empty()
+                };
+                while left > 0
+                    && buf
+                        .cell((content_area.x + left - 1, screen_y))
+                        .is_some_and(linked)
+                {
+                    left -= 1;
+                }
+                while right < content_area.width
+                    && buf
+                        .cell((content_area.x + right, screen_y))
+                        .is_some_and(linked)
+                {
+                    right += 1;
+                }
+            }
+            for buffer_y in top..bottom {
+                let screen_y = content_area
+                    .y
+                    .saturating_add(buffer_y.saturating_sub(offset));
+                for relative_x in left..right {
+                    let screen_x = content_area.x.saturating_add(relative_x);
+                    // A tool/member card can contain an expanded read_image
+                    // result. Its outer hover target spans the full card, but
+                    // protocol/half-block image cells carry real pixel colors
+                    // and must never receive the card's hover/pressed fill.
+                    if self.screen_cell_is_image(screen_x, screen_y) {
+                        continue;
+                    }
+                    if let Some(cell) = buf.cell_mut((screen_x, screen_y)) {
+                        if pressed {
+                            cell.set_style(
+                                Style::default()
+                                    .fg(role::SELECTION_TEXT)
+                                    .bg(role::INTERACTION_PRESSED_BG)
+                                    .add_modifier(Modifier::BOLD),
+                            );
+                        } else {
+                            cell.set_bg(self.pointer_hover_background());
+                            if link {
+                                cell.modifier.insert(Modifier::BOLD);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1640,6 +1811,21 @@ impl Widget for &mut ConversationPanel {
             }
         }
 
+        if self.copied_visible() && content_area.width >= 10 && content_area.height > 0 {
+            let label = " ✓ Copied ";
+            let width = label.chars().count() as u16;
+            let x = content_area.right().saturating_sub(width);
+            buf.set_string(
+                x,
+                content_area.y,
+                label,
+                Style::default()
+                    .fg(role::SELECTION_TEXT)
+                    .bg(role::SELECTION_BG)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+
         // "Jump to bottom" indicator: shown only while scrolled up, at the
         // bottom-right of the content area. Clickable (see the mouse handler).
         if area.height > 0 && !self.scroll_view_state.is_at_bottom() {
@@ -1648,15 +1834,23 @@ impl Widget for &mut ConversationPanel {
             if content_area.width >= w {
                 let x = content_area.right().saturating_sub(w);
                 let y = area.y + area.height - 1;
-                buf.set_string(
-                    x,
-                    y,
-                    label,
+                let style = if self.jump_button_pressed() {
+                    Style::new()
+                        .fg(role::SELECTION_TEXT)
+                        .bg(role::INTERACTION_PRESSED_BG)
+                        .add_modifier(Modifier::BOLD)
+                } else if self.jump_button_hovered() {
+                    Style::new()
+                        .fg(palette::TEXT)
+                        .bg(self.pointer_hover_background())
+                        .add_modifier(Modifier::BOLD)
+                } else {
                     Style::new()
                         .fg(palette::TEXT)
                         .bg(palette::SURFACE)
-                        .add_modifier(Modifier::BOLD),
-                );
+                        .add_modifier(Modifier::BOLD)
+                };
+                buf.set_string(x, y, label, style);
                 self.set_jump_button(Some(Rect {
                     x,
                     y,
@@ -1669,15 +1863,6 @@ impl Widget for &mut ConversationPanel {
         } else {
             self.set_jump_button(None);
         }
-
-        self.set_layout(
-            content_area,
-            offset,
-            layout,
-            live_layout,
-            tool_group_layout,
-            live_tool_group_layout,
-        );
     }
 }
 
@@ -1685,24 +1870,42 @@ impl Widget for &mut ConversationPanel {
 mod tests {
     use super::{
         is_hidden_developer_input, live_cache_matches, render_virtual_paragraph,
-        restore_bottom_follow,
+        restore_bottom_follow, transcript_content_area,
     };
     use async_openai::types::responses::{
-        FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall, InputContent,
-        InputMessage, InputRole, InputTextContent, Item, MessageItem as ApiMessageItem, OutputItem,
-        OutputStatus,
+        AssistantRole, FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
+        InputContent, InputMessage, InputRole, InputTextContent, Item,
+        MessageItem as ApiMessageItem, OutputItem, OutputMessage, OutputMessageContent,
+        OutputStatus, OutputTextContent,
     };
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+    use ratatui::style::{Color, Modifier};
     use ratatui::widgets::Widget;
     use ratatui_widgets::paragraph::Paragraph;
     use std::sync::Arc;
 
     use crate::tools::ToolOutput;
     use crate::ui::components::conversation_panel::conversation_panel::{
-        ActivePhase, ConversationPanel, LiveRenderCache, ViewportParagraphCache,
+        ActivePhase, ConversationPanel, ConversationPointerTarget, LiveRenderCache,
+        ViewportParagraphCache,
     };
+    use crate::ui::components::conversation_panel::tool_group::MEMBER_INDENT;
+    use crate::ui::markdown_theme::palette;
+    use crate::ui::theme::role;
     use std::collections::HashSet;
+
+    fn assert_hover_background(color: Color) {
+        assert!(
+            matches!(
+                color,
+                palette::SURFACE_HOVER_SOFT
+                    | palette::SURFACE_HOVER_MEDIUM
+                    | palette::SURFACE_HOVER
+            ),
+            "unexpected hover background: {color:?}"
+        );
+    }
 
     #[test]
     fn expanded_compaction_summary_stays_at_historical_boundary() {
@@ -1757,6 +1960,18 @@ mod tests {
             .collect();
         assert!(rows.windows(2).all(|pair| pair[0] < pair[1]), "{rows:?}");
         assert!(panel.expanded_items.contains(&1));
+
+        // Every row of a disclosure is interactive, not only its title. Use
+        // empty horizontal space on the compaction summary row to prove both
+        // pointer feedback and click handling cover the complete expanded item.
+        let summary_hit = panel.pointer_hit_screen(80, rows[2]).unwrap();
+        assert_eq!(
+            summary_hit.target,
+            ConversationPointerTarget::HistoryItem { index: 1 }
+        );
+        assert!(summary_hit.rect.height > 1);
+        panel.handle_click(80, rows[2]).unwrap();
+        assert!(!panel.expanded_items.contains(&1));
     }
 
     #[test]
@@ -1886,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_header_expands_turn_snapshot_and_details_do_not_toggle() {
+    fn usage_card_toggles_from_header_details_and_empty_horizontal_space() {
         use crate::response::message_item::MessageItem;
         use async_openai::types::responses::InputItem;
         let snapshot = |body: &str| {
@@ -1935,10 +2150,33 @@ mod tests {
                     .contains("189135 tokens")
             })
             .unwrap();
-        panel.handle_click(2, top + 1).unwrap();
-        assert!(panel.expanded_items.contains(&3));
-        panel.handle_click(2, top).unwrap();
+        // Empty horizontal space on a detail row belongs to the same card,
+        // including hover/pressed hit-testing rather than click handling alone.
+        let detail_hit = panel.pointer_hit_screen(80, top + 1).unwrap();
+        assert_eq!(
+            detail_hit.target,
+            ConversationPointerTarget::HistoryItem { index: 3 }
+        );
+        assert!(detail_hit.rect.height > 1);
+        panel.handle_click(80, top + 1).unwrap();
         assert!(!panel.expanded_items.contains(&3));
+
+        panel.render(area, &mut buffer);
+        let top = (0..area.height)
+            .find(|&y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("189135 tokens")
+            })
+            .unwrap();
+        // Empty horizontal space on the collapsed row expands it again.
+        panel.handle_click(80, top).unwrap();
+        assert!(panel.expanded_items.contains(&3));
+        panel.render(area, &mut buffer);
+        panel.handle_click(2, top + 1).unwrap();
+        assert!(!panel.expanded_items.contains(&3));
+
         let mut buffer = Buffer::empty(area);
         panel.render(area, &mut buffer);
         let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
@@ -2009,6 +2247,8 @@ mod tests {
         let cache = LiveRenderCache {
             response_revision: 7,
             content_width: 80,
+            tool_title_modifier: Modifier::DIM,
+            animates_tool_titles: true,
             conversation_len: 12,
             conversation_mutation_version: 3,
             expanded_items: HashSet::from([2]),
@@ -2023,6 +2263,7 @@ mod tests {
             &cache,
             7,
             80,
+            Modifier::DIM,
             12,
             3,
             &expanded_items,
@@ -2032,6 +2273,7 @@ mod tests {
             &cache,
             8,
             80,
+            Modifier::DIM,
             12,
             3,
             &expanded_items,
@@ -2041,10 +2283,22 @@ mod tests {
             &cache,
             7,
             81,
+            Modifier::DIM,
             12,
             3,
             &expanded_items,
             &live_expanded_items
+        ));
+
+        assert!(!live_cache_matches(
+            &cache,
+            7,
+            80,
+            Modifier::BOLD,
+            12,
+            3,
+            &expanded_items,
+            &live_expanded_items,
         ));
 
         let mut changed_folds = expanded_items.clone();
@@ -2053,6 +2307,7 @@ mod tests {
             &cache,
             7,
             80,
+            Modifier::DIM,
             12,
             3,
             &changed_folds,
@@ -2165,7 +2420,26 @@ mod tests {
             .lines()
             .position(|line| line.contains("Exploring"))
             .unwrap() as u16;
-        panel.handle_click(2, group_row).unwrap();
+        panel.pointer_moved(2, group_row);
+        let mut hover_buffer = Buffer::empty(area);
+        panel.render(area, &mut hover_buffer);
+        assert_hover_background(hover_buffer[(2, group_row)].bg);
+        panel.pointer_down(2, group_row);
+        let mut pressed_buffer = Buffer::empty(area);
+        panel.render(area, &mut pressed_buffer);
+        assert_eq!(
+            pressed_buffer[(2, group_row)].bg,
+            role::INTERACTION_PRESSED_BG
+        );
+        panel.pointer_up(2, group_row);
+
+        let summary_row = group_row + 1;
+        panel.pointer_moved(2, summary_row);
+        let mut summary_hover = Buffer::empty(area);
+        panel.render(area, &mut summary_hover);
+        assert_hover_background(summary_hover[(2, summary_row)].bg);
+
+        panel.handle_click(2, summary_row).unwrap();
         assert!(panel.expanded_tool_groups.contains("call-0"));
         let expanded = render_text(&mut panel, area);
         assert!(expanded.contains("grep  {}"), "{expanded}");
@@ -2176,7 +2450,8 @@ mod tests {
             .lines()
             .position(|line| line.contains("grep  {}"))
             .unwrap() as u16;
-        panel.handle_click(2, first_call_row).unwrap();
+        let member_column = transcript_content_area(area).x + MEMBER_INDENT;
+        panel.handle_click(member_column, first_call_row).unwrap();
         assert!(panel.expanded_items.contains(&0));
 
         for index in 0..3 {
@@ -2197,6 +2472,269 @@ mod tests {
         }
         let completed = render_text(&mut panel, area);
         assert!(completed.contains("Explored · 1 failed"));
+    }
+
+    #[test]
+    fn welcome_link_hover_and_copy_confirmation_are_visible() {
+        let mut panel = ConversationPanel::new();
+        let area = Rect::new(0, 0, 100, 24);
+        let mut base = Buffer::empty(area);
+        panel.render(area, &mut base);
+        let link_position = (area.y..area.bottom())
+            .find_map(|y| {
+                (area.x..area.right())
+                    .find(|&x| base[(x, y)].modifier.contains(Modifier::UNDERLINED))
+                    .map(|x| (x, y))
+            })
+            .expect("welcome project link");
+
+        panel.pointer_moved(link_position.0, link_position.1);
+        panel.show_copied();
+        let mut hover = Buffer::empty(area);
+        panel.render(area, &mut hover);
+        assert_hover_background(hover[link_position].bg);
+        assert!(hover[link_position].modifier.contains(Modifier::BOLD));
+        let first_row = (area.x..area.right())
+            .filter_map(|x| hover.cell((x, area.y)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(first_row.contains("Copied"), "{first_row}");
+    }
+
+    #[test]
+    fn history_hover_does_not_wait_for_the_conversation_lock() {
+        let mut panel = ConversationPanel::new();
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_output(assistant_message("[project](https://example.com)"));
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        let link_position = (area.y..area.bottom())
+            .find_map(|y| {
+                (area.x..area.right())
+                    .find(|&x| buffer[(x, y)].modifier.contains(Modifier::UNDERLINED))
+                    .map(|x| (x, y))
+            })
+            .expect("history link");
+
+        let conversation = Arc::clone(&panel.conversation);
+        let guard = conversation.lock().unwrap();
+        panel.pointer_moved(link_position.0, link_position.1);
+        drop(guard);
+
+        panel.pointer_moved(link_position.0, link_position.1);
+        assert!(matches!(
+            panel.pointer_hit().map(|hit| hit.target),
+            Some(ConversationPointerTarget::Link { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_card_hover_and_pressed_preserve_embedded_image_cells() {
+        let mut panel = ConversationPanel::new();
+        {
+            let mut conversation = panel.conversation.lock().unwrap();
+            conversation.add_output(OutputItem::FunctionCall(tool_call(
+                0,
+                crate::tools::read_image::NAME,
+            )));
+            conversation.add_tool_output(ToolOutput {
+                param: image_tool_output("call-0"),
+                failed: false,
+                approval_label: None,
+            });
+        }
+        panel.expanded_items.insert(0);
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut idle = Buffer::empty(area);
+        panel.render(area, &mut idle);
+        let mut image_positions = Vec::new();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                if panel.screen_cell_is_image(x, y) {
+                    image_positions.push((x, y));
+                }
+            }
+        }
+        assert!(
+            !image_positions.is_empty(),
+            "expanded image must be visible"
+        );
+
+        let card_position = (area.y..area.bottom())
+            .find_map(|y| {
+                (area.x..area.right()).find_map(|x| {
+                    matches!(
+                        panel.pointer_hit_screen(x, y).map(|hit| hit.target),
+                        Some(ConversationPointerTarget::HistoryItem { index: 0 })
+                    )
+                    .then_some((x, y))
+                })
+            })
+            .expect("non-image part of the read_image card");
+
+        panel.pointer_moved(card_position.0, card_position.1);
+        let mut hover = Buffer::empty(area);
+        panel.render(area, &mut hover);
+        assert_hover_background(hover[card_position].bg);
+        for &position in &image_positions {
+            assert_eq!(
+                hover[position].symbol(),
+                idle[position].symbol(),
+                "{position:?}"
+            );
+            assert_eq!(hover[position].fg, idle[position].fg, "{position:?}");
+            assert_eq!(hover[position].bg, idle[position].bg, "{position:?}");
+            assert_eq!(
+                hover[position].modifier, idle[position].modifier,
+                "{position:?}"
+            );
+        }
+
+        panel.pointer_down(card_position.0, card_position.1);
+        let mut pressed = Buffer::empty(area);
+        panel.render(area, &mut pressed);
+        assert_eq!(pressed[card_position].bg, role::INTERACTION_PRESSED_BG);
+        for &position in &image_positions {
+            assert_eq!(
+                pressed[position].symbol(),
+                idle[position].symbol(),
+                "{position:?}"
+            );
+            assert_eq!(pressed[position].fg, idle[position].fg, "{position:?}");
+            assert_eq!(pressed[position].bg, idle[position].bg, "{position:?}");
+            assert_eq!(
+                pressed[position].modifier, idle[position].modifier,
+                "{position:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_tool_and_copy_button_have_hover_and_pressed_feedback() {
+        let mut panel = ConversationPanel::new();
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_output(OutputItem::FunctionCall(tool_call(
+                0,
+                crate::tools::command::NAME,
+            )));
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_tool_output(ToolOutput {
+                param: FunctionCallOutputItemParam {
+                    call_id: "call-0".into(),
+                    output: FunctionCallOutput::Text("done".into()),
+                    id: None,
+                    status: None,
+                },
+                failed: false,
+                approval_label: None,
+            });
+        panel
+            .conversation
+            .lock()
+            .unwrap()
+            .add_output(assistant_message(
+                "after the standalone tool\n\n```rust\nfn main() {}\n```",
+            ));
+        let area = Rect::new(0, 0, 80, 24);
+        let rendered = render_text(&mut panel, area);
+        let tool_row = rendered
+            .lines()
+            .position(|line| line.contains("command  {}"))
+            .expect("standalone command header") as u16;
+
+        panel.pointer_moved(2, tool_row);
+        let mut hover_buffer = Buffer::empty(area);
+        panel.render(area, &mut hover_buffer);
+        assert_hover_background(hover_buffer[(2, tool_row)].bg);
+        panel.pointer_down(2, tool_row);
+        let mut pressed_buffer = Buffer::empty(area);
+        panel.render(area, &mut pressed_buffer);
+        assert_eq!(
+            pressed_buffer[(2, tool_row)].bg,
+            role::INTERACTION_PRESSED_BG
+        );
+        panel.pointer_up(2, tool_row);
+
+        let copy_position = (area.y..area.bottom())
+            .find_map(|y| {
+                (area.x..area.right())
+                    .find(|&x| pressed_buffer[(x, y)].symbol() == "⧉")
+                    .map(|x| (x, y))
+            })
+            .expect("code copy button");
+        panel.pointer_moved(copy_position.0, copy_position.1);
+        let mut copy_hover = Buffer::empty(area);
+        panel.render(area, &mut copy_hover);
+        assert_hover_background(copy_hover[copy_position].bg);
+        panel.pointer_down(copy_position.0, copy_position.1);
+        let mut copy_pressed = Buffer::empty(area);
+        panel.render(area, &mut copy_pressed);
+        assert_eq!(copy_pressed[copy_position].bg, role::INTERACTION_PRESSED_BG);
+    }
+
+    #[test]
+    fn grouped_reasoning_copy_button_keeps_its_own_pointer_feedback() {
+        use async_openai::types::responses::{ReasoningItem, SummaryPart, SummaryTextContent};
+
+        let mut panel = ConversationPanel::new();
+        {
+            let mut conversation = panel.conversation.lock().unwrap();
+            conversation.add_output(OutputItem::Reasoning(ReasoningItem {
+                id: Some("grouped-reasoning-copy".into()),
+                summary: vec![SummaryPart::SummaryText(SummaryTextContent {
+                    text: "grouped reasoning\n\n```rust\nfn grouped() {}\n```".into(),
+                })],
+                content: None,
+                encrypted_content: None,
+                status: None,
+            }));
+            conversation.add_output(OutputItem::FunctionCall(tool_call(0, "grep")));
+            conversation.add_output(OutputItem::FunctionCall(tool_call(1, "blob")));
+        }
+        panel.expanded_tool_groups.insert("call-0".into());
+        panel.expanded_items.insert(0);
+
+        let area = Rect::new(0, 0, 80, 24);
+        let rendered = render_text(&mut panel, area);
+        assert!(rendered.contains("fn grouped() {}"), "{rendered}");
+        let mut base = Buffer::empty(area);
+        panel.render(area, &mut base);
+        let copy_position = (area.y..area.bottom())
+            .find_map(|y| {
+                (area.x..area.right())
+                    .find(|&x| base[(x, y)].symbol() == "⧉")
+                    .map(|x| (x, y))
+            })
+            .expect("grouped reasoning copy button");
+        let hit = panel
+            .pointer_hit_screen(copy_position.0, copy_position.1)
+            .expect("copy button pointer target");
+        assert!(matches!(
+            hit.target,
+            crate::ui::components::conversation_panel::conversation_panel::ConversationPointerTarget::HistoryCopyButton { .. }
+        ));
+
+        panel.pointer_moved(copy_position.0, copy_position.1);
+        let mut hover = Buffer::empty(area);
+        panel.render(area, &mut hover);
+        assert_hover_background(hover[copy_position].bg);
+        panel.pointer_down(copy_position.0, copy_position.1);
+        let mut pressed = Buffer::empty(area);
+        panel.render(area, &mut pressed);
+        assert_eq!(pressed[copy_position].bg, role::INTERACTION_PRESSED_BG);
+        assert!(panel.expanded_tool_groups.contains("call-0"));
+        assert!(panel.expanded_items.contains(&0));
     }
 
     #[test]
@@ -2243,16 +2781,56 @@ mod tests {
             .lines()
             .position(|line| line.contains("command  {}"))
             .expect("first command header") as u16;
-        panel.handle_click(2, member_row).unwrap();
+        let member_column = transcript_content_area(area).x + MEMBER_INDENT;
+        let mut member_idle = Buffer::empty(area);
+        panel.render(area, &mut member_idle);
+        let idle_background = member_idle[(member_column, member_row)].bg;
+        assert_eq!(idle_background, palette::SURFACE);
+
+        panel.pointer_moved(member_column, member_row);
+        let mut member_hover = Buffer::empty(area);
+        panel.render(area, &mut member_hover);
+        assert_hover_background(member_hover[(member_column, member_row)].bg);
+        assert_ne!(
+            member_hover[(member_column, member_row)].bg,
+            idle_background
+        );
+        panel.pointer_down(member_column, member_row);
+        let mut member_pressed = Buffer::empty(area);
+        panel.render(area, &mut member_pressed);
+        assert_eq!(
+            member_pressed[(member_column, member_row)].bg,
+            role::INTERACTION_PRESSED_BG
+        );
+        panel.pointer_up(member_column, member_row);
+        panel.handle_click(member_column, member_row).unwrap();
         assert!(panel.expanded_items.contains(&0));
         let member_expanded = render_text(&mut panel, area);
         assert!(member_expanded.contains("full-only-0"), "{member_expanded}");
 
-        let expanded_header_row = member_expanded
+        let detail_row = member_expanded
             .lines()
-            .position(|line| line.contains("command"))
-            .expect("expanded command header") as u16;
-        panel.handle_click(2, expanded_header_row).unwrap();
+            .position(|line| line.contains("full-only-0"))
+            .expect("expanded command detail") as u16;
+        panel.pointer_moved(member_column, detail_row);
+        let mut detail_hover = Buffer::empty(area);
+        panel.render(area, &mut detail_hover);
+        assert_hover_background(detail_hover[(member_column, detail_row)].bg);
+
+        // Moving while held becomes selection and never dispatches the card
+        // click that would fold this member.
+        panel.pointer_down(member_column, detail_row);
+        panel.selection_begin(member_column, detail_row);
+        panel.pointer_dragged(member_column + 4, detail_row);
+        panel.selection_drag(member_column + 4, detail_row);
+        assert!(matches!(
+            panel.selection_end(member_column + 4, detail_row),
+            crate::ui::components::conversation_panel::conversation_panel::SelectionEnd::Copied(_)
+        ));
+        assert!(panel.expanded_items.contains(&0));
+        panel.cancel_pointer_gesture();
+
+        panel.handle_click(member_column, detail_row).unwrap();
         assert!(!panel.expanded_items.contains(&0));
         let member_collapsed = render_text(&mut panel, area);
         assert!(
@@ -2281,6 +2859,49 @@ mod tests {
             id: None,
             status: None,
         }
+    }
+
+    fn image_tool_output(call_id: &str) -> FunctionCallOutputItemParam {
+        use async_openai::types::responses::{ImageDetail, InputImageContent};
+        use base64::Engine;
+        use image::{ImageBuffer, ImageFormat, Rgb};
+        use std::io::Cursor;
+
+        let image = ImageBuffer::from_fn(32, 32, |x, y| {
+            Rgb([x.saturating_mul(8) as u8, y.saturating_mul(8) as u8, 128])
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        FunctionCallOutputItemParam {
+            call_id: call_id.into(),
+            output: FunctionCallOutput::Content(vec![
+                InputContent::InputText("Read image test.png (32x32).".into()),
+                InputContent::InputImage(InputImageContent {
+                    detail: ImageDetail::Auto,
+                    file_id: None,
+                    image_url: Some(format!(
+                        "data:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+                    )),
+                }),
+            ]),
+            id: None,
+            status: None,
+        }
+    }
+
+    fn assistant_message(text: &str) -> OutputItem {
+        OutputItem::Message(OutputMessage {
+            content: vec![OutputMessageContent::OutputText(OutputTextContent {
+                annotations: Vec::new(),
+                logprobs: None,
+                text: text.into(),
+            })],
+            id: "assistant-message".into(),
+            role: AssistantRole::Assistant,
+            phase: None,
+            status: OutputStatus::Completed,
+        })
     }
 
     fn render_text(panel: &mut ConversationPanel, area: Rect) -> String {
@@ -2809,7 +3430,7 @@ mod tests {
                 item: OutputItem::Reasoning(ReasoningItem {
                     id: Some("run-reasoning".into()),
                     summary: vec![SummaryPart::SummaryText(SummaryTextContent {
-                        text: "reasoning-body-marker".into(),
+                        text: "reasoning-body-marker\n\n```rust\nfn live_grouped() {}\n```".into(),
                     })],
                     content: None,
                     encrypted_content: None,
@@ -2829,7 +3450,7 @@ mod tests {
             ));
         }
 
-        let area = Rect::new(0, 0, 80, 24);
+        let area = Rect::new(0, 0, 80, 40);
         let collapsed = render_text(&mut panel, area);
         let group_row = collapsed
             .lines()
@@ -2842,7 +3463,20 @@ mod tests {
             .lines()
             .position(|line| line.contains("command-marker-2"))
             .expect("second live command") as u16;
-        panel.handle_click(2, second_call_row).unwrap();
+        let member_column = transcript_content_area(area).x + MEMBER_INDENT;
+        panel.pointer_moved(member_column, second_call_row);
+        let mut live_hover = Buffer::empty(area);
+        panel.render(area, &mut live_hover);
+        assert_hover_background(live_hover[(member_column, second_call_row)].bg);
+        panel.pointer_down(member_column, second_call_row);
+        let mut live_pressed = Buffer::empty(area);
+        panel.render(area, &mut live_pressed);
+        assert_eq!(
+            live_pressed[(member_column, second_call_row)].bg,
+            role::INTERACTION_PRESSED_BG
+        );
+        panel.pointer_up(member_column, second_call_row);
+        panel.handle_click(member_column, second_call_row).unwrap();
         assert!(panel.live_expanded_items.contains(&2));
         let second_expanded = render_text(&mut panel, area);
         assert!(
@@ -2854,7 +3488,9 @@ mod tests {
             .lines()
             .position(|line| line.contains("cmd: command-marker-2"))
             .expect("expanded command detail") as u16;
-        panel.handle_click(2, detail_row.saturating_sub(1)).unwrap();
+        panel
+            .handle_click(member_column, detail_row.saturating_sub(1))
+            .unwrap();
         assert!(!panel.live_expanded_items.contains(&2));
 
         let collapsed_member = render_text(&mut panel, area);
@@ -2862,11 +3498,11 @@ mod tests {
             .lines()
             .position(|line| line.contains("Thinking") || line.contains("Thought"))
             .expect("live reasoning member") as u16;
-        panel.handle_click(2, reasoning_row).unwrap();
+        panel.handle_click(member_column, reasoning_row).unwrap();
         assert!(panel.live_expanded_items.contains(&0));
         let mut reasoning_expanded = render_text(&mut panel, area);
-        for _ in 0..100 {
-            if reasoning_expanded.contains("reasoning-body-marker") {
+        for _ in 0..200 {
+            if reasoning_expanded.contains("⧉") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -2876,11 +3512,32 @@ mod tests {
             reasoning_expanded.contains("reasoning-body-marker"),
             "{reasoning_expanded}"
         );
+        assert!(reasoning_expanded.contains("fn live_grouped() {}"));
+        assert!(reasoning_expanded.contains("⧉"), "{reasoning_expanded}");
+        let mut reasoning_buffer = Buffer::empty(area);
+        panel.render(area, &mut reasoning_buffer);
+        let copy_position = (area.y..area.bottom())
+            .find_map(|y| {
+                (area.x..area.right())
+                    .find(|&x| reasoning_buffer[(x, y)].symbol() == "⧉")
+                    .map(|x| (x, y))
+            })
+            .unwrap_or_else(|| panic!("live grouped reasoning copy button\n{reasoning_expanded}"));
+        let copy_hit = panel
+            .pointer_hit_screen(copy_position.0, copy_position.1)
+            .expect("live copy pointer target");
+        assert!(matches!(
+            copy_hit.target,
+            crate::ui::components::conversation_panel::conversation_panel::ConversationPointerTarget::LiveCopyButton { .. }
+        ));
+
         let reasoning_header_row = reasoning_expanded
             .lines()
             .position(|line| line.contains("reasoning-body-marker"))
             .expect("expanded live reasoning header") as u16;
-        panel.handle_click(2, reasoning_header_row).unwrap();
+        panel
+            .handle_click(member_column, reasoning_header_row)
+            .unwrap();
         assert!(!panel.live_expanded_items.contains(&0));
     }
 
@@ -2957,7 +3614,8 @@ mod tests {
             .lines()
             .position(|line| line.contains("committed-marker"))
             .expect("committed member") as u16;
-        panel.handle_click(2, committed_row).unwrap();
+        let member_column = transcript_content_area(area).x + MEMBER_INDENT;
+        panel.handle_click(member_column, committed_row).unwrap();
         assert!(panel.expanded_items.contains(&0));
         assert!(render_text(&mut panel, area).contains("committed-full-only"));
 
@@ -2966,7 +3624,7 @@ mod tests {
             .lines()
             .position(|line| line.contains("live-marker-1"))
             .expect("live member") as u16;
-        panel.handle_click(2, live_row).unwrap();
+        panel.handle_click(member_column, live_row).unwrap();
         assert!(panel.live_expanded_items.contains(&1));
     }
 

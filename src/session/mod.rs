@@ -624,46 +624,295 @@ pub(crate) fn sessions_for_working_dir(
 }
 
 const PICKER_QUIT_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const PICKER_DOUBLE_CLICK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn picker_quit_is_confirmed(previous: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     previous.is_some_and(|pressed_at| now.duration_since(pressed_at) <= PICKER_QUIT_CONFIRM_TIMEOUT)
 }
 
-/// Show a ratatui TUI list of sessions and let the user pick one with arrow keys.
+fn picker_session_double_click(
+    previous: &mut Option<(String, std::time::Instant)>,
+    uuid: &str,
+    now: std::time::Instant,
+) -> bool {
+    let double_click = previous
+        .as_ref()
+        .is_some_and(|(previous_uuid, clicked_at)| {
+            previous_uuid == uuid && now.duration_since(*clicked_at) <= PICKER_DOUBLE_CLICK_TIMEOUT
+        });
+    if double_click {
+        *previous = None;
+    } else {
+        *previous = Some((uuid.to_string(), now));
+    }
+    double_click
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickerPointerTarget {
+    Session(usize),
+    Filter,
+    Resume,
+    NewSession,
+    Delete,
+    Quit,
+    ConfirmDelete,
+    CancelDelete,
+}
+
+#[derive(Default)]
+struct PickerPointerState {
+    hovered: Option<PickerPointerTarget>,
+    pressed: Option<PickerPointerTarget>,
+    animation: crate::ui::interaction::InteractionAnimation,
+}
+
+impl PickerPointerState {
+    fn move_to(&mut self, target: Option<PickerPointerTarget>) {
+        if self.hovered == target {
+            return;
+        }
+        self.hovered = target;
+        if self.hovered.is_some() {
+            self.animation.restart();
+        } else {
+            self.animation.cancel();
+        }
+    }
+
+    fn press(&mut self, target: Option<PickerPointerTarget>) {
+        self.pressed = target;
+    }
+
+    fn release(&mut self, target: Option<PickerPointerTarget>) -> Option<PickerPointerTarget> {
+        let pressed = self.pressed.take();
+        if pressed.as_ref() == target.as_ref() {
+            pressed
+        } else {
+            None
+        }
+    }
+
+    fn clear(&mut self) {
+        self.hovered = None;
+        self.pressed = None;
+        self.animation.cancel();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PickerAreas {
+    list: ratatui::layout::Rect,
+    filter: ratatui::layout::Rect,
+    filter_footer: ratatui::layout::Rect,
+    resume: ratatui::layout::Rect,
+    new_session: ratatui::layout::Rect,
+    delete: ratatui::layout::Rect,
+    quit: ratatui::layout::Rect,
+    confirm_delete: ratatui::layout::Rect,
+    cancel_delete: ratatui::layout::Rect,
+}
+
+fn picker_areas(area: ratatui::layout::Rect) -> PickerAreas {
+    use ratatui::layout::{Constraint, Direction, Layout};
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    let title = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(24), Constraint::Length(24)])
+        .split(chunks[0]);
+    let footer = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(13),
+            Constraint::Length(13),
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Length(14),
+            Constraint::Length(11),
+            Constraint::Min(0),
+        ])
+        .split(chunks[2]);
+    let confirmation = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(30),
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Min(0),
+        ])
+        .split(chunks[2]);
+
+    let first_line = |area: ratatui::layout::Rect| {
+        ratatui::layout::Rect::new(area.x, area.y, area.width, area.height.min(1))
+    };
+    let title_filter = ratatui::layout::Rect::new(
+        title[1].right().saturating_sub(18),
+        title[1].y,
+        title[1].width.min(18),
+        title[1].height.min(1),
+    );
+
+    PickerAreas {
+        list: chunks[1],
+        filter: title_filter,
+        filter_footer: first_line(footer[4]),
+        resume: first_line(footer[1]),
+        new_session: first_line(footer[2]),
+        delete: first_line(footer[3]),
+        quit: first_line(footer[5]),
+        confirm_delete: first_line(confirmation[1]),
+        cancel_delete: first_line(confirmation[2]),
+    }
+}
+
+fn picker_rect_contains(area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn picker_session_at(
+    area: ratatui::layout::Rect,
+    offset: usize,
+    session_count: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let inner = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .inner(area);
+    if !picker_rect_contains(inner, column, row) {
+        return None;
+    }
+    let index = offset + usize::from(row - inner.y) / 2;
+    (index < session_count).then_some(index)
+}
+
+fn picker_pointer_target(
+    areas: PickerAreas,
+    offset: usize,
+    session_count: usize,
+    confirmation: bool,
+    quit_warning: bool,
+    column: u16,
+    row: u16,
+) -> Option<PickerPointerTarget> {
+    if quit_warning {
+        return None;
+    }
+    if confirmation {
+        return if picker_rect_contains(areas.confirm_delete, column, row) {
+            Some(PickerPointerTarget::ConfirmDelete)
+        } else if picker_rect_contains(areas.cancel_delete, column, row) {
+            Some(PickerPointerTarget::CancelDelete)
+        } else {
+            None
+        };
+    }
+    if picker_rect_contains(areas.filter, column, row)
+        || picker_rect_contains(areas.filter_footer, column, row)
+    {
+        return Some(PickerPointerTarget::Filter);
+    }
+    if let Some(index) = picker_session_at(areas.list, offset, session_count, column, row) {
+        return Some(PickerPointerTarget::Session(index));
+    }
+    [
+        (areas.resume, PickerPointerTarget::Resume),
+        (areas.new_session, PickerPointerTarget::NewSession),
+        (areas.delete, PickerPointerTarget::Delete),
+        (areas.quit, PickerPointerTarget::Quit),
+    ]
+    .into_iter()
+    .find_map(|(area, target)| picker_rect_contains(area, column, row).then_some(target))
+}
+
+fn picker_scroll_selection(
+    selected: Option<usize>,
+    session_count: usize,
+    scroll_up: bool,
+) -> Option<usize> {
+    if session_count == 0 {
+        return None;
+    }
+    let selected = selected.unwrap_or(0).min(session_count - 1);
+    Some(if scroll_up {
+        selected.saturating_sub(1)
+    } else {
+        (selected + 1).min(session_count - 1)
+    })
+}
+
+fn picker_interaction_style(
+    pointer: &PickerPointerState,
+    target: &PickerPointerTarget,
+) -> ratatui::style::Style {
+    use crate::ui::theme::role;
+    use ratatui::style::Style;
+
+    if pointer.pressed.as_ref() == Some(target) {
+        Style::default().bg(role::INTERACTION_PRESSED_BG)
+    } else if pointer.hovered.as_ref() == Some(target) {
+        Style::default().bg(pointer.animation.hover_background())
+    } else {
+        Style::default()
+    }
+}
+
+/// Show a ratatui TUI list of sessions and let the user pick one with arrow keys or the mouse.
 /// Runs its own terminal setup/teardown; the main app will re-init the terminal.
 /// Returns the chosen UUID, or `None` if the user chose "new session".
 /// On quit (q / Esc) the process exits after cleanup.
 /// Press `d` on a session to delete it after confirmation.
 pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Option<String> {
-    use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers};
+    use crate::ui::markdown_theme::palette;
+    use crate::ui::theme::role;
+    use crossterm::event::{
+        self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    };
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use crossterm::execute;
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     };
     use ratatui::backend::CrosstermBackend;
-    use ratatui::layout::{Constraint, Layout};
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
     use ratatui::{Frame, Terminal};
     use std::io;
 
-    // ---- outcome types for the picker loop ----
     enum Outcome {
         Selected(String),
         NewSession,
         Quit,
     }
 
+    struct PickerTerminalGuard;
+
+    impl Drop for PickerTerminalGuard {
+        fn drop(&mut self) {
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+        }
+    }
+
     if sessions.is_empty() {
         return None;
     }
 
-    // ---- run the TUI ----
     let outcome = std::panic::catch_unwind(|| {
         let mut stdout = io::stdout();
         let _ = enable_raw_mode();
-        let _ = execute!(stdout, EnterAlternateScreen);
+        let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
+        let _terminal_guard = PickerTerminalGuard;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).expect("terminal init");
 
@@ -676,31 +925,34 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
             list_state.select(Some(0));
         }
 
-        // Confirmation state: when set, shows a confirmation overlay.
         let mut confirm_uuid: Option<String> = None;
         let mut quit_requested_at: Option<std::time::Instant> = None;
+        let mut last_session_click: Option<(String, std::time::Instant)> = None;
+        let mut pointer = PickerPointerState::default();
+        let mut rendered_area = ratatui::layout::Rect::default();
 
-        let result = loop {
+        loop {
             let _ = terminal.draw(|f: &mut Frame| {
                 let area = f.area();
+                rendered_area = area;
+                let areas = picker_areas(area);
                 let chunks = Layout::default()
-                    .direction(ratatui::layout::Direction::Vertical)
+                    .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(2),
                         Constraint::Min(3),
                         Constraint::Length(2),
                     ])
                     .split(area);
-
-                // -- Title and working-directory filter toggle --
                 let title_chunks = Layout::default()
-                    .direction(ratatui::layout::Direction::Horizontal)
+                    .direction(Direction::Horizontal)
                     .constraints([Constraint::Min(24), Constraint::Length(24)])
                     .split(chunks[0]);
+
                 let title = Paragraph::new(Line::from(vec![
                     Span::styled(
                         "📂  Saved sessions",
-                        Style::default().fg(Color::Cyan).bold(),
+                        Style::default().fg(palette::CYAN).bold(),
                     ),
                     Span::styled(
                         format!(
@@ -708,7 +960,7 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                             sessions.len(),
                             all_sessions.len()
                         ),
-                        Style::default().fg(Color::Gray).italic(),
+                        Style::default().fg(palette::MUTED).italic(),
                     ),
                 ]));
                 f.render_widget(title, title_chunks[0]);
@@ -721,24 +973,36 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                     filter_label,
                     Style::default()
                         .fg(if filter_working_dir {
-                            Color::Green
+                            palette::GREEN
                         } else {
-                            Color::DarkGray
+                            palette::MUTED
                         })
-                        .bold(),
+                        .bold()
+                        .patch(picker_interaction_style(
+                            &pointer,
+                            &PickerPointerTarget::Filter,
+                        )),
                 ))
                 .alignment(ratatui::layout::Alignment::Right);
                 f.render_widget(filter, title_chunks[1]);
 
-                // -- Session list --
+                let selected_target = list_state.selected().map(PickerPointerTarget::Session);
+                let highlight_background = if pointer.pressed.as_ref() == selected_target.as_ref() {
+                    role::INTERACTION_PRESSED_BG
+                } else if pointer.hovered.as_ref() == selected_target.as_ref() {
+                    pointer.animation.hover_background()
+                } else {
+                    role::SELECTION_BG
+                };
                 let highlight_style = Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(role::SELECTION_TEXT)
+                    .bg(highlight_background)
                     .add_modifier(Modifier::BOLD);
 
                 let items: Vec<ListItem> = sessions
                     .iter()
-                    .map(|s| {
+                    .enumerate()
+                    .map(|(index, s)| {
                         let preview = if !s.title.is_empty() {
                             truncate_first_line(&s.title, 60)
                         } else if !s.first_message.is_empty() {
@@ -748,27 +1012,29 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                         };
                         let time_str = unix_to_local(s.updated_at);
                         let short_uuid = &s.uuid[..s.uuid.floor_char_boundary(8)];
+                        let target = PickerPointerTarget::Session(index);
 
                         ListItem::new(vec![
                             Line::from(vec![Span::styled(
                                 preview,
-                                Style::default().fg(Color::White),
+                                Style::default().fg(palette::TEXT),
                             )]),
                             Line::from(vec![
                                 Span::styled(
                                     format!("  {} messages", s.message_count),
-                                    Style::default().fg(Color::Gray),
+                                    Style::default().fg(palette::MUTED),
                                 ),
                                 Span::styled(
                                     format!(" · {}", time_str),
-                                    Style::default().fg(Color::DarkGray),
+                                    Style::default().fg(palette::FAINT),
                                 ),
                                 Span::styled(
                                     format!(" · {}", short_uuid),
-                                    Style::default().fg(Color::DarkGray),
+                                    Style::default().fg(palette::FAINT),
                                 ),
                             ]),
                         ])
+                        .style(picker_interaction_style(&pointer, &target))
                     })
                     .collect();
 
@@ -776,66 +1042,243 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::DarkGray)),
+                            .border_style(Style::default().fg(role::BORDER)),
                     )
                     .highlight_style(highlight_style)
                     .highlight_symbol("❯ ");
-
                 f.render_stateful_widget(list, chunks[1], &mut list_state);
 
-                // -- Help bar (or confirmation prompt) --
                 if quit_requested_at.is_some() {
                     let warning = Span::styled(
                         " Press Ctrl+C again within 2 seconds to exit.",
-                        Style::default().fg(Color::Yellow).bold(),
+                        Style::default().fg(palette::YELLOW).bold(),
                     );
                     f.render_widget(Paragraph::new(warning), chunks[2]);
                 } else if let Some(ref uuid) = confirm_uuid {
                     let short = &uuid[..uuid.floor_char_boundary(8)];
-                    let confirm = Line::from(vec![
-                        Span::styled(
-                            format!(" Delete session {}?  ", short),
-                            Style::default().fg(Color::Yellow).bold(),
-                        ),
-                        Span::styled("y", Style::default().fg(Color::Green).bold()),
-                        Span::styled(" yes  ", Style::default().fg(Color::Gray)),
-                        Span::styled("n", Style::default().fg(Color::Red).bold()),
-                        Span::styled(" cancel", Style::default().fg(Color::Gray)),
-                    ]);
-                    f.render_widget(Paragraph::new(confirm), chunks[2]);
+                    let confirmation = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Length(30),
+                            Constraint::Length(6),
+                            Constraint::Length(9),
+                            Constraint::Min(0),
+                        ])
+                        .split(chunks[2]);
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            format!(" Delete session {}?", short),
+                            Style::default().fg(palette::YELLOW).bold(),
+                        )),
+                        confirmation[0],
+                    );
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            " y yes",
+                            Style::default().fg(palette::RED).bold().patch(
+                                picker_interaction_style(
+                                    &pointer,
+                                    &PickerPointerTarget::ConfirmDelete,
+                                ),
+                            ),
+                        )),
+                        areas.confirm_delete,
+                    );
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            " n cancel",
+                            Style::default().fg(palette::GREEN).bold().patch(
+                                picker_interaction_style(
+                                    &pointer,
+                                    &PickerPointerTarget::CancelDelete,
+                                ),
+                            ),
+                        )),
+                        areas.cancel_delete,
+                    );
                 } else {
-                    let help = Line::from(vec![
-                        Span::styled(" ↑↓", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" navigate  ", Style::default().fg(Color::Gray)),
-                        Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" select  ", Style::default().fg(Color::Gray)),
-                        Span::styled("n", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" new  ", Style::default().fg(Color::Gray)),
-                        Span::styled("d", Style::default().fg(Color::Red).bold()),
-                        Span::styled(" delete  ", Style::default().fg(Color::Gray)),
-                        Span::styled("f", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" current dir  ", Style::default().fg(Color::Gray)),
-                        Span::styled("q/Esc", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" quit", Style::default().fg(Color::Gray)),
-                    ]);
-                    f.render_widget(Paragraph::new(help), chunks[2]);
+                    let footer = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Length(13),
+                            Constraint::Length(13),
+                            Constraint::Length(6),
+                            Constraint::Length(9),
+                            Constraint::Length(14),
+                            Constraint::Length(11),
+                            Constraint::Min(0),
+                        ])
+                        .split(chunks[2]);
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            " ↑↓/wheel",
+                            Style::default().fg(palette::MUTED),
+                        )),
+                        footer[0],
+                    );
+                    for (area, label, target, color) in [
+                        (
+                            areas.resume,
+                            " Enter resume",
+                            PickerPointerTarget::Resume,
+                            palette::CYAN,
+                        ),
+                        (
+                            areas.new_session,
+                            " n new",
+                            PickerPointerTarget::NewSession,
+                            palette::CYAN,
+                        ),
+                        (
+                            areas.delete,
+                            " d delete",
+                            PickerPointerTarget::Delete,
+                            palette::RED,
+                        ),
+                        (
+                            areas.quit,
+                            " q/Esc quit",
+                            PickerPointerTarget::Quit,
+                            palette::CYAN,
+                        ),
+                    ] {
+                        if label.is_empty() {
+                            continue;
+                        }
+                        f.render_widget(
+                            Paragraph::new(Span::styled(
+                                label,
+                                Style::default()
+                                    .fg(color)
+                                    .bold()
+                                    .patch(picker_interaction_style(&pointer, &target)),
+                            )),
+                            area,
+                        );
+                    }
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            " f current dir",
+                            Style::default().fg(palette::CYAN).bold().patch(
+                                picker_interaction_style(&pointer, &PickerPointerTarget::Filter),
+                            ),
+                        )),
+                        areas.filter_footer,
+                    );
                 }
+
+                crate::ui::theme::apply(
+                    crate::ui::theme::Theme::Auto.effective(),
+                    area,
+                    f.buffer_mut(),
+                );
             });
 
-            let Ok(CEvent::Key(key)) = event::read() else {
+            let next_event = if pointer.animation.active() {
+                match event::poll(std::time::Duration::from_millis(16)) {
+                    Ok(true) => event::read().ok(),
+                    Ok(false) => continue,
+                    Err(_) => None,
+                }
+            } else {
+                event::read().ok()
+            };
+            let Some(next_event) = next_event else {
                 continue;
             };
-            if key.kind != KeyEventKind::Press {
+
+            let mut input = match next_event {
+                CEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    last_session_click = None;
+                    Some((key.code, key.modifiers))
+                }
+                CEvent::Mouse(mouse) => {
+                    let areas = picker_areas(rendered_area);
+                    let target = picker_pointer_target(
+                        areas,
+                        list_state.offset(),
+                        sessions.len(),
+                        confirm_uuid.is_some(),
+                        quit_requested_at.is_some(),
+                        mouse.column,
+                        mouse.row,
+                    );
+                    pointer.move_to(target.clone());
+                    match mouse.kind {
+                        MouseEventKind::Moved => None,
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            pointer.press(target);
+                            None
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            let released = pointer.release(target);
+                            if !matches!(&released, Some(PickerPointerTarget::Session(_))) {
+                                last_session_click = None;
+                            }
+                            match released {
+                                Some(PickerPointerTarget::Session(index)) => {
+                                    list_state.select(Some(index));
+                                    sessions.get(index).and_then(|session| {
+                                        picker_session_double_click(
+                                            &mut last_session_click,
+                                            &session.uuid,
+                                            std::time::Instant::now(),
+                                        )
+                                        .then_some((KeyCode::Enter, KeyModifiers::NONE))
+                                    })
+                                }
+                                Some(PickerPointerTarget::Filter) => {
+                                    Some((KeyCode::Char('f'), KeyModifiers::NONE))
+                                }
+                                Some(PickerPointerTarget::Resume) => {
+                                    Some((KeyCode::Enter, KeyModifiers::NONE))
+                                }
+                                Some(PickerPointerTarget::NewSession) => {
+                                    Some((KeyCode::Char('n'), KeyModifiers::NONE))
+                                }
+                                Some(PickerPointerTarget::Delete) => {
+                                    Some((KeyCode::Char('d'), KeyModifiers::NONE))
+                                }
+                                Some(PickerPointerTarget::Quit) => {
+                                    Some((KeyCode::Char('q'), KeyModifiers::NONE))
+                                }
+                                Some(PickerPointerTarget::ConfirmDelete) => {
+                                    Some((KeyCode::Char('y'), KeyModifiers::NONE))
+                                }
+                                Some(PickerPointerTarget::CancelDelete) => {
+                                    Some((KeyCode::Char('n'), KeyModifiers::NONE))
+                                }
+                                None => None,
+                            }
+                        }
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                            if confirm_uuid.is_none() && quit_requested_at.is_none() =>
+                        {
+                            last_session_click = None;
+                            list_state.select(picker_scroll_selection(
+                                list_state.selected(),
+                                sessions.len(),
+                                mouse.kind == MouseEventKind::ScrollUp,
+                            ));
+                            None
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some((code, modifiers)) = input.take() else {
                 continue;
-            }
+            };
 
             let now = std::time::Instant::now();
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
                 if picker_quit_is_confirmed(quit_requested_at, now) {
                     break Outcome::Quit;
                 }
                 quit_requested_at = Some(now);
                 confirm_uuid = None;
+                pointer.clear();
                 continue;
             }
             if quit_requested_at.is_some_and(|pressed_at| {
@@ -844,11 +1287,9 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                 quit_requested_at = None;
             }
 
-            // ---- confirmation mode ----
             if let Some(ref uuid) = confirm_uuid {
-                match key.code {
+                match code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        // Delete and refresh the list.
                         let _ = mgr.delete(uuid);
                         match mgr.list_all() {
                             Ok(fresh) => {
@@ -867,17 +1308,18 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                             }
                         }
                         confirm_uuid = None;
+                        pointer.clear();
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('d') => {
                         confirm_uuid = None;
+                        pointer.clear();
                     }
                     _ => {}
                 }
                 continue;
             }
 
-            // ---- normal mode ----
-            match key.code {
+            match code {
                 KeyCode::Char('q') | KeyCode::Esc => break Outcome::Quit,
                 KeyCode::Char('n') => break Outcome::NewSession,
                 KeyCode::Char('f') | KeyCode::Char('F') => {
@@ -888,12 +1330,14 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                         all_sessions.clone()
                     };
                     list_state.select((!sessions.is_empty()).then_some(0));
+                    pointer.clear();
                 }
                 KeyCode::Char('d') => {
                     if let Some(i) = list_state.selected()
                         && let Some(s) = sessions.get(i)
                     {
                         confirm_uuid = Some(s.uuid.clone());
+                        pointer.clear();
                     }
                 }
                 KeyCode::Enter => {
@@ -904,24 +1348,22 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
                     }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    let i = list_state.selected().unwrap_or(0);
-                    if i > 0 {
-                        list_state.select(Some(i - 1));
-                    }
+                    list_state.select(picker_scroll_selection(
+                        list_state.selected(),
+                        sessions.len(),
+                        true,
+                    ));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    let i = list_state.selected().unwrap_or(0);
-                    if i + 1 < sessions.len() {
-                        list_state.select(Some(i + 1));
-                    }
+                    list_state.select(picker_scroll_selection(
+                        list_state.selected(),
+                        sessions.len(),
+                        false,
+                    ));
                 }
                 _ => {}
             }
-        };
-
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        result
+        }
     });
 
     match outcome {
@@ -930,11 +1372,7 @@ pub(crate) fn pick_session(sessions: &[SessionMeta], mgr: &SessionManager) -> Op
         Ok(Outcome::Quit) => {
             std::process::exit(0);
         }
-        Err(_) => {
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
-            None
-        }
+        Err(_) => None,
     }
 }
 
@@ -1182,6 +1620,122 @@ mod tests {
             Some(now - std::time::Duration::from_secs(3)),
             now
         ));
+    }
+
+    #[test]
+    fn picker_double_click_requires_the_same_session_within_timeout() {
+        let now = std::time::Instant::now();
+        let mut previous = None;
+
+        assert!(!picker_session_double_click(&mut previous, "first", now));
+        assert!(!picker_session_double_click(
+            &mut previous,
+            "second",
+            now + std::time::Duration::from_millis(100),
+        ));
+        assert!(picker_session_double_click(
+            &mut previous,
+            "second",
+            now + std::time::Duration::from_millis(200),
+        ));
+        assert!(previous.is_none());
+
+        assert!(!picker_session_double_click(
+            &mut previous,
+            "first",
+            now + std::time::Duration::from_secs(1),
+        ));
+        assert!(!picker_session_double_click(
+            &mut previous,
+            "first",
+            now + std::time::Duration::from_secs(2),
+        ));
+    }
+
+    #[test]
+    fn picker_hit_tests_both_lines_of_visible_session_rows() {
+        let areas = picker_areas(ratatui::layout::Rect::new(0, 0, 100, 20));
+        let inner = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .inner(areas.list);
+
+        assert_eq!(
+            picker_pointer_target(areas, 2, 8, false, false, inner.x + 1, inner.y),
+            Some(PickerPointerTarget::Session(2))
+        );
+        assert_eq!(
+            picker_pointer_target(areas, 2, 8, false, false, inner.x + 1, inner.y + 1),
+            Some(PickerPointerTarget::Session(2))
+        );
+        assert_eq!(
+            picker_pointer_target(areas, 2, 8, false, false, inner.x + 1, inner.y + 2),
+            Some(PickerPointerTarget::Session(3))
+        );
+        assert_eq!(
+            picker_pointer_target(areas, 2, 3, false, false, inner.x + 1, inner.y + 2),
+            None
+        );
+    }
+
+    #[test]
+    fn picker_only_activates_a_press_released_on_the_same_target() {
+        let first = PickerPointerTarget::Session(0);
+        let second = PickerPointerTarget::Session(1);
+        let mut pointer = PickerPointerState::default();
+
+        pointer.press(Some(first.clone()));
+        assert_eq!(pointer.release(Some(second)), None);
+        assert_eq!(pointer.pressed, None);
+
+        pointer.press(Some(first.clone()));
+        assert_eq!(pointer.release(Some(first.clone())), Some(first));
+        assert_eq!(pointer.pressed, None);
+        assert_eq!(pointer.release(Some(PickerPointerTarget::Session(0))), None);
+    }
+
+    #[test]
+    fn picker_wheel_navigation_is_bounded_and_handles_empty_lists() {
+        assert_eq!(picker_scroll_selection(None, 0, false), None);
+        assert_eq!(picker_scroll_selection(Some(0), 3, true), Some(0));
+        assert_eq!(picker_scroll_selection(Some(0), 3, false), Some(1));
+        assert_eq!(picker_scroll_selection(Some(2), 3, false), Some(2));
+        assert_eq!(picker_scroll_selection(Some(99), 3, true), Some(1));
+    }
+
+    #[test]
+    fn picker_confirmation_exposes_only_safe_confirmation_controls() {
+        let areas = picker_areas(ratatui::layout::Rect::new(0, 0, 100, 20));
+        assert_eq!(
+            picker_pointer_target(
+                areas,
+                0,
+                3,
+                true,
+                false,
+                areas.confirm_delete.x,
+                areas.confirm_delete.y,
+            ),
+            Some(PickerPointerTarget::ConfirmDelete)
+        );
+        assert_eq!(
+            picker_pointer_target(
+                areas,
+                0,
+                3,
+                true,
+                false,
+                areas.cancel_delete.x,
+                areas.cancel_delete.y,
+            ),
+            Some(PickerPointerTarget::CancelDelete)
+        );
+        let list_inner = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .inner(areas.list);
+        assert_eq!(
+            picker_pointer_target(areas, 0, 3, true, false, list_inner.x, list_inner.y),
+            None
+        );
     }
 
     #[test]

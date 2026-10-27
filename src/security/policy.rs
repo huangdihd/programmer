@@ -206,6 +206,41 @@ struct CompiledRule {
     matcher: GlobMatcher,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SessionGrant {
+    operation: AccessKind,
+    path: PathBuf,
+    recursive: bool,
+}
+
+impl SessionGrant {
+    fn sandbox_directory(&self) -> Option<PathBuf> {
+        // The sandbox API interprets every path as a subtree. Exact-file grants
+        // cannot be represented without risking broader access if the file is
+        // later replaced by a directory, so keep them out of child policies.
+        if !self.recursive {
+            return None;
+        }
+        // A stored grant is canonical. Re-resolve it before propagation so an
+        // ancestor replaced by a symlink cannot redirect the approved pathname
+        // to a different subtree.
+        let current = self.path.canonicalize().ok()?;
+        (current == self.path && current.is_dir()).then_some(current)
+    }
+
+    fn sandbox_intersection(&self, other: &Self) -> Option<PathBuf> {
+        let path = self.sandbox_directory()?;
+        let other_path = other.sandbox_directory()?;
+        if path.starts_with(&other_path) {
+            return Some(path);
+        }
+        if other_path.starts_with(&path) {
+            return Some(other_path);
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct PersistedFileSnapshot {
     pub(crate) path: PathBuf,
@@ -216,7 +251,7 @@ pub(crate) struct SecurityManager {
     workspace: PathBuf,
     config: SecurityConfig,
     rules: Vec<CompiledRule>,
-    session_grants: RwLock<HashSet<(AccessKind, PathBuf)>>,
+    session_grants: RwLock<HashSet<SessionGrant>>,
     snapshots: Mutex<HashMap<(u64, PathBuf), blake3::Hash>>,
     dirty: Arc<Mutex<HashSet<PathBuf>>>,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -325,7 +360,11 @@ impl SecurityManager {
             .session_grants
             .read()
             .map_err(|_| "session permission store is unavailable".to_string())?
-            .contains(&(operation, path.clone()))
+            .iter()
+            .any(|grant| {
+                grant.operation == operation
+                    && (path == grant.path || grant.recursive && path.starts_with(&grant.path))
+            })
         {
             return Ok(path);
         }
@@ -372,16 +411,61 @@ impl SecurityManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn grant_path(
         &self,
         operation: AccessKind,
         path: impl AsRef<Path>,
+        recursive: bool,
     ) -> Result<PathBuf, String> {
         let path = self.resolve_path(path)?;
+        self.grant_resolved_path(operation, path, recursive)
+    }
+
+    pub(crate) fn grant_path_if_unchanged(
+        &self,
+        operation: AccessKind,
+        requested_path: impl AsRef<Path>,
+        approved_path: impl AsRef<Path>,
+        recursive: bool,
+    ) -> Result<PathBuf, String> {
+        let path = self.resolve_path(requested_path)?;
+        if path != approved_path.as_ref() {
+            return Err(format!(
+                "filesystem permission target changed while awaiting approval: expected {}, now {}",
+                approved_path.as_ref().display(),
+                path.display()
+            ));
+        }
+        self.grant_resolved_path(operation, path, recursive)
+    }
+
+    fn grant_resolved_path(
+        &self,
+        operation: AccessKind,
+        path: PathBuf,
+        recursive: bool,
+    ) -> Result<PathBuf, String> {
+        if recursive && !path.is_dir() {
+            return Err(format!(
+                "recursive filesystem grants require an existing directory: {}",
+                path.display()
+            ));
+        }
+        if !recursive && path.is_dir() {
+            return Err(format!(
+                "exact filesystem grants cannot target a directory: {}",
+                path.display()
+            ));
+        }
         self.session_grants
             .write()
             .map_err(|_| "session permission store is unavailable".to_string())?
-            .insert((operation, path.clone()));
+            .insert(SessionGrant {
+                operation,
+                path: path.clone(),
+                recursive,
+            });
         Ok(path)
     }
 
@@ -411,8 +495,33 @@ impl SecurityManager {
             .map(|grants| {
                 grants
                     .iter()
-                    .filter(|(granted_operation, _)| *granted_operation == operation)
-                    .map(|(_, path)| path.clone())
+                    .filter(|grant| grant.operation == operation)
+                    .filter_map(SessionGrant::sandbox_directory)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The process sandbox only exposes read-only and read-write path rules.
+    /// Propagate write access only where the user separately granted read
+    /// access, so a write-only grant cannot silently become read permission.
+    pub(crate) fn session_read_write_paths(&self) -> Vec<PathBuf> {
+        self.session_grants
+            .read()
+            .map(|grants| {
+                let read_grants = grants
+                    .iter()
+                    .filter(|grant| grant.operation == AccessKind::Read);
+                grants
+                    .iter()
+                    .filter(|grant| grant.operation == AccessKind::Write)
+                    .flat_map(|write_grant| {
+                        read_grants.clone().filter_map(move |read_grant| {
+                            write_grant.sandbox_intersection(read_grant)
+                        })
+                    })
+                    .collect::<HashSet<_>>()
+                    .into_iter()
                     .collect()
             })
             .unwrap_or_default()
@@ -790,7 +899,30 @@ denied_environment = ["CUSTOM_*"]
     }
 
     #[test]
-    fn session_grant_allows_only_the_exact_operation_and_path() {
+    fn explicit_session_grant_overrides_matching_deny_rule() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
+        let private = root.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        let config = SecurityConfig {
+            rules: vec![PermissionRule {
+                operation: AccessKind::Write,
+                pattern: "workspace/private/**".into(),
+                effect: PermissionEffect::Deny,
+            }],
+            ..SecurityConfig::default()
+        };
+        let security = manager(config, &root);
+        let secret = private.join("secret.txt");
+
+        assert!(security.authorize_path(AccessKind::Write, &secret).is_err());
+        security.grant_path(AccessKind::Write, &root, true).unwrap();
+        assert!(security.authorize_path(AccessKind::Write, &secret).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_file_grant_allows_only_the_exact_operation_and_path() {
         let root =
             std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
         let external =
@@ -810,13 +942,148 @@ denied_environment = ["CUSTOM_*"]
             .unwrap_err();
         assert!(denial.contains("call request_permission"));
         assert!(denial.contains("operation 'write'"));
-        security.grant_path(AccessKind::Write, &granted).unwrap();
+        security
+            .grant_path(AccessKind::Write, &granted, false)
+            .unwrap();
 
         assert!(security.authorize_path(AccessKind::Write, &granted).is_ok());
         assert!(security.authorize_path(AccessKind::Read, &granted).is_err());
         assert!(security.authorize_path(AccessKind::Write, &denied).is_err());
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn session_directory_grant_allows_descendants_but_not_prefix_siblings() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
+        let external =
+            std::env::temp_dir().join(format!("programmer-external-{}", uuid::Uuid::new_v4()));
+        let granted_directory = external.join("granted");
+        let sibling = external.join("granted-sibling");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(granted_directory.join("nested")).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let security = manager(
+            SecurityConfig {
+                allow_read_outside_workspace: false,
+                ..SecurityConfig::default()
+            },
+            &root,
+        );
+
+        security
+            .grant_path(AccessKind::Write, &granted_directory, true)
+            .unwrap();
+
+        assert!(
+            security
+                .authorize_path(AccessKind::Write, granted_directory.join("nested/file.txt"))
+                .is_ok()
+        );
+        assert!(
+            security
+                .authorize_path(AccessKind::Write, sibling.join("file.txt"))
+                .is_err()
+        );
+        assert!(
+            security
+                .authorize_path(AccessKind::Read, granted_directory.join("nested/file.txt"))
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn sandbox_paths_include_only_recursive_existing_directories() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
+        let directory = root.join("directory");
+        let exact_file = root.join("exact.txt");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&exact_file, b"exact").unwrap();
+        let security = manager(SecurityConfig::default(), &root);
+
+        security
+            .grant_path(AccessKind::Read, &directory, true)
+            .unwrap();
+        security
+            .grant_path(AccessKind::Read, &exact_file, false)
+            .unwrap();
+        assert_eq!(
+            security.session_granted_paths(AccessKind::Read),
+            [directory.canonicalize().unwrap()]
+        );
+
+        std::fs::remove_file(&exact_file).unwrap();
+        std::fs::create_dir(&exact_file).unwrap();
+        assert_eq!(
+            security.session_granted_paths(AccessKind::Read),
+            [directory.canonicalize().unwrap()]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirected_recursive_grants_do_not_reach_child_policies() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
+        let external =
+            std::env::temp_dir().join(format!("programmer-external-{}", uuid::Uuid::new_v4()));
+        let parent = external.join("parent");
+        let original_parent = external.join("original-parent");
+        let granted = parent.join("granted");
+        let redirected = external.join("redirected");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&granted).unwrap();
+        std::fs::create_dir_all(redirected.join("granted")).unwrap();
+        let security = manager(SecurityConfig::default(), &root);
+        for operation in [AccessKind::Read, AccessKind::Write] {
+            security.grant_path(operation, &granted, true).unwrap();
+        }
+
+        std::fs::rename(&parent, &original_parent).unwrap();
+        std::os::unix::fs::symlink(&redirected, &parent).unwrap();
+
+        assert!(security.session_granted_paths(AccessKind::Read).is_empty());
+        assert!(security.session_read_write_paths().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn sandbox_read_write_paths_use_only_recursive_scope_intersections() {
+        let root =
+            std::env::temp_dir().join(format!("programmer-security-{}", uuid::Uuid::new_v4()));
+        let read_parent = root.join("read-parent");
+        let shared_child = read_parent.join("shared-child");
+        let write_only = root.join("write-only");
+        let exact_file = root.join("exact.txt");
+        std::fs::create_dir_all(&shared_child).unwrap();
+        std::fs::create_dir_all(&write_only).unwrap();
+        std::fs::write(&exact_file, b"exact").unwrap();
+        let security = manager(SecurityConfig::default(), &root);
+
+        security
+            .grant_path(AccessKind::Read, &read_parent, true)
+            .unwrap();
+        security
+            .grant_path(AccessKind::Write, &shared_child, true)
+            .unwrap();
+        security
+            .grant_path(AccessKind::Write, &write_only, true)
+            .unwrap();
+        for operation in [AccessKind::Read, AccessKind::Write] {
+            security.grant_path(operation, &exact_file, false).unwrap();
+        }
+
+        assert_eq!(
+            security.session_read_write_paths(),
+            [shared_child.canonicalize().unwrap()]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

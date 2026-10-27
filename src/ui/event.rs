@@ -20,8 +20,8 @@ use async_openai::types::responses::{FunctionToolCall, ResponseStreamEvent};
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 /// Representation of all possible events.
@@ -34,6 +34,12 @@ pub enum Event {
     Redraw,
     /// A timer step for mouse-selection edge auto-scroll.
     SelectionScroll,
+    /// Latest event in one contiguous run of TUI pointer-motion reports.
+    ///
+    /// The terminal reader updates the shared slot instead of growing the
+    /// unbounded event queue. [`EventHandler`] resolves this internal marker
+    /// back to a regular Crossterm mouse event before returning it.
+    PointerMove(Arc<Mutex<PointerMoveBatch>>),
     /// Crossterm events.
     ///
     /// These events are emitted by the terminal.
@@ -388,6 +394,57 @@ impl std::fmt::Debug for AppEvent {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct PointerMoveBatch {
+    latest: Option<crossterm::event::MouseEvent>,
+    marker_queued: bool,
+}
+
+fn queue_crossterm_event(
+    sender: &mpsc::UnboundedSender<Event>,
+    pending_pointer_move: &mut Option<Arc<Mutex<PointerMoveBatch>>>,
+    event: CrosstermEvent,
+    coalesce_pointer_moves: bool,
+) -> bool {
+    let CrosstermEvent::Mouse(mouse) = event else {
+        *pending_pointer_move = None;
+        return sender.send(Event::Crossterm(event)).is_ok();
+    };
+    if mouse.kind != crossterm::event::MouseEventKind::Moved || !coalesce_pointer_moves {
+        *pending_pointer_move = None;
+        return sender
+            .send(Event::Crossterm(CrosstermEvent::Mouse(mouse)))
+            .is_ok();
+    }
+
+    let batch = pending_pointer_move
+        .get_or_insert_with(|| Arc::new(Mutex::new(PointerMoveBatch::default())))
+        .clone();
+    let should_queue_marker = {
+        let mut batch = batch.lock().unwrap();
+        batch.latest = Some(mouse);
+        if batch.marker_queued {
+            false
+        } else {
+            batch.marker_queued = true;
+            true
+        }
+    };
+    !should_queue_marker || sender.send(Event::PointerMove(batch)).is_ok()
+}
+
+fn resolve_pointer_move(event: Event) -> Option<Event> {
+    let Event::PointerMove(batch) = event else {
+        return Some(event);
+    };
+    let mut batch = batch.lock().unwrap();
+    batch.marker_queued = false;
+    batch
+        .latest
+        .take()
+        .map(|mouse| Event::Crossterm(CrosstermEvent::Mouse(mouse)))
+}
+
 /// Application event handler.
 #[derive(Debug)]
 pub struct EventHandler {
@@ -401,6 +458,8 @@ pub struct EventHandler {
     status_tick_queued: Arc<AtomicBool>,
     /// At most one selection auto-scroll step may wait in the FIFO.
     selection_scroll_queued: Arc<AtomicBool>,
+    /// Whether raw pointer moves may be collapsed before entering the FIFO.
+    coalesce_pointer_moves: Arc<AtomicBool>,
     /// The task that reads crossterm events and emits ticks.
     _task: tokio::task::JoinHandle<()>,
 }
@@ -413,20 +472,30 @@ impl EventHandler {
         let redraw_queued = Arc::new(AtomicBool::new(false));
         let status_tick_queued = Arc::new(AtomicBool::new(false));
         let selection_scroll_queued = Arc::new(AtomicBool::new(false));
+        let coalesce_pointer_moves = Arc::new(AtomicBool::new(true));
+        let reader_coalesce_pointer_moves = coalesce_pointer_moves.clone();
         let _task = tokio::spawn(async move {
             #[cfg(not(test))]
             let mut reader = crossterm::event::EventStream::new();
             // Unit tests inject events through the channel and have no terminal reader.
             #[cfg(test)]
             let mut reader = futures::stream::pending::<std::io::Result<CrosstermEvent>>();
+            let mut pending_pointer_move = None;
             loop {
                 let crossterm_event = reader.next().fuse();
                 tokio::select! {
                   _ = _sender.closed() => {
                     break;
                   }
-                  Some(Ok(evt)) = crossterm_event => {
-                    let _ = _sender.send(Event::Crossterm(evt));
+                  Some(Ok(event)) = crossterm_event => {
+                    if !queue_crossterm_event(
+                        &_sender,
+                        &mut pending_pointer_move,
+                        event,
+                        reader_coalesce_pointer_moves.load(Ordering::Acquire),
+                    ) {
+                        break;
+                    }
                   }
                 }
             }
@@ -438,6 +507,7 @@ impl EventHandler {
             redraw_queued,
             status_tick_queued,
             selection_scroll_queued,
+            coalesce_pointer_moves,
             _task,
         }
     }
@@ -447,22 +517,32 @@ impl EventHandler {
     /// This function will block the current thread until an event is received. The event can be a
     /// tick event, a crossterm event, or an application event.
     pub async fn next(&mut self) -> color_eyre::Result<Event> {
-        let event = self
-            .receiver
-            .recv()
-            .await
-            .ok_or_eyre("application event channel closed unexpectedly")?;
-        self.mark_received(&event);
-        Ok(event)
+        loop {
+            let event = self
+                .receiver
+                .recv()
+                .await
+                .ok_or_eyre("application event channel closed unexpectedly")?;
+            let Some(event) = resolve_pointer_move(event) else {
+                continue;
+            };
+            self.mark_received(&event);
+            return Ok(event);
+        }
     }
 
     /// Attempt to receive an event without blocking.
     ///
     /// This can be used to drain the event queue between frames.
     pub fn try_next(&mut self) -> Option<Event> {
-        let event = self.receiver.try_recv().ok()?;
-        self.mark_received(&event);
-        Some(event)
+        loop {
+            let event = self.receiver.try_recv().ok()?;
+            let Some(event) = resolve_pointer_move(event) else {
+                continue;
+            };
+            self.mark_received(&event);
+            return Some(event);
+        }
     }
 
     /// Queue an app event to be sent to the event receiver.
@@ -513,6 +593,13 @@ impl EventHandler {
         });
     }
 
+    /// Preserve every pointer event while an embedded terminal owns the mouse;
+    /// otherwise the TUI only needs the latest hover position.
+    pub(crate) fn set_pointer_move_coalescing(&self, enabled: bool) {
+        self.coalesce_pointer_moves
+            .store(enabled, Ordering::Release);
+    }
+
     /// Schedule one selection edge-scroll step at roughly 30 FPS. This is
     /// separate from the 10 FPS status timer so each step can remain one line.
     pub fn schedule_selection_scroll(&self) {
@@ -545,7 +632,80 @@ impl EventHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, EventHandler};
+    use super::{Event, EventHandler, queue_crossterm_event};
+    use crossterm::event::{
+        Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+    };
+
+    #[tokio::test]
+    async fn pointer_move_queue_keeps_only_the_latest_contiguous_position() {
+        let mut handler = EventHandler::new();
+        let mut pending_pointer_move = None;
+        let pointer_move = |column| {
+            CrosstermEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        assert!(queue_crossterm_event(
+            &handler.sender,
+            &mut pending_pointer_move,
+            pointer_move(1),
+            true,
+        ));
+        assert!(queue_crossterm_event(
+            &handler.sender,
+            &mut pending_pointer_move,
+            pointer_move(9),
+            true,
+        ));
+        assert!(queue_crossterm_event(
+            &handler.sender,
+            &mut pending_pointer_move,
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            true,
+        ));
+
+        let Event::Crossterm(CrosstermEvent::Mouse(mouse)) = handler.next().await.unwrap() else {
+            panic!("expected one resolved pointer move");
+        };
+        assert_eq!((mouse.column, mouse.row), (9, 7));
+        assert!(matches!(
+            handler.next().await.unwrap(),
+            Event::Crossterm(CrosstermEvent::Key(_))
+        ));
+        assert!(handler.try_next().is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_pointer_move_coalescing_preserves_each_report() {
+        let mut handler = EventHandler::new();
+        let mut pending_pointer_move = None;
+        for column in [1, 9] {
+            assert!(queue_crossterm_event(
+                &handler.sender,
+                &mut pending_pointer_move,
+                CrosstermEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column,
+                    row: 7,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                false,
+            ));
+        }
+
+        for expected_column in [1, 9] {
+            let Event::Crossterm(CrosstermEvent::Mouse(mouse)) = handler.next().await.unwrap()
+            else {
+                panic!("expected raw pointer move");
+            };
+            assert_eq!(mouse.column, expected_column);
+        }
+    }
 
     #[tokio::test]
     async fn channel_only_handler_delivers_events_and_joins_without_panicking() {

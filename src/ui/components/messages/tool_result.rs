@@ -33,6 +33,7 @@ pub struct ToolResultMessage<'a> {
     width: u16,
     failed: bool,
     expanded: bool,
+    image_previews: Option<&'a crate::ui::image_preview::ImagePreviewStore>,
 }
 
 impl<'a> ToolResultMessage<'a> {
@@ -42,6 +43,7 @@ impl<'a> ToolResultMessage<'a> {
             width,
             failed: false,
             expanded: false,
+            image_previews: None,
         }
     }
 
@@ -52,6 +54,14 @@ impl<'a> ToolResultMessage<'a> {
 
     pub fn expanded(mut self, expanded: bool) -> Self {
         self.expanded = expanded;
+        self
+    }
+
+    pub(crate) fn image_previews(
+        mut self,
+        image_previews: &'a crate::ui::image_preview::ImagePreviewStore,
+    ) -> Self {
+        self.image_previews = Some(image_previews);
         self
     }
 
@@ -110,10 +120,9 @@ impl<'a> ToolResultMessage<'a> {
         // rendered inside the block padding.
         let preview_width = self.width.saturating_sub(PAD_RIGHT);
 
-        lines.extend(crate::ui::image_preview::preview_lines(
-            &self.output.output,
-            preview_width,
-        ));
+        if let Some(image_previews) = self.image_previews {
+            lines.extend(image_previews.preview_lines(&self.output.output, preview_width));
+        }
 
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })

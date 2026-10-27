@@ -80,8 +80,193 @@ pub(crate) fn render_read_only_markdown(md: &str, render_width: u16) -> Text<'st
 
 fn render_markdown_with_hooks(md: &str, render_width: u16, hooks: CodeBlockHooks) -> Text<'static> {
     let renderer = MarkdownRenderer::new(render_width as usize).with_render_hooks(Box::new(hooks));
-    let blocks = renderer.parse(md);
+    let md = normalize_math(md);
+    let blocks = renderer.parse(&md);
     Text::from(renderer.render(&blocks, &AppTheme))
+}
+
+fn normalize_math(markdown: &str) -> String {
+    let mut output = Vec::new();
+    let mut display_math = None::<Vec<&str>>;
+    let mut fenced_code = None::<(char, usize)>;
+
+    for line in markdown.split('\n') {
+        let trimmed = line.trim();
+        if let Some(lines) = display_math.as_mut() {
+            if trimmed == "$$" {
+                let fence = "`".repeat(math_fence_len(lines));
+                output.push(format!("{fence}math"));
+                output.extend(lines.drain(..).map(str::to_string));
+                output.push(fence);
+                display_math = None;
+            } else {
+                lines.push(line);
+            }
+            continue;
+        }
+
+        if let Some((marker, length)) = fenced_code {
+            output.push(line.to_string());
+            if closing_fence(line, marker, length) {
+                fenced_code = None;
+            }
+            continue;
+        }
+        if let Some(fence) = opening_fence(line) {
+            fenced_code = Some(fence);
+            output.push(line.to_string());
+            continue;
+        }
+
+        if trimmed == "$$" {
+            display_math = Some(Vec::new());
+        } else if let Some(formula) = trimmed
+            .strip_prefix("$$")
+            .and_then(|value| value.strip_suffix("$$"))
+            .filter(|value| !value.is_empty())
+        {
+            let formula = formula.trim();
+            let fence = "`".repeat(math_fence_len(&[formula]));
+            output.push(format!("{fence}math"));
+            output.push(formula.to_string());
+            output.push(fence);
+        } else {
+            output.push(normalize_inline_math(line));
+        }
+    }
+
+    if let Some(lines) = display_math {
+        output.push("$$".to_string());
+        output.extend(lines.into_iter().map(str::to_string));
+    }
+    output.join("\n")
+}
+
+fn opening_fence(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let marker = trimmed.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let length = trimmed.chars().take_while(|ch| *ch == marker).count();
+    (length >= 3).then_some((marker, length))
+}
+
+fn closing_fence(line: &str, marker: char, opening_length: usize) -> bool {
+    let trimmed = line.trim();
+    let length = trimmed.chars().take_while(|ch| *ch == marker).count();
+    length >= opening_length && trimmed.chars().skip(length).all(char::is_whitespace)
+}
+
+fn math_fence_len(lines: &[&str]) -> usize {
+    lines
+        .iter()
+        .flat_map(|line| line.split(|ch| ch != '`'))
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+        .max(2)
+        + 1
+}
+
+fn normalize_inline_math(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut index = 0;
+
+    while index < line.len() {
+        let Some(relative) = line[index..].find(['`', '$']) else {
+            output.push_str(&line[index..]);
+            break;
+        };
+        let start = index + relative;
+        output.push_str(&line[index..start]);
+
+        if line.as_bytes()[start] == b'`' {
+            let ticks = line[start..]
+                .bytes()
+                .take_while(|byte| *byte == b'`')
+                .count();
+            if delimiter_is_escaped(line, start) {
+                output.push_str(&line[start..start + ticks]);
+                index = start + ticks;
+            } else if let Some(end) = code_span_end(line, start + ticks, ticks) {
+                output.push_str(&line[start..end]);
+                index = end;
+            } else {
+                output.push_str(&line[start..start + ticks]);
+                index = start + ticks;
+            }
+            continue;
+        }
+
+        if line[start + 1..].starts_with('$') {
+            output.push_str("$$");
+            index = start + 2;
+            continue;
+        }
+        if delimiter_is_escaped(line, start)
+            || line[start + 1..]
+                .chars()
+                .next()
+                .is_none_or(|ch| ch.is_whitespace() || ch.is_ascii_digit())
+        {
+            output.push('$');
+            index = start + 1;
+            continue;
+        }
+
+        let mut search = start + 1;
+        let mut closing = None;
+        while let Some(relative) = line[search..].find('$') {
+            let candidate = search + relative;
+            let before = line[..candidate].chars().next_back();
+            let after = line[candidate + 1..].chars().next();
+            if !delimiter_is_escaped(line, candidate)
+                && before.is_some_and(|ch| !ch.is_whitespace() && ch != '$')
+                && after.is_none_or(|ch| !ch.is_ascii_digit() && ch != '$')
+            {
+                closing = Some(candidate);
+                break;
+            }
+            search = candidate + 1;
+        }
+
+        if let Some(end) = closing {
+            output.push_str(&crate::ui::markdown_code_block::latex_to_unicode(
+                &line[start + 1..end],
+            ));
+            index = end + 1;
+        } else {
+            output.push('$');
+            index = start + 1;
+        }
+    }
+    output
+}
+
+fn code_span_end(line: &str, mut search: usize, ticks: usize) -> Option<usize> {
+    while let Some(relative) = line[search..].find('`') {
+        let candidate = search + relative;
+        let length = line[candidate..]
+            .bytes()
+            .take_while(|byte| *byte == b'`')
+            .count();
+        if length == ticks {
+            return Some(candidate + ticks);
+        }
+        search = candidate + length;
+    }
+    None
+}
+
+fn delimiter_is_escaped(line: &str, index: usize) -> bool {
+    line[..index]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 #[cfg(test)]
@@ -108,6 +293,36 @@ mod tests {
                 assert_eq!(read_only, conversation, "width {width}, {document:?}");
             }
         }
+    }
+
+    #[test]
+    fn math_normalization_handles_inline_display_and_code_literals() {
+        let markdown =
+            "Euler: $e^{i\\pi} + 1 = 0$\n\n$$\n\\frac{1}{2}\n$$\n\n~~~sh\necho '$HOME'\n~~~";
+        let normalized = normalize_math(markdown);
+
+        assert!(normalized.contains("Euler: e^(iπ) + 1 = 0"), "{normalized}");
+        assert!(
+            normalized.contains("```math\n\\frac{1}{2}\n```"),
+            "{normalized}"
+        );
+        assert!(normalized.contains("echo '$HOME'"), "{normalized}");
+    }
+
+    #[test]
+    fn inline_math_preserves_currency_escapes_and_code_spans() {
+        let line = r"Pay $5 or $10; `$x$`, ``$y$``, `code `` $hidden$`, \`literal $z$\`, \$HOME, and $$w$$ stay literal; solve $x^2$.";
+
+        assert_eq!(
+            normalize_inline_math(line),
+            r"Pay $5 or $10; `$x$`, ``$y$``, `code `` $hidden$`, \`literal z\`, \$HOME, and $$w$$ stay literal; solve x²."
+        );
+    }
+
+    #[test]
+    fn display_math_uses_safe_fences_and_leaves_unclosed_blocks_literal() {
+        assert_eq!(normalize_math("$$\na ``` b\n$$"), "````math\na ``` b\n````");
+        assert_eq!(normalize_math("before\n$$\nx + y"), "before\n$$\nx + y");
     }
 
     #[test]

@@ -24,13 +24,16 @@ use crate::config::programmer_config::{ProgrammerConfig, ProviderConfig};
 use crate::providers::ProviderManager;
 use crate::ui::components::completion_popup::CompletionPopup;
 use crate::ui::components::panel_search::{PanelSearch, SearchKey};
+use crate::ui::interaction::InteractionAnimation;
 use crate::ui::markdown_theme::palette;
-use crossterm::event::{KeyCode, KeyEvent};
+use crate::ui::theme::role;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget};
+use std::cell::{Cell, RefCell};
 
 /// What the app should do after the panel handled a key.
 #[derive(Debug, PartialEq)]
@@ -96,11 +99,45 @@ enum Mode {
     GlobalSettings(GlobalForm),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseTarget {
+    Provider(usize),
+    Add,
+    Edit,
+    Models,
+    Refresh,
+    GlobalSettings,
+    Search,
+    Delete,
+    Close,
+    ConfirmDelete(bool),
+    FormField(usize),
+    FormSave,
+    FormCancel,
+    Completion(usize),
+    Model(usize),
+    Role(usize),
+    GlobalField(usize),
+    GlobalSave,
+    GlobalCancel,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HitRegion {
+    area: Rect,
+    target: MouseTarget,
+}
+
 #[derive(Debug)]
 pub struct ProviderPanel {
     mode: Mode,
     selected: usize,
     search: PanelSearch,
+    hit_regions: RefCell<Vec<HitRegion>>,
+    scroll_area: Cell<Option<Rect>>,
+    hovered: Cell<Option<MouseTarget>>,
+    pressed: Cell<Option<MouseTarget>>,
+    interaction_animation: InteractionAnimation,
 }
 
 fn rename_global_model_provider(value: &mut Option<String>, old: &str, new: &str) {
@@ -118,6 +155,11 @@ impl ProviderPanel {
             mode: Mode::List,
             selected: 0,
             search: PanelSearch::default(),
+            hit_regions: RefCell::new(Vec::new()),
+            scroll_area: Cell::new(None),
+            hovered: Cell::new(None),
+            pressed: Cell::new(None),
+            interaction_animation: InteractionAnimation::default(),
         }
     }
 
@@ -167,6 +209,160 @@ impl ProviderPanel {
             let clean: String = data.chars().filter(|c| *c != '\n' && *c != '\r').collect();
             form.fields[form.focus].push_str(&clean);
         }
+    }
+
+    /// Handle a pointer event using hit regions from the most recent render.
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        config: &mut ProgrammerConfig,
+        pm: &ProviderManager,
+    ) -> PanelAction {
+        let target = self
+            .hit_regions
+            .borrow()
+            .iter()
+            .find(|hit| hit.area.contains((mouse.column, mouse.row).into()))
+            .map(|hit| hit.target);
+        match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                self.set_mouse_hover(target);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.set_mouse_hover(target);
+                self.pressed.set(target);
+                self.select_mouse_target(target);
+                self.interaction_animation.cancel();
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.set_mouse_hover(target);
+                let activate = self
+                    .pressed
+                    .replace(None)
+                    .filter(|pressed| Some(*pressed) == target);
+                if let Some(target) = activate {
+                    self.interaction_animation.restart();
+                    return self.activate_mouse_target(target, config, pm);
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let code = if mouse.kind == MouseEventKind::ScrollUp {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                };
+                let over_list = self
+                    .scroll_area
+                    .get()
+                    .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
+                    || matches!(target, Some(MouseTarget::Completion(_)));
+                if over_list {
+                    return self.handle_key(KeyEvent::new(code, mouse.modifiers), config, pm);
+                }
+            }
+            _ => {}
+        }
+        PanelAction::None
+    }
+
+    /// Whether pointer feedback still needs animation frames.
+    pub fn interaction_animation_active(&self) -> bool {
+        self.interaction_animation.active()
+    }
+
+    pub(crate) fn cancel_pointer_gesture(&mut self) {
+        self.hovered.set(None);
+        self.pressed.set(None);
+        self.interaction_animation.cancel();
+    }
+
+    fn set_mouse_hover(&mut self, target: Option<MouseTarget>) {
+        if self.hovered.get() != target {
+            self.hovered.set(target);
+            if target.is_some() {
+                self.interaction_animation.restart();
+            } else {
+                self.interaction_animation.cancel();
+            }
+        }
+    }
+
+    fn select_mouse_target(&mut self, target: Option<MouseTarget>) {
+        match target {
+            Some(MouseTarget::Provider(index)) => self.selected = index,
+            Some(MouseTarget::Model(index)) => {
+                if let Mode::Models { selected, .. } = &mut self.mode {
+                    *selected = index;
+                }
+            }
+            Some(MouseTarget::Role(index)) => {
+                if let Mode::RoleMenu { selected, .. } = &mut self.mode {
+                    *selected = index;
+                }
+            }
+            Some(MouseTarget::FormField(index)) => {
+                if let Mode::Form(form) = &mut self.mode {
+                    form.focus = index;
+                    form.completion = None;
+                }
+            }
+            Some(MouseTarget::GlobalField(index)) => {
+                if let Mode::GlobalSettings(form) = &mut self.mode {
+                    form.focus = index;
+                }
+            }
+            Some(MouseTarget::Completion(index)) => {
+                if let Mode::Form(form) = &mut self.mode
+                    && let Some(completion) = &mut form.completion
+                    && index < completion.candidates.len()
+                {
+                    completion.selected = index;
+                    form.fields[3] = completion.candidates[index].clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn activate_mouse_target(
+        &mut self,
+        target: MouseTarget,
+        config: &mut ProgrammerConfig,
+        pm: &ProviderManager,
+    ) -> PanelAction {
+        self.select_mouse_target(Some(target));
+        if matches!(self.mode, Mode::List) {
+            match target {
+                MouseTarget::Search => {
+                    self.search.focus();
+                    return PanelAction::None;
+                }
+                MouseTarget::Close => return PanelAction::Close,
+                _ => self.search.blur(),
+            }
+        }
+        let code = match target {
+            MouseTarget::Provider(_) | MouseTarget::Model(_) | MouseTarget::Role(_) => {
+                KeyCode::Enter
+            }
+            MouseTarget::Add => KeyCode::Char('a'),
+            MouseTarget::Edit => KeyCode::Char('e'),
+            MouseTarget::Models => KeyCode::Char('m'),
+            MouseTarget::Refresh => KeyCode::Char('r'),
+            MouseTarget::GlobalSettings => KeyCode::Char('g'),
+            MouseTarget::Search => KeyCode::Char('/'),
+            MouseTarget::Delete => KeyCode::Char('d'),
+            MouseTarget::Close | MouseTarget::FormCancel | MouseTarget::GlobalCancel => {
+                KeyCode::Esc
+            }
+            MouseTarget::ConfirmDelete(true) => KeyCode::Char('y'),
+            MouseTarget::ConfirmDelete(false) => KeyCode::Char('n'),
+            MouseTarget::FormSave | MouseTarget::GlobalSave | MouseTarget::Completion(_) => {
+                KeyCode::Enter
+            }
+            MouseTarget::FormField(_) | MouseTarget::GlobalField(_) => return PanelAction::None,
+        };
+        self.handle_key(KeyEvent::new(code, KeyModifiers::NONE), config, pm)
     }
 
     fn handle_list_key(
@@ -705,10 +901,13 @@ impl ProviderPanel {
         let total = config.providers.len();
         let names = self.filtered_names(config);
         let mut title = vec![Line::from(vec![
-            Span::styled("🔌  Providers", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(
+                "🔌  Providers",
+                Style::default().fg(role::SECTION_PROVIDERS).bold(),
+            ),
             Span::styled(
                 format!("  ({total} configured)"),
-                Style::default().fg(Color::Gray).italic(),
+                Style::default().fg(palette::MUTED).italic(),
             ),
         ])];
         if !pm.startup_errors.is_empty() {
@@ -717,14 +916,14 @@ impl ProviderPanel {
                     "⚠ Model list refresh incomplete ({}) · providers remain usable · press r to retry",
                     pm.startup_errors.len()
                 ),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(palette::YELLOW),
             )));
         }
         Paragraph::new(title).render(chunks[0], buf);
 
         let mut list_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(role::BORDER));
         if let Some(title) = self.search.block_title(names.len(), total) {
             list_block = list_block.title(title);
         }
@@ -737,30 +936,30 @@ impl ProviderPanel {
                 let is_default = config.default_provider == *name;
                 let mut first = vec![Span::styled(
                     name.clone(),
-                    Style::default().fg(Color::White).bold(),
+                    Style::default().fg(palette::TEXT).bold(),
                 )];
                 if is_default {
                     first.push(Span::styled(
                         "  [default]",
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(palette::GREEN),
                     ));
                 }
                 let model_count = pm.models_for(name).len();
                 let second = Line::from(vec![
                     Span::styled(
                         format!("  {}", p.base_url),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(palette::MUTED),
                     ),
                     Span::styled(
                         format!(
                             " · default_model: {}",
                             p.default_model.as_deref().unwrap_or("(first available)")
                         ),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette::FAINT),
                     ),
                     Span::styled(
                         format!(" · {model_count} models"),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette::FAINT),
                     ),
                 ]);
                 ListItem::new(vec![Line::from(first), second])
@@ -771,7 +970,7 @@ impl ProviderPanel {
                 Line::from(""),
                 Line::from(Span::styled(
                     "  No providers match the search.",
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(palette::MUTED),
                 )),
             ])
             .block(list_block)
@@ -781,8 +980,8 @@ impl ProviderPanel {
                 .block(list_block)
                 .highlight_style(
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .fg(role::SELECTION_TEXT)
+                        .bg(role::SELECTION_BG)
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("❯ ");
@@ -797,27 +996,27 @@ impl ProviderPanel {
         match &self.mode {
             Mode::List => {
                 let mut help = vec![
-                    Span::styled(" ↑↓", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" navigate  ", Style::default().fg(Color::Gray)),
-                    Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" set default  ", Style::default().fg(Color::Gray)),
-                    Span::styled("a", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" add  ", Style::default().fg(Color::Gray)),
-                    Span::styled("e", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" edit  ", Style::default().fg(Color::Gray)),
-                    Span::styled("m", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" models  ", Style::default().fg(Color::Gray)),
-                    Span::styled("r", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" refresh  ", Style::default().fg(Color::Gray)),
-                    Span::styled("g", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" global settings  ", Style::default().fg(Color::Gray)),
+                    Span::styled(" ↑↓", Style::default().fg(palette::BLUE).bold()),
+                    Span::styled(" navigate  ", Style::default().fg(palette::MUTED)),
+                    Span::styled("Enter", Style::default().fg(palette::BLUE).bold()),
+                    Span::styled(" set default  ", Style::default().fg(palette::MUTED)),
+                    Span::styled("a", Style::default().fg(palette::BLUE).bold()),
+                    Span::styled(" add  ", Style::default().fg(palette::MUTED)),
+                    Span::styled("e", Style::default().fg(palette::BLUE).bold()),
+                    Span::styled(" edit  ", Style::default().fg(palette::MUTED)),
+                    Span::styled("m", Style::default().fg(palette::BLUE).bold()),
+                    Span::styled(" models  ", Style::default().fg(palette::MUTED)),
+                    Span::styled("r", Style::default().fg(palette::BLUE).bold()),
+                    Span::styled(" refresh  ", Style::default().fg(palette::MUTED)),
+                    Span::styled("g", Style::default().fg(palette::BLUE).bold()),
+                    Span::styled(" global settings  ", Style::default().fg(palette::MUTED)),
                 ];
                 help.extend(PanelSearch::help_spans());
                 help.extend([
-                    Span::styled("d", Style::default().fg(Color::Red).bold()),
-                    Span::styled(" delete  ", Style::default().fg(Color::Gray)),
-                    Span::styled("q/Esc", Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" close", Style::default().fg(Color::Gray)),
+                    Span::styled("d", Style::default().fg(palette::RED).bold()),
+                    Span::styled(" delete  ", Style::default().fg(palette::MUTED)),
+                    Span::styled("q/Esc", Style::default().fg(palette::BLUE).bold()),
+                    Span::styled(" close", Style::default().fg(palette::MUTED)),
                 ]);
                 Paragraph::new(Line::from(help)).render(chunks[2], buf);
             }
@@ -825,12 +1024,12 @@ impl ProviderPanel {
                 let confirm = Line::from(vec![
                     Span::styled(
                         format!(" Delete provider '{name}'?  "),
-                        Style::default().fg(Color::Yellow).bold(),
+                        Style::default().fg(palette::YELLOW).bold(),
                     ),
-                    Span::styled("y", Style::default().fg(Color::Green).bold()),
-                    Span::styled(" yes  ", Style::default().fg(Color::Gray)),
-                    Span::styled("n", Style::default().fg(Color::Red).bold()),
-                    Span::styled(" cancel", Style::default().fg(Color::Gray)),
+                    Span::styled("y", Style::default().fg(palette::GREEN).bold()),
+                    Span::styled(" yes  ", Style::default().fg(palette::MUTED)),
+                    Span::styled("n", Style::default().fg(palette::RED).bold()),
+                    Span::styled(" cancel", Style::default().fg(palette::MUTED)),
                 ]);
                 Paragraph::new(confirm).render(chunks[2], buf);
             }
@@ -847,58 +1046,58 @@ impl ProviderPanel {
                         let focused = i == form.focus;
                         let marker = if focused { "❯ " } else { "  " };
                         let label_style = if focused {
-                            Style::default().fg(Color::Cyan).bold()
+                            Style::default().fg(palette::BLUE).bold()
                         } else {
-                            Style::default().fg(Color::Gray)
+                            Style::default().fg(palette::MUTED)
                         };
                         let value = &form.fields[i];
                         let cursor = if focused { "▏" } else { "" };
                         Line::from(vec![
                             Span::styled(format!("{marker}{label:>14}: "), label_style),
-                            Span::styled(value.clone(), Style::default().fg(Color::White)),
-                            Span::styled(cursor, Style::default().fg(Color::Cyan)),
+                            Span::styled(value.clone(), Style::default().fg(palette::TEXT)),
+                            Span::styled(cursor, Style::default().fg(palette::BLUE)),
                         ])
                     })
                     .collect();
                 if let Some(err) = &form.error {
                     lines.push(Line::from(Span::styled(
                         format!("  {err}"),
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(palette::RED),
                     )));
                 }
                 // Hint line: mention Tab completion if focused on default_model.
                 let hint = if form.focus == 3 {
                     if form.completion.is_some() {
                         Line::from(vec![
-                            Span::styled("  Tab", Style::default().fg(Color::Cyan).bold()),
-                            Span::styled(" next  ", Style::default().fg(Color::Gray)),
-                            Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
-                            Span::styled(" select  ", Style::default().fg(Color::Gray)),
-                            Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-                            Span::styled(" accept  ", Style::default().fg(Color::Gray)),
-                            Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-                            Span::styled(" close popup  ", Style::default().fg(Color::Gray)),
+                            Span::styled("  Tab", Style::default().fg(palette::BLUE).bold()),
+                            Span::styled(" next  ", Style::default().fg(palette::MUTED)),
+                            Span::styled("↑↓", Style::default().fg(palette::BLUE).bold()),
+                            Span::styled(" select  ", Style::default().fg(palette::MUTED)),
+                            Span::styled("Enter", Style::default().fg(palette::GREEN).bold()),
+                            Span::styled(" accept  ", Style::default().fg(palette::MUTED)),
+                            Span::styled("Esc", Style::default().fg(palette::BLUE).bold()),
+                            Span::styled(" close popup  ", Style::default().fg(palette::MUTED)),
                         ])
                     } else {
                         Line::from(vec![
-                            Span::styled("  Tab", Style::default().fg(Color::Cyan).bold()),
-                            Span::styled(" complete model  ", Style::default().fg(Color::Gray)),
-                            Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
-                            Span::styled(" next field  ", Style::default().fg(Color::Gray)),
-                            Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
-                            Span::styled(" save  ", Style::default().fg(Color::Gray)),
-                            Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-                            Span::styled(" cancel", Style::default().fg(Color::Gray)),
+                            Span::styled("  Tab", Style::default().fg(palette::BLUE).bold()),
+                            Span::styled(" complete model  ", Style::default().fg(palette::MUTED)),
+                            Span::styled("↑↓", Style::default().fg(palette::BLUE).bold()),
+                            Span::styled(" next field  ", Style::default().fg(palette::MUTED)),
+                            Span::styled("Enter", Style::default().fg(palette::BLUE).bold()),
+                            Span::styled(" save  ", Style::default().fg(palette::MUTED)),
+                            Span::styled("Esc", Style::default().fg(palette::BLUE).bold()),
+                            Span::styled(" cancel", Style::default().fg(palette::MUTED)),
                         ])
                     }
                 } else {
                     Line::from(vec![
-                        Span::styled("  Tab/↑↓", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" next field  ", Style::default().fg(Color::Gray)),
-                        Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" save  ", Style::default().fg(Color::Gray)),
-                        Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(" cancel", Style::default().fg(Color::Gray)),
+                        Span::styled("  Tab/↑↓", Style::default().fg(palette::BLUE).bold()),
+                        Span::styled(" next field  ", Style::default().fg(palette::MUTED)),
+                        Span::styled("Enter", Style::default().fg(palette::BLUE).bold()),
+                        Span::styled(" save  ", Style::default().fg(palette::MUTED)),
+                        Span::styled("Esc", Style::default().fg(palette::BLUE).bold()),
+                        Span::styled(" cancel", Style::default().fg(palette::MUTED)),
                     ])
                 };
                 lines.push(hint);
@@ -915,7 +1114,8 @@ impl ProviderPanel {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Cyan))
+                            .border_style(Style::default().fg(role::FOCUS))
+                            .title_style(Style::default().fg(role::FOCUS).bold())
                             .title(title),
                     )
                     .render(form_area, buf);
@@ -946,6 +1146,9 @@ impl ProviderPanel {
                         label: String::as_str,
                         selected: comp.selected,
                         scroll_offset: comp.scroll_offset,
+                        hovered: None,
+                        pressed: None,
+                        hover_background: palette::SURFACE_HOVER,
                     };
                     popup.render(popup_area, buf);
                 }
@@ -1030,13 +1233,14 @@ impl ProviderPanel {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(palette::BORDER))
+                            .border_style(Style::default().fg(role::BORDER))
                             .title_style(Style::default().fg(palette::BLUE).bold())
                             .title(title),
                     )
                     .highlight_style(
                         Style::default()
-                            .bg(palette::SURFACE)
+                            .fg(role::SELECTION_TEXT)
+                            .bg(role::SELECTION_BG)
                             .add_modifier(Modifier::BOLD),
                     )
                     .highlight_symbol("› ");
@@ -1096,8 +1300,8 @@ impl ProviderPanel {
                 let items = choices.iter().enumerate().map(|(index, choice)| {
                     let style = if index == *selected {
                         Style::default()
-                            .fg(palette::BLUE)
-                            .bg(palette::SURFACE)
+                            .fg(role::SELECTION_TEXT)
+                            .bg(role::SELECTION_BG)
                             .bold()
                     } else {
                         Style::default().fg(palette::TEXT)
@@ -1107,7 +1311,7 @@ impl ProviderPanel {
                 let list = List::new(items).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(palette::BORDER))
+                        .border_style(Style::default().fg(role::BORDER))
                         .title_style(Style::default().fg(palette::BLUE).bold())
                         .title(format!(" Model role: {provider}/{model} ")),
                 );
@@ -1152,13 +1356,337 @@ impl ProviderPanel {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(palette::BORDER))
+                            .border_style(Style::default().fg(role::BORDER))
                             .title_style(Style::default().fg(palette::BLUE).bold())
                             .title(" Global model-role settings "),
                     )
                     .render(chunks[1], buf);
                 Paragraph::new("Tab/arrows field  Enter save globally  Esc cancel")
                     .render(chunks[2], buf);
+            }
+        }
+
+        let hits = self.mouse_hit_regions(config, pm, area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(2),
+            ])
+            .split(area);
+        self.scroll_area.set(match self.mode {
+            Mode::List | Mode::Models { .. } | Mode::RoleMenu { .. } => {
+                Some(Block::default().borders(Borders::ALL).inner(chunks[1]))
+            }
+            _ => None,
+        });
+        paint_mouse_feedback(
+            buf,
+            &hits,
+            self.hovered.get(),
+            self.pressed.get(),
+            self.interaction_animation.hover_background(),
+        );
+        *self.hit_regions.borrow_mut() = hits;
+    }
+
+    fn mouse_hit_regions(
+        &self,
+        config: &ProgrammerConfig,
+        pm: &ProviderManager,
+        area: Rect,
+    ) -> Vec<HitRegion> {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(2),
+            ])
+            .split(area);
+        let mut hits = Vec::new();
+        match &self.mode {
+            Mode::List => {
+                let names = self.filtered_names(config);
+                add_list_hits(
+                    &mut hits,
+                    chunks[1],
+                    2,
+                    self.selected,
+                    names.len(),
+                    MouseTarget::Provider,
+                );
+                add_footer_hits(
+                    &mut hits,
+                    chunks[2],
+                    " ↑↓ navigate  Enter set default  ",
+                    &[
+                        ("a", " add  ", MouseTarget::Add),
+                        ("e", " edit  ", MouseTarget::Edit),
+                        ("m", " models  ", MouseTarget::Models),
+                        ("r", " refresh  ", MouseTarget::Refresh),
+                        ("g", " global settings  ", MouseTarget::GlobalSettings),
+                    ],
+                );
+                add_footer_hits(
+                    &mut hits,
+                    chunks[2],
+                    " ↑↓ navigate  Enter set default  a add  e edit  m models  r refresh  g global settings  ",
+                    &[
+                        ("/", " search  ", MouseTarget::Search),
+                        ("d", " delete  ", MouseTarget::Delete),
+                        ("q/Esc", " close", MouseTarget::Close),
+                    ],
+                );
+            }
+            Mode::ConfirmDelete(name) => {
+                add_footer_hits(
+                    &mut hits,
+                    chunks[2],
+                    &format!(" Delete provider '{name}'?  "),
+                    &[
+                        ("y", " yes  ", MouseTarget::ConfirmDelete(true)),
+                        ("n", " cancel", MouseTarget::ConfirmDelete(false)),
+                    ],
+                );
+            }
+            Mode::Form(form) => {
+                let line_count = FORM_LABELS.len() + usize::from(form.error.is_some()) + 1;
+                let height = (line_count as u16 + 2).min(area.height);
+                let form_area = Rect::new(
+                    area.x,
+                    area.bottom().saturating_sub(height),
+                    area.width,
+                    height,
+                );
+                let inner = Block::default().borders(Borders::ALL).inner(form_area);
+                for index in 0..FORM_LABELS.len().min(usize::from(inner.height)) {
+                    hits.push(HitRegion {
+                        area: Rect::new(inner.x, inner.y + index as u16, inner.width, 1),
+                        target: MouseTarget::FormField(index),
+                    });
+                }
+                let hint_area =
+                    Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+                let prefix = if form.focus == 3 && form.completion.is_some() {
+                    "  Tab next  ↑↓ select  "
+                } else if form.focus == 3 {
+                    "  Tab complete model  ↑↓ next field  "
+                } else {
+                    "  Tab/↑↓ next field  "
+                };
+                add_footer_hits(
+                    &mut hits,
+                    hint_area,
+                    prefix,
+                    &[
+                        (
+                            "Enter",
+                            if form.completion.is_some() {
+                                " accept  "
+                            } else {
+                                " save  "
+                            },
+                            MouseTarget::FormSave,
+                        ),
+                        (
+                            "Esc",
+                            if form.completion.is_some() {
+                                " close popup  "
+                            } else {
+                                " cancel"
+                            },
+                            MouseTarget::FormCancel,
+                        ),
+                    ],
+                );
+                if let Some(completion) = &form.completion {
+                    let count = (completion.candidates.len() as u16).min(10);
+                    let field_line = 3u16;
+                    let value_x = form_area.x.saturating_add(20);
+                    let longest = completion
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.len())
+                        .max()
+                        .unwrap_or(0) as u16;
+                    let popup_width = (longest + 2).clamp(14, form_area.width);
+                    let popup_y = form_area.y.saturating_add(field_line).saturating_sub(count);
+                    let popup_area = Rect {
+                        x: value_x.min(form_area.right().saturating_sub(popup_width)),
+                        y: popup_y.min(form_area.bottom().saturating_sub(count)),
+                        width: popup_width,
+                        height: count.min(form_area.y + field_line),
+                    };
+                    for (row, index) in (completion.scroll_offset..completion.candidates.len())
+                        .take(usize::from(popup_area.height))
+                        .enumerate()
+                    {
+                        hits.insert(
+                            row,
+                            HitRegion {
+                                area: Rect::new(
+                                    popup_area.x,
+                                    popup_area.y + row as u16,
+                                    popup_area.width,
+                                    1,
+                                ),
+                                target: MouseTarget::Completion(index),
+                            },
+                        );
+                    }
+                }
+            }
+            Mode::Models {
+                provider,
+                filter,
+                selected,
+            } => {
+                let needle = filter.to_lowercase();
+                let count = pm
+                    .models_for(provider)
+                    .iter()
+                    .filter(|model| model.to_lowercase().contains(&needle))
+                    .count();
+                add_list_hits(
+                    &mut hits,
+                    chunks[1],
+                    1,
+                    *selected,
+                    count,
+                    MouseTarget::Model,
+                );
+                let prefix = if filter.is_empty() {
+                    "type to filter  ↑↓ navigate  Enter choose role  "
+                } else {
+                    // The rendered prefix includes the dynamic filter text.
+                    // Its display width, not its byte length, positions Esc.
+                    ""
+                };
+                if filter.is_empty() {
+                    add_footer_hits(
+                        &mut hits,
+                        chunks[2],
+                        prefix,
+                        &[("Esc", " back", MouseTarget::Close)],
+                    );
+                } else {
+                    add_footer_hits(
+                        &mut hits,
+                        chunks[2],
+                        &format!(" filter: \"{filter}\"  ↑↓ navigate  Enter choose role  "),
+                        &[("Esc", " back", MouseTarget::Close)],
+                    );
+                }
+            }
+            Mode::RoleMenu { selected, .. } => {
+                add_list_hits(&mut hits, chunks[1], 1, *selected, 11, MouseTarget::Role);
+                add_footer_hits(
+                    &mut hits,
+                    chunks[2],
+                    "↑↓ navigate  Enter apply globally  ",
+                    &[("Esc", " back", MouseTarget::Close)],
+                );
+            }
+            Mode::GlobalSettings(form) => {
+                let inner = Block::default().borders(Borders::ALL).inner(chunks[1]);
+                for index in 0..form.fields.len().min(usize::from(inner.height)) {
+                    hits.push(HitRegion {
+                        area: Rect::new(inner.x, inner.y + index as u16, inner.width, 1),
+                        target: MouseTarget::GlobalField(index),
+                    });
+                }
+                add_footer_hits(
+                    &mut hits,
+                    chunks[2],
+                    "Tab/arrows field  ",
+                    &[
+                        ("Enter", " save globally  ", MouseTarget::GlobalSave),
+                        ("Esc", " cancel", MouseTarget::GlobalCancel),
+                    ],
+                );
+            }
+        }
+        hits
+    }
+}
+
+fn add_list_hits(
+    hits: &mut Vec<HitRegion>,
+    area: Rect,
+    item_height: u16,
+    selected: usize,
+    len: usize,
+    target: impl Fn(usize) -> MouseTarget,
+) {
+    if len == 0 {
+        return;
+    }
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let visible = (usize::from(inner.height) / usize::from(item_height)).max(1);
+    let offset = selected
+        .min(len.saturating_sub(1))
+        .saturating_add(1)
+        .saturating_sub(visible);
+    for (row, index) in (offset..len).take(visible).enumerate() {
+        hits.push(HitRegion {
+            area: Rect::new(
+                inner.x,
+                inner.y + row as u16 * item_height,
+                inner.width,
+                item_height.min(
+                    inner
+                        .bottom()
+                        .saturating_sub(inner.y + row as u16 * item_height),
+                ),
+            ),
+            target: target(index),
+        });
+    }
+}
+
+fn add_footer_hits(
+    hits: &mut Vec<HitRegion>,
+    area: Rect,
+    prefix: &str,
+    entries: &[(&str, &str, MouseTarget)],
+) {
+    use unicode_width::UnicodeWidthStr;
+
+    let mut x = area.x.saturating_add(prefix.width() as u16);
+    for (key, suffix, target) in entries {
+        let width = key.width().saturating_add(suffix.width()) as u16;
+        if x < area.right() {
+            hits.push(HitRegion {
+                area: Rect::new(x, area.y, width.min(area.right() - x), 1),
+                target: *target,
+            });
+        }
+        x = x.saturating_add(width);
+    }
+}
+
+fn paint_mouse_feedback(
+    buf: &mut Buffer,
+    hits: &[HitRegion],
+    hovered: Option<MouseTarget>,
+    pressed: Option<MouseTarget>,
+    hover_background: ratatui::style::Color,
+) {
+    let Some(target) = hovered else { return };
+    let Some(hit) = hits.iter().find(|hit| hit.target == target) else {
+        return;
+    };
+    for y in hit.area.y..hit.area.bottom() {
+        for x in hit.area.x..hit.area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if pressed == Some(target) {
+                    cell.set_bg(role::INTERACTION_PRESSED_BG);
+                    cell.set_fg(role::SELECTION_TEXT);
+                } else {
+                    cell.set_bg(hover_background);
+                }
             }
         }
     }
@@ -1203,6 +1731,15 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     #[test]
@@ -1484,7 +2021,7 @@ mod tests {
         assert!(!rendered.contains("default_model:"), "{rendered}");
         assert!(rendered.contains("deepseek-v4-flash"), "{rendered}");
         assert!(
-            (0..area.height).all(|y| { (0..area.width).all(|x| buf[(x, y)].bg != Color::Cyan) })
+            (0..area.height).all(|y| { (0..area.width).all(|x| buf[(x, y)].bg != palette::BLUE) })
         );
     }
 
@@ -1514,6 +2051,138 @@ mod tests {
         );
         assert!(rendered.contains("providers remain usable"), "{rendered}");
         assert!(!rendered.contains("raw transport error"), "{rendered}");
+    }
+
+    #[test]
+    fn model_mouse_matching_release_opens_role_menu_for_filtered_row() {
+        let mut config = config_with(&["alpha"]);
+        let pm = ProviderManager::stub(HashMap::from([(
+            "alpha".to_string(),
+            vec![
+                "ignored".to_string(),
+                "coder-small".to_string(),
+                "coder-large".to_string(),
+            ],
+        )]));
+        let mut panel = ProviderPanel::new();
+        panel.mode = Mode::Models {
+            provider: "alpha".to_string(),
+            filter: "coder".to_string(),
+            selected: 0,
+        };
+        let area = Rect::new(0, 0, 80, 12);
+        panel.render(&config, &pm, area, &mut Buffer::empty(area));
+        let second = panel
+            .hit_regions
+            .borrow()
+            .iter()
+            .find(|hit| hit.target == MouseTarget::Model(1))
+            .unwrap()
+            .area;
+
+        assert_eq!(
+            panel.handle_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), second.x, second.y),
+                &mut config,
+                &pm,
+            ),
+            PanelAction::None
+        );
+        assert!(matches!(&panel.mode, Mode::Models { selected: 1, .. }));
+        assert_eq!(
+            panel.handle_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), second.x, second.y),
+                &mut config,
+                &pm,
+            ),
+            PanelAction::None
+        );
+        assert!(matches!(
+            &panel.mode,
+            Mode::RoleMenu { provider, model, selected: 0 }
+                if provider == "alpha" && model == "coder-large"
+        ));
+    }
+
+    #[test]
+    fn model_mouse_mismatched_release_does_not_activate() {
+        let mut config = config_with(&["alpha"]);
+        let pm = ProviderManager::stub(HashMap::from([(
+            "alpha".to_string(),
+            vec!["first".to_string(), "second".to_string()],
+        )]));
+        let mut panel = ProviderPanel::new();
+        panel.mode = Mode::Models {
+            provider: "alpha".to_string(),
+            filter: String::new(),
+            selected: 0,
+        };
+        let area = Rect::new(0, 0, 80, 12);
+        panel.render(&config, &pm, area, &mut Buffer::empty(area));
+        let hits = panel.hit_regions.borrow();
+        let first = hits
+            .iter()
+            .find(|hit| hit.target == MouseTarget::Model(0))
+            .unwrap()
+            .area;
+        let second = hits
+            .iter()
+            .find(|hit| hit.target == MouseTarget::Model(1))
+            .unwrap()
+            .area;
+        drop(hits);
+
+        panel.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), first.x, first.y),
+            &mut config,
+            &pm,
+        );
+        assert_eq!(
+            panel.handle_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), second.x, second.y),
+                &mut config,
+                &pm,
+            ),
+            PanelAction::None
+        );
+        assert!(matches!(&panel.mode, Mode::Models { selected: 0, .. }));
+    }
+
+    #[test]
+    fn model_mouse_wheel_navigates_the_current_filtered_list() {
+        let mut config = config_with(&["alpha"]);
+        let pm = ProviderManager::stub(HashMap::from([(
+            "alpha".to_string(),
+            vec![
+                "other".to_string(),
+                "coder-small".to_string(),
+                "coder-large".to_string(),
+            ],
+        )]));
+        let mut panel = ProviderPanel::new();
+        panel.mode = Mode::Models {
+            provider: "alpha".to_string(),
+            filter: "coder".to_string(),
+            selected: 0,
+        };
+
+        let area = Rect::new(0, 0, 80, 12);
+        panel.render(&config, &pm, area, &mut Buffer::empty(area));
+        panel.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0), &mut config, &pm);
+        assert!(matches!(&panel.mode, Mode::Models { selected: 0, .. }));
+        let list = panel.scroll_area.get().expect("models list area");
+        panel.handle_mouse(
+            mouse(MouseEventKind::ScrollDown, list.x, list.y),
+            &mut config,
+            &pm,
+        );
+        assert!(matches!(&panel.mode, Mode::Models { selected: 1, .. }));
+        panel.handle_mouse(
+            mouse(MouseEventKind::ScrollUp, list.x, list.y),
+            &mut config,
+            &pm,
+        );
+        assert!(matches!(&panel.mode, Mode::Models { selected: 0, .. }));
     }
 
     #[test]

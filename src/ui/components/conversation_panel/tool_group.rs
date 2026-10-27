@@ -47,7 +47,10 @@ use crate::ui::components::messages::assistant::reasoning::{
     ReasoningMessage, reasoning_summary_title,
 };
 use crate::ui::components::messages::assistant::tool_call::ToolCallMessage;
-use crate::ui::components::messages::assistant_message::EXPANDED_BG;
+use crate::ui::components::messages::assistant_message::{
+    EXPANDED_BG, scan_copy_buttons_from_lines,
+};
+use crate::ui::markdown_code_block::CodeCopyButton;
 use crate::ui::markdown_theme::palette;
 use async_openai::types::responses::ReasoningItem;
 
@@ -57,6 +60,8 @@ pub(crate) const MIN_TOOL_GROUP_SIZE: usize = 2;
 /// How many tool names the collapsed summary shows before abbreviating with
 /// `…`, keeping the muted detail line short enough to rarely wrap.
 const SUMMARY_TOOL_CAP: usize = 4;
+/// Expanded members sit visibly inside their parent tool-group card.
+pub(crate) const MEMBER_INDENT: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolGroup {
@@ -127,14 +132,20 @@ pub(crate) struct ToolGroupMember<'a> {
     pub expanded: bool,
 }
 
-/// The rows occupied by a member's clickable header, relative to the group's
-/// paragraph. Details are intentionally not clickable, so selecting output
-/// text never unexpectedly folds it.
+/// The rows occupied by one nested member card, relative to the group paragraph.
+/// A drag still selects text; a stationary click anywhere in this range toggles it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MemberHeader {
     pub index: usize,
     pub top: u16,
     pub bottom: u16,
+}
+
+/// Background-rendered reasoning reused while assembling a tool group.
+#[derive(Debug, Clone)]
+pub(crate) struct GroupReasoningRender {
+    pub text: Arc<Text<'static>>,
+    pub copy_buttons: Arc<Vec<CodeCopyButton>>,
 }
 
 /// Find maximal runs of non-interactive function calls and retain runs with at
@@ -538,7 +549,7 @@ pub(crate) fn build_tool_group_paragraph<'a>(
     width: u16,
     expanded: bool,
     thought_in_progress: bool,
-) -> (Paragraph<'static>, Vec<MemberHeader>) {
+) -> (Paragraph<'static>, Vec<MemberHeader>, Vec<CodeCopyButton>) {
     build_tool_group_paragraph_with_reasoning_cache(
         group,
         members,
@@ -548,6 +559,8 @@ pub(crate) fn build_tool_group_paragraph<'a>(
         thought_in_progress,
         None,
         &HashSet::new(),
+        None,
+        Modifier::empty(),
     )
 }
 
@@ -564,9 +577,11 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
     width: u16,
     expanded: bool,
     thought_in_progress: bool,
-    reasoning_cache: Option<&HashMap<usize, Arc<Text<'static>>>>,
+    reasoning_cache: Option<&HashMap<usize, GroupReasoningRender>>,
     live_reasoning_indices: &HashSet<usize>,
-) -> (Paragraph<'static>, Vec<MemberHeader>) {
+    image_previews: Option<&crate::ui::image_preview::ImagePreviewStore>,
+    tool_title_modifier: Modifier,
+) -> (Paragraph<'static>, Vec<MemberHeader>, Vec<CodeCopyButton>) {
     let completed = members
         .iter()
         .filter(|member| member.output.is_some())
@@ -584,14 +599,22 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
     };
     let arrow = if expanded { "\u{25BE}" } else { "\u{25B8}" };
     let muted = Style::new().fg(palette::MUTED);
+    let header_modifier = if completed < members.len() {
+        tool_title_modifier
+    } else {
+        Modifier::empty()
+    };
+    let header_muted = muted.add_modifier(header_modifier);
     let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{arrow} "), muted),
+        Span::styled(format!("{arrow} "), header_muted),
         Span::styled(
             format!(
                 "\u{1F6E0} {}",
                 group.title_with_members(members, completed, failed)
             ),
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(color)
+                .add_modifier(Modifier::BOLD | header_modifier),
         ),
     ])];
     // Collapsed groups get a muted summary line: which tools, the MCP server
@@ -603,7 +626,8 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
         )));
     }
     let mut headers = Vec::new();
-    let inner_width = width.saturating_sub(1).max(1);
+    let mut code_contents = Vec::new();
+    let inner_width = width.saturating_sub(1).saturating_sub(MEMBER_INDENT).max(1);
     let mut rendered_rows = lines.len() as u16;
 
     if expanded {
@@ -626,18 +650,25 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
                     .failed(member.output.map(|(_, failed, _)| failed).unwrap_or(false))
                     .approval_label(member.output.and_then(|(_, _, label)| label))
                     .live_output(member.live_output)
+                    .title_modifier(if member.output.is_none() {
+                        tool_title_modifier
+                    } else {
+                        Modifier::empty()
+                    })
                     .expanded(member.expanded)
+                    .with_optional_image_previews(image_previews)
                     .into_text();
                 let text = if member.expanded {
                     wrap_text(text, inner_width)
                 } else {
                     text
                 };
+                let text = indent_member(text);
                 let height = text.lines.len() as u16;
                 headers.push(MemberHeader {
                     index: member.index,
                     top: rendered_rows,
-                    bottom: rendered_rows.saturating_add(1),
+                    bottom: rendered_rows.saturating_add(height),
                 });
                 rendered_rows = rendered_rows.saturating_add(height);
                 lines.extend(text.lines);
@@ -645,7 +676,13 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
                 let (index, item, thought_expanded) = thoughts.next().unwrap();
                 let text = if let Some(cached) = reasoning_cache.and_then(|cache| cache.get(&index))
                 {
-                    cached.as_ref().clone()
+                    code_contents.extend(
+                        cached
+                            .copy_buttons
+                            .iter()
+                            .map(|button| button.content.clone()),
+                    );
+                    cached.text.as_ref().clone()
                 } else if live_reasoning_indices.contains(&index) {
                     // The worker is still rendering this live body. Keep the
                     // group geometry valid without doing Markdown work here.
@@ -654,21 +691,23 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
                         Style::new().fg(palette::MUTED),
                     )))
                 } else {
-                    ReasoningMessage::new(false, item, width)
+                    let (text, codes) = ReasoningMessage::new(false, item, width)
                         .expanded(thought_expanded)
-                        .into_parts()
-                        .0
+                        .into_parts();
+                    code_contents.extend(codes);
+                    text
                 };
                 let text = if thought_expanded {
                     wrap_text(text, inner_width)
                 } else {
                     text
                 };
+                let text = indent_member(text);
                 let height = text.lines.len() as u16;
                 headers.push(MemberHeader {
                     index,
                     top: rendered_rows,
-                    bottom: rendered_rows.saturating_add(1),
+                    bottom: rendered_rows.saturating_add(height),
                 });
                 rendered_rows = rendered_rows.saturating_add(height);
                 lines.extend(text.lines);
@@ -683,8 +722,22 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
         } else {
             Style::new()
         });
+    let copy_buttons = scan_copy_buttons_from_lines(&lines, &code_contents);
     let paragraph = Paragraph::new(Text::from(lines)).block(block);
-    (paragraph, headers)
+    (paragraph, headers, copy_buttons)
+}
+
+fn indent_member(text: Text<'static>) -> Text<'static> {
+    Text::from(
+        text.lines
+            .into_iter()
+            .map(|line| {
+                let mut spans = vec![Span::raw(" ".repeat(MEMBER_INDENT as usize))];
+                spans.extend(line.spans);
+                Line::from(spans)
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Wrap only expanded member bodies. Applying a Paragraph-wide wrap would also
@@ -695,9 +748,10 @@ fn wrap_text(text: Text<'static>, width: u16) -> Text<'static> {
     let mut wrapped = Vec::new();
 
     for line in text.lines {
+        let spans = trim_trailing_overflow(line.spans, width);
         let mut current = Vec::new();
         let mut current_width = 0usize;
-        for span in &line.spans {
+        for span in &spans {
             let mut chunk = String::new();
             for character in span.content.chars() {
                 let character_width =
@@ -722,6 +776,35 @@ fn wrap_text(text: Text<'static>, width: u16) -> Text<'static> {
     }
 
     Text::from(wrapped)
+}
+
+/// Cached reasoning was rendered at standalone width. When it is nested, drop
+/// only right-padding cells that exceed the child card before wrapping real
+/// content; otherwise each shaded code row would create a blank continuation.
+fn trim_trailing_overflow(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let total_width = spans.iter().map(Span::width).sum::<usize>();
+    let mut excess = total_width.saturating_sub(width);
+    while excess > 0 {
+        let Some(last) = spans.last_mut() else {
+            break;
+        };
+        let mut content = last.content.to_string();
+        let Some((byte_index, character)) = content.char_indices().next_back() else {
+            spans.pop();
+            continue;
+        };
+        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if !character.is_whitespace() || character_width > excess {
+            break;
+        }
+        content.truncate(byte_index);
+        last.content = content.into();
+        excess = excess.saturating_sub(character_width);
+        if last.content.is_empty() {
+            spans.pop();
+        }
+    }
+    spans
 }
 
 /// The muted detail line under a collapsed group header: the tool names, the
@@ -795,6 +878,78 @@ mod tests {
     }
 
     #[test]
+    fn pending_group_animation_applies_to_the_complete_header() {
+        let first = FunctionToolCall {
+            arguments: "{}".into(),
+            call_id: "call-0".into(),
+            namespace: None,
+            name: "grep".into(),
+            id: None,
+            status: None,
+        };
+        let second = FunctionToolCall {
+            arguments: "{}".into(),
+            call_id: "call-1".into(),
+            namespace: None,
+            name: "read_file".into(),
+            id: None,
+            status: None,
+        };
+        let items = vec![
+            MessageItem::Output(OutputItem::FunctionCall(first.clone())),
+            MessageItem::Output(OutputItem::FunctionCall(second.clone())),
+        ];
+        let group = discover_tool_groups(&items).pop().unwrap();
+        let members = [
+            ToolGroupMember {
+                index: 0,
+                call: &first,
+                output: None,
+                live_output: None,
+                expanded: false,
+            },
+            ToolGroupMember {
+                index: 1,
+                call: &second,
+                output: None,
+                live_output: None,
+                expanded: false,
+            },
+        ];
+        let (paragraph, _, _) = build_tool_group_paragraph_with_reasoning_cache(
+            &group,
+            &members,
+            &[],
+            80,
+            false,
+            false,
+            None,
+            &HashSet::new(),
+            None,
+            Modifier::DIM,
+        );
+        let area = Rect::new(0, 0, 80, 3);
+        let mut buffer = Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+
+        let title_cells = (0..area.width)
+            .filter_map(|column| {
+                let cell = &buffer[(column, 0)];
+                (cell.symbol() != " ").then_some(cell)
+            })
+            .collect::<Vec<_>>();
+        assert!(!title_cells.is_empty());
+        assert!(
+            title_cells
+                .iter()
+                .all(|cell| cell.modifier.contains(Modifier::DIM))
+        );
+        assert!(
+            (0..area.width).all(|column| { !buffer[(column, 1)].modifier.contains(Modifier::DIM) })
+        );
+    }
+
+    #[test]
     fn expanding_one_member_does_not_wrap_collapsed_siblings() {
         let first = FunctionToolCall {
             arguments: r#"{"path":"src/main.rs","old_string":"old","new_string":"new"}"#.into(),
@@ -850,7 +1005,7 @@ mod tests {
             },
         ];
 
-        let (_, headers) = build_tool_group_paragraph(&group, &members, &[], 24, true, false);
+        let (_, headers, _) = build_tool_group_paragraph(&group, &members, &[], 24, true, false);
 
         assert_eq!(headers.len(), 3);
         // A collapsed command has its summary, waiting line, and hint. Its
@@ -1275,7 +1430,7 @@ mod tests {
             })
             .collect();
 
-        let (paragraph, _) =
+        let (paragraph, _, _) =
             build_tool_group_paragraph(&group, &members, &absorbed, 80, true, false);
         let rendered = render_paragraph(&paragraph, 80, 40);
         let grep_row = rendered.lines().position(|l| l.contains("grep")).unwrap();
@@ -1293,7 +1448,7 @@ mod tests {
 
         // Folded: the calls and thoughts disappear into the header, which now
         // carries a muted summary line: tool names, then the thought state.
-        let (paragraph, _) =
+        let (paragraph, _, _) =
             build_tool_group_paragraph(&group, &members, &absorbed, 80, false, false);
         let rendered = render_paragraph(&paragraph, 80, 40);
         assert!(!rendered.contains("grep  {}"), "{rendered}");
@@ -1338,7 +1493,7 @@ mod tests {
         };
         let absorbed = [(0, reasoning, false)];
 
-        let (thinking, _) =
+        let (thinking, _, _) =
             build_tool_group_paragraph(&group, &members, &absorbed, 80, false, true);
         let thinking = render_paragraph(&thinking, 80, 10);
         assert!(
@@ -1346,7 +1501,7 @@ mod tests {
             "{thinking}"
         );
 
-        let (thought, _) =
+        let (thought, _, _) =
             build_tool_group_paragraph(&group, &members, &absorbed, 80, false, false);
         let thought = render_paragraph(&thought, 80, 10);
         assert!(

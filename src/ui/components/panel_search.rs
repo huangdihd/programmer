@@ -23,8 +23,9 @@
 //! reaches the panel and closes it). Navigation keys pass through, so ↑/↓
 //! work mid-search.
 
+use crate::ui::markdown_theme::palette;
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 /// How [`PanelSearch::handle_key`] treated a key.
@@ -87,6 +88,16 @@ impl PanelSearch {
         }
     }
 
+    /// Give the search field pointer focus without typing a `/` into it.
+    pub fn focus(&mut self) {
+        self.active = true;
+    }
+
+    /// Remove pointer focus while keeping the current filter applied.
+    pub fn blur(&mut self) {
+        self.active = false;
+    }
+
     /// Whether a filter is currently narrowing the list.
     pub fn is_filtering(&self) -> bool {
         !self.query.is_empty()
@@ -111,11 +122,11 @@ impl PanelSearch {
         Some(Line::from(vec![
             Span::styled(
                 format!(" /{}{cursor} ", self.query),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(palette::BLUE),
             ),
             Span::styled(
                 format!("({shown}/{total}) "),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::FAINT),
             ),
         ]))
     }
@@ -123,8 +134,8 @@ impl PanelSearch {
     /// Help-bar spans advertising the search key.
     pub fn help_spans() -> [Span<'static>; 2] {
         [
-            Span::styled("/", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" search  ", Style::default().fg(Color::Gray)),
+            Span::styled("/", Style::default().fg(palette::BLUE).bold()),
+            Span::styled(" search  ", Style::default().fg(palette::MUTED)),
         ]
     }
 }
@@ -193,5 +204,21 @@ mod tests {
         let s = PanelSearch::default();
         assert!(s.matches(&["anything"]));
         assert!(s.block_title(1, 1).is_none());
+    }
+
+    #[test]
+    fn pointer_focus_and_blur_keep_the_filter_without_typing_slashes() {
+        let mut search = PanelSearch::default();
+        search.focus();
+        search.handle_key(key(KeyCode::Char('x')));
+        search.blur();
+
+        assert!(search.is_filtering());
+        assert!(search.matches(&["example"]));
+        assert!(!search.matches(&["other"]));
+        assert_eq!(
+            search.handle_key(key(KeyCode::Char('a'))),
+            SearchKey::Ignored
+        );
     }
 }
