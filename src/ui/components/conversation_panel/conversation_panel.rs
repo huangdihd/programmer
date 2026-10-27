@@ -566,6 +566,7 @@ pub struct ConversationPanel {
     /// alongside `item_layout` so clicks on streaming items can be mapped.
     live_item_layout: Vec<(usize, u16, u16)>,
     pub(crate) render_cache: RenderCache,
+    pub(crate) image_previews: Arc<crate::ui::image_preview::ImagePreviewStore>,
     pub(crate) viewport_paragraph_cache: ViewportParagraphCache,
     /// Monotonic frame counter, incremented every render. Drives the animated
     /// "Thinking..." dots on the live reasoning indicator during streaming.
@@ -685,6 +686,7 @@ impl ConversationPanel {
             live_item_layout: Vec::new(),
             live_tool_group_layout: Vec::new(),
             render_cache: RenderCache::default(),
+            image_previews: Arc::new(crate::ui::image_preview::ImagePreviewStore::default()),
             viewport_paragraph_cache: ViewportParagraphCache::default(),
             frame_count: 0,
             live_expanded_items: HashSet::new(),
@@ -746,6 +748,31 @@ impl ConversationPanel {
         placements: Vec<crate::ui::image_preview::ImagePlacement>,
     ) {
         self.image_placements = placements;
+    }
+
+    /// Drop the marker registry and every pointer artifact that refers to its
+    /// numeric image ids. These must move together because a fresh registry
+    /// starts allocating ids from zero again.
+    pub(crate) fn invalidate_image_previews(&mut self) {
+        self.image_previews.clear();
+        self.viewport_paragraph_cache = ViewportParagraphCache::default();
+        self.image_placements.clear();
+        // Paragraph markers, hit regions, and the semantic target captured on
+        // mouse-down are one generation. If any side is rebuilt, cancel the
+        // whole gesture rather than letting mouse-up activate reused ids.
+        self.selection = None;
+        self.selection_drag_position = None;
+        self.pressed_link = None;
+        self.pressed_image = None;
+        self.pointer_pressed = None;
+        self.pointer_animation.cancel();
+    }
+
+    pub(crate) fn image_viewer(
+        &self,
+        image_id: usize,
+    ) -> Option<crate::ui::image_preview::ImageViewer> {
+        self.image_previews.viewer(image_id)
     }
 
     pub(crate) fn update_scrollbar_geometry(&mut self, track: Rect) {
@@ -1465,8 +1492,21 @@ impl ConversationPanel {
             .selection
             .filter(|sel| !sel.dragging && sel.screen_anchor == (column, row))
         {
+            // Validate against the original buffer coordinate, not whatever a
+            // redraw placed under the physical cursor. This preserves harmless
+            // viewport movement while preventing a replaced target from being
+            // activated with stale mouse-down state.
+            let pressed_target = self.pointer_pressed;
+            let current_target = self
+                .pointer_hit_buffer(sel.anchor.0, sel.anchor.1)
+                .map(|hit| hit.target);
             self.selection = None;
             self.selection_drag_position = None;
+            if pressed_target != current_target {
+                self.pressed_image = None;
+                self.pressed_link = None;
+                return SelectionEnd::Ignored;
+            }
             if let Some(image_id) = self.pressed_image.take() {
                 return SelectionEnd::Image(image_id);
             }
@@ -1583,8 +1623,10 @@ impl ConversationPanel {
         self.conversation.clone()
     }
 
-    /// History indices changed; discard index-keyed display state only.
+    /// History indices changed; discard every index-keyed display artifact.
     pub fn history_indices_changed(&mut self) {
+        self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         self.expanded_items.clear();
         self.invalidate_live_markdown();
     }
@@ -1647,6 +1689,8 @@ impl ConversationPanel {
 
     /// A summary was installed in history, shifting subsequent display indices.
     pub fn history_compacted(&mut self) {
+        self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
         self.invalidate_live_markdown();
@@ -1656,6 +1700,7 @@ impl ConversationPanel {
     /// Clear pending display state after the domain history was cleared.
     pub fn clear_view(&mut self) {
         self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         self.pending_message = None;
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
@@ -1670,6 +1715,7 @@ impl ConversationPanel {
     /// Reset display caches after replacing the domain history.
     pub fn history_restored(&mut self) {
         self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         self.expanded_items.clear();
         self.expanded_tool_groups.clear();
         self.invalidate_live_markdown();
@@ -1678,6 +1724,11 @@ impl ConversationPanel {
 
     pub fn history_truncated(&mut self) {
         self.abort_receiving();
+        // The remaining item indices and their image-marker paragraphs may
+        // have changed. Drop both sides together so cached markers never point
+        // into a freshly cleared registry.
+        self.render_cache = RenderCache::default();
+        self.invalidate_image_previews();
         // `abort_receiving` intentionally preserves committed hand-offs when
         // there is no active response. Truncation changes absolute item
         // indices, so discard those hand-offs explicitly.
@@ -2518,6 +2569,7 @@ mod tests {
             live_index_base: None,
         });
 
+        panel.pointer_down(3, 4);
         panel.selection_begin(3, 4);
         panel.view_offset = 24;
 
@@ -2604,15 +2656,77 @@ mod tests {
             !panel.interaction_animation_active(),
             "image pixels must not receive animated hover background colors"
         );
+        panel.pointer_down(12, 7);
         panel.selection_begin(12, 7);
         assert!(matches!(panel.selection_end(12, 7), SelectionEnd::Image(7)));
+        panel.pointer_up(12, 7);
 
+        panel.pointer_down(12, 7);
         panel.selection_begin(12, 7);
         panel.selection_drag(13, 7);
         assert!(matches!(
             panel.selection_end(13, 7),
             SelectionEnd::Copied(_)
         ));
+    }
+
+    #[test]
+    fn invalidating_image_previews_cancels_a_pressed_image_id() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(6, 3, 40, 10);
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 0,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+        panel.pointer_down(12, 7);
+        panel.selection_begin(12, 7);
+
+        panel.invalidate_image_previews();
+        // A new registry may immediately reuse image id 0. The mouse-up from
+        // the old generation must not open whichever image inherited that id.
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 0,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+
+        assert!(!matches!(
+            panel.selection_end(12, 7),
+            SelectionEnd::Image(_)
+        ));
+    }
+
+    #[test]
+    fn a_target_created_after_mouse_down_is_not_activated() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(6, 3, 40, 10);
+        panel.pointer_down(12, 7);
+        panel.selection_begin(12, 7);
+
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 7,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+
+        assert!(matches!(panel.selection_end(12, 7), SelectionEnd::Ignored));
+    }
+
+    #[test]
+    fn replacing_a_pressed_target_cancels_activation() {
+        let mut panel = ConversationPanel::new();
+        panel.view_area = Rect::new(6, 3, 40, 10);
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 7,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+        panel.pointer_down(12, 7);
+        panel.selection_begin(12, 7);
+
+        panel.set_image_placements(vec![crate::ui::image_preview::ImagePlacement {
+            image_id: 8,
+            area: Rect::new(11, 6, 8, 3),
+        }]);
+
+        assert!(matches!(panel.selection_end(12, 7), SelectionEnd::Ignored));
     }
 
     #[test]

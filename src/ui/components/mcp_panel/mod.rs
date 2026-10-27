@@ -1103,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_confirm_form_fields_save_cancel_and_animation() {
+    fn mouse_confirm_form_fields_save_cancel_and_static_feedback() {
         let mut panel = McpPanel::new();
         let mut config = ProgrammerConfig::default();
         config.mcp_servers.push(server("old"));
@@ -1115,7 +1115,7 @@ mod tests {
             &mut config,
         );
         assert_eq!(panel.hovered.get(), Some(MouseTarget::Delete));
-        assert!(panel.interaction_animation_active());
+        assert!(!panel.interaction_animation_active());
         panel.handle_mouse(mouse(MouseEventKind::Moved, 99, 19), &mut config);
         assert_eq!(panel.hovered.get(), None);
         assert!(!panel.interaction_animation_active());

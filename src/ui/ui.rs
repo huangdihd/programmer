@@ -588,6 +588,7 @@ impl Widget for &mut App<'_> {
         if !terminal_pane {
             crate::ui::theme::apply(theme, area, buf);
         }
+        crate::ui::image_preview::render_kitty_cleanup(buf);
     }
 }
 
@@ -897,6 +898,12 @@ impl App<'_> {
         }
 
         if let Some(viewer) = self.ui.image_viewer.as_mut() {
+            if viewer.requires_exclusive_render() {
+                // A Kitty chunk stream may span frames and cannot contain any
+                // other graphics command. Remove protocol images rendered by
+                // the underlying conversation before emitting this batch.
+                Clear.render(area, buf);
+            }
             viewer.render(area, buf);
         }
     }

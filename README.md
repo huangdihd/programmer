@@ -582,10 +582,11 @@ pointer:
 - Click a decoded inline image to open the modal viewer. Use `+`/`-` or the
   wheel to zoom from 50% to 800% of the fitted size; the title reports the
   actual on-screen scale relative to the source pixels. Use arrow keys or
-  left-button drag to pan, `0` to reset to fit, and `Esc` to close. Dragging
-  uses a lower-detail native-protocol preview for responsiveness and restores
-  the full-quality crop on release. Remote image URLs are not fetched
-  synchronously for preview.
+  left-button drag to pan, `0` to reset to fit, and `Esc` to close. Kitty
+  uploads the source once and replaces one native cropped placement while zooming or panning;
+  other native protocols use a lower-detail drag preview and restore the
+  full-quality crop on release. Remote image URLs are not fetched synchronously
+  for preview.
 - Click a rendered inline HTTP(S) Markdown link in an assistant message to open
   it in the default browser. The underlined project GitHub URL in the welcome
   card is also clickable. A drag is treated as selection, not as a link click.
@@ -606,10 +607,10 @@ pointer:
   keep priority.
 
 Interactive rows and cards use the same lightweight terminal feedback: hover
-steps through a short 120 ms palette transition, while mouse-down switches
-immediately to a stronger pressed state. Animation redraws are coalesced and stop
-when the transition settles, so the effect adds no continuous idle refresh or
-large web-style movement.
+uses a stable highlight, while mouse-down uses a stronger pressed state. TUI
+pointer moves are collapsed to the latest position and presented by the existing
+periodic frame instead of forcing a full redraw for every terminal motion report;
+embedded terminal mouse input remains unthrottled.
 
 Selection and link hit-testing account for wrapped and scrolled conversation
 text. With `/select on`, the terminal owns mouse selection instead, so these

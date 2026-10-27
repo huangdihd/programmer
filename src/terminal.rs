@@ -117,6 +117,7 @@ impl Drop for TerminalGuard {
         if self.keyboard_enhanced {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         }
+        let _ = crate::ui::image_preview::write_kitty_cleanup(&mut io::stdout());
         ratatui::restore();
         let _ = execute!(
             io::stdout(),

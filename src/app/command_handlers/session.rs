@@ -237,6 +237,8 @@ async fn clear(app: &mut App<'_>) -> CommandOutcome {
     app.agent_loop.session.agents = crate::agents::AgentManager::default();
     app.agent_loop.agent_notifications = crate::app::AgentNotificationState::new();
     app.agent_loop.session.conversation = Default::default();
+    app.ui.image_viewer = None;
+    app.ui.agent_panel = None;
     app.ui.conversation_panel = crate::ui::components::conversation_panel::conversation_panel::ConversationPanel::from_shared(
         app.agent_loop.session.conversation.clone(),
     );
@@ -291,6 +293,8 @@ async fn new(app: &mut App<'_>) -> CommandOutcome {
     app.agent_loop.session.conversation = conversation.clone();
     app.ui.conversation_panel.conversation = conversation;
     app.agent_loop.session.conversation.lock().unwrap().clear();
+    app.ui.image_viewer = None;
+    app.ui.agent_panel = None;
     app.ui.conversation_panel.clear_view();
     app.agent_loop.session.todo_store = Default::default();
     diagnostics::reset_diagnostics_state(app);
@@ -362,7 +366,28 @@ fn help(app: &mut App<'_>) -> CommandOutcome {
 mod tests {
     use super::{format_session_info, format_usage};
     use crate::conversation::UsageSummary;
+    use async_openai::types::responses::{ImageDetail, InputContent, InputImageContent};
+    use base64::Engine;
+    use image::{ImageBuffer, ImageFormat, Rgb};
+    use std::io::Cursor;
     use std::path::Path;
+
+    fn image_viewer() -> crate::ui::image_preview::ImageViewer {
+        let image = ImageBuffer::from_pixel(1, 1, Rgb([0u8, 0, 0]));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        let content = [InputContent::InputImage(InputImageContent {
+            detail: ImageDetail::Auto,
+            file_id: None,
+            image_url: Some(format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+            )),
+        })];
+        let image_previews = crate::ui::image_preview::ImagePreviewStore::default();
+        image_previews.content_preview_lines(&content, 80);
+        image_previews.viewer(0).expect("decoded image viewer")
+    }
 
     #[test]
     fn session_info_reports_identity_path_and_saved_state() {
@@ -412,5 +437,30 @@ mod tests {
             format_usage(UsageSummary::default()),
             "No token usage recorded for this session."
         );
+    }
+
+    #[tokio::test]
+    async fn replacing_the_session_closes_an_open_image_viewer() {
+        for command in ["/clear", "/new"] {
+            let mut app = crate::app::commands::tests::command_test_app().await;
+            app.ui.image_viewer = Some(image_viewer());
+            app.ui.agent_panel = Some(crate::ui::components::agent_panel::AgentPanel::new(
+                app.agent_loop.session.tasks.clone(),
+                1,
+                "old agent".into(),
+                app.agent_loop.session.conversation.clone(),
+            ));
+
+            crate::app::commands::execute_command(&mut app, command).await;
+
+            assert!(
+                app.ui.image_viewer.is_none(),
+                "{command} retained the previous session's image viewer"
+            );
+            assert!(
+                app.ui.agent_panel.is_none(),
+                "{command} retained the previous session's agent panel"
+            );
+        }
     }
 }

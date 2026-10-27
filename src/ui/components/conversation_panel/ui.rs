@@ -383,6 +383,7 @@ fn build_live_group_slot<'a>(
     group_expanded: bool,
     live_reasoning_text: &HashMap<usize, GroupReasoningRender>,
     live_reasoning_indices: &HashSet<usize>,
+    image_previews: &crate::ui::image_preview::ImagePreviewStore,
 ) -> CachedLiveSlot {
     let live_outputs: Vec<Option<String>> = group
         .member_indices
@@ -464,6 +465,7 @@ fn build_live_group_slot<'a>(
                 thought_in_progress,
                 Some(live_reasoning_text),
                 live_reasoning_indices,
+                Some(image_previews),
             );
         let collapsed_height = collapsed.line_count(content_width) as u16;
         let (expanded, expanded_headers, expanded_buttons) =
@@ -476,6 +478,7 @@ fn build_live_group_slot<'a>(
                 thought_in_progress,
                 Some(live_reasoning_text),
                 live_reasoning_indices,
+                Some(image_previews),
             );
         let expanded_height = expanded.line_count(content_width) as u16;
         CachedLiveSlot::Explore {
@@ -504,6 +507,7 @@ fn build_live_group_slot<'a>(
                 thought_in_progress,
                 Some(live_reasoning_text),
                 live_reasoning_indices,
+                Some(image_previews),
             );
         let height = paragraph.line_count(content_width) as u16;
         CachedLiveSlot::Fixed {
@@ -568,6 +572,7 @@ fn build_item_paragraph(
     tool_output: Option<(&FunctionCallOutputItemParam, bool, Option<&str>)>,
     live_output: Option<&str>,
     memory_snapshots: Vec<String>,
+    image_previews: &crate::ui::image_preview::ImagePreviewStore,
 ) -> (Paragraph<'static>, Vec<CodeCopyButton>) {
     match item {
         MessageItem::ToolOutput { output, failed, .. } => {
@@ -575,6 +580,7 @@ fn build_item_paragraph(
             // with a call render inside that call's item.
             (
                 ToolResultMessage::new(output, content_width)
+                    .image_previews(image_previews)
                     .failed(*failed)
                     .expanded(expanded)
                     .into_paragraph(),
@@ -582,10 +588,13 @@ fn build_item_paragraph(
             )
         }
         MessageItem::Input(input_item) => (
-            UserMessage::new(input_item, content_width).into_paragraph(),
+            UserMessage::new(input_item, content_width)
+                .image_previews(image_previews)
+                .into_paragraph(),
             Vec::new(),
         ),
         MessageItem::Output(output_item) => AssistantMessage::new(output_item, content_width)
+            .image_previews(image_previews)
             .expanded(expanded)
             .tool_output(tool_output)
             .live_output(live_output)
@@ -685,6 +694,7 @@ impl Widget for &mut ConversationPanel {
         // margins plus one extra left column here, not in individual messages.
         let content_area = transcript_content_area(area);
         let content_width = content_area.width;
+        let image_previews = self.image_previews.clone();
         // Pull a completed background Markdown result into the front buffer
         // before calculating live layout. No Markdown parser is run on this
         // render thread.
@@ -707,6 +717,19 @@ impl Widget for &mut ConversationPanel {
         let conv_arc = self.conversation.clone();
         let conv = conv_arc.lock().unwrap();
         self.queue_committed_markdown_jobs(&conv.items, content_width);
+
+        let width_changed = self.render_cache.width != content_width;
+        let mutation_changed = self.render_cache.seen_mutation_version != conv.mutation_version;
+        if width_changed || mutation_changed {
+            self.render_cache.width = content_width;
+            self.render_cache.seen_mutation_version = conv.mutation_version;
+            self.render_cache.entries.clear();
+            // Cached paragraphs and their private-use image markers are one
+            // cache generation. Drop pointer ids too because the fresh image
+            // registry starts allocating ids from zero again.
+            self.invalidate_image_previews();
+            self.selection = None;
+        }
 
         // A response is appended to `conv` before the commit event reaches the
         // UI. Keep its worker keys addressable by absolute history index so a
@@ -833,17 +856,6 @@ impl Widget for &mut ConversationPanel {
         // the user toggles that specific item's expand/collapse state, or when a
         // tool call's result arrives.
         let cache = &mut self.render_cache;
-        if cache.width != content_width {
-            cache.width = content_width;
-            cache.entries.clear();
-            self.selection = None;
-        }
-        // An in-place mutation (the runner folding diagnostics into a tool
-        // output) invalidates by version; appends never bump it.
-        if cache.seen_mutation_version != conv.mutation_version {
-            cache.seen_mutation_version = conv.mutation_version;
-            cache.entries.clear();
-        }
         if cache.entries.len() > conv.items.len() {
             cache.entries.truncate(conv.items.len());
         }
@@ -1111,6 +1123,7 @@ impl Widget for &mut ConversationPanel {
                             false,
                             Some(&committed_reasoning_text),
                             &committed_pending_reasoning,
+                            Some(&image_previews),
                         );
                     let height = paragraph.line_count(content_width) as u16;
                     CachedParagraph {
@@ -1182,6 +1195,7 @@ impl Widget for &mut ConversationPanel {
                             } else {
                                 Vec::new()
                             },
+                            &image_previews,
                         );
                         let height = paragraph.line_count(content_width) as u16;
                         CachedParagraph {
@@ -1361,6 +1375,7 @@ impl Widget for &mut ConversationPanel {
                         group_expanded,
                         &reasoning_text,
                         &reasoning_pending,
+                        &image_previews,
                     );
                     let (paragraph, group_header) = materialize_live_slot(
                         &slot,
@@ -1632,7 +1647,7 @@ impl Widget for &mut ConversationPanel {
             );
         }
         clipped_paragraphs.finish_frame();
-        let image_placements = crate::ui::image_preview::render_protocol_images(content_area, buf);
+        let image_placements = image_previews.render_protocol_images(content_area, buf);
         self.set_image_placements(image_placements);
 
         // Store the virtual offset and layout before painting pointer feedback,

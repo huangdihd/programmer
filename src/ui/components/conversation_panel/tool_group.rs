@@ -559,6 +559,7 @@ pub(crate) fn build_tool_group_paragraph<'a>(
         thought_in_progress,
         None,
         &HashSet::new(),
+        None,
     )
 }
 
@@ -577,6 +578,7 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
     thought_in_progress: bool,
     reasoning_cache: Option<&HashMap<usize, GroupReasoningRender>>,
     live_reasoning_indices: &HashSet<usize>,
+    image_previews: Option<&crate::ui::image_preview::ImagePreviewStore>,
 ) -> (Paragraph<'static>, Vec<MemberHeader>, Vec<CodeCopyButton>) {
     let completed = members
         .iter()
@@ -639,6 +641,7 @@ pub(crate) fn build_tool_group_paragraph_with_reasoning_cache<'a>(
                     .approval_label(member.output.and_then(|(_, _, label)| label))
                     .live_output(member.live_output)
                     .expanded(member.expanded)
+                    .with_optional_image_previews(image_previews)
                     .into_text();
                 let text = if member.expanded {
                     wrap_text(text, inner_width)

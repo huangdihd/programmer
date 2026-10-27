@@ -56,6 +56,9 @@ pub(crate) async fn handle_event(app: &mut App<'_>, event: Event) -> color_eyre:
         Event::Tick => app.tick(),
         Event::Redraw => {}
         Event::SelectionScroll => app.ui.conversation_panel.selection_auto_scroll_tick(),
+        Event::PointerMove(_) => {
+            unreachable!("pointer-move batches must be resolved by EventHandler")
+        }
         Event::Crossterm(event) => handle_crossterm(app, event).await?,
         Event::App(app_event) => handle_app_event(app, app_event).await,
     }

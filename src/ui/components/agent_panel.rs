@@ -94,6 +94,11 @@ impl AgentPanel {
         block.render(area, buf);
         self.conversation.render(inner, buf);
         if let Some(viewer) = self.image_viewer.as_mut() {
+            if viewer.requires_exclusive_render() {
+                // Kitty upload chunks must not be interleaved with protocol
+                // images from the underlying child conversation.
+                Clear.render(area, buf);
+            }
             viewer.render(area, buf);
         }
     }
@@ -179,8 +184,9 @@ impl AgentPanel {
                     }
                     return Ok(());
                 }
+                let selection_end = self.conversation.selection_end(mouse.column, mouse.row);
                 self.conversation.pointer_up(mouse.column, mouse.row);
-                match self.conversation.selection_end(mouse.column, mouse.row) {
+                match selection_end {
                     SelectionEnd::Click { column, row } => self
                         .conversation
                         .handle_buffer_click(column, row)
@@ -196,7 +202,7 @@ impl AgentPanel {
                         self.conversation.show_copied();
                     }
                     SelectionEnd::Image(image_id) => {
-                        self.image_viewer = crate::ui::image_preview::viewer(image_id);
+                        self.image_viewer = self.conversation.image_viewer(image_id);
                         self.conversation.cancel_pointer_gesture();
                     }
                     SelectionEnd::Ignored => {}

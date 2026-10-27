@@ -132,6 +132,10 @@ fn is_pointer_move(event: &Event) -> bool {
     )
 }
 
+fn throttle_pointer_move(event: &Event, terminal_pane_open: bool) -> bool {
+    is_pointer_move(event) && !terminal_pane_open
+}
+
 fn throttle_image_drag(event: &Event, surface: Option<ImagePointerSurface>) -> bool {
     is_left_drag(event)
         && matches!(
@@ -1074,14 +1078,31 @@ impl App<'_> {
                 self.events.schedule_redraw();
             }
             while self.running {
+                self.events
+                    .set_pointer_move_coalescing(self.ui.terminal_pane.is_none());
                 let mut event = Some(self.events.next().await?);
                 let mut redraw = false;
                 let mut regular_events = 0;
                 let mut chunks = 0;
                 loop {
-                    let Some(current) = event.take() else {
+                    let Some(mut current) = event.take() else {
                         break;
                     };
+                    let throttle_pointer_move =
+                        throttle_pointer_move(&current, self.ui.terminal_pane.is_some());
+                    if throttle_pointer_move {
+                        // Static hover only needs the latest contiguous pointer
+                        // position. Keeping every motion report would let the
+                        // unbounded terminal-event FIFO delay keyboard and model
+                        // events behind frames that can no longer be observed.
+                        while let Some(next) = self.events.try_next() {
+                            if !is_pointer_move(&next) {
+                                event = Some(next);
+                                break;
+                            }
+                            current = next;
+                        }
+                    }
                     let chunk_received = matches!(
                         &current,
                         Event::App(crate::ui::event::AppEvent::ChunkReceived(_, _))
@@ -1095,6 +1116,7 @@ impl App<'_> {
                     let throttle_sidebar_drag = current_is_left_drag && self.ui.sidebar_resizing;
                     let throttle_image_drag = throttle_image_drag(&current, current_image_surface);
                     let immediate_redraw = event_requests_immediate_redraw(&current)
+                        && !throttle_pointer_move
                         && !throttle_sidebar_drag
                         && !throttle_image_drag;
                     // Interactive terminal programs can request every pointer
@@ -1103,15 +1125,19 @@ impl App<'_> {
                     let coalesce_left_drag =
                         current_is_left_drag && self.ui.terminal_pane.is_none();
                     self.handle_event(current).await?;
+                    let stable_image_pointer = image_pointer_before
+                        .flatten()
+                        .is_some_and(|before| image_pointer_surface(&self) == Some(before));
                     if throttle_sidebar_drag || throttle_image_drag {
                         // Mouse reports can exceed the terminal frame rate.
                         // Apply the newest pointer position now, but coalesce
                         // layout and native-image requests to at most 60 FPS.
                         self.events.schedule_redraw();
                     }
-                    let stable_image_pointer = image_pointer_before
-                        .flatten()
-                        .is_some_and(|before| image_pointer_surface(&self) == Some(before));
+                    // Pure TUI hover moves deliberately do not request a frame.
+                    // The periodic status frame presents the latest coalesced
+                    // target without turning pointer motion into a stream of
+                    // full terminal renders.
                     // Native image protocols are emitted outside the normal
                     // cell grid. Re-emitting the same image for every motion
                     // report causes visible flicker in some terminals, and no
@@ -1452,7 +1478,7 @@ pub(crate) fn dream_transcript(items: &[crate::response::message_item::MessageIt
 mod tests {
     use super::{
         ImagePointerSurface, TaskNotificationState, dream_transcript,
-        event_requests_immediate_redraw, is_left_drag, throttle_image_drag,
+        event_requests_immediate_redraw, is_left_drag, throttle_image_drag, throttle_pointer_move,
     };
     use crate::ui::event::{AppEvent, Event};
     use crossterm::event::{
@@ -1540,6 +1566,17 @@ mod tests {
         assert!(event_requests_immediate_redraw(&mouse_event(
             MouseEventKind::Moved
         )));
+    }
+
+    #[test]
+    fn tui_pointer_moves_are_deferred_but_terminal_mouse_input_is_not() {
+        let pointer_move = mouse_event(MouseEventKind::Moved);
+        assert!(throttle_pointer_move(&pointer_move, false));
+        assert!(!throttle_pointer_move(&pointer_move, true));
+        assert!(!throttle_pointer_move(
+            &mouse_event(MouseEventKind::Down(MouseButton::Left)),
+            false,
+        ));
     }
 
     #[test]

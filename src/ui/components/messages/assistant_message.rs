@@ -53,6 +53,7 @@ pub struct AssistantMessage<'a> {
     /// For a still-running `command` call: its output so far, rendered live
     /// until the committed result arrives.
     live_output: Option<&'a str>,
+    image_previews: Option<&'a crate::ui::image_preview::ImagePreviewStore>,
 }
 
 impl<'a> AssistantMessage<'a> {
@@ -65,6 +66,7 @@ impl<'a> AssistantMessage<'a> {
             frame_count: None,
             tool_output: None,
             live_output: None,
+            image_previews: None,
         }
     }
 
@@ -78,6 +80,14 @@ impl<'a> AssistantMessage<'a> {
 
     pub fn live_output(mut self, live_output: Option<&'a str>) -> Self {
         self.live_output = live_output;
+        self
+    }
+
+    pub(crate) fn image_previews(
+        mut self,
+        image_previews: &'a crate::ui::image_preview::ImagePreviewStore,
+    ) -> Self {
+        self.image_previews = Some(image_previews);
         self
     }
 
@@ -116,6 +126,7 @@ impl<'a> AssistantMessage<'a> {
                     .approval_label(self.tool_output.and_then(|(_, _, label)| label))
                     .live_output(self.live_output)
                     .expanded(self.expanded)
+                    .with_optional_image_previews(self.image_previews)
                     .into_text(),
                 Vec::new(),
             ),

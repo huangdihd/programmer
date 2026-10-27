@@ -777,14 +777,14 @@ pub(crate) async fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) -> color_
                 }
                 return Ok(());
             }
+            let selection_end = app
+                .ui
+                .conversation_panel
+                .selection_end(mouse.column, mouse.row);
             app.ui
                 .conversation_panel
                 .pointer_up(mouse.column, mouse.row);
-            match app
-                .ui
-                .conversation_panel
-                .selection_end(mouse.column, mouse.row)
-            {
+            match selection_end {
                 SelectionEnd::Click { column, row } => {
                     if let Err(error) = app.ui.conversation_panel.handle_buffer_click(column, row) {
                         app.agent_loop
@@ -823,7 +823,7 @@ pub(crate) async fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) -> color_
                     }
                 }
                 SelectionEnd::Image(image_id) => {
-                    app.ui.image_viewer = crate::ui::image_preview::viewer(image_id);
+                    app.ui.image_viewer = app.ui.conversation_panel.image_viewer(image_id);
                     app.ui.clear_pointer_feedback();
                     app.ui.conversation_panel.cancel_pointer_gesture();
                 }

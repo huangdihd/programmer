@@ -39,6 +39,7 @@ pub struct ToolCallMessage<'a> {
     /// control sequences). Rendered in place of the "waiting" spinner until the
     /// call's committed `output` arrives.
     live_output: Option<&'a str>,
+    image_previews: Option<&'a crate::ui::image_preview::ImagePreviewStore>,
 }
 
 impl<'a> ToolCallMessage<'a> {
@@ -51,6 +52,7 @@ impl<'a> ToolCallMessage<'a> {
             expanded: false,
             approval_label: None,
             live_output: None,
+            image_previews: None,
         }
     }
 
@@ -66,6 +68,14 @@ impl<'a> ToolCallMessage<'a> {
 
     pub fn failed(mut self, failed: bool) -> Self {
         self.failed = failed;
+        self
+    }
+
+    pub(crate) fn with_optional_image_previews(
+        mut self,
+        image_previews: Option<&'a crate::ui::image_preview::ImagePreviewStore>,
+    ) -> Self {
+        self.image_previews = image_previews;
         self
     }
 
@@ -250,11 +260,8 @@ impl<'a> ToolCallMessage<'a> {
                     detail_style(),
                 )));
             }
-            if let Some(output) = output {
-                lines.extend(crate::ui::image_preview::preview_lines(
-                    &output.output,
-                    self.width,
-                ));
+            if let (Some(output), Some(image_previews)) = (output, self.image_previews) {
+                lines.extend(image_previews.preview_lines(&output.output, self.width));
             }
         } else if let Some(live) = self.live_output {
             push_live_output(&mut lines, live, muted, None);
@@ -700,8 +707,10 @@ mod tests {
             status: None,
         };
 
+        let image_previews = crate::ui::image_preview::ImagePreviewStore::default();
         let collapsed = ToolCallMessage::new(&call, 80)
             .output(Some(&output))
+            .with_optional_image_previews(Some(&image_previews))
             .into_text();
         assert!(
             !plain(&collapsed.lines)
@@ -711,6 +720,7 @@ mod tests {
 
         let expanded = ToolCallMessage::new(&call, 80)
             .output(Some(&output))
+            .with_optional_image_previews(Some(&image_previews))
             .expanded(true)
             .into_text();
         assert!(
