@@ -13,31 +13,53 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Shared static pointer feedback for terminal controls.
+//! Shared, short-lived interaction animation for terminal pointer feedback.
 //!
-//! Hover transitions previously requested several full TUI redraws. Native
-//! image protocols can turn those decorative frames into expensive terminal
-//! output, so hover now changes once and remains stable until the target moves.
+//! Terminals cannot blend every frame reliably across light and dark themes,
+//! so the transition uses three semantic palette steps over 120 ms. Frames are
+//! requested only while a transition is active.
 
 use crate::ui::markdown_theme::palette;
 use ratatui::style::Color;
+use std::time::{Duration, Instant};
+
+const HOVER_STEP: Duration = Duration::from_millis(40);
+const HOVER_DURATION: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Default)]
 pub(crate) struct InteractionAnimation {
-    _private: (),
+    started_at: Option<Instant>,
 }
 
 impl InteractionAnimation {
-    pub(crate) fn restart(&mut self) {}
+    pub(crate) fn restart(&mut self) {
+        self.started_at = Some(Instant::now());
+    }
 
-    pub(crate) fn cancel(&mut self) {}
+    /// Stop requesting frames when no animated target remains visible.
+    pub(crate) fn cancel(&mut self) {
+        self.started_at = None;
+    }
 
     pub(crate) fn hover_background(&self) -> Color {
-        palette::SURFACE_HOVER
+        self.started_at
+            .map(|started_at| hover_background_at(started_at.elapsed()))
+            .unwrap_or(palette::SURFACE_HOVER)
     }
 
     pub(crate) fn active(&self) -> bool {
-        false
+        self.started_at
+            .is_some_and(|started_at| started_at.elapsed() < HOVER_DURATION)
+    }
+}
+
+fn hover_background_at(elapsed: Duration) -> Color {
+    if elapsed < HOVER_STEP {
+        palette::SURFACE_HOVER_SOFT
+    } else if elapsed < HOVER_STEP.saturating_mul(2) {
+        palette::SURFACE_HOVER_MEDIUM
+    } else {
+        palette::SURFACE_HOVER
     }
 }
 
@@ -46,15 +68,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hover_feedback_is_immediate_and_never_schedules_animation_frames() {
-        let mut feedback = InteractionAnimation::default();
+    fn hover_animation_advances_to_a_stable_final_color() {
+        assert_eq!(
+            hover_background_at(Duration::ZERO),
+            palette::SURFACE_HOVER_SOFT
+        );
+        assert_eq!(
+            hover_background_at(Duration::from_millis(40)),
+            palette::SURFACE_HOVER_MEDIUM
+        );
+        assert_eq!(
+            hover_background_at(Duration::from_millis(80)),
+            palette::SURFACE_HOVER
+        );
+        assert_eq!(
+            hover_background_at(Duration::from_secs(1)),
+            palette::SURFACE_HOVER
+        );
+    }
 
-        feedback.restart();
-        assert_eq!(feedback.hover_background(), palette::SURFACE_HOVER);
-        assert!(!feedback.active());
+    #[test]
+    fn default_is_stable_and_restart_activates_the_transition() {
+        let mut animation = InteractionAnimation::default();
+        assert!(!animation.active());
+        assert_eq!(animation.hover_background(), palette::SURFACE_HOVER);
+        animation.restart();
+        assert!(animation.active());
+        assert_eq!(animation.hover_background(), palette::SURFACE_HOVER_SOFT);
+        animation.started_at = Some(Instant::now() - HOVER_DURATION);
+        assert!(!animation.active());
+        assert_eq!(animation.hover_background(), palette::SURFACE_HOVER);
 
-        feedback.cancel();
-        assert_eq!(feedback.hover_background(), palette::SURFACE_HOVER);
-        assert!(!feedback.active());
+        animation.cancel();
+        assert!(!animation.active());
+        assert_eq!(animation.hover_background(), palette::SURFACE_HOVER);
     }
 }

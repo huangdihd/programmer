@@ -1091,10 +1091,10 @@ impl App<'_> {
                     let throttle_pointer_move =
                         throttle_pointer_move(&current, self.ui.terminal_pane.is_some());
                     if throttle_pointer_move {
-                        // Static hover only needs the latest contiguous pointer
-                        // position. Keeping every motion report would let the
-                        // unbounded terminal-event FIFO delay keyboard and model
-                        // events behind frames that can no longer be observed.
+                        // Hover only needs the latest contiguous pointer position.
+                        // Keeping every motion report would let the unbounded
+                        // terminal-event FIFO delay keyboard and model events
+                        // behind frames that can no longer be observed.
                         while let Some(next) = self.events.try_next() {
                             if !is_pointer_move(&next) {
                                 event = Some(next);
@@ -1125,6 +1125,12 @@ impl App<'_> {
                     let coalesce_left_drag =
                         current_is_left_drag && self.ui.terminal_pane.is_none();
                     self.handle_event(current).await?;
+                    if throttle_pointer_move && self.ui.interaction_animation_active() {
+                        // Pointer moves still avoid immediate full draws. A newly
+                        // started hover transition requests one coalesced frame;
+                        // rendered frames schedule the remaining short-lived steps.
+                        self.events.schedule_redraw();
+                    }
                     let stable_image_pointer = image_pointer_before
                         .flatten()
                         .is_some_and(|before| image_pointer_surface(&self) == Some(before));

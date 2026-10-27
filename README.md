@@ -607,10 +607,11 @@ pointer:
   keep priority.
 
 Interactive rows and cards use the same lightweight terminal feedback: hover
-uses a stable highlight, while mouse-down uses a stronger pressed state. TUI
-pointer moves are collapsed to the latest position and presented by the existing
-periodic frame instead of forcing a full redraw for every terminal motion report;
-embedded terminal mouse input remains unthrottled.
+fades through three semantic palette steps over 120 ms, while mouse-down uses a
+stronger pressed state. TUI pointer moves are collapsed to the latest position
+and presented by the existing periodic frame instead of forcing a full redraw
+for every terminal motion report; only an active transition requests short-lived
+coalesced redraws. Embedded terminal mouse input remains unthrottled.
 
 Selection and link hit-testing account for wrapped and scrolled conversation
 text. With `/select on`, the terminal owns mouse selection instead, so these
