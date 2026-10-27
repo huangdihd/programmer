@@ -1078,6 +1078,7 @@ mod tests {
                         Some(PeerKey::Session("other-peer".into()))
                     );
                 }
+                panel.cancel_pointer_gesture();
                 assert_persistent_selection(&mut panel, theme);
             }
         }
